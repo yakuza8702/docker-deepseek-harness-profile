@@ -3,9 +3,10 @@
  *
  * The Web UI half renders the pill; this half owns the profile facts:
  *
- *   GET  /api/dsh-profile-switcher/list      -> { ok, active, profiles[], canRestart }
+ *   GET  /api/dsh-profile-switcher/list      -> { ok, active, profiles[], safeProfile, locked[] }
  *   POST /api/dsh-profile-switcher/select    { name }             -> writes the selection
  *   POST /api/dsh-profile-switcher/create    { name, from? }      -> copies a profile
+ *   POST /api/dsh-profile-switcher/delete    { name }             -> deletes a profile
  *   POST /api/dsh-profile-switcher/safe      {}                   -> ensure + select Safe Mode
  *   POST /api/dsh-profile-switcher/restart   {}                   -> exit; the container policy reboots
  *
@@ -16,18 +17,20 @@
  * then exits the process; `restart: unless-stopped` brings the container back on
  * the selected profile. The UI confirms before doing it.
  *
- * Deliberately inert when the pieces are missing: no DSH_HOME, no profiles dir,
- * or a profile that cannot boot the Web app (`@deepseek-ai/dsh-base` +
- * `@deepseek-ai/dsh-web-app`) is refused rather than selected — a bad selection
- * must never leave the container without a UI.
+ * Guards: only a profile that can boot the Web app (`@deepseek-ai/dsh-base` +
+ * `@deepseek-ai/dsh-web-app`) is selectable, the shipped `web` profile can never
+ * be deleted (it is the launcher's fallback), and the active profile can never be
+ * deleted — a bad request must not leave the container without a UI.
  */
 
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const ROUTE = '/api/dsh-profile-switcher'
 const WEB_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
 const SAFE_PROFILE = 'shell-safe'
+/** Profiles that must always exist: `web` is the entrypoint's fallback. */
+const LOCKED = new Set(['web'])
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/iu
 const RESERVED = new Set(['node_modules', 'con', 'prn', 'aux', 'nul', 'com1', 'com2', 'com3', 'com4', 'lpt1', 'lpt2', 'lpt3'])
 
@@ -82,6 +85,8 @@ function listProfiles() {
         webCapable: webCapable(bundles),
         active: entry.name === active,
         safeMode: entry.name === SAFE_PROFILE,
+        locked: LOCKED.has(entry.name),
+        deletable: !LOCKED.has(entry.name) && entry.name !== active && bundles !== undefined,
       }
     })
     .sort((a, b) => a.name.localeCompare(b.name))
@@ -114,24 +119,30 @@ function create(name, from) {
   return { name, from: source }
 }
 
+function remove(name) {
+  if (!validName(name)) throw new Error(`invalid profile name: ${JSON.stringify(name)}`)
+  if (LOCKED.has(name)) throw new Error(`"${name}" is the default profile and cannot be deleted`)
+  if (name === activeName()) throw new Error(`"${name}" is the active profile — switch to another profile first, then delete it`)
+  const dir = join(profilesRoot(), name)
+  if (!existsSync(join(dir, 'package.json'))) throw new Error(`profile "${name}" does not exist`)
+  rmSync(dir, { recursive: true, force: false })
+  log(`deleted profile ${name}`)
+  return { name, deleted: true }
+}
+
 /** Safe Mode: the shipped bundles only, so a broken third-party plugin can be removed. */
 function ensureSafeProfile() {
   const target = join(profilesRoot(), SAFE_PROFILE)
   if (!existsSync(join(target, 'package.json'))) {
     create(SAFE_PROFILE, 'web')
-    const manifestPath = join(target, 'package.json')
-    const manifest = readJson(manifestPath) ?? {}
-    manifest.dsh = { ...(manifest.dsh ?? {}), profile: { bundles: [...WEB_BUNDLES] } }
-    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
     const patchPath = join(target, 'cordis.patch.yml')
     writeFileSync(patchPath, '# Safe Mode: the shipped bundles only, no user patch layer.\n[]\n')
     log(`created ${SAFE_PROFILE} (stock bundles only)`)
-  } else {
-    const manifestPath = join(target, 'package.json')
-    const manifest = readJson(manifestPath) ?? {}
-    manifest.dsh = { ...(manifest.dsh ?? {}), profile: { bundles: [...WEB_BUNDLES] } }
-    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
   }
+  const manifestPath = join(target, 'package.json')
+  const manifest = readJson(manifestPath) ?? {}
+  manifest.dsh = { ...(manifest.dsh ?? {}), profile: { bundles: [...WEB_BUNDLES] } }
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
   return select(SAFE_PROFILE)
 }
 
@@ -178,12 +189,19 @@ export function apply(ctx) {
         const body = await readBody(req)
         switch (action) {
           case 'list':
-            return send(res, 200, { ok: true, home: home(), active: activeName(), profiles: listProfiles(), safeProfile: SAFE_PROFILE })
+            return send(res, 200, {
+              ok: true, home: home(), active: activeName(), profiles: listProfiles(),
+              safeProfile: SAFE_PROFILE, locked: [...LOCKED],
+            })
           case 'select':
             return send(res, 200, { ok: true, ...select(String(body.name ?? '')), restartRequired: true })
           case 'create': {
             const created = create(String(body.name ?? ''), body.from === undefined ? undefined : String(body.from))
             return send(res, 200, { ok: true, ...created, profiles: listProfiles() })
+          }
+          case 'delete': {
+            const deleted = remove(String(body.name ?? ''))
+            return send(res, 200, { ok: true, ...deleted, profiles: listProfiles() })
           }
           case 'safe':
             return send(res, 200, { ok: true, ...ensureSafeProfile(), restartRequired: true })
