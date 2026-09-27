@@ -6,14 +6,20 @@
  * offers: switch, New Profile…, Delete (never for `web` — the launcher's
  * fallback), and Safe Mode. No menu bar.
  *
- * Layout follows `dsh-mobile`: the same `(max-width: 720px)` breakpoint, the same
- * 44px touch targets. Below it the popover becomes a bottom sheet, so the control
- * is usable on a phone; above it stays an anchored popover. The control is mounted
- * by the launcher for EVERY profile, so the mobile look is inherited everywhere.
+ * Layout follows `dsh-mobile`:
+ *   * the slot's own `wide` prop decides the trigger shape — the labelled pill in
+ *     the expanded sidebar, a 36×36 round icon button when the sidebar is the
+ *     rail (the same treatment `dsh-mobile` gives its own footer control);
+ *   * the same `(max-width: 720px)` breakpoint switches the panel to a bottom
+ *     sheet with 44px touch targets and safe-area padding;
+ *   * open/close animate (the sheet slides, the popover fades), and everything
+ *     collapses to no motion under `prefers-reduced-motion`.
  *
- * A switch is always a restart (a profile is a boot-time launcher input), so the
- * pill confirms, calls the host half, then waits for the harness to go down and
- * come back before reloading the page.
+ * Closing: ✕ in the panel header, a click anywhere outside, Escape, or tapping
+ * the backdrop of the sheet.
+ *
+ * The control is mounted by the launcher for EVERY profile, so the same trigger
+ * and the same mobile behaviour appear everywhere.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-profile-switcher',
@@ -21,6 +27,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const ROUTE = '/api/dsh-profile-switcher'
     const MOBILE_QUERY = '(max-width: 720px)'
+    const REDUCED_QUERY = '(prefers-reduced-motion: reduce)'
     const inject = ['slots']
 
     /** Small JSON client for the host half. */
@@ -33,27 +40,34 @@ window.__ModuleLoader__.load({
       return payload
     }
 
-    /** dsh-mobile's breakpoint — one media query keeps both looking related. */
-    function useMobile() {
-      const query = React.useMemo(() => window.matchMedia(MOBILE_QUERY), [])
-      const [mobile, setMobile] = React.useState(query.matches)
+    function useMedia(query) {
+      const list = React.useMemo(() => window.matchMedia(query), [query])
+      const [matches, setMatches] = React.useState(list.matches)
       React.useEffect(() => {
-        const listener = (event) => setMobile(event.matches)
-        query.addEventListener('change', listener)
-        setMobile(query.matches)
-        return () => query.removeEventListener('change', listener)
-      }, [query])
-      return mobile
+        const listener = (event) => setMatches(event.matches)
+        list.addEventListener('change', listener)
+        setMatches(list.matches)
+        return () => list.removeEventListener('change', listener)
+      }, [list])
+      return matches
     }
 
     const styles = (mobile) => ({
-      wrap: { position: 'relative' },
-      button: {
-        display: 'flex', alignItems: 'center', gap: 8, width: '100%',
-        minHeight: mobile ? 48 : 32, padding: mobile ? '10px 12px' : '6px 10px',
-        background: 'transparent', border: 0, borderRadius: 10, color: 'inherit',
-        cursor: 'pointer', font: 'inherit', fontSize: mobile ? 15 : 13, textAlign: 'left',
+      wrap: { position: 'relative', display: 'flex', flex: '1 1 auto', minWidth: 0 },
+      // Expanded sidebar: the 42px footer row dsh-mobile also uses.
+      trigger: {
+        boxSizing: 'border-box', display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+        height: 42, margin: '4px 0', padding: '0 10px 0 8px', border: 0, borderRadius: 12,
+        background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 14, lineHeight: '22px',
+        cursor: 'pointer', overflow: 'hidden', textAlign: 'left',
       },
+      // Rail: the icon-only circle.
+      triggerRail: {
+        boxSizing: 'border-box', flex: '0 0 auto', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        width: 36, height: 36, margin: '8px 0 10px', padding: 0, border: 0, borderRadius: '50%',
+        background: 'transparent', color: 'inherit', cursor: 'pointer',
+      },
+      triggerLabel: { minWidth: 0, flex: '1 1 auto', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' },
       panel: mobile
         ? {
             position: 'fixed', left: 8, right: 8, bottom: 'calc(8px + env(safe-area-inset-bottom, 0px))',
@@ -61,8 +75,7 @@ window.__ModuleLoader__.load({
             border: '1px solid rgba(127,127,127,.35)', zIndex: 2147483000,
             background: 'var(--dsw-alias-bg-layer-1, rgba(24,24,32,.99))',
             color: 'var(--dsw-alias-label-primary, inherit)',
-            boxShadow: '0 18px 48px rgba(0,0,0,.55)',
-            WebkitOverflowScrolling: 'touch',
+            boxShadow: '0 18px 48px rgba(0,0,0,.55)', WebkitOverflowScrolling: 'touch',
           }
         : {
             position: 'fixed', width: 340, maxHeight: '70vh', overflowY: 'auto', padding: 12, borderRadius: 12,
@@ -71,6 +84,17 @@ window.__ModuleLoader__.load({
             color: 'var(--dsw-alias-label-primary, inherit)',
             boxShadow: '0 18px 40px rgba(0,0,0,.5)',
           },
+      backdrop: {
+        position: 'fixed', inset: 0, zIndex: 2147482999, background: 'rgba(0,0,0,.45)',
+        transition: 'opacity 200ms cubic-bezier(.2,.8,.2,1)',
+      },
+      header: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 2 },
+      close: {
+        flex: '0 0 auto', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        width: mobile ? 44 : 28, height: mobile ? 44 : 28, marginTop: mobile ? -6 : -4, marginRight: mobile ? -6 : -4,
+        padding: 0, border: 0, borderRadius: 999, background: 'transparent', color: 'inherit',
+        fontSize: mobile ? 20 : 15, lineHeight: 1, cursor: 'pointer', opacity: .75,
+      },
       title: { fontWeight: 650, fontSize: mobile ? 17 : 13.5, marginBottom: 2 },
       subtitle: { opacity: .65, fontSize: mobile ? 13 : 12, marginBottom: 12, lineHeight: 1.4 },
       row: {
@@ -96,43 +120,47 @@ window.__ModuleLoader__.load({
         border: '1px solid rgba(127,127,127,.4)', background: 'rgba(127,127,127,.10)', color: 'inherit',
       },
       note: { marginTop: 10, fontSize: mobile ? 13 : 12, lineHeight: 1.45 },
-      sheetGrabber: { width: 42, height: 4, borderRadius: 999, background: 'rgba(127,127,127,.45)', margin: '0 auto 10px' },
+      sheetGrabber: { width: 42, height: 4, borderRadius: 999, background: 'rgba(127,127,127,.45)', margin: '0 auto 12px' },
     })
 
     const describe = (profile) => {
       if (profile.bundles === null) return 'no package.json — not switchable'
       if (!profile.webCapable) return `${profile.bundleCount} bundles — not web-capable`
-      const thirdParty = profile.bundleCount - 2
       if (profile.safeMode) return 'Safe Mode — stock bundles'
+      const thirdParty = profile.bundleCount - 2
       return thirdParty > 0 ? `${profile.bundleCount} bundles (${thirdParty} added)` : 'stock (dsh-base + web-app)'
     }
 
-    function ProfilePill() {
-      const mobile = useMobile()
+    /** The slot hands `wide` down: false when the sidebar is the icon rail. */
+    function ProfilePill({ wide = true }) {
+      const mobile = useMedia(MOBILE_QUERY)
+      const reduced = useMedia(REDUCED_QUERY)
       const S = React.useMemo(() => styles(mobile), [mobile])
-      const [open, setOpen] = React.useState(false)
+      const duration = reduced ? 0 : (mobile ? 240 : 180)
+
+      const [mounted, setMounted] = React.useState(false)
+      const [entered, setEntered] = React.useState(false)
       const [profiles, setProfiles] = React.useState([])
       const [active, setActive] = React.useState(null)
       const [note, setNote] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
       const [draft, setDraft] = React.useState('')
       const [elapsed, setElapsed] = React.useState(null)
-      const buttonRef = React.useRef(null)
       const [anchor, setAnchor] = React.useState(null)
+      const buttonRef = React.useRef(null)
+      const panelRef = React.useRef(null)
+      const closeTimer = React.useRef(null)
 
-      /** Anchor the popover to the pill (desktop only; mobile uses the sheet). */
+      const open = mounted
+
       const place = React.useCallback(() => {
         const rect = buttonRef.current?.getBoundingClientRect()
         if (rect === undefined || rect === null) return
-        setAnchor({ left: Math.max(8, Math.min(rect.left, window.innerWidth - 348)), bottom: Math.max(8, window.innerHeight - rect.top + 8) })
+        setAnchor({
+          left: Math.max(8, Math.min(rect.left, window.innerWidth - 348)),
+          bottom: Math.max(8, window.innerHeight - rect.top + 8),
+        })
       }, [])
-
-      React.useEffect(() => {
-        if (!open || mobile) return undefined
-        place()
-        window.addEventListener('resize', place)
-        return () => window.removeEventListener('resize', place)
-      }, [open, mobile, place])
 
       const refresh = React.useCallback(async () => {
         try {
@@ -147,6 +175,48 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => { void refresh() }, [refresh])
 
+      const show = React.useCallback(() => {
+        if (closeTimer.current !== null) { clearTimeout(closeTimer.current); closeTimer.current = null }
+        setMounted(true)
+        void refresh()
+        // Enter in two steps so the transition has a from-state to run out of.
+        // rAF is the smooth path, but it is PAUSED in some renderers (an occluded
+        // or non-composited window), so a timer guarantees the panel still opens
+        // instead of sitting at opacity 0.
+        const kick = () => setEntered(true)
+        requestAnimationFrame(() => requestAnimationFrame(kick))
+        setTimeout(kick, 60)
+      }, [refresh])
+
+      const hide = React.useCallback(() => {
+        setEntered(false)
+        closeTimer.current = setTimeout(() => { setMounted(false); closeTimer.current = null }, duration)
+      }, [duration])
+
+      React.useEffect(() => () => { if (closeTimer.current !== null) clearTimeout(closeTimer.current) }, [])
+
+      // Outside click + Escape close, and the popover follows the trigger.
+      React.useEffect(() => {
+        if (!mounted) return undefined
+        const onPointerDown = (event) => {
+          const target = event.target
+          if (panelRef.current?.contains(target) === true) return
+          if (buttonRef.current?.contains(target) === true) return
+          hide()
+        }
+        const onKeyDown = (event) => { if (event.key === 'Escape') hide() }
+        const onResize = () => { if (!mobile) place() }
+        document.addEventListener('pointerdown', onPointerDown, true)
+        document.addEventListener('keydown', onKeyDown)
+        window.addEventListener('resize', onResize)
+        if (!mobile) place()
+        return () => {
+          document.removeEventListener('pointerdown', onPointerDown, true)
+          document.removeEventListener('keydown', onKeyDown)
+          window.removeEventListener('resize', onResize)
+        }
+      }, [mounted, mobile, place, hide])
+
       /** Confirm, apply, restart, then wait for the harness to come back. */
       const applyAndWait = async (action, body, label) => {
         if (!window.confirm(`Switch to “${label}” and restart the harness?\n\nThe interface disconnects for about 20 seconds. Sessions, settings and credentials are kept — only the plugin set changes.`)) return
@@ -156,8 +226,8 @@ window.__ModuleLoader__.load({
         const started = Date.now()
         const ticker = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 1000)
         try {
-          await call(action, body)          // selects (or creates + selects) the profile
-          await call('restart', {})         // asks the harness to exit; the container policy reboots it
+          await call(action, body)
+          await call('restart', {})
           let down = false
           for (let attempt = 0; attempt < 180; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 1000))
@@ -244,21 +314,44 @@ window.__ModuleLoader__.load({
                   }, 'Delete')
                 : null))))
 
+      const panelPosition = mobile || anchor === null ? {} : { left: anchor.left, bottom: anchor.bottom }
+      const panelTransition = `opacity ${duration}ms cubic-bezier(.2,.8,.2,1), transform ${duration}ms cubic-bezier(.2,.8,.2,1)`
+      const panelEnter = mobile
+        ? { opacity: entered ? 1 : 0, transform: entered ? 'translateY(0)' : 'translateY(101%)' }
+        : { opacity: entered ? 1 : 0, transform: entered ? 'none' : 'translateY(6px) scale(.97)' }
+
       return React.createElement('div', { style: S.wrap },
         React.createElement('button', {
-          type: 'button', ref: buttonRef, style: S.button,
-          title: 'Profile — switch the plugin set this harness boots',
-          onClick: () => { setOpen((value) => !value); if (!open) void refresh() },
+          type: 'button',
+          ref: buttonRef,
+          style: wide ? S.trigger : S.triggerRail,
+          title: `Profile: ${active ?? 'unknown'} — switch the plugin set this harness boots`,
+          'aria-label': `Profile: ${active ?? 'unknown'}`,
+          'aria-expanded': open,
+          onClick: () => { if (open) hide(); else show() },
         },
-          React.createElement('span', { style: { opacity: .7 } }, '◍'),
-          React.createElement('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-            `Profile: ${active ?? 'unknown'}`),
-          React.createElement('span', { style: { opacity: .5, fontSize: 11 } }, open ? '▾' : '▸')),
-        open && React.createElement('div', {
-          style: mobile || anchor === null ? S.panel : { ...S.panel, left: anchor.left, bottom: anchor.bottom },
+          React.createElement('span', { style: { flex: '0 0 auto', fontSize: wide ? 15 : 18, opacity: .85 } }, '◍'),
+          wide
+            ? React.createElement('span', { style: S.triggerLabel }, `Profile: ${active ?? 'unknown'}`)
+            : null),
+        mounted && mobile && React.createElement('div', {
+          style: { ...S.backdrop, opacity: entered ? 1 : 0 },
+          onClick: hide,
+          'aria-hidden': true,
+        }),
+        mounted && React.createElement('div', {
+          ref: panelRef,
+          role: 'dialog',
+          'aria-label': 'Available Profiles',
+          style: { ...S.panel, ...panelPosition, ...panelEnter, transition: panelTransition },
         },
           mobile && React.createElement('div', { style: S.sheetGrabber }),
-          React.createElement('div', { style: S.title }, 'Available Profiles'),
+          React.createElement('div', { style: S.header },
+            React.createElement('div', { style: S.title }, 'Available Profiles'),
+            React.createElement('button', {
+              type: 'button', style: S.close, title: 'Close', 'aria-label': 'Close',
+              onClick: hide,
+            }, '✕')),
           React.createElement('div', { style: S.subtitle }, 'Switch to another Web-compatible Profile, create or delete one. Switching restarts the harness.'),
           ...rows,
           React.createElement('div', { style: S.divider }),
