@@ -60,18 +60,23 @@ window.__ModuleLoader__.load({
      * expanded sidebar and the rail.
      */
     const CSS = `
-.dsh-ps__trigger{transition:background-color 120ms ease}
-.dsh-ps__trigger:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f3f6)}
-.dsh-ps__trigger:active,.dsh-ps__trigger[aria-expanded="true"]{background:var(--dsw-alias-interactive-bg-active,#e8ebf0)}
+/* Geometry and colours are copied from the shipped Settings trigger
+   (.VOzbGW_trigger in this build): same radius variable, same label colour, and
+   the SAME two theme variables for hover/active — deliberately with NO fallback
+   literal, because a hard-coded light tint is what made the control glow in the
+   dark theme. If a variable is missing the declaration resolves to nothing,
+   which is still consistent with the surrounding UI. */
+.dsh-ps__trigger{box-sizing:border-box;display:flex;align-items:center;justify-content:center;gap:0;
+  width:36px;height:36px;flex:0 0 auto;margin:0;padding:0;border:none;border-radius:var(--dsw-radius-md,12px);
+  background:none;color:var(--dsw-alias-label-primary,inherit);cursor:pointer;transition:background-color 120ms ease}
+.dsh-ps__trigger:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-ps__trigger:active,.dsh-ps__trigger[aria-expanded="true"]{background:var(--dsw-alias-interactive-bg-active)}
 .dsh-ps__trigger:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
-.dsh-ps__action{background:rgba(127,127,127,.12);transition:background-color 120ms ease}
-.dsh-ps__action:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.24))}
-.dsh-ps__action:not(:disabled):active{background:var(--dsw-alias-interactive-bg-active,rgba(127,127,127,.3))}
-.dsh-ps__danger{background:rgba(220,90,90,.12)}
-.dsh-ps__danger:not(:disabled):hover{background:rgba(220,90,90,.24)}
-.dsh-ps__danger:not(:disabled):active{background:rgba(220,90,90,.3)}
+.dsh-ps__action{background:var(--dsw-alias-interactive-bg-hover);transition:background-color 120ms ease}
+.dsh-ps__action:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-active)}
+.dsh-ps__danger{border-color:var(--dsw-alias-state-error-primary,rgba(220,90,90,.5))}
 .dsh-ps__close{transition:background-color 120ms ease}
-.dsh-ps__close:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.22))}
+.dsh-ps__close:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .dsh-ps__close:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
 `
 
@@ -89,11 +94,7 @@ window.__ModuleLoader__.load({
       // Icon only, in the expanded sidebar AND the rail — the same shape and
       // hover highlight the shipped footer controls (Settings, and the Mobile
       // access trigger when installed) use. Its colours live in CSS below.
-      trigger: {
-        boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center',
-        width: 36, height: 36, flex: '0 0 auto', margin: '4px 0', padding: 0, border: 0,
-        borderRadius: 10, color: 'inherit', cursor: 'pointer',
-      },
+      trigger: {},  // geometry + colours: the injected stylesheet, copied from Settings
       triggerLabel: { minWidth: 0, flex: '1 1 auto', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' },
       panel: mobile
         ? {
@@ -176,6 +177,7 @@ window.__ModuleLoader__.load({
       const [anchor, setAnchor] = React.useState(null)
       const buttonRef = React.useRef(null)
       const panelRef = React.useRef(null)
+      const wrapRef = React.useRef(null)
       const closeTimer = React.useRef(null)
 
       const open = mounted
@@ -243,6 +245,50 @@ window.__ModuleLoader__.load({
           window.removeEventListener('resize', onResize)
         }
       }, [mounted, mobile, place, hide])
+
+      /**
+       * Sit BESIDE Settings while the sidebar is expanded.
+       *
+       * The footer slot renders above the Settings row (that is why the control
+       * looked stacked). The shipped Settings trigger lives in
+       * `[class*="settingsArea"] [class*="_triggerRow"]`, a flex row with an 8px
+       * gap — the same insertion point the reference deployment's mobile control
+       * uses. We move our own node there when the sidebar is wide, and put it
+       * back where the slot rendered it when the sidebar is the rail (the rail
+       * stacking is already correct). Re-inserted on DOM churn, because React
+       * may re-render the slot.
+       */
+      React.useEffect(() => {
+        const node = wrapRef.current
+        if (node === null) return undefined
+        const home = { parent: node.parentElement, next: node.nextSibling }
+        let scheduled = false
+        const place = () => {
+          const foot = document.querySelector('[class*="footArea"]')
+          if (foot === null) return
+          const row = foot.querySelector('[class*="settingsArea"] [class*="_triggerRow"]')
+          const expanded = foot.getBoundingClientRect().width > 120
+          if (expanded && row !== null) {
+            if (node.parentElement !== row) row.insertBefore(node, row.firstChild)
+          } else if (home.parent !== null && node.parentElement !== home.parent) {
+            home.parent.insertBefore(node, home.next)
+          }
+        }
+        const schedule = () => {
+          if (scheduled) return
+          scheduled = true
+          window.setTimeout(() => { scheduled = false; place() }, 120)
+        }
+        place()
+        const observer = new MutationObserver(schedule)
+        observer.observe(document.body, { childList: true, subtree: true })
+        window.addEventListener('resize', schedule)
+        return () => {
+          observer.disconnect()
+          window.removeEventListener('resize', schedule)
+          if (home.parent !== null && node.parentElement !== home.parent) home.parent.insertBefore(node, home.next)
+        }
+      }, [])
 
       /** Confirm, apply, restart, then wait for the harness to come back. */
       const applyAndWait = async (action, body, label) => {
@@ -349,7 +395,7 @@ window.__ModuleLoader__.load({
         ? { opacity: entered ? 1 : 0, transform: entered ? 'translateY(0)' : 'translateY(101%)' }
         : { opacity: entered ? 1 : 0, transform: entered ? 'none' : 'translateY(6px) scale(.97)' }
 
-      return React.createElement('div', { style: S.wrap },
+      return React.createElement('div', { ref: wrapRef, style: S.wrap },
         React.createElement('button', {
           type: 'button',
           ref: buttonRef,
