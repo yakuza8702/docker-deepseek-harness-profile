@@ -64,9 +64,12 @@ window.__ModuleLoader__.load({
 .dsh-ps__trigger:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f3f6)}
 .dsh-ps__trigger:active,.dsh-ps__trigger[aria-expanded="true"]{background:var(--dsw-alias-interactive-bg-active,#e8ebf0)}
 .dsh-ps__trigger:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
-.dsh-ps__action{transition:background-color 120ms ease}
-.dsh-ps__action:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.22))}
-.dsh-ps__danger:not(:disabled):hover{background:rgba(220,90,90,.22)}
+.dsh-ps__action{background:rgba(127,127,127,.12);transition:background-color 120ms ease}
+.dsh-ps__action:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.24))}
+.dsh-ps__action:not(:disabled):active{background:var(--dsw-alias-interactive-bg-active,rgba(127,127,127,.3))}
+.dsh-ps__danger{background:rgba(220,90,90,.12)}
+.dsh-ps__danger:not(:disabled):hover{background:rgba(220,90,90,.24)}
+.dsh-ps__danger:not(:disabled):active{background:rgba(220,90,90,.3)}
 .dsh-ps__close{transition:background-color 120ms ease}
 .dsh-ps__close:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.22))}
 .dsh-ps__close:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
@@ -82,14 +85,14 @@ window.__ModuleLoader__.load({
     }
 
     const styles = (mobile) => ({
-      wrap: { position: 'relative', display: 'flex', flex: '0 0 auto', minWidth: 0 },
-      // Expanded sidebar AND rail: the icon alone, sized like dsh-mobile's own
-      // footer control (the labelled version squeezed the footer row and got
-      // truncated next to "Mobile access").
+      wrap: { position: 'relative', display: 'flex', flex: '0 0 auto', alignItems: 'center', justifyContent: 'center', minWidth: 0 },
+      // Icon only, in the expanded sidebar AND the rail — the same shape and
+      // hover highlight the shipped footer controls (Settings, and the Mobile
+      // access trigger when installed) use. Its colours live in CSS below.
       trigger: {
         boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center',
-        width: 36, height: 36, flex: '0 0 auto', margin: 0, padding: 0, border: 0,
-        borderRadius: '50%', background: 'transparent', color: 'inherit', cursor: 'pointer',
+        width: 36, height: 36, flex: '0 0 auto', margin: '4px 0', padding: 0, border: 0,
+        borderRadius: 10, color: 'inherit', cursor: 'pointer',
       },
       triggerLabel: { minWidth: 0, flex: '1 1 auto', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' },
       panel: mobile
@@ -116,7 +119,7 @@ window.__ModuleLoader__.load({
       close: {
         flex: '0 0 auto', display: 'flex', alignItems: 'center', justifyContent: 'center',
         width: mobile ? 44 : 28, height: mobile ? 44 : 28, marginTop: mobile ? -6 : -4, marginRight: mobile ? -6 : -4,
-        padding: 0, border: 0, borderRadius: 999, background: 'transparent', color: 'inherit',
+        padding: 0, border: 0, borderRadius: 999, color: 'inherit',
         fontSize: mobile ? 20 : 15, lineHeight: 1, cursor: 'pointer', opacity: .75,
       },
       title: { fontWeight: 650, fontSize: mobile ? 17 : 13.5, marginBottom: 2 },
@@ -133,9 +136,9 @@ window.__ModuleLoader__.load({
       action: {
         flex: '0 0 auto', padding: mobile ? '10px 14px' : '4px 10px', borderRadius: 999, cursor: 'pointer',
         font: 'inherit', fontSize: mobile ? 13 : 12, minHeight: mobile ? 44 : 0,
-        border: '1px solid rgba(127,127,127,.4)', background: 'rgba(127,127,127,.12)', color: 'inherit',
+        border: '1px solid rgba(127,127,127,.4)', color: 'inherit',
       },
-      danger: { borderColor: 'rgba(220,90,90,.5)', background: 'rgba(220,90,90,.12)' },
+      danger: { borderColor: 'rgba(220,90,90,.5)' },
       lock: { opacity: .55, fontSize: mobile ? 12 : 11, flex: '0 0 auto' },
       divider: { height: 1, background: 'rgba(127,127,127,.25)', margin: '12px 0' },
       input: {
@@ -357,7 +360,12 @@ window.__ModuleLoader__.load({
           'aria-expanded': open,
           onClick: () => { if (open) hide(); else show() },
         },
-          React.createElement('span', { style: { fontSize: 18, lineHeight: 1, opacity: .85 } }, '◍')),
+          React.createElement('svg', {
+            'aria-hidden': true, focusable: false, width: 18, height: 18, viewBox: '0 0 16 16',
+            fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+          },
+            React.createElement('circle', { cx: 8, cy: 5.4, r: 2.6 }),
+            React.createElement('path', { d: 'M3.3 13.3c.75-2.4 2.6-3.7 4.7-3.7s3.95 1.3 4.7 3.7' }))),
         mounted && mobile && React.createElement('div', {
           style: { ...S.backdrop, opacity: entered ? 1 : 0 },
           onClick: hide,

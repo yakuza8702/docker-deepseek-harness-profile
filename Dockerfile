@@ -185,39 +185,17 @@ RUN set -eux; \
     rm -rf /opt/dsh-profile-switcher; \
     chmod -R a+rX /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-profile-switcher 2>/dev/null || true
 
-# Global mobile surface: dsh-mobile (the same release the reference deployment
-# runs) is installed into the DSH installation so the launcher can mount it for
-# every profile that does not already carry it — that is what makes the Web UI
-# adapt at phone widths instead of rendering the desktop layout squeezed.
-# Packages already present in the installation are left untouched (only the
-# missing ones — dsh-mobile itself plus bonjour-service/qrcode/selfsigned — are
-# copied in), so nothing in the pinned DSH tree is replaced.
-RUN set -eux; \
-    mkdir -p /tmp/mob && cd /tmp/mob \
- && npm init -y >/dev/null 2>&1 \
- && npm install --omit=dev --no-audit --no-fund --no-package-lock dsh-mobile@0.4.7 >/dev/null \
- && node -e 'const fs=require("node:fs"),path=require("node:path");\
-const src="/tmp/mob/node_modules";\
-const dsts=["/opt/dsh/node_modules","/opt/dsh-src/node_modules"].filter((d)=>fs.existsSync(d));\
-const copy=(from,to)=>{fs.mkdirSync(path.dirname(to),{recursive:true});fs.cpSync(from,to,{recursive:true})};\
-for(const dst of dsts){for(const name of fs.readdirSync(src)){if(name.startsWith("."))continue;\
-const s=path.join(src,name);\
-if(name.startsWith("@")){for(const inner of fs.readdirSync(s)){const t=path.join(dst,name,inner);\
-if(fs.existsSync(t)){console.log("keep existing",name+"/"+inner);continue}copy(path.join(s,inner),t)}}\
-else{const t=path.join(dst,name);if(fs.existsSync(t)){console.log("keep existing",name);continue}copy(s,t)}}}' \
- && rm -rf /tmp/mob
 
 # Declare the plugins in the DSH installation's own manifest. This is what makes
 # their bare row names resolvable at boot: the launcher builds a module-resolution
 # table by walking the installation package's dependency closure (a package that
 # merely sits in node_modules is invisible to the loader — it fails with
 # "failed to import"), and `client-modules` scans loader entries for packages
-# declaring `dsh.client`, which needs the specifier to be a package name. The walk
-# then follows dsh-mobile's own manifest, so its dependencies resolve too.
+# declaring `dsh.client`, which needs the specifier to be a package name.
 RUN set -eux; \
     for anchor in /opt/dsh/node_modules/@deepseek-ai/dsh/package.json /opt/dsh-src/apps/cli/package.json; do \
       [ -f "$anchor" ] || continue; \
-      node -e 'const fs = require("node:fs"); const p = process.argv[1]; const m = JSON.parse(fs.readFileSync(p, "utf8")); m.dependencies = { ...(m.dependencies ?? {}), "dsh-profile-switcher": "0.1.0", "dsh-mobile": "0.4.7" }; fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n"); console.log("declared the profile switcher + dsh-mobile in", p);' "$anchor"; \
+      node -e 'const fs = require("node:fs"); const p = process.argv[1]; const m = JSON.parse(fs.readFileSync(p, "utf8")); m.dependencies = { ...(m.dependencies ?? {}), "dsh-profile-switcher": "0.1.0" }; fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n"); console.log("declared the profile switcher in", p);' "$anchor"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 

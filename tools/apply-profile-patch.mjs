@@ -50,36 +50,13 @@ PROFILE="\${PROFILE:-web}"
 log "active profile: \${PROFILE}"
 
 # ---------------------------------------------------------------------
-# Launcher overlay for the in-app profile control + the global mobile surface.
-# GENERATED here, not a fixed file, because one row must not be mounted twice:
-#   * dsh-profile-switcher always — the pill beside Settings;
-#   * dsh-mobile only when the selected profile does not already select it, so
-#     every profile renders the mobile surface at phone widths (a profile that
-#     carries dsh-mobile itself, e.g. a copy of a full profile set, keeps its own
-#     single mount and is not duplicated — duplicate loader ids abort the tree).
-# Applied AFTER the profile layer as a launcher --patch, so no profile directory
-# in $DSH_HOME is ever edited. DSH_PROFILE_OVERLAY=<path> overrides it entirely.
+# In-app profile control (dsh-profile-switcher) as a launcher overlay.
+# Applied AFTER the profile layer, so no profile directory is ever edited: the
+# pill in the Web UI comes from this file. DSH_PROFILE_OVERLAY=<path> overrides
+# it; DSH_PROFILE_OVERLAY= disables it.
 # ---------------------------------------------------------------------
 declare -a overlay_args=()
-OVERLAY="\${DSH_PROFILE_OVERLAY-}"
-if [[ -z "$OVERLAY" ]]; then
-  OVERLAY=/tmp/dsh-profile-overlay.yml
-  cat /opt/seek-harness/profile-switcher.overlay.yml > "$OVERLAY"
-  MOBILE_PATCH=""
-  for candidate in /opt/dsh/node_modules/dsh-mobile/cordis.patch.yml /opt/dsh-src/node_modules/dsh-mobile/cordis.patch.yml; do
-    [[ -f "$candidate" ]] && MOBILE_PATCH="$candidate" && break
-  done
-  if [[ -n "$MOBILE_PATCH" ]]; then
-    if node -e 'const fs=require("fs"),path=require("path");try{const p=path.join(process.env.DSH_HOME||"/home/node/.dsh","profiles",process.argv[1],"package.json");const b=((JSON.parse(fs.readFileSync(p,"utf8")).dsh||{}).profile||{}).bundles||[];process.exit(b.includes("dsh-mobile")?0:1)}catch{process.exit(1)}' "$PROFILE"; then
-      log "profile \${PROFILE} already selects dsh-mobile — mobile surface not overlaid"
-    else
-      { printf '\\n'; cat "$MOBILE_PATCH"; } >> "$OVERLAY"
-      log "mobile surface (dsh-mobile) overlaid for profile \${PROFILE}"
-    fi
-  else
-    log "dsh-mobile not installed in this image — no mobile surface overlaid"
-  fi
-fi
+OVERLAY="\${DSH_PROFILE_OVERLAY-/opt/seek-harness/profile-switcher.overlay.yml}"
 if [[ -n "$OVERLAY" && -f "$OVERLAY" ]]; then
   overlay_args+=(--patch "$OVERLAY")
   log "overlay: $OVERLAY"
