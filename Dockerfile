@@ -169,6 +169,35 @@ COPY docker/proxy.mjs docker/entrypoint.sh /opt/seek-harness/
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh \
  && ln -sfn /opt/seek-harness/entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# In-app profile control (dsh-profile-switcher). The package is placed in the
+# DSH installation's node_modules so the launcher can mount it by name from any
+# profile; the overlay patch that mounts it sits beside the entrypoint that
+# applies it (`--patch`, AFTER the profile layer) — no profile directory in
+# $DSH_HOME is ever edited. Uninstall = remove the overlay (or set
+# DSH_PROFILE_OVERLAY=) .
+COPY plugins/dsh-profile-switcher /opt/dsh-profile-switcher
+RUN set -eux; \
+    installed=0; \
+    for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
+      if [ -d "$target" ]; then cp -a /opt/dsh-profile-switcher "$target/dsh-profile-switcher"; installed=1; fi; \
+    done; \
+    [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
+    rm -rf /opt/dsh-profile-switcher; \
+    chmod -R a+rX /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-profile-switcher 2>/dev/null || true
+
+# Declare the plugin in the DSH installation's own manifest. This is what makes
+# the bare row name resolvable at boot: the launcher builds a module-resolution
+# table by walking the installation package's dependency closure (a package that
+# merely sits in node_modules is invisible to the loader — it fails with
+# "failed to import"), and `client-modules` scans loader entries for packages
+# declaring `dsh.client`, which needs the specifier to be a package name.
+RUN set -eux; \
+    for anchor in /opt/dsh/node_modules/@deepseek-ai/dsh/package.json /opt/dsh-src/apps/cli/package.json; do \
+      [ -f "$anchor" ] || continue; \
+      node -e 'const fs = require("node:fs"); const p = process.argv[1]; const m = JSON.parse(fs.readFileSync(p, "utf8")); m.dependencies = { ...(m.dependencies ?? {}), "dsh-profile-switcher": "0.1.0" }; fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n"); console.log("declared dsh-profile-switcher in", p);' "$anchor"; \
+    done
+COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
+
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \
     HOME=/workspace \

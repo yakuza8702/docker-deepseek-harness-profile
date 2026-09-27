@@ -1,0 +1,27 @@
+{
+  "name": "dsh-profile-switcher",
+  "version": "0.1.0",
+  "description": "Minimal in-app Profile control for the DSH Web UI: a pill beside Settings that lists profiles, switches the boot selection (active-profile.json + restart) and offers Safe Mode.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "files": [
+    "lib/",
+    "README.md"
+  ],
+  "license": "MIT"
+}

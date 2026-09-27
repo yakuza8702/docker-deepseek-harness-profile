@@ -73,6 +73,53 @@ from upstream (idempotent, content-anchored: it refuses an absent or ambiguous
 anchor). A companion Electron shell that manages profiles and restarts the
 container lives outside this repo.
 
+## In-app profile control — the pill beside Settings
+
+The image also carries **`dsh-profile-switcher`**: one pill in the Web UI's
+sidebar foot (slot `sidebar.footer.action`, right beside *Settings*), and in it
+exactly three things — switch profile, *New Profile…*, *Safe Mode*. No menu bar,
+no other entries.
+
+```
+sidebar footer:   ◍ Profile: research ▸      Settings
+                  ┌────────────────────────────────────────────┐
+                  │ Available Profiles                         │
+                  │ research · current    3 bundles (1 added)  │
+                  │ web                   stock bundles  [Switch]
+                  │ ─────────────────────────────────────────  │
+                  │ [ new profile name ]        [ + New Profile ]
+                  │ [ Safe Mode — boot stock bundles only ]     │
+                  └────────────────────────────────────────────┘
+```
+
+* host routes: `GET /api/dsh-profile-switcher/list`, `POST …/select`,
+  `POST …/create`, `POST …/safe`, `POST …/restart`;
+* a switch writes `active-profile.json` and asks the harness to exit — the
+  container's `restart: unless-stopped` brings it back **on the selected
+  profile** (the UI confirms first, then waits for the harness and reloads);
+* **Safe Mode** creates/boots `shell-safe` (the shipped bundles only) with an
+  empty patch layer, so a broken third-party plugin can be removed from the UI;
+* installation/removal is one file: the launcher applies
+  `/opt/seek-harness/profile-switcher.overlay.yml` as a `--patch` overlay
+  (`DSH_PROFILE_OVERLAY=` disables it, any other path replaces it). No profile
+  directory in `$DSH_HOME` is edited — the pill is mounted by the launcher, so it
+  appears in *every* profile, including Safe Mode.
+
+Two implementation details that were not obvious and are load-bearing:
+
+1. **The package must be declared in the installation manifest.**
+   `node_modules/…` alone is not enough: the launcher builds its module-resolution
+   table by walking the installation package's dependency closure, and
+   `client-modules` maps a loader row back to a *package name* to compose its
+   browser half. A package that merely sits in `node_modules` fails with
+   `failed to import`. The Dockerfile therefore adds
+   `"dsh-profile-switcher": "0.1.0"` to the dependencies of
+   `/opt/dsh/node_modules/@deepseek-ai/dsh/package.json` (and of
+   `/opt/dsh-src/apps/cli/package.json` on source-channel images).
+2. **The browser half follows the `client-modules` contract**:
+   `window.__ModuleLoader__.load({ id, factory })` where `factory(require)`
+   **returns** the exports object — there is no `exports`/`module` in that scope.
+
 ## Quick start (plain docker run)
 
 ```bash

@@ -94,7 +94,7 @@ DSH_LOG=/tmp/dsh-web.log
 : > /tmp/dsh-token
 log "starting DSH web on 127.0.0.1:${DSH_PORT} (DSH_HOME=${DSH_HOME:-unset}, HOME=${HOME})"
 # ---------------------------------------------------------------------
-# Profile-aware boot (this repo's one change against upstream).
+# Profile-aware boot (this repo's change against upstream).
 # A DSH profile is a LAUNCHER input, so the selection has to be resolved here,
 # at boot: $DSH_HOME/active-profile.json { version, active }. Anything missing,
 # malformed, or not web-capable falls back to "web": a bad selection must never
@@ -103,7 +103,22 @@ log "starting DSH web on 127.0.0.1:${DSH_PORT} (DSH_HOME=${DSH_HOME:-unset}, HOM
 PROFILE="$(node -e 'const fs=require("fs"),path=require("path");try{const home=process.env.DSH_HOME||"/home/node/.dsh";const j=JSON.parse(fs.readFileSync(path.join(home,"active-profile.json"),"utf8"));const n=String(j.active||"");if(!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(n))process.exit(0);const m=JSON.parse(fs.readFileSync(path.join(home,"profiles",n,"package.json"),"utf8"));const b=(m&&m.dsh&&m.dsh.profile&&m.dsh.profile.bundles)||[];if(b.includes("@deepseek-ai/dsh-base")&&b.includes("@deepseek-ai/dsh-web-app"))process.stdout.write(n)}catch{}' 2>/dev/null || true)"
 PROFILE="${PROFILE:-web}"
 log "active profile: ${PROFILE}"
+
+# ---------------------------------------------------------------------
+# In-app profile control (dsh-profile-switcher) as a launcher overlay.
+# Applied AFTER the profile layer, so no profile directory is ever edited:
+# the pill in the Web UI comes from this patch file. Set DSH_PROFILE_OVERLAY=
+# to disable, or point it at a different overlay.
+# ---------------------------------------------------------------------
+declare -a overlay_args=()
+OVERLAY="${DSH_PROFILE_OVERLAY-/opt/seek-harness/profile-switcher.overlay.yml}"
+if [[ -n "$OVERLAY" && -f "$OVERLAY" ]]; then
+  overlay_args+=(--patch "$OVERLAY")
+  log "profile switcher overlay: $OVERLAY"
+fi
+
 node "${node_flags[@]}" "$DSH_BIN" --profile "${PROFILE}" \
+  ${overlay_args[@]+"${overlay_args[@]}"} \
   --no-open --host 127.0.0.1 --port "$DSH_PORT" \
   ${trusted_args[@]+"${trusted_args[@]}"} "$@" >"$DSH_LOG" 2>&1 &
 DSH_PID=$!
