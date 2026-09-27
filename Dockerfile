@@ -207,19 +207,6 @@ if(fs.existsSync(t)){console.log("keep existing",name+"/"+inner);continue}copy(p
 else{const t=path.join(dst,name);if(fs.existsSync(t)){console.log("keep existing",name);continue}copy(s,t)}}}' \
  && rm -rf /tmp/mob
 
-# dsh-mobile decides its surface from the HOSTNAME alone, and that check is true
-# for every private IPv4 — so a LAN deployment renders the DESKTOP page at 390px
-# (measured: 0 `data-dsh-mobile-*` nodes, versus 4 on a healed deployment). Heal
-# the installed client at BUILD time (the runtime rootfs is read-only): narrow
-# pages take the phone surface, and the narrow branch's gateway-only asset fetch
-# is gated on the dedicated frontend. Content-anchored, idempotent, syntax-gated,
-# fails closed on an unrecognised shape, backup kept beside the file.
-COPY tools/heal-mobile-surface.mjs /opt/seek-harness/heal-mobile-surface.mjs
-RUN set -eux; \
-    for client in /opt/dsh/node_modules/dsh-mobile/lib/client.js /opt/dsh-src/node_modules/dsh-mobile/lib/client.js; do \
-      if [ -f "$client" ]; then node /opt/seek-harness/heal-mobile-surface.mjs "$client"; fi; \
-    done
-
 # Declare the plugins in the DSH installation's own manifest. This is what makes
 # their bare row names resolvable at boot: the launcher builds a module-resolution
 # table by walking the installation package's dependency closure (a package that

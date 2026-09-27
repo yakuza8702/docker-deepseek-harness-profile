@@ -52,20 +52,44 @@ window.__ModuleLoader__.load({
       return matches
     }
 
+    /**
+     * Interactive states need CSS (`:hover`/`:active`/`:focus-visible` are not
+     * expressible inline); layout stays inline. Colours come from the theme
+     * variables dsh-mobile uses for its own footer control, so the pill sits in
+     * the footer exactly like Settings and Mobile access do — in both the
+     * expanded sidebar and the rail.
+     */
+    const CSS = `
+.dsh-ps__trigger{transition:background-color 120ms ease}
+.dsh-ps__trigger:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f3f6)}
+.dsh-ps__trigger:active,.dsh-ps__trigger[aria-expanded="true"]{background:var(--dsw-alias-interactive-bg-active,#e8ebf0)}
+.dsh-ps__trigger:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
+.dsh-ps__action{transition:background-color 120ms ease}
+.dsh-ps__action:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.22))}
+.dsh-ps__danger:not(:disabled):hover{background:rgba(220,90,90,.22)}
+.dsh-ps__close{transition:background-color 120ms ease}
+.dsh-ps__close:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.22))}
+.dsh-ps__close:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
+`
+
+    /** Install the stylesheet once, beside the tag dsh-mobile manages. */
+    function installStyles(ctx) {
+      const style = document.createElement('style')
+      style.dataset.plugin = 'dsh-profile-switcher'
+      style.textContent = CSS
+      document.head.append(style)
+      return () => { if (style.isConnected) style.remove() }
+    }
+
     const styles = (mobile) => ({
       wrap: { position: 'relative', display: 'flex', flex: '1 1 auto', minWidth: 0 },
-      // Expanded sidebar: the 42px footer row dsh-mobile also uses.
+      // Expanded sidebar AND rail: the icon alone, sized like dsh-mobile's own
+      // footer control (the labelled version squeezed the footer row and got
+      // truncated next to "Mobile access").
       trigger: {
-        boxSizing: 'border-box', display: 'flex', alignItems: 'center', gap: 8, width: '100%',
-        height: 42, margin: '4px 0', padding: '0 10px 0 8px', border: 0, borderRadius: 12,
-        background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 14, lineHeight: '22px',
-        cursor: 'pointer', overflow: 'hidden', textAlign: 'left',
-      },
-      // Rail: the icon-only circle.
-      triggerRail: {
-        boxSizing: 'border-box', flex: '0 0 auto', display: 'flex', alignItems: 'center', justifyContent: 'center',
-        width: 36, height: 36, margin: '8px 0 10px', padding: 0, border: 0, borderRadius: '50%',
-        background: 'transparent', color: 'inherit', cursor: 'pointer',
+        boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        width: 36, height: 36, flex: '0 0 auto', margin: '8px 0 10px', padding: 0, border: 0,
+        borderRadius: '50%', background: 'transparent', color: 'inherit', cursor: 'pointer',
       },
       triggerLabel: { minWidth: 0, flex: '1 1 auto', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' },
       panel: mobile
@@ -298,6 +322,7 @@ window.__ModuleLoader__.load({
             ? React.createElement('span', { style: S.meta, title: 'the profile this harness booted' }, 'Current Profile')
             : React.createElement('button', {
                 type: 'button',
+                className: 'dsh-ps__action',
                 style: { ...S.action, opacity: !profile.webCapable || busy ? .5 : 1 },
                 disabled: !profile.webCapable || busy,
                 onClick: () => void applyAndWait('select', { name: profile.name }, profile.name),
@@ -307,6 +332,7 @@ window.__ModuleLoader__.load({
             : (profile.deletable && !profile.active
                 ? React.createElement('button', {
                     type: 'button',
+                    className: 'dsh-ps__action dsh-ps__danger',
                     style: { ...S.action, ...S.danger, opacity: busy ? .5 : 1 },
                     disabled: busy,
                     title: `delete profiles/${profile.name}`,
@@ -324,16 +350,14 @@ window.__ModuleLoader__.load({
         React.createElement('button', {
           type: 'button',
           ref: buttonRef,
-          style: wide ? S.trigger : S.triggerRail,
+          className: 'dsh-ps__trigger',
+          style: S.trigger,
           title: `Profile: ${active ?? 'unknown'} — switch the plugin set this harness boots`,
           'aria-label': `Profile: ${active ?? 'unknown'}`,
           'aria-expanded': open,
           onClick: () => { if (open) hide(); else show() },
         },
-          React.createElement('span', { style: { flex: '0 0 auto', fontSize: wide ? 15 : 18, opacity: .85 } }, '◍'),
-          wide
-            ? React.createElement('span', { style: S.triggerLabel }, `Profile: ${active ?? 'unknown'}`)
-            : null),
+          React.createElement('span', { style: { fontSize: 18, lineHeight: 1, opacity: .85 } }, '◍')),
         mounted && mobile && React.createElement('div', {
           style: { ...S.backdrop, opacity: entered ? 1 : 0 },
           onClick: hide,
@@ -349,7 +373,7 @@ window.__ModuleLoader__.load({
           React.createElement('div', { style: S.header },
             React.createElement('div', { style: S.title }, 'Available Profiles'),
             React.createElement('button', {
-              type: 'button', style: S.close, title: 'Close', 'aria-label': 'Close',
+              type: 'button', className: 'dsh-ps__close', style: S.close, title: 'Close', 'aria-label': 'Close',
               onClick: hide,
             }, '✕')),
           React.createElement('div', { style: S.subtitle }, 'Switch to another Web-compatible Profile, create or delete one. Switching restarts the harness.'),
@@ -362,11 +386,12 @@ window.__ModuleLoader__.load({
               onKeyDown: (event) => { if (event.key === 'Enter') void createProfile() },
             }),
             React.createElement('button', {
-              type: 'button', style: { ...S.action, opacity: draft.trim() === '' || busy ? .5 : 1 },
+              type: 'button', className: 'dsh-ps__action', style: { ...S.action, opacity: draft.trim() === '' || busy ? .5 : 1 },
               disabled: draft.trim() === '' || busy, onClick: () => void createProfile(),
             }, '+ New Profile')),
           React.createElement('button', {
             type: 'button',
+            className: 'dsh-ps__action',
             style: { ...S.action, width: '100%', marginTop: 10, borderRadius: 10, minHeight: mobile ? 48 : 0, opacity: busy ? .5 : 1 },
             disabled: busy,
             onClick: () => void applyAndWait('safe', {}, 'Safe Mode'),
@@ -377,6 +402,7 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
+      ctx.effect(() => installStyles(ctx), 'dsh-profile-switcher: footer control stylesheet')
       ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
         { name: 'sidebar.footer.action', id: 'dsh-profile-switcher', order: 40, label: 'Profile' },
         ProfilePill,
