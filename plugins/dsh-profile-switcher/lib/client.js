@@ -82,13 +82,13 @@ window.__ModuleLoader__.load({
     }
 
     const styles = (mobile) => ({
-      wrap: { position: 'relative', display: 'flex', flex: '1 1 auto', minWidth: 0 },
+      wrap: { position: 'relative', display: 'flex', flex: '0 0 auto', minWidth: 0 },
       // Expanded sidebar AND rail: the icon alone, sized like dsh-mobile's own
       // footer control (the labelled version squeezed the footer row and got
       // truncated next to "Mobile access").
       trigger: {
         boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center',
-        width: 36, height: 36, flex: '0 0 auto', margin: '8px 0 10px', padding: 0, border: 0,
+        width: 36, height: 36, flex: '0 0 auto', margin: 0, padding: 0, border: 0,
         borderRadius: '50%', background: 'transparent', color: 'inherit', cursor: 'pointer',
       },
       triggerLabel: { minWidth: 0, flex: '1 1 auto', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' },
