@@ -24,6 +24,10 @@ import http from "node:http";
 import net from "node:net";
 import fs from "node:fs";
 import { timingSafeEqual } from "node:crypto";
+// Recovery surface: when the harness cannot boot, no plugin inside it can render
+// anything — this proxy is the process that survives, so it serves the failure,
+// the profile list and the two fixes (switch profile / Safe Mode).
+import { handleRecovery, recoveryPage, recoverySnapshot, wantsRecoveryPage } from "./recovery.mjs";
 
 const PROXY_HOST = process.env.PROXY_HOST || "0.0.0.0";
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || "3080", 10);
@@ -118,7 +122,28 @@ function deny(res, upgrade) {
   }
 }
 
-function upstreamUnavailable(res, upgrade) {
+function upstreamUnavailable(res, upgrade, req) {
+  // A browser asking for a page while the harness is down gets the recovery
+  // screen (boot failure + profile switch + Safe Mode) instead of a bare 502 —
+  // this is the one moment where nothing inside the harness can help.
+  if (!upgrade && req !== undefined && wantsRecoveryPage(req)) {
+    let html;
+    try {
+      html = recoveryPage(recoverySnapshot(process.env));
+    } catch (error) {
+      console.log("[recovery] could not render the page:", error && error.message);
+    }
+    if (html !== undefined) {
+      res.writeHead(503, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Retry-After": "3",
+        "Content-Length": Buffer.byteLength(html),
+      });
+      res.end(html);
+      return;
+    }
+  }
   const body = JSON.stringify({
     error: "dsh is not ready yet — reverse proxy is up, upstream starting",
   });
@@ -259,7 +284,7 @@ function forwardToUpstream(req, res, autoAuthTried) {
         );
         authed.on("error", (err) => {
           if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET") {
-            upstreamUnavailable(res, false);
+            upstreamUnavailable(res, false, req);
           } else {
             res.writeHead(502, { "Content-Type": "text/plain" });
             res.end("502 Bad Gateway");
@@ -334,14 +359,14 @@ function forwardToUpstream(req, res, autoAuthTried) {
         res.end(out);
       });
       upRes.on("error", () => {
-        if (!res.headersSent) upstreamUnavailable(res, false);
+        if (!res.headersSent) upstreamUnavailable(res, false, req);
         else res.destroy();
       });
     }
   );
   upstream.on("error", (err) => {
     if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET") {
-      upstreamUnavailable(res, false);
+      upstreamUnavailable(res, false, req);
     } else {
       res.writeHead(502, { "Content-Type": "text/plain" });
       res.end("502 Bad Gateway");
@@ -352,7 +377,14 @@ function forwardToUpstream(req, res, autoAuthTried) {
 
 const server = http.createServer((req, res) => {
   if (!checkAuth(req, false)) return deny(res, false);
-  forwardToUpstream(req, res, false);
+  // The recovery API answers even while DSH is down, so it must be routed before
+  // anything else. It needs no writable upstream — only $DSH_HOME.
+  handleRecovery(req, res, { log: console.log })
+    .then((handled) => { if (!handled) forwardToUpstream(req, res, false); })
+    .catch((error) => {
+      console.log("[recovery] handler failed:", error && error.message);
+      forwardToUpstream(req, res, false);
+    });
 });
 
 // WebSocket upgrade → raw TCP tunnel (headers pass through untouched,

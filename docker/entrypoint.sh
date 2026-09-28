@@ -23,14 +23,38 @@ DSH_BIN="${DSH_BIN:-/usr/local/bin/dsh}"
 PROXY_SCRIPT="${PROXY_SCRIPT:-/opt/seek-harness/proxy.mjs}"
 
 log() { echo "[seek-harness] $*"; }
+# ---------------------------------------------------------------------
+# Boot diagnostics for the recovery surface (docker/recovery.mjs).
+# The state file is the only witness of a boot that never reached the harness,
+# so the reverse proxy can show WHY instead of a bare 502.
+# ---------------------------------------------------------------------
+BOOT_STATE_FILE="${DSH_BOOT_STATE_FILE:-/tmp/dsh-boot.json}"
+write_boot_state() {   # write_boot_state <state> <reason> [detail]
+  node -e '
+    const fs = require("fs");
+    const [file, state, reason, detail, profile] = process.argv.slice(1);
+    let logTail = "";
+    try { logTail = fs.readFileSync("/tmp/dsh-web.log", "utf8").split("\n").slice(-40).join("\n").trim() } catch {}
+    fs.writeFileSync(file, JSON.stringify({ state, reason: reason || null, detail: detail || null, profile: profile || null, at: new Date().toISOString(), logTail: logTail || null }, null, 2) + "\n");
+  ' "$BOOT_STATE_FILE" "$1" "$2" "${3:-}" "${PROFILE:-}"
+}
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
-  # never leave a half-started stack behind
-  if [[ -n "${DSH_PID:-}" ]]; then
-    kill -TERM "$DSH_PID" ${PROXY_PID:+"$PROXY_PID"} 2>/dev/null || true
+  write_boot_state failed "$*" "the harness process exited during startup"
+  # KEEP THE PROXY ALIVE. This is the whole point of the recovery surface: if the
+  # harness cannot boot, the proxy must stay up to serve the failure page and the
+  # switch-profile / Safe-Mode actions. Tearing everything down (the stock
+  # behaviour) turns a broken profile into an unrecoverable crash loop.
+  if [[ -n "${PROXY_PID:-}" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    log "harness failed to start — leaving the reverse proxy up on ${PROXY_HOST}:${PROXY_PORT} so the recovery page can fix the profile"
+    write_boot_state failed "$*" "harness down; recovery surface serving on port ${PROXY_PORT}"
+    set +e
+    wait "$PROXY_PID"
+    exit 0
   fi
   exit 1
 }
+
 
 if [[ "$DSH_PORT" == "$PROXY_PORT" ]]; then
   fatal "DSH_PORT (${DSH_PORT}) must differ from PROXY_PORT (${PROXY_PORT})."
@@ -103,6 +127,7 @@ log "starting DSH web on 127.0.0.1:${DSH_PORT} (DSH_HOME=${DSH_HOME:-unset}, HOM
 PROFILE="$(node -e 'const fs=require("fs"),path=require("path");try{const home=process.env.DSH_HOME||"/home/node/.dsh";const j=JSON.parse(fs.readFileSync(path.join(home,"active-profile.json"),"utf8"));const n=String(j.active||"");if(!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(n))process.exit(0);const m=JSON.parse(fs.readFileSync(path.join(home,"profiles",n,"package.json"),"utf8"));const b=(m&&m.dsh&&m.dsh.profile&&m.dsh.profile.bundles)||[];if(b.includes("@deepseek-ai/dsh-base")&&b.includes("@deepseek-ai/dsh-web-app"))process.stdout.write(n)}catch{}' 2>/dev/null || true)"
 PROFILE="${PROFILE:-web}"
 log "active profile: ${PROFILE}"
+write_boot_state starting "booting profile ${PROFILE}"
 
 # ---------------------------------------------------------------------
 # In-app profile control (dsh-profile-switcher) as a launcher overlay.
@@ -131,7 +156,8 @@ PROXY_PID=$!
 
 terminate() {
   log "signal received — stopping DSH (${DSH_PID}) and proxy (${PROXY_PID})"
-  kill -TERM "$DSH_PID" "$PROXY_PID" ${TAIL_PID:+"$TAIL_PID"} 2>/dev/null || true
+  : > /tmp/dsh-stopping
+  kill -TERM "$DSH_PID" "$PROXY_PID" ${TAIL_PID:+"$TAIL_PID"} ${WATCHDOG_PID:+"$WATCHDOG_PID"} 2>/dev/null || true
 }
 trap terminate TERM INT
 
@@ -184,6 +210,31 @@ AUTH_STATE="OFF"
 if ! kill -0 "$DSH_PID" 2>/dev/null; then fatal "dsh exited during startup — check logs above"; fi
 if ! kill -0 "$PROXY_PID" 2>/dev/null; then fatal "proxy exited during startup — check logs above"; fi
 
+# A degraded boot still SERVES the UI, so it is not a failure — but the user
+# should not have to open the container log to learn that an entry did not
+# activate, or which profile is missing a plugin. Record it as degraded with
+# the reasons; the in-app panel and the recovery page both read this.
+if grep -qE "warning: [0-9]+ entr(y|ies) did not activate|failed to import" "$DSH_LOG" 2>/dev/null; then
+  DEGRADED="$(grep -E "did not activate|failed to import|skipping profile bundle|Error:" "$DSH_LOG" 2>/dev/null | head -12 | paste -sd ' | ' - || true)"
+  write_boot_state degraded "the harness started with errors" "${DEGRADED:-see the log tail}"
+  log "WARNING: degraded boot — see the recovery panel for details"
+else
+  write_boot_state ready "" ""
+fi
+# Late-death watchdog: if the harness dies AFTER the ready banner (a plugin that
+# crashes on its first request, an OOM), flip the state to failed so the recovery
+# page shows the real reason instead of an empty 502. A deliberate stop writes the
+# flag first, so a normal container stop is never reported as a boot failure.
+(
+  while kill -0 "$DSH_PID" 2>/dev/null; do
+    [[ -f /tmp/dsh-stopping ]] && exit 0
+    sleep 5
+  done
+  [[ -f /tmp/dsh-stopping ]] && exit 0
+  write_boot_state failed "the harness process exited after startup" "exit observed by the entrypoint watchdog"
+) &
+WATCHDOG_PID=$!
+
 log "=============================================================="
 log " DeepSeek Harness is ready (no browser stack included)"
 log "   local : http://127.0.0.1:${PROXY_PORT}/"
@@ -193,11 +244,22 @@ log "   WS channels are forwarded automatically by the proxy"
 log "   DSH pid=${DSH_PID}  proxy pid=${PROXY_PID}"
 log "=============================================================="
 
-# Supervise: if either process exits, stop the other and propagate status.
+# Supervise. A DSH exit keeps the REVERSE PROXY serving the recovery page, so a
+# profile that cannot boot is fixable from the browser instead of becoming a
+# crash loop. The proxy's own exit (a deliberate restart from that page) still
+# shuts the stack down so the container policy can boot the new selection.
 set +e
-wait -n "$DSH_PID" "$PROXY_PID"
-status=$?
-log "a managed process exited (status=${status}) — shutting down"
-terminate
-wait "$DSH_PID" "$PROXY_PID" 2>/dev/null
-exit "$status"
+while true; do
+  wait -n "$DSH_PID" "$PROXY_PID"
+  status=$?
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    log "proxy exited (status=${status}) — shutting down"
+    terminate
+    exit "$status"
+  fi
+  write_boot_state failed "the harness process exited" "recovery surface serving on port ${PROXY_PORT}"
+  log "harness exited (status=${status}) — recovery surface still serving on ${PROXY_HOST}:${PROXY_PORT}"
+  log "open the harness URL to switch profile or boot Safe Mode"
+  wait "$PROXY_PID"
+  exit 0
+done

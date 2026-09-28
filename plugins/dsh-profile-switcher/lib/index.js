@@ -7,8 +7,21 @@
  *   POST /api/dsh-profile-switcher/select    { name }             -> writes the selection
  *   POST /api/dsh-profile-switcher/create    { name, from? }      -> copies a profile
  *   POST /api/dsh-profile-switcher/delete    { name }             -> deletes a profile
+ *   POST /api/dsh-profile-switcher/rename    { name, label }      -> display label only
+ *   POST /api/dsh-profile-switcher/move      { name, direction }  -> reorder the list
  *   POST /api/dsh-profile-switcher/safe      {}                   -> ensure + select Safe Mode
  *   POST /api/dsh-profile-switcher/restart   {}                   -> exit; the container policy reboots
+ *   GET  /api/dsh-profile-switcher/state     -> last boot outcome (for the recovery view)
+ *
+ * RENAME IS COSMETIC, ON PURPOSE: a profile's DIRECTORY name is its launcher
+ * input (`dsh --profile <name>`) and every companion/entry that references it.
+ * Renaming the directory would break those references, so a rename only writes a
+ * display label into a sidecar (`profile-labels.json`) that this UI reads. The
+ * folder keeps the name it was created with, exactly as asked.
+ *
+ * ORDER is likewise a sidecar (`profile-order.json`): a user-chosen list of
+ * directory names. Unknown profiles are appended alphabetically, so a new
+ * profile can never be hidden by a stale order file.
  *
  * WHY a restart: a DSH profile is a BOOT-TIME launcher input
  * (`dsh --profile <name>` -> `$DSH_HOME/profiles/<name>`), so nothing running
@@ -38,6 +51,9 @@ const RESERVED = new Set(['node_modules', 'con', 'prn', 'aux', 'nul', 'com1', 'c
 const home = () => process.env.DSH_HOME ?? '/home/node/.dsh'
 const profilesRoot = () => join(home(), 'profiles')
 const selectionFile = () => join(home(), 'active-profile.json')
+/** Cosmetic layer: display labels + the user's ordering. Never the folder name. */
+const labelsFile = () => join(home(), 'profile-labels.json')
+const orderFile = () => join(home(), 'profile-order.json')
 
 const log = (...parts) => console.log('[dsh-profile-switcher]', ...parts)
 
@@ -70,16 +86,56 @@ function validName(name) {
   return typeof name === 'string' && NAME_RE.test(name) && !RESERVED.has(name.toLowerCase())
 }
 
+/** Display labels, keyed by profile (folder) name. */
+function readLabels() {
+  const saved = readJson(labelsFile())
+  if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) return {}
+  const labels = {}
+  for (const [name, label] of Object.entries(saved)) {
+    if (typeof label === 'string' && label.trim() !== '') labels[name] = label.trim().slice(0, 40)
+  }
+  return labels
+}
+
+/** The user's ordering, as a list of profile (folder) names. */
+function readOrder() {
+  const saved = readJson(orderFile())
+  return Array.isArray(saved) ? saved.filter((entry) => typeof entry === 'string') : []
+}
+
+function writeJsonAtomic(file, value) {
+  mkdirSync(home(), { recursive: true })
+  const temporary = `${file}.tmp`
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`)
+  renameSync(temporary, file)
+}
+
+/** Order: the user's list first (skipping names that no longer exist), then A→Z. */
+function sortProfiles(profiles) {
+  const order = readOrder()
+  const rank = new Map(order.map((name, index) => [name, index]))
+  return profiles.sort((a, b) => {
+    const ra = rank.get(a.name)
+    const rb = rank.get(b.name)
+    if (ra !== undefined && rb !== undefined) return ra - rb
+    if (ra !== undefined) return -1
+    if (rb !== undefined) return 1
+    return a.name.localeCompare(b.name)
+  })
+}
+
 function listProfiles() {
   const root = profilesRoot()
   if (!existsSync(root)) return []
   const active = activeName()
-  return readdirSync(root, { withFileTypes: true })
+  const labels = readLabels()
+  return sortProfiles(readdirSync(root, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && entry.name !== 'node_modules')
     .map((entry) => {
       const bundles = bundlesOf(entry.name)
       return {
         name: entry.name,
+        label: labels[entry.name] ?? null,
         bundles: bundles ?? null,
         bundleCount: bundles?.length ?? 0,
         webCapable: webCapable(bundles),
@@ -88,8 +144,7 @@ function listProfiles() {
         locked: LOCKED.has(entry.name),
         deletable: !LOCKED.has(entry.name) && entry.name !== active && bundles !== undefined,
       }
-    })
-    .sort((a, b) => a.name.localeCompare(b.name))
+    }))
 }
 
 /** Atomic selection write — a torn file would be ignored by the launcher anyway. */
@@ -130,6 +185,37 @@ function remove(name) {
   return { name, deleted: true }
 }
 
+/**
+ * Cosmetic rename: stores a display label; the profile directory keeps its name.
+ * An empty label clears the override, so the row falls back to the folder name.
+ */
+function rename(name, label) {
+  if (!validName(name) || bundlesOf(name) === undefined) throw new Error(`profile "${name}" does not exist`)
+  const text = typeof label === 'string' ? label.trim().slice(0, 40) : ''
+  const labels = readLabels()
+  if (text === '') delete labels[name]
+  else labels[name] = text
+  writeJsonAtomic(labelsFile(), labels)
+  log(`labelled ${name} as ${text === '' ? '(folder name)' : text}`)
+  return { name, label: text === '' ? null : text }
+}
+
+/** Reorder the list by one step. Only the sidecar changes — never the folder. */
+function move(name, direction) {
+  if (direction !== 'up' && direction !== 'down') throw new Error(`direction must be "up" or "down", got ${JSON.stringify(direction)}`)
+  const current = listProfiles().map((profile) => profile.name)
+  const index = current.indexOf(name)
+  if (index === -1) throw new Error(`profile "${name}" does not exist`)
+  const target = direction === 'up' ? index - 1 : index + 1
+  if (target < 0 || target >= current.length) return { order: current, moved: false }
+  const next = [...current]
+  const [moved] = next.splice(index, 1)
+  next.splice(target, 0, moved)
+  writeJsonAtomic(orderFile(), next)
+  log(`moved ${name} ${direction}`)
+  return { order: next, moved: true }
+}
+
 /** Safe Mode: the shipped bundles only, so a broken third-party plugin can be removed. */
 function ensureSafeProfile() {
   const target = join(profilesRoot(), SAFE_PROFILE)
@@ -144,6 +230,26 @@ function ensureSafeProfile() {
   manifest.dsh = { ...(manifest.dsh ?? {}), profile: { bundles: [...WEB_BUNDLES] } }
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
   return select(SAFE_PROFILE)
+}
+
+/**
+ * The last boot outcome, written by the image's entrypoint.
+ *
+ * The entrypoint is the only thing that runs when a profile cannot boot (the
+ * harness never starts, so no plugin code runs), so it is the one that records
+ * the failure. When DSH is up — as now — this simply reports `ready`, and the
+ * recovery VIEW lives in the reverse proxy, which also survives a dead DSH.
+ */
+function bootState() {
+  const saved = readJson(process.env.DSH_BOOT_STATE_FILE ?? '/tmp/dsh-boot.json')
+  if (saved === null || typeof saved !== 'object') return { state: 'unknown' }
+  return {
+    state: typeof saved.state === 'string' ? saved.state : 'unknown',
+    reason: typeof saved.reason === 'string' ? saved.reason : null,
+    detail: typeof saved.detail === 'string' ? saved.detail : null,
+    profile: typeof saved.profile === 'string' ? saved.profile : null,
+    at: typeof saved.at === 'string' ? saved.at : null,
+  }
 }
 
 /** Answer the caller first, then leave — the container policy boots the new profile. */
@@ -191,7 +297,7 @@ export function apply(ctx) {
           case 'list':
             return send(res, 200, {
               ok: true, home: home(), active: activeName(), profiles: listProfiles(),
-              safeProfile: SAFE_PROFILE, locked: [...LOCKED],
+              safeProfile: SAFE_PROFILE, locked: [...LOCKED], boot: bootState(),
             })
           case 'select':
             return send(res, 200, { ok: true, ...select(String(body.name ?? '')), restartRequired: true })
@@ -199,12 +305,18 @@ export function apply(ctx) {
             const created = create(String(body.name ?? ''), body.from === undefined ? undefined : String(body.from))
             return send(res, 200, { ok: true, ...created, profiles: listProfiles() })
           }
+          case 'rename':
+            return send(res, 200, { ok: true, ...rename(String(body.name ?? ''), body.label), profiles: listProfiles() })
+          case 'move':
+            return send(res, 200, { ok: true, ...move(String(body.name ?? ''), body.direction), profiles: listProfiles() })
           case 'delete': {
             const deleted = remove(String(body.name ?? ''))
             return send(res, 200, { ok: true, ...deleted, profiles: listProfiles() })
           }
           case 'safe':
             return send(res, 200, { ok: true, ...ensureSafeProfile(), restartRequired: true })
+          case 'state':
+            return send(res, 200, { ok: true, boot: bootState(), active: activeName(), profiles: listProfiles() })
           case 'restart':
             return send(res, 200, restartSoon())
           default:

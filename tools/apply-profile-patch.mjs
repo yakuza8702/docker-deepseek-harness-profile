@@ -48,6 +48,7 @@ const BLOCK = `# ---------------------------------------------------------------
 PROFILE="$(node -e 'const fs=require("fs"),path=require("path");try{const home=process.env.DSH_HOME||"/home/node/.dsh";const j=JSON.parse(fs.readFileSync(path.join(home,"active-profile.json"),"utf8"));const n=String(j.active||"");if(!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(n))process.exit(0);const m=JSON.parse(fs.readFileSync(path.join(home,"profiles",n,"package.json"),"utf8"));const b=(m&&m.dsh&&m.dsh.profile&&m.dsh.profile.bundles)||[];if(b.includes("@deepseek-ai/dsh-base")&&b.includes("@deepseek-ai/dsh-web-app"))process.stdout.write(n)}catch{}' 2>/dev/null || true)"
 PROFILE="\${PROFILE:-web}"
 log "active profile: \${PROFILE}"
+write_boot_state starting "booting profile \${PROFILE}"
 
 # ---------------------------------------------------------------------
 # In-app profile control (dsh-profile-switcher) as a launcher overlay.
@@ -78,9 +79,157 @@ if (original.includes(MARKER)) {
 }
 const occurrences = original.split(ANCHOR).length - 1
 if (occurrences !== 1) {
-  console.error(`anchor matched ${occurrences} time(s) in ${source} — refusing to write (upstream changed?)`)
+  console.error(`anchor matched ${occurrences} times in ${source} — refusing to write (upstream changed?)`)
   process.exit(1)
 }
-fs.writeFileSync(target, original.replace(ANCHOR, BLOCK), { mode: 0o755 })
+let patched = original.replace(ANCHOR, BLOCK)
+
+/**
+ * 3. BOOT DIAGNOSTICS — record the boot outcome where the RECOVERY SURFACE can
+ *    read it. The failure case is the whole point: when the profile cannot boot,
+ *    no plugin inside the harness runs, so the entrypoint is the only witness.
+ *    `docker/proxy.mjs` serves it to the browser (see docker/recovery.mjs).
+ */
+const DIAG_HELPER = `# ---------------------------------------------------------------------
+# Boot diagnostics for the recovery surface (docker/recovery.mjs).
+# The state file is the only witness of a boot that never reached the harness,
+# so the reverse proxy can show WHY instead of a bare 502.
+# ---------------------------------------------------------------------
+BOOT_STATE_FILE="\${DSH_BOOT_STATE_FILE:-/tmp/dsh-boot.json}"
+write_boot_state() {   # write_boot_state <state> <reason> [detail]
+  node -e '
+    const fs = require("fs");
+    const [file, state, reason, detail, profile] = process.argv.slice(1);
+    let logTail = "";
+    try { logTail = fs.readFileSync("/tmp/dsh-web.log", "utf8").split("\\n").slice(-40).join("\\n").trim() } catch {}
+    fs.writeFileSync(file, JSON.stringify({ state, reason: reason || null, detail: detail || null, profile: profile || null, at: new Date().toISOString(), logTail: logTail || null }, null, 2) + "\\n");
+  ' "$BOOT_STATE_FILE" "$1" "$2" "\${3:-}" "\${PROFILE:-}"
+}
+fatal() {
+  echo "[seek-harness] FATAL: $*" >&2
+  write_boot_state failed "$*" "the harness process exited during startup"
+  # KEEP THE PROXY ALIVE. This is the whole point of the recovery surface: if the
+  # harness cannot boot, the proxy must stay up to serve the failure page and the
+  # switch-profile / Safe-Mode actions. Tearing everything down (the stock
+  # behaviour) turns a broken profile into an unrecoverable crash loop.
+  if [[ -n "\${PROXY_PID:-}" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    log "harness failed to start — leaving the reverse proxy up on \${PROXY_HOST}:\${PROXY_PORT} so the recovery page can fix the profile"
+    write_boot_state failed "$*" "harness down; recovery surface serving on port \${PROXY_PORT}"
+    set +e
+    wait "$PROXY_PID"
+    exit 0
+  fi
+  exit 1
+}
+
+`
+const FATAL_ANCHOR = `fatal() {
+  echo "[seek-harness] FATAL: $*" >&2
+  # never leave a half-started stack behind
+  if [[ -n "\${DSH_PID:-}" ]]; then
+    kill -TERM "$DSH_PID" \${PROXY_PID:+"$PROXY_PID"} 2>/dev/null || true
+  fi
+  exit 1
+}
+`
+// terminate() must mark a deliberate stop so the watchdog stands down.
+const TERMINATE_OLD = `terminate() {
+  log "signal received — stopping DSH (\${DSH_PID}) and proxy (\${PROXY_PID})"
+  kill -TERM "$DSH_PID" "$PROXY_PID" \${TAIL_PID:+"$TAIL_PID"} 2>/dev/null || true
+}`
+const TERMINATE_NEW = `terminate() {
+  log "signal received — stopping DSH (\${DSH_PID}) and proxy (\${PROXY_PID})"
+  : > /tmp/dsh-stopping
+  kill -TERM "$DSH_PID" "$PROXY_PID" \${TAIL_PID:+"$TAIL_PID"} \${WATCHDOG_PID:+"$WATCHDOG_PID"} 2>/dev/null || true
+}`
+if (patched.split(TERMINATE_OLD).length - 1 !== 1) {
+  console.error('anchor (terminate) matched an unexpected number of times — refusing to write')
+  process.exit(1)
+}
+patched = patched.replace(TERMINATE_OLD, TERMINATE_NEW)
+
+if (patched.split(FATAL_ANCHOR).length - 1 !== 1) {
+  console.error('anchor (fatal) matched an unexpected number of times — refusing to write')
+  process.exit(1)
+}
+patched = patched.replace(FATAL_ANCHOR, DIAG_HELPER)
+
+/** 3b. Mark the boot as started, then as ready, and watch for a late death. */
+const READY_ANCHOR = `log "=============================================================="
+log " DeepSeek Harness is ready (no browser stack included)"`
+const READY_BLOCK = `# A degraded boot still SERVES the UI, so it is not a failure — but the user
+# should not have to open the container log to learn that an entry did not
+# activate, or which profile is missing a plugin. Record it as degraded with
+# the reasons; the in-app panel and the recovery page both read this.
+if grep -qE "warning: [0-9]+ entr(y|ies) did not activate|failed to import" "$DSH_LOG" 2>/dev/null; then
+  DEGRADED="$(grep -E "did not activate|failed to import|skipping profile bundle|Error:" "$DSH_LOG" 2>/dev/null | head -12 | paste -sd ' | ' - || true)"
+  write_boot_state degraded "the harness started with errors" "\${DEGRADED:-see the log tail}"
+  log "WARNING: degraded boot — see the recovery panel for details"
+else
+  write_boot_state ready "" ""
+fi
+# Late-death watchdog: if the harness dies AFTER the ready banner (a plugin that
+# crashes on its first request, an OOM), flip the state to failed so the recovery
+# page shows the real reason instead of an empty 502. A deliberate stop writes the
+# flag first, so a normal container stop is never reported as a boot failure.
+(
+  while kill -0 "$DSH_PID" 2>/dev/null; do
+    [[ -f /tmp/dsh-stopping ]] && exit 0
+    sleep 5
+  done
+  [[ -f /tmp/dsh-stopping ]] && exit 0
+  write_boot_state failed "the harness process exited after startup" "exit observed by the entrypoint watchdog"
+) &
+WATCHDOG_PID=$!
+
+log "=============================================================="
+log " DeepSeek Harness is ready (no browser stack included)"`
+if (patched.split(READY_ANCHOR).length - 1 !== 1) {
+  console.error('anchor (ready banner) matched an unexpected number of times — refusing to write')
+  process.exit(1)
+}
+patched = patched.replace(READY_ANCHOR, READY_BLOCK)
+
+/**
+ * 4. RESILIENT SUPERVISION — a DSH exit must NOT take the recovery surface down.
+ *    Stock behaviour stops the proxy and exits, which turns a broken profile into
+ *    a crash loop with nothing to click. Here the proxy stays up and serves the
+ *    recovery page; the proxy's own exit (a deliberate restart from that page)
+ *    still shuts the stack down.
+ */
+const SUPERVISE_OLD = `# Supervise: if either process exits, stop the other and propagate status.
+set +e
+wait -n "$DSH_PID" "$PROXY_PID"
+status=$?
+log "a managed process exited (status=\${status}) \u2014 shutting down"
+terminate
+wait "$DSH_PID" "$PROXY_PID" 2>/dev/null
+exit "$status"`
+const SUPERVISE_NEW = `# Supervise. A DSH exit keeps the REVERSE PROXY serving the recovery page, so a
+# profile that cannot boot is fixable from the browser instead of becoming a
+# crash loop. The proxy's own exit (a deliberate restart from that page) still
+# shuts the stack down so the container policy can boot the new selection.
+set +e
+while true; do
+  wait -n "$DSH_PID" "$PROXY_PID"
+  status=$?
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    log "proxy exited (status=\${status}) \u2014 shutting down"
+    terminate
+    exit "$status"
+  fi
+  write_boot_state failed "the harness process exited" "recovery surface serving on port \${PROXY_PORT}"
+  log "harness exited (status=\${status}) \u2014 recovery surface still serving on \${PROXY_HOST}:\${PROXY_PORT}"
+  log "open the harness URL to switch profile or boot Safe Mode"
+  wait "$PROXY_PID"
+  exit 0
+done`
+if (patched.split(SUPERVISE_OLD).length - 1 !== 1) {
+  console.error('anchor (supervise) matched an unexpected number of times — refusing to write')
+  process.exit(1)
+}
+patched = patched.replace(SUPERVISE_OLD, SUPERVISE_NEW)
+
+fs.writeFileSync(target, patched, { mode: 0o755 })
 const added = BLOCK.split('\n').length - ANCHOR.split('\n').length
-console.log(`wrote ${path.relative(process.cwd(), target)} (+${added} lines) from ${source}`)
+console.log(`wrote ${path.relative(process.cwd(), target)} (+${added} lines from the profile block, + boot diagnostics) from ${source}`)

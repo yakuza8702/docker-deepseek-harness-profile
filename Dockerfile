@@ -164,9 +164,11 @@ RUN set -eux; \
       fi; \
     fi
 
-# Reverse proxy ("0.0.0.0 fix", smanx pattern) + entrypoint
-COPY docker/proxy.mjs docker/entrypoint.sh /opt/seek-harness/
-RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh \
+# Reverse proxy ("0.0.0.0 fix", smanx pattern) + entrypoint + recovery surface.
+# recovery.mjs is imported by the proxy: it renders the boot-failure screen and
+# serves its API while the harness itself is down.
+COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs /opt/seek-harness/
+RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
  && ln -sfn /opt/seek-harness/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # In-app profile control (dsh-profile-switcher). The package is placed in the

@@ -78,6 +78,21 @@ window.__ModuleLoader__.load({
 .dsh-ps__close{transition:background-color 120ms ease}
 .dsh-ps__close:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .dsh-ps__close:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
+/* Square icon buttons in a row: trash, pencil and the reorder arrows. */
+.dsh-ps__icon{display:flex;align-items:center;justify-content:center;gap:4px;flex:0 0 auto;
+  min-width:30px;height:30px;padding:0 6px;border:1px solid transparent;border-radius:8px;
+  background:none;color:inherit;font:inherit;font-size:12px;cursor:pointer;transition:background-color 120ms ease}
+.dsh-ps__icon:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-ps__icon:not(:disabled):active{background:var(--dsw-alias-interactive-bg-active)}
+.dsh-ps__icon:disabled{cursor:not-allowed;opacity:.35}
+.dsh-ps__icon:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
+/* The delete word appears BESIDE the trash icon only while the button is hovered
+   (or focused), which is what keeps the row quiet the rest of the time. */
+.dsh-ps__delLabel{max-width:0;overflow:hidden;white-space:nowrap;opacity:0;transition:max-width 140ms ease,opacity 140ms ease}
+.dsh-ps__icon:hover .dsh-ps__delLabel,.dsh-ps__icon:focus-visible .dsh-ps__delLabel{max-width:60px;opacity:1}
+.dsh-ps__dangerIcon:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-error-primary,inherit)}
+.dsh-ps__renameInput{box-sizing:border-box;width:100%;margin-top:6px;padding:6px 8px;border-radius:8px;font:inherit;font-size:13px;
+  border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.45));background:var(--dsw-alias-bg-layer-2,transparent);color:inherit}
 `
 
     /** Install the stylesheet once, beside the tag dsh-mobile manages. */
@@ -88,6 +103,36 @@ window.__ModuleLoader__.load({
       document.head.append(style)
       return () => { if (style.isConnected) style.remove() }
     }
+
+/**
+ * Icon set: plain stroke SVGs in `currentColor`, so they inherit the theme
+ * (the same approach the shipped footer icons use).
+ */
+const Icon = (paths, size = 15) => React.createElement('svg', {
+  'aria-hidden': true, focusable: false, width: size, height: size, viewBox: '0 0 16 16',
+  fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+}, ...paths.map((d, index) => React.createElement('path', { key: index, d })))
+
+const Icons = {
+  // trash can: lid, body, two ribs
+  trash: () => Icon(['M2.6 4.3h10.8', 'M6.3 4.3V3a1 1 0 0 1 1-1h1.4a1 1 0 0 1 1 1v1.3', 'M4.2 4.3l.6 8.2a1.2 1.2 0 0 0 1.2 1.1h4a1.2 1.2 0 0 0 1.2-1.1l.6-8.2', 'M6.7 6.9v4.4', 'M9.3 6.9v4.4']),
+  // pencil: rename
+  pencil: () => Icon(['M11.1 2.6a1.3 1.3 0 0 1 1.9 0l.4.4a1.3 1.3 0 0 1 0 1.9L5.9 12.4l-2.5.6.6-2.5 7.1-7.9Z', 'M10.2 3.6l2.2 2.2']),
+  up: () => Icon(['M8 12.5V3.8', 'M4.4 7.4 8 3.8l3.6 3.6'], 14),
+  down: () => Icon(['M8 3.5v8.7', 'M4.4 8.6 8 12.2l3.6-3.6'], 14),
+}
+
+/** Trash button whose word appears beside the icon only on hover/focus. */
+function DeleteButton({ disabled, onDelete, name }) {
+  return React.createElement('button', {
+    type: 'button',
+    className: 'dsh-ps__icon dsh-ps__dangerIcon',
+    disabled,
+    title: `delete profiles/${name}`,
+    'aria-label': `Delete ${name}`,
+    onClick: onDelete,
+  }, Icons.trash(), React.createElement('span', { className: 'dsh-ps__delLabel' }, 'Delete'))
+}
 
     const styles = (mobile) => ({
       wrap: { position: 'relative', display: 'flex', flex: '0 0 auto', alignItems: 'center', justifyContent: 'center', minWidth: 0 },
@@ -173,6 +218,9 @@ window.__ModuleLoader__.load({
       const [note, setNote] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
       const [draft, setDraft] = React.useState('')
+      const [boot, setBoot] = React.useState(null)
+      const [renaming, setRenaming] = React.useState(null)
+      const [renameDraft, setRenameDraft] = React.useState('')
       const [elapsed, setElapsed] = React.useState(null)
       const [anchor, setAnchor] = React.useState(null)
       const buttonRef = React.useRef(null)
@@ -196,6 +244,7 @@ window.__ModuleLoader__.load({
           const data = await call('list')
           setProfiles(Array.isArray(data.profiles) ? data.profiles : [])
           setActive(typeof data.active === 'string' ? data.active : null)
+          setBoot(data.boot ?? null)
           setNote(null)
         } catch (error) {
           setNote(`cannot read profiles: ${error.message}`)
@@ -348,6 +397,37 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** Cosmetic rename: only the label changes, never the profile directory. */
+      const commitRename = async (profile) => {
+        setBusy(true)
+        try {
+          const result = await call('rename', { name: profile.name, label: renameDraft })
+          await refresh()
+          setRenaming(null)
+          setRenameDraft('')
+          setNote(result.label === null
+            ? `“${profile.name}” now shows its folder name again (the folder itself never changed)`
+            : `“${profile.name}” is shown as “${result.label}” — the folder stays profiles/${profile.name}`)
+        } catch (error) {
+          setNote(error.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      /** Reorder by one step: the sidecar order changes, the folders do not move. */
+      const moveProfile = async (profile, direction) => {
+        setBusy(true)
+        try {
+          await call('move', { name: profile.name, direction })
+          await refresh()
+        } catch (error) {
+          setNote(error.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
       const deleteProfile = async (profile) => {
         if (!window.confirm(`Delete profile “${profile.name}”?\n\nIts plugin set (profiles/${profile.name}) is removed. Other profiles, sessions and settings are untouched.`)) return
         setBusy(true)
@@ -362,10 +442,38 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const rows = profiles.map((profile) => React.createElement('div', { key: profile.name, style: S.row },
+      const rows = profiles.map((profile, index) => React.createElement('div', { key: profile.name, style: S.row },
         React.createElement('div', { style: S.name },
-          React.createElement('span', { style: S.nameText }, profile.active ? `${profile.name} · current` : profile.name),
-          React.createElement('span', { style: S.meta }, describe(profile))),
+          React.createElement('span', { style: S.nameText },
+            (profile.label ?? profile.name) + (profile.active ? ' · current' : '')),
+          React.createElement('span', { style: S.meta },
+            profile.label === null || profile.label === undefined
+              ? describe(profile)
+              : `${profile.name} — ${describe(profile)}`),
+          renaming === profile.name && React.createElement('input', {
+            className: 'dsh-ps__renameInput',
+            autoFocus: true,
+            value: renameDraft,
+            placeholder: profile.name,
+            disabled: busy,
+            onChange: (event) => setRenameDraft(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') void commitRename(profile)
+              if (event.key === 'Escape') { setRenaming(null); setRenameDraft('') }
+            },
+            onBlur: () => { /* committed by the Save button / Enter, so a stray click cannot rename */ },
+          }),
+          renaming === profile.name && React.createElement('div', { style: { display: 'flex', gap: 6, marginTop: 6 } },
+            React.createElement('button', {
+              type: 'button', className: 'dsh-ps__action',
+              style: { ...S.action, opacity: busy ? .5 : 1 }, disabled: busy,
+              onClick: () => void commitRename(profile),
+            }, 'Save'),
+            React.createElement('button', {
+              type: 'button', className: 'dsh-ps__action',
+              style: { ...S.action, opacity: busy ? .5 : 1 }, disabled: busy,
+              onClick: () => { setRenaming(null); setRenameDraft('') },
+            }, 'Cancel'))),
         React.createElement('div', { style: S.actions },
           profile.active
             ? React.createElement('span', { style: S.meta, title: 'the profile this harness booted' }, 'Current Profile')
@@ -374,19 +482,29 @@ window.__ModuleLoader__.load({
                 className: 'dsh-ps__action',
                 style: { ...S.action, opacity: !profile.webCapable || busy ? .5 : 1 },
                 disabled: !profile.webCapable || busy,
-                onClick: () => void applyAndWait('select', { name: profile.name }, profile.name),
+                onClick: () => void applyAndWait('select', { name: profile.name }, profile.label ?? profile.name),
               }, 'Switch'),
+          React.createElement('button', {
+            type: 'button', className: 'dsh-ps__icon', style: S.action,
+            disabled: busy, title: `rename the label for ${profile.name} (the folder keeps its name)`,
+            'aria-label': `Rename ${profile.name}`, onClick: () => { setRenaming(profile.name); setRenameDraft(profile.label ?? '') },
+          }, Icons.pencil()),
+          React.createElement('button', {
+            type: 'button', className: 'dsh-ps__icon', style: S.action,
+            disabled: busy || index === 0, title: 'move up', 'aria-label': `Move ${profile.name} up`,
+            onClick: () => void moveProfile(profile, 'up'),
+          }, Icons.up()),
+          React.createElement('button', {
+            type: 'button', className: 'dsh-ps__icon', style: S.action,
+            disabled: busy || index === profiles.length - 1, title: 'move down', 'aria-label': `Move ${profile.name} down`,
+            onClick: () => void moveProfile(profile, 'down'),
+          }, Icons.down()),
           profile.locked
-            ? React.createElement('span', { style: S.lock, title: 'default profile — the launcher falls back to it, so it cannot be deleted' }, '🔒 default')
+            ? React.createElement('span', { style: S.lock, title: 'default profile — the launcher falls back to it, so it cannot be deleted' }, '🔒')
             : (profile.deletable && !profile.active
-                ? React.createElement('button', {
-                    type: 'button',
-                    className: 'dsh-ps__action dsh-ps__danger',
-                    style: { ...S.action, ...S.danger, opacity: busy ? .5 : 1 },
-                    disabled: busy,
-                    title: `delete profiles/${profile.name}`,
-                    onClick: () => void deleteProfile(profile),
-                  }, 'Delete')
+                ? React.createElement(DeleteButton, {
+                    disabled: busy, name: profile.name, onDelete: () => void deleteProfile(profile),
+                  })
                 : null))))
 
       const panelPosition = mobile || anchor === null ? {} : { left: anchor.left, bottom: anchor.bottom }
@@ -431,6 +549,28 @@ window.__ModuleLoader__.load({
               onClick: hide,
             }, '✕')),
           React.createElement('div', { style: S.subtitle }, 'Switch to another Web-compatible Profile, create or delete one. Switching restarts the harness.'),
+          boot !== null && boot.state === 'degraded' && React.createElement('div', {
+            style: {
+              marginBottom: 10, padding: '10px 12px', borderRadius: 10, fontSize: mobile ? 13 : 12, lineHeight: 1.45,
+              border: '1px solid var(--dsw-alias-state-warn-primary, rgba(220,160,60,.5))',
+              background: 'var(--dsw-alias-state-warn-tertiary, rgba(220,160,60,.12))',
+            },
+          },
+            React.createElement('div', { style: { fontWeight: 650, marginBottom: 4 } }, 'This boot reported errors'),
+            React.createElement('div', { style: { opacity: .85, overflowWrap: 'anywhere' } },
+              boot.detail ?? boot.reason ?? 'see the container log'),
+            React.createElement('div', { style: { opacity: .7, marginTop: 6 } },
+              'Switching to another profile, or Safe Mode, restarts the harness without them.')),
+          boot !== null && boot.state === 'failed' && React.createElement('div', {
+            style: {
+              marginBottom: 10, padding: '10px 12px', borderRadius: 10, fontSize: mobile ? 13 : 12, lineHeight: 1.45,
+              border: '1px solid var(--dsw-alias-state-error-primary, rgba(220,90,90,.5))',
+              background: 'rgba(220,90,90,.12)',
+            },
+          },
+            React.createElement('div', { style: { fontWeight: 650, marginBottom: 4 } }, 'The last boot failed'),
+            React.createElement('div', { style: { opacity: .85, overflowWrap: 'anywhere' } }, boot.reason ?? 'unknown reason'),
+            boot.detail !== null && boot.detail !== undefined && React.createElement('div', { style: { opacity: .7, marginTop: 4, overflowWrap: 'anywhere' } }, boot.detail)),
           ...rows,
           React.createElement('div', { style: S.divider }),
           React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
