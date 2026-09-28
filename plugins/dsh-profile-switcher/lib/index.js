@@ -54,6 +54,16 @@ const selectionFile = () => join(home(), 'active-profile.json')
 /** Cosmetic layer: display labels + the user's ordering. Never the folder name. */
 const labelsFile = () => join(home(), 'profile-labels.json')
 const orderFile = () => join(home(), 'profile-order.json')
+/**
+ * Flag that marks this process exit as a REQUESTED profile switch. The image's
+ * entrypoint supervises the reverse proxy and keeps serving the recovery page
+ * when DSH exits (so a profile that cannot boot stays fixable from the browser),
+ * which means exiting here no longer reboots the container on its own: the
+ * supervisor waits for the proxy instead. This flag is how the supervisor tells
+ * a requested switch apart from a crash and tears the stack down so
+ * `restart: unless-stopped` boots the new selection.
+ */
+const RESTART_FLAG = '/tmp/dsh-restart-requested'
 
 const log = (...parts) => console.log('[dsh-profile-switcher]', ...parts)
 
@@ -254,6 +264,11 @@ function bootState() {
 
 /** Answer the caller first, then leave — the container policy boots the new profile. */
 function restartSoon(extra = {}) {
+  try {
+    writeFileSync(RESTART_FLAG, `${Date.now()}\n`)
+  } catch (error) {
+    log(`could not write ${RESTART_FLAG}: ${error.message}`)
+  }
   setTimeout(() => {
     log('exiting so the container can boot the selected profile')
     process.exit(0)

@@ -44,6 +44,22 @@ window.__ModuleLoader__.load({
       return payload
     }
 
+    /**
+     * The recovery surface lives in the REVERSE PROXY, not in DSH, so it is the
+     * one thing that still answers while the harness is down (and it needs no
+     * token — the proxy serves it to any browser). `null` means "no answer", which
+     * is not the same as "not broken".
+     */
+    const recoveryState = async () => {
+      try {
+        const response = await fetch('/__recovery/state', { headers: { accept: 'application/json' }, cache: 'no-store' })
+        if (response.ok !== true) return null
+        return await response.json()
+      } catch {
+        return null
+      }
+    }
+
     function useMedia(query) {
       const list = React.useMemo(() => window.matchMedia(query), [query])
       const [matches, setMatches] = React.useState(list.matches)
@@ -438,6 +454,7 @@ function DeleteButton({ disabled, onDelete, name }) {
           await call(action, body)
           await call('restart', {})
           let down = false
+          let handedOff = false
           for (let attempt = 0; attempt < 180; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 1000))
             try {
@@ -456,6 +473,29 @@ function DeleteButton({ disabled, onDelete, name }) {
             if (!down && attempt >= 30) {
               setNote('the harness did not restart — the container needs `restart: unless-stopped` (or any supervisor) for a profile switch to take effect')
               break
+            }
+            /**
+             * A profile that CANNOT boot never brings this page back — and the
+             * user is left staring at a dead UI with no idea that a reload would
+             * hand them the diagnostics. The reverse proxy answers while the
+             * harness is down, and the recovery surface knows whether the boot it
+             * is serving has already failed, so hand off to it by ourselves.
+             * The 12s floor is what keeps a NORMAL switch (which reports
+             * `starting` for its whole restart) from being mistaken for this.
+             */
+            if (down && !handedOff && Date.now() - started > 12000) {
+              handedOff = true
+              const state = await recoveryState()
+              const broken = state !== null && state.ready !== true
+                && (state.boot?.state === 'failed' || state.boot?.state === 'client-failed')
+              if (!broken) {
+                handedOff = false
+              } else {
+                clearInterval(ticker)
+                setNote(`“${label}” did not boot — opening the recovery page…`)
+                window.location.replace('/__recovery/page?from=switch')
+                return
+              }
             }
           }
           clearInterval(ticker)

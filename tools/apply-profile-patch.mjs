@@ -178,12 +178,14 @@ fi
 # crashes on its first request, an OOM), flip the state to failed so the recovery
 # page shows the real reason instead of an empty 502. A deliberate stop writes the
 # flag first, so a normal container stop is never reported as a boot failure.
+# A REQUESTED profile switch (/tmp/dsh-restart-requested, written by the in-app
+# switcher) is deliberate too: it must not be recorded as a crash.
 (
   while kill -0 "$DSH_PID" 2>/dev/null; do
-    [[ -f /tmp/dsh-stopping ]] && exit 0
+    [[ -f /tmp/dsh-stopping || -f /tmp/dsh-restart-requested ]] && exit 0
     sleep 5
   done
-  [[ -f /tmp/dsh-stopping ]] && exit 0
+  [[ -f /tmp/dsh-stopping || -f /tmp/dsh-restart-requested ]] && exit 0
   write_boot_state failed "the harness process exited after startup" "exit observed by the entrypoint watchdog"
 ) &
 WATCHDOG_PID=$!
@@ -202,6 +204,11 @@ patched = patched.replace(READY_ANCHOR, READY_BLOCK)
  *    a crash loop with nothing to click. Here the proxy stays up and serves the
  *    recovery page; the proxy's own exit (a deliberate restart from that page)
  *    still shuts the stack down.
+ *
+ *    The ONE exception is a profile switch requested from the in-app control: it
+ *    exits DSH after writing /tmp/dsh-restart-requested, and that exit has to
+ *    take the whole stack down — otherwise nothing ever reboots the container and
+ *    the switch silently does not happen. Same teardown as the recovery page.
  */
 const SUPERVISE_OLD = `# Supervise: if either process exits, stop the other and propagate status.
 set +e
@@ -214,7 +221,8 @@ exit "$status"`
 const SUPERVISE_NEW = `# Supervise. A DSH exit keeps the REVERSE PROXY serving the recovery page, so a
 # profile that cannot boot is fixable from the browser instead of becoming a
 # crash loop. The proxy's own exit (a deliberate restart from that page) still
-# shuts the stack down so the container policy can boot the new selection.
+# shuts the stack down so the container policy can boot the new selection — and so
+# does a profile switch requested in the UI (/tmp/dsh-restart-requested).
 set +e
 while true; do
   wait -n "$DSH_PID" "$PROXY_PID"
@@ -223,6 +231,11 @@ while true; do
     log "proxy exited (status=\${status}) \u2014 shutting down"
     terminate
     exit "$status"
+  fi
+  if [[ -f /tmp/dsh-restart-requested ]]; then
+    log "profile switch requested — shutting the stack down so the container boots the new selection"
+    terminate
+    exit 0
   fi
   write_boot_state failed "the harness process exited" "recovery surface serving on port \${PROXY_PORT}"
   log "harness exited (status=\${status}) \u2014 recovery surface still serving on \${PROXY_HOST}:\${PROXY_PORT}"
