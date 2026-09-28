@@ -29,6 +29,10 @@ window.__ModuleLoader__.load({
     const MOBILE_QUERY = '(max-width: 720px)'
     const REDUCED_QUERY = '(prefers-reduced-motion: reduce)'
     const inject = ['slots']
+    // The clone that sits beside Settings while the sidebar is expanded, and the
+    // body class that takes the real (slot-rendered) control out of the flow.
+    const INLINE_ID = 'dsh-ps-trigger-inline'
+    const INLINE_CLASS = 'dsh-ps--beside-settings'
 
     /** Small JSON client for the host half. */
     const call = async (action, body) => {
@@ -72,6 +76,18 @@ window.__ModuleLoader__.load({
 .dsh-ps__trigger:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .dsh-ps__trigger:active,.dsh-ps__trigger[aria-expanded="true"]{background:var(--dsw-alias-interactive-bg-active)}
 .dsh-ps__trigger:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
+/* Beside Settings (expanded sidebar only): the visible control is the plain DOM
+   clone in the Settings trigger row — see the placement effect — while the real,
+   slot-rendered control is taken out of the flow so the slot does not leave an
+   empty row above Settings. Out of the FLOW, not merely hidden: an absolutely
+   positioned child is no longer a flex item, so it adds no row and no gap. The
+   !important is load-bearing — React owns the inline position:relative on that
+   wrapper and would otherwise win over this rule. The clone keeps the same 36x36
+   box, the same 12px radius and the same theme colours, so the two controls sit
+   in one row exactly like the shipped footer controls do. */
+body.dsh-ps--beside-settings .dsh-ps__wrap{position:absolute!important;left:-9999px;top:0;width:0;height:0;overflow:hidden}
+body.dsh-ps--beside-settings .dsh-ps__trigger:not(.dsh-ps__inline){display:none}
+.dsh-ps__inline{flex:0 0 auto;margin:0}
 .dsh-ps__action{background:var(--dsw-alias-interactive-bg-hover);transition:background-color 120ms ease}
 .dsh-ps__action:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-active)}
 .dsh-ps__danger{border-color:var(--dsw-alias-state-error-primary,rgba(220,90,90,.5))}
@@ -231,7 +247,11 @@ function DeleteButton({ disabled, onDelete, name }) {
       const open = mounted
 
       const place = React.useCallback(() => {
-        const rect = buttonRef.current?.getBoundingClientRect()
+        // Measure whatever the user actually sees: beside Settings the real button
+        // is out of the flow, so the panel hangs off the clone instead.
+        const inline = document.getElementById(INLINE_ID)
+        const target = inline !== null && inline.isConnected ? inline : buttonRef.current
+        const rect = target?.getBoundingClientRect()
         if (rect === undefined || rect === null) return
         setAnchor({
           left: Math.max(8, Math.min(rect.left, window.innerWidth - 348)),
@@ -280,6 +300,10 @@ function DeleteButton({ disabled, onDelete, name }) {
           const target = event.target
           if (panelRef.current?.contains(target) === true) return
           if (buttonRef.current?.contains(target) === true) return
+          // The beside-Settings clone is a plain copy of the trigger, so it counts
+          // as the trigger: without this every click on it would be an "outside"
+          // click first and the panel would just close.
+          if (document.getElementById(INLINE_ID)?.contains(target) === true) return
           hide()
         }
         const onKeyDown = (event) => { if (event.key === 'Escape') hide() }
@@ -296,18 +320,112 @@ function DeleteButton({ disabled, onDelete, name }) {
       }, [mounted, mobile, place, hide])
 
       /**
-       * Placement: KEEP THE CONTROL WHERE THE SLOT PUTS IT.
+       * Sit BESIDE Settings while the sidebar is expanded — WITHOUT touching a
+       * React-owned node.
        *
-       * An earlier version moved this React-owned node into the Settings row to sit
-       * beside Settings. That crashed the whole slot entry
-       * ("insertBefore … is not a child of this node") as soon as React re-rendered
-       * the footer, taking the control off screen entirely — the node was moved
-       * while React still owned its position, and the MutationObserver that was
-       * meant to re-place it fired on its own mutations.
+       * An earlier version MOVED this control's wrapper into the Settings row. It
+       * looked right, and it was fatal: the node belongs to React, so the next
+       * commit in `sidebar.footer.action` raised
+       * "insertBefore … is not a child of this node" and the whole slot entry
+       * disappeared (commit 7350968 removed it again).
        *
-       * The footer slot already renders directly above Settings, which is the
-       * grouping the user asked for, so the honest fix is to leave the node alone.
+       * The safe way — the one the reference deployment's own Mobile Access
+       * control uses — is a CLONE. This component keeps rendering exactly where
+       * the slot put it, so React stays the only owner of that subtree; an inert,
+       * imperatively-created copy of the trigger is what gets inserted into the
+       * Settings trigger row. A plain DOM node cannot break a React commit, and
+       * the real button stays the single source of truth: the copy only forwards
+       * clicks to it and mirrors `aria-expanded` / `title` / `aria-label` back.
+       *
+       * Only while the sidebar is EXPANDED: in the rail the slot's own stacked
+       * placement is already the correct layout, so nothing is cloned and nothing
+       * is hidden there.
        */
+      React.useEffect(() => {
+        const TRIGGER = `.dsh-ps__trigger:not(#${INLINE_ID})`
+        const ATTRS = ['aria-expanded', 'title', 'aria-label']
+        let observed = null
+        let attrs = null
+        let scheduled = false
+
+        /** Mirror the real trigger's live state onto the copy. */
+        const sync = (from, to) => {
+          for (const name of ATTRS) {
+            const value = from.getAttribute(name)
+            if (value !== null && to.getAttribute(name) !== value) to.setAttribute(name, value)
+          }
+        }
+
+        const clearClone = () => {
+          const clone = document.getElementById(INLINE_ID)
+          if (clone !== null) clone.remove()
+          if (attrs !== null) { attrs.disconnect(); attrs = null }
+          observed = null
+          document.body.classList.remove(INLINE_CLASS)
+        }
+
+        const place = () => {
+          const orig = document.querySelector(TRIGGER)
+          if (orig === null) { clearClone(); return }
+          const foot = orig.closest('[class*="footArea"]')
+          const row = foot === null ? null : foot.querySelector('[class*="settingsArea"] [class*="_triggerRow"]')
+          // The footer is wide when the sidebar is expanded and ~a rail when it is
+          // collapsed; the reference deployment's row only exists in the expanded
+          // sidebar anyway, so both conditions agree.
+          const expanded = foot !== null && foot.getBoundingClientRect().width > 120
+          if (!expanded || row === null) { clearClone(); return }
+
+          document.body.classList.add(INLINE_CLASS)
+          let clone = document.getElementById(INLINE_ID)
+          if (clone === null || clone.parentElement !== row) {
+            if (clone !== null) clone.remove()
+            clone = orig.cloneNode(true)
+            clone.id = INLINE_ID
+            clone.classList.add('dsh-ps__inline')
+            clone.addEventListener('click', (event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              const live = document.querySelector(TRIGGER)
+              if (live !== null) live.click()
+            })
+            row.insertBefore(clone, row.firstChild)
+          }
+          sync(orig, clone)
+          // Re-bind when React replaces the real node (the slot may re-render it).
+          if (observed !== orig) {
+            if (attrs !== null) attrs.disconnect()
+            attrs = new MutationObserver(() => {
+              const live = document.querySelector(TRIGGER)
+              const copy = document.getElementById(INLINE_ID)
+              if (live !== null && copy !== null) sync(live, copy)
+            })
+            attrs.observe(orig, { attributes: true, attributeFilter: ATTRS })
+            observed = orig
+          }
+        }
+
+        // Both paths on purpose: the observer is the fast one, the interval is the
+        // one that still works where animation frames are paused (an occluded
+        // window) and after a collapse/expand animation that changes no children.
+        const schedule = () => {
+          if (scheduled) return
+          scheduled = true
+          const run = () => { if (!scheduled) return; scheduled = false; place() }
+          requestAnimationFrame(run)
+          window.setTimeout(run, 90)
+        }
+        place()
+        const watcher = new MutationObserver(schedule)
+        watcher.observe(document.body, { childList: true, subtree: true })
+        window.addEventListener('resize', schedule)
+        const ticker = window.setInterval(place, 700)
+        return () => {
+          watcher.disconnect()
+          window.removeEventListener('resize', schedule)
+          window.clearInterval(ticker)
+          clearClone()
+        }
+      }, [])
       /** Confirm, apply, restart, then wait for the harness to come back. */
       const applyAndWait = async (action, body, label) => {
         if (!window.confirm(`Switch to “${label}” and restart the harness?\n\nThe interface disconnects for about 20 seconds. Sessions, settings and credentials are kept — only the plugin set changes.`)) return
@@ -482,23 +600,28 @@ function DeleteButton({ disabled, onDelete, name }) {
         ? { opacity: entered ? 1 : 0, transform: entered ? 'translateY(0)' : 'translateY(101%)' }
         : { opacity: entered ? 1 : 0, transform: entered ? 'none' : 'translateY(6px) scale(.97)' }
 
-      return React.createElement('div', { ref: wrapRef, style: S.wrap },
-        React.createElement('button', {
-          type: 'button',
-          ref: buttonRef,
-          className: 'dsh-ps__trigger',
-          style: S.trigger,
-          title: `Profile: ${active ?? 'unknown'} — switch the plugin set this harness boots`,
-          'aria-label': `Profile: ${active ?? 'unknown'}`,
-          'aria-expanded': open,
-          onClick: () => { if (open) hide(); else show() },
-        },
-          React.createElement('svg', {
-            'aria-hidden': true, focusable: false, width: 18, height: 18, viewBox: '0 0 16 16',
-            fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+      // The panel and the backdrop are SIBLINGS of the wrapper, not children: the
+      // wrapper is what gets taken out of the flow while the control sits beside
+      // Settings, and anything inside it would go with it. Both are fixed to the
+      // viewport anyway, so their position does not depend on the wrapper.
+      return React.createElement(React.Fragment, null,
+        React.createElement('div', { ref: wrapRef, className: 'dsh-ps__wrap', style: S.wrap },
+          React.createElement('button', {
+            type: 'button',
+            ref: buttonRef,
+            className: 'dsh-ps__trigger',
+            style: S.trigger,
+            title: `Profile: ${active ?? 'unknown'} — switch the plugin set this harness boots`,
+            'aria-label': `Profile: ${active ?? 'unknown'}`,
+            'aria-expanded': open,
+            onClick: () => { if (open) hide(); else show() },
           },
-            React.createElement('circle', { cx: 8, cy: 5.4, r: 2.6 }),
-            React.createElement('path', { d: 'M3.3 13.3c.75-2.4 2.6-3.7 4.7-3.7s3.95 1.3 4.7 3.7' }))),
+            React.createElement('svg', {
+              'aria-hidden': true, focusable: false, width: 18, height: 18, viewBox: '0 0 16 16',
+              fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+            },
+              React.createElement('circle', { cx: 8, cy: 5.4, r: 2.6 }),
+              React.createElement('path', { d: 'M3.3 13.3c.75-2.4 2.6-3.7 4.7-3.7s3.95 1.3 4.7 3.7' })))),
         mounted && mobile && React.createElement('div', {
           style: { ...S.backdrop, opacity: entered ? 1 : 0 },
           onClick: hide,
