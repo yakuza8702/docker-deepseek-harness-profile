@@ -454,7 +454,6 @@ function DeleteButton({ disabled, onDelete, name }) {
           await call(action, body)
           await call('restart', {})
           let down = false
-          let handedOff = false
           for (let attempt = 0; attempt < 180; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 1000))
             try {
@@ -475,25 +474,43 @@ function DeleteButton({ disabled, onDelete, name }) {
               break
             }
             /**
-             * A profile that CANNOT boot never brings this page back — and the
-             * user is left staring at a dead UI with no idea that a reload would
-             * hand them the diagnostics. The reverse proxy answers while the
-             * harness is down, and the recovery surface knows whether the boot it
-             * is serving has already failed, so hand off to it by ourselves.
-             * The 12s floor is what keeps a NORMAL switch (which reports
-             * `starting` for its whole restart) from being mistaken for this.
+             * A profile that CANNOT boot never brings this page back: the user is
+             * left staring at a dead UI with no idea that a reload would hand them
+             * the diagnostics — while a switch to a WORKING profile reloads by
+             * itself. Both directions have to behave the same way.
+             *
+             * The reverse proxy is the one thing still answering (it serves the
+             * recovery surface), so ask IT whether the boot this switch started
+             * has already failed, and navigate there when it has. This check is
+             * deliberately independent of `down` above: the hand-off must not
+             * depend on how the client happened to learn the harness went away.
+             *
+             * The floor is what keeps a NORMAL switch — which reports `starting`
+             * for its whole restart — from being mistaken for a broken one.
              */
-            if (down && !handedOff && Date.now() - started > 12000) {
-              handedOff = true
+            const waited = Date.now() - started
+            if (waited > 10000) {
               const state = await recoveryState()
               const broken = state !== null && state.ready !== true
                 && (state.boot?.state === 'failed' || state.boot?.state === 'client-failed')
-              if (!broken) {
-                handedOff = false
-              } else {
+              if (broken) {
                 clearInterval(ticker)
                 setNote(`“${label}” did not boot — opening the recovery page…`)
                 window.location.replace('/__recovery/page?from=switch')
+                return
+              }
+              /**
+               * Last resort, for a stack whose boot state never resolves (an older
+               * image, or a container policy that does not reboot at all): nothing
+               * has answered for 45s, so reload. A navigation taken WHILE the
+               * harness is down is what serves the recovery page, and that page
+               * reloads itself into the app as soon as the harness answers — so
+               * the user is never left on a frozen tab.
+               */
+              if (down && waited > 45000) {
+                clearInterval(ticker)
+                setNote('the harness has not come back — reloading to the recovery page…')
+                window.location.reload()
                 return
               }
             }
