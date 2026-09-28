@@ -296,49 +296,18 @@ function DeleteButton({ disabled, onDelete, name }) {
       }, [mounted, mobile, place, hide])
 
       /**
-       * Sit BESIDE Settings while the sidebar is expanded.
+       * Placement: KEEP THE CONTROL WHERE THE SLOT PUTS IT.
        *
-       * The footer slot renders above the Settings row (that is why the control
-       * looked stacked). The shipped Settings trigger lives in
-       * `[class*="settingsArea"] [class*="_triggerRow"]`, a flex row with an 8px
-       * gap — the same insertion point the reference deployment's mobile control
-       * uses. We move our own node there when the sidebar is wide, and put it
-       * back where the slot rendered it when the sidebar is the rail (the rail
-       * stacking is already correct). Re-inserted on DOM churn, because React
-       * may re-render the slot.
+       * An earlier version moved this React-owned node into the Settings row to sit
+       * beside Settings. That crashed the whole slot entry
+       * ("insertBefore … is not a child of this node") as soon as React re-rendered
+       * the footer, taking the control off screen entirely — the node was moved
+       * while React still owned its position, and the MutationObserver that was
+       * meant to re-place it fired on its own mutations.
+       *
+       * The footer slot already renders directly above Settings, which is the
+       * grouping the user asked for, so the honest fix is to leave the node alone.
        */
-      React.useEffect(() => {
-        const node = wrapRef.current
-        if (node === null) return undefined
-        const home = { parent: node.parentElement, next: node.nextSibling }
-        let scheduled = false
-        const place = () => {
-          const foot = document.querySelector('[class*="footArea"]')
-          if (foot === null) return
-          const row = foot.querySelector('[class*="settingsArea"] [class*="_triggerRow"]')
-          const expanded = foot.getBoundingClientRect().width > 120
-          if (expanded && row !== null) {
-            if (node.parentElement !== row) row.insertBefore(node, row.firstChild)
-          } else if (home.parent !== null && node.parentElement !== home.parent) {
-            home.parent.insertBefore(node, home.next)
-          }
-        }
-        const schedule = () => {
-          if (scheduled) return
-          scheduled = true
-          window.setTimeout(() => { scheduled = false; place() }, 120)
-        }
-        place()
-        const observer = new MutationObserver(schedule)
-        observer.observe(document.body, { childList: true, subtree: true })
-        window.addEventListener('resize', schedule)
-        return () => {
-          observer.disconnect()
-          window.removeEventListener('resize', schedule)
-          if (home.parent !== null && node.parentElement !== home.parent) home.parent.insertBefore(node, home.next)
-        }
-      }, [])
-
       /** Confirm, apply, restart, then wait for the harness to come back. */
       const applyAndWait = async (action, body, label) => {
         if (!window.confirm(`Switch to “${label}” and restart the harness?\n\nThe interface disconnects for about 20 seconds. Sessions, settings and credentials are kept — only the plugin set changes.`)) return
