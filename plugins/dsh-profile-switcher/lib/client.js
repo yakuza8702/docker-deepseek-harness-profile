@@ -25,6 +25,18 @@ window.__ModuleLoader__.load({
   id: 'dsh-profile-switcher',
   factory: (require) => {
     const React = require('react')
+    /**
+     * The panel is rendered through a portal into <body>, and that is load-bearing,
+     * not decoration: the sidebar carries a `transform`, which makes it the
+     * containing block for every `position:fixed` descendant. The panel was
+     * therefore positioned inside the SIDEBAR — on a phone that put the bottom
+     * sheet at the off-canvas drawer's coordinates (x ≈ -300, 226px wide) instead
+     * of across the screen. <body> has no transform, so fixed means the viewport
+     * again. `react-dom` is part of the client module table; if a build ever lacks
+     * it the panel still renders, just inline, exactly as before.
+     */
+    let createPortal = null
+    try { createPortal = require('react-dom').createPortal } catch { createPortal = null }
     const ROUTE = '/api/dsh-profile-switcher'
     const MOBILE_QUERY = '(max-width: 720px)'
     const REDUCED_QUERY = '(prefers-reduced-motion: reduce)'
@@ -154,11 +166,18 @@ const Icons = {
   down: () => Icon(['M8 3.5v8.7', 'M4.4 8.6 8 12.2l3.6-3.6'], 14),
 }
 
-/** Trash button whose word appears beside the icon only on hover/focus. */
-function DeleteButton({ disabled, onDelete, name }) {
+/**
+ * Trash button whose word appears beside the icon only on hover/focus.
+ *
+ * It takes the SAME action style as its neighbours (the row's other icon
+ * buttons), which is what keeps it 44px on a phone: without it the trash was the
+ * only 30px control in a row of 44px ones — visibly undersized and harder to hit.
+ */
+function DeleteButton({ disabled, onDelete, name, style }) {
   return React.createElement('button', {
     type: 'button',
     className: 'dsh-ps__icon dsh-ps__dangerIcon',
+    style,
     disabled,
     title: `delete profiles/${name}`,
     'aria-label': `Delete ${name}`,
@@ -183,7 +202,11 @@ function DeleteButton({ disabled, onDelete, name }) {
             boxShadow: '0 18px 48px rgba(0,0,0,.55)', WebkitOverflowScrolling: 'touch',
           }
         : {
-            position: 'fixed', width: 340, maxHeight: '70vh', overflowY: 'auto', padding: 12, borderRadius: 12,
+            // Wide enough that a name and its five buttons fit on one line: at the
+            // old 340 the name column was ~110px, so every longer profile read
+            // "web-plug…" on the desktop too. Keep PANEL_WIDTH in sync with the
+            // clamp in place().
+            position: 'fixed', width: 400, maxHeight: '70vh', overflowY: 'auto', padding: 12, borderRadius: 12,
             border: '1px solid rgba(127,127,127,.35)', zIndex: 2147483000, fontSize: 13,
             background: 'var(--dsw-alias-bg-layer-1, rgba(28,28,36,.99))',
             color: 'var(--dsw-alias-label-primary, inherit)',
@@ -193,7 +216,20 @@ function DeleteButton({ disabled, onDelete, name }) {
         position: 'fixed', inset: 0, zIndex: 2147482999, background: 'rgba(0,0,0,.45)',
         transition: 'opacity 200ms cubic-bezier(.2,.8,.2,1)',
       },
-      header: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 2 },
+      /**
+       * The header is sticky on the phone. The sheet scrolls, so without it the
+       * title — and with it the ✕ — leaves the screen as soon as the list is longer
+       * than the sheet (the reported "no way to see the top"). The negative top
+       * margin/offsets are what make it stick flush to the sheet's edge while the
+       * padding stays part of the panel.
+       */
+      header: mobile
+        ? {
+            display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 2,
+            position: 'sticky', top: -16, zIndex: 3, margin: '-16px -16px 8px', padding: '16px 16px 8px',
+            background: 'var(--dsw-alias-bg-layer-1, rgba(24,24,32,.99))',
+          }
+        : { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 2 },
       close: {
         flex: '0 0 auto', display: 'flex', alignItems: 'center', justifyContent: 'center',
         width: mobile ? 44 : 28, height: mobile ? 44 : 28, marginTop: mobile ? -6 : -4, marginRight: mobile ? -6 : -4,
@@ -202,15 +238,25 @@ function DeleteButton({ disabled, onDelete, name }) {
       },
       title: { fontWeight: 650, fontSize: mobile ? 17 : 13.5, marginBottom: 2 },
       subtitle: { opacity: .65, fontSize: mobile ? 13 : 12, marginBottom: 12, lineHeight: 1.4 },
+      /**
+       * On a phone the row is TWO lines: the name (and its meta line) get the full
+       * width, the buttons sit under it. Sharing one line truncated every name to
+       * "we…" and "BR…" — the name is the one thing the row has to communicate, so
+       * it must not be the thing that loses the space.
+       */
       row: {
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
-        minHeight: mobile ? 56 : 0, padding: mobile ? '10px 12px' : '8px 10px',
-        borderRadius: 10, background: 'rgba(127,127,127,.10)', marginBottom: 8,
+        display: 'flex', flexDirection: mobile ? 'column' : 'row',
+        alignItems: mobile ? 'stretch' : 'center', justifyContent: 'space-between', gap: 10,
+        minHeight: mobile ? 0 : 0, padding: mobile ? '12px 14px' : '8px 10px',
+        borderRadius: mobile ? 12 : 10, background: 'rgba(127,127,127,.10)', marginBottom: 8,
       },
-      name: { display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 },
+      name: { display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, width: mobile ? '100%' : undefined },
       nameText: { fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontSize: mobile ? 15 : 13 },
       meta: { opacity: .6, fontSize: mobile ? 12 : 11, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
-      actions: { display: 'flex', alignItems: 'center', gap: 8, flex: '0 0 auto' },
+      actions: {
+        display: 'flex', alignItems: 'center', gap: 8, flex: '0 0 auto',
+        flexWrap: mobile ? 'wrap' : 'nowrap', alignSelf: mobile ? 'flex-start' : undefined,
+      },
       action: {
         flex: '0 0 auto', padding: mobile ? '10px 14px' : '4px 10px', borderRadius: 999, cursor: 'pointer',
         font: 'inherit', fontSize: mobile ? 13 : 12, minHeight: mobile ? 44 : 0,
@@ -270,7 +316,8 @@ function DeleteButton({ disabled, onDelete, name }) {
         const rect = target?.getBoundingClientRect()
         if (rect === undefined || rect === null) return
         setAnchor({
-          left: Math.max(8, Math.min(rect.left, window.innerWidth - 348)),
+          // 400 + 8px of breathing room: the panel's own width is PANEL-1 in styles().
+          left: Math.max(8, Math.min(rect.left, window.innerWidth - 408)),
           bottom: Math.max(8, window.innerHeight - rect.top + 8),
         })
       }, [])
@@ -647,7 +694,8 @@ function DeleteButton({ disabled, onDelete, name }) {
             ? React.createElement('span', { style: S.lock, title: 'default profile — the launcher falls back to it, so it cannot be deleted' }, '🔒')
             : (profile.deletable && !profile.active
                 ? React.createElement(DeleteButton, {
-                    disabled: busy, name: profile.name, onDelete: () => void deleteProfile(profile),
+                    disabled: busy, name: profile.name, style: S.action,
+                    onDelete: () => void deleteProfile(profile),
                   })
                 : null))))
 
@@ -657,34 +705,40 @@ function DeleteButton({ disabled, onDelete, name }) {
         ? { opacity: entered ? 1 : 0, transform: entered ? 'translateY(0)' : 'translateY(101%)' }
         : { opacity: entered ? 1 : 0, transform: entered ? 'none' : 'translateY(6px) scale(.97)' }
 
-      // The panel and the backdrop are SIBLINGS of the wrapper, not children: the
-      // wrapper is what gets taken out of the flow while the control sits beside
-      // Settings, and anything inside it would go with it. Both are fixed to the
-      // viewport anyway, so their position does not depend on the wrapper.
-      return React.createElement(React.Fragment, null,
-        React.createElement('div', { ref: wrapRef, className: 'dsh-ps__wrap', style: S.wrap },
-          React.createElement('button', {
-            type: 'button',
-            ref: buttonRef,
-            className: 'dsh-ps__trigger',
-            style: S.trigger,
-            title: `Profile: ${active ?? 'unknown'} — switch the plugin set this harness boots`,
-            'aria-label': `Profile: ${active ?? 'unknown'}`,
-            'aria-expanded': open,
-            onClick: () => { if (open) hide(); else show() },
+      const trigger = React.createElement('div', { ref: wrapRef, className: 'dsh-ps__wrap', style: S.wrap },
+        React.createElement('button', {
+          type: 'button',
+          ref: buttonRef,
+          className: 'dsh-ps__trigger',
+          style: S.trigger,
+          title: `Profile: ${active ?? 'unknown'} — switch the plugin set this harness boots`,
+          'aria-label': `Profile: ${active ?? 'unknown'}`,
+          'aria-expanded': open,
+          onClick: () => { if (open) hide(); else show() },
+        },
+          React.createElement('svg', {
+            'aria-hidden': true, focusable: false, width: 18, height: 18, viewBox: '0 0 16 16',
+            fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
           },
-            React.createElement('svg', {
-              'aria-hidden': true, focusable: false, width: 18, height: 18, viewBox: '0 0 16 16',
-              fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
-            },
-              React.createElement('circle', { cx: 8, cy: 5.4, r: 2.6 }),
-              React.createElement('path', { d: 'M3.3 13.3c.75-2.4 2.6-3.7 4.7-3.7s3.95 1.3 4.7 3.7' })))),
-        mounted && mobile && React.createElement('div', {
+            React.createElement('circle', { cx: 8, cy: 5.4, r: 2.6 }),
+            React.createElement('path', { d: 'M3.3 13.3c.75-2.4 2.6-3.7 4.7-3.7s3.95 1.3 4.7 3.7' }))))
+
+      /**
+       * The panel and the backdrop are SIBLINGS of the wrapper (not children: the
+       * wrapper is taken out of the flow while the control sits beside Settings and
+       * anything inside it would go with it), and they are portaled into <body> so
+       * that `position:fixed` really means the viewport — the sidebar's transform
+       * otherwise makes IT the containing block (see the note at createPortal).
+       * Both are gated on `mounted`, so the exit animation still runs and the
+       * portal disappears with it.
+       */
+      const overlay = React.createElement(React.Fragment, null,
+        mobile && React.createElement('div', {
           style: { ...S.backdrop, opacity: entered ? 1 : 0 },
           onClick: hide,
           'aria-hidden': true,
         }),
-        mounted && React.createElement('div', {
+        React.createElement('div', {
           ref: panelRef,
           role: 'dialog',
           'aria-label': 'Available Profiles',
@@ -742,6 +796,10 @@ function DeleteButton({ disabled, onDelete, name }) {
           note !== null && React.createElement('div', {
             style: { ...S.note, color: 'var(--dsw-alias-label-secondary, inherit)' },
           }, elapsed === null ? note : `${note} (${elapsed}s)`)))
+
+      return React.createElement(React.Fragment, null,
+        trigger,
+        mounted && (createPortal === null ? overlay : createPortal(overlay, document.body)))
     }
 
     function apply(ctx) {
