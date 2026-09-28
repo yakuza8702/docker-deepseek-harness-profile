@@ -177,6 +177,14 @@ function upstreamUnavailable(res, upgrade, req) {
  * clearly did NOT boot, never on a slow-but-working load.
  */
 const BOOT_WATCHDOG = `<script>(function(){
+  // The recovery page offers "Open the main page anyway": a client-side failure
+  // is not always something a profile switch can fix, and being unable to reach
+  // the app at all is worse than a degraded one. That flag must survive the
+  // navigation, so it is read from the URL and then remembered for this tab.
+  try {
+    if (/[?&]skipRecovery=1/.test(location.search)) sessionStorage.setItem("dsh-skip-recovery", "1");
+    if (sessionStorage.getItem("dsh-skip-recovery") === "1") return;
+  } catch (e) {}
   var RECOVERY = "/__recovery/page?from=client";
   var fired = false;
   // The shell renders this card when the composed client bundle aborts. It is the
@@ -355,17 +363,39 @@ function forwardToUpstream(req, res, autoAuthTried) {
         }
         bufferAndRewrite(upRes, res, (body) => {
           const str = body.toString("utf8");
-          // Refactor-tolerant: survive identifier renames / quote / spacing
-          // changes upstream; warn if a future version reshapes the decision.
-          const re = /[A-Za-z_$][\w$]*\.isLoopback\s*\?\s*["']host["']\s*:\s*["']memory["']/g;
+          // FIX (the dangling-receiver bug, seen again 2026-09-28): the pattern
+          // MUST capture the FULL dotted receiver chain. A one-segment pattern
+          // (`…$host.isLoopback ? …`) matches inside `ctx.remote.$host.isLoopback
+          // ? "host" : "memory"` and replaces only that part, leaving a dangling
+          // `ctx.remote.` prefix:
+          //
+          //   const persistence = ctx.remote."host";     // SyntaxError
+          //
+          // The client bundle then fails to parse, the entry never registers, and
+          // every dependent plugin cascades:
+          //   "web boot: 51 entries did not activate"
+          // and the browser shows "Failed to load plugins" with no controls. It
+          // only reproduces on a COLD load, because a warm browser serves the
+          // bundle from cache — which is why it looked like an incognito-only bug.
+          const re = /((?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*)\.isLoopback\s*\?\s*["']host["']\s*:\s*["']memory["']/g;
           const hits = str.match(re);
           if (!hits) {
             if (str.includes("isLoopback"))
               console.log("[proxy] WARNING: isLoopback present but settings pattern missed - check upstream shape");
             return body;
           }
+          // Prove the rewrite is safe before serving it: a buffer that does not
+          // parse must never leave the proxy. Fail OPEN (serve the original) —
+          // a locked settings page beats a dead client.
+          const rewritten = Buffer.from(str.replace(re, '"host"'), "utf8");
+          try {
+            new Function(rewritten.toString("utf8"));
+          } catch (error) {
+            console.log("[proxy] WARNING: settings rewrite would break the bundle — serving the original:", error.message);
+            return body;
+          }
           console.log("[proxy] unlocked remote settings persistence in served JS");
-          return Buffer.from(str.replace(re, '"host"'), "utf8");
+          return rewritten;
         });
         return;
       }

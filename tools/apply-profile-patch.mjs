@@ -101,7 +101,13 @@ write_boot_state() {   # write_boot_state <state> <reason> [detail]
     const fs = require("fs");
     const [file, state, reason, detail, profile] = process.argv.slice(1);
     let logTail = "";
-    try { logTail = fs.readFileSync("/tmp/dsh-web.log", "utf8").split("\\n").slice(-40).join("\\n").trim() } catch {}
+    try {
+      const full = fs.readFileSync("/tmp/dsh-web.log", "utf8");
+      // The whole log is what a user needs to hand to an agent (DSH NEXT shows a
+      // full, copyable report). Keep a generous tail rather than a teaser.
+      const lines = full.split("\\n");
+      logTail = lines.slice(-400).join("\\n").trim();
+    } catch {}
     fs.writeFileSync(file, JSON.stringify({ state, reason: reason || null, detail: detail || null, profile: profile || null, at: new Date().toISOString(), logTail: logTail || null }, null, 2) + "\\n");
   ' "$BOOT_STATE_FILE" "$1" "$2" "\${3:-}" "\${PROFILE:-}"
 }

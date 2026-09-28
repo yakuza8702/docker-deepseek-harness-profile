@@ -154,6 +154,10 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/gu, (char) =>
 /** The standalone recovery page: no build step, no external asset. */
 export function recoveryPage(snapshot) {
   const { boot, profiles, active, safeProfile } = snapshot
+  // JSON lives inside a raw-text <script> element: HTML entities are NOT decoded
+  // there, so escape only characters that could terminate the script tag.
+  const bootData = JSON.stringify({ state: boot.state, reason: boot.reason, detail: boot.detail, profile: boot.profile, at: boot.at, active, profiles })
+    .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
   const rows = profiles.map((profile) => `        <li class="row${profile.active ? ' is-current' : ''}">
           <div class="who">
             <span class="name">${escapeHtml(profile.label ?? profile.name)}${profile.active ? ' · current' : ''}</span>
@@ -199,14 +203,14 @@ export function recoveryPage(snapshot) {
 </style></head><body><div class="wrap">
   <h1>${boot.state === 'client-failed' ? 'Harness interface failed to load' : 'Harness did not start'}</h1>
   <div class="sub">${boot.state === 'client-failed'
-    ? 'The server is running, but this profile’s browser half could not compose. Pick another profile or boot Safe Mode — the container restarts into it.'
-    : 'The reverse proxy is up; the harness itself is not. Pick another profile or boot Safe Mode — the container restarts into it.'}</div>
+    ? 'The server is running, but this profile\u2019s browser half could not compose. Pick another profile or boot Safe Mode \u2014 the container restarts into it.'
+    : 'The reverse proxy is up; the harness itself is not. Pick another profile or boot Safe Mode \u2014 the container restarts into it.'}</div>
 
   <div class="card">
-    <h2>Why</h2>
-    <p class="reason">${escapeHtml(boot.reason ?? 'No boot failure recorded yet — the harness may still be starting.')}</p>
+    <h2>What failed</h2>
+    <p class="reason">${escapeHtml(boot.reason ?? 'No boot failure recorded yet \u2014 the harness may still be starting.')}</p>
     ${boot.detail === null ? '' : `<p class="detail">${escapeHtml(boot.detail)}</p>`}
-    <p class="detail">state: ${escapeHtml(boot.state)}${boot.profile === null ? '' : ` · profile: ${escapeHtml(boot.profile)}`}${boot.at === null ? '' : ` · at: ${escapeHtml(boot.at)}`}</p>
+    <p class="detail">state: ${escapeHtml(boot.state)}${boot.profile === null ? '' : ` \u00b7 profile: ${escapeHtml(boot.profile)}`}${boot.at === null ? '' : ` \u00b7 at: ${escapeHtml(boot.at)}`}</p>
   </div>
 
   <div class="card">
@@ -217,18 +221,34 @@ ${rows}
     <div class="actions">
       <button class="primary" id="safe">Boot Safe Mode${active === safeProfile ? ' (already current)' : ''}</button>
       <button id="retry">Retry boot</button>
+      <button id="open">Open the main page anyway</button>
     </div>
     <div class="note" id="note"></div>
   </div>
 
-  ${boot.logTail === null ? '' : `<div class="card"><h2>Last log lines</h2><pre>${escapeHtml(boot.logTail)}</pre></div>`}
+  <div class="card">
+    <h2>Diagnostic report \u2014 copy and hand to an agent</h2>
+    <p class="detail">The full log tail is below. <b>Copy report</b> puts the reason, the profile list and every log line on the clipboard in one go, so a harness can fix the broken profile without a shell on the host.</p>
+    <div class="actions" style="margin:10px 0">
+      <button id="copy">Copy report</button>
+      <button id="download">Download report</button>
+    </div>
+    <details ${boot.state === 'client-failed' || boot.state === 'failed' ? 'open' : ''}>
+      <summary style="cursor:pointer;color:var(--muted);margin-bottom:8px">Full log tail${boot.logTail === null ? ' (none recorded)' : ` (${String(boot.logTail.split('\n').length)} lines)`}</summary>
+      <pre id="log">${escapeHtml(boot.logTail ?? 'No log tail was recorded for this boot.')}</pre>
+    </details>
+  </div>
+
+  <script type="application/json" id="bootdata">${bootData}</script>
 
   <div class="card">
     <h2>Notes</h2>
     <p class="detail">Switching writes the profile selection and restarts the container. Sessions, settings and credentials are shared by every profile and are never touched.</p>
+    <p class="detail">If the interface still fails after a switch, use <b>Open the main page anyway</b>: a client-side failure is not always something a profile can fix, and being unable to reach the app at all is worse.</p>
   </div>
 </div>
 <script>
+  const BOOT = JSON.parse(document.getElementById('bootdata').textContent)
   const note = (text) => { document.getElementById('note').textContent = text }
   const body = () => document.body.classList.add('busy')
   const waitAndReload = async () => {
@@ -274,6 +294,67 @@ ${rows}
     body()
     try { await post('/__recovery/safe', {}); await post('/__recovery/restart', {}); await waitAndReload() }
     catch (error) { document.body.classList.remove('busy'); note(error.message) }
+  })
+  const report = () => [
+    'seek-harness diagnostic report',
+    'generated: ' + new Date().toISOString(),
+    'state: ' + (BOOT.state || 'unknown'),
+    'profile: ' + (BOOT.profile || '(unknown)'),
+    'active: ' + (BOOT.active || '(unknown)'),
+    'reason: ' + (BOOT.reason || '(none)'),
+    'detail: ' + (BOOT.detail || '(none)'),
+    'url: ' + location.href,
+    '',
+    'profiles:',
+    ...(BOOT.profiles || []).map((p) => '  - ' + p.name + (p.active ? ' (current)' : '') + ' [' + p.bundleCount + ' bundles' + (p.webCapable ? '' : ', NOT web-capable') + ']'),
+    '',
+    'log tail:',
+    document.getElementById('log') ? document.getElementById('log').textContent : '(none)',
+  ].join('\\n')
+  const copyText = async (text) => {
+    // LAN HTTP is not a secure context, and some browser implementations expose
+    // clipboard.writeText but leave its promise pending. Race it against a
+    // timeout, then use a selected textarea as the universal fallback.
+    try {
+      if (navigator.clipboard?.writeText) {
+        await Promise.race([
+          navigator.clipboard.writeText(text),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('clipboard timeout')), 1500)),
+        ])
+        return true
+      }
+    } catch { /* fall through to the selection fallback */ }
+    const area = document.createElement('textarea')
+    area.value = text
+    area.setAttribute('readonly', '')
+    area.style.position = 'fixed'
+    area.style.left = '-10000px'
+    document.body.appendChild(area)
+    area.select()
+    let ok = false
+    try { ok = document.execCommand('copy') } catch { ok = false }
+    area.remove()
+    if (!ok) document.getElementById('log').scrollIntoView({ block: 'center' })
+    return ok
+  }
+  document.getElementById('copy').addEventListener('click', async () => {
+    const ok = await copyText(report())
+    note(ok ? 'report copied to the clipboard' : 'clipboard unavailable — select the full log below and press Ctrl/Cmd+C')
+  })
+  document.getElementById('download').addEventListener('click', () => {
+    const blob = new Blob([report()], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'seek-harness-diagnostics.txt'
+    a.click()
+    URL.revokeObjectURL(url)
+    note('report downloaded')
+  })
+  document.getElementById('open').addEventListener('click', () => {
+    // Hard navigation, not a re-render: the watchdog lives in the document, so a
+    // normal load is what re-runs it.
+    window.location.href = '/?skipRecovery=1'
   })
   document.getElementById('retry').addEventListener('click', async () => {
     body()
