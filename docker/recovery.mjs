@@ -197,8 +197,10 @@ export function recoveryPage(snapshot) {
   .note{margin-top:14px;color:var(--muted);min-height:1.4em}
   .busy{opacity:.6;pointer-events:none}
 </style></head><body><div class="wrap">
-  <h1>Harness did not start</h1>
-  <div class="sub">The reverse proxy is up; the harness itself is not. Pick another profile or boot Safe Mode — the container restarts into it.</div>
+  <h1>${boot.state === 'client-failed' ? 'Harness interface failed to load' : 'Harness did not start'}</h1>
+  <div class="sub">${boot.state === 'client-failed'
+    ? 'The server is running, but this profile’s browser half could not compose. Pick another profile or boot Safe Mode — the container restarts into it.'
+    : 'The reverse proxy is up; the harness itself is not. Pick another profile or boot Safe Mode — the container restarts into it.'}</div>
 
   <div class="card">
     <h2>Why</h2>
@@ -231,16 +233,29 @@ ${rows}
   const body = () => document.body.classList.add('busy')
   const waitAndReload = async () => {
     note('restarting… the page reloads when the harness answers')
+    // Two phases: the container goes down (ready:false), then comes back
+    // (ready:true). We then reload — and let the BOOT WATCHDOG decide whether the
+    // interface is healthy: if this profile's browser half is still broken, the
+    // watchdog immediately hands the user back here, so a reload can never strand
+    // anyone on a dead page. (An earlier version judged the client itself with a
+    // content probe; it could not tell a working shell from a broken one, and one
+    // of its checks matched the watchdog script that the proxy injects into every
+    // page, so it waited forever.)
+    let sawDown = false
     for (let i = 0; i < 240; i += 1) {
       await new Promise((r) => setTimeout(r, 1000))
       try {
-        const response = await fetch('/__recovery/state', { headers: { accept: 'application/json' } })
+        const response = await fetch('/__recovery/state', { headers: { accept: 'application/json' }, cache: 'no-store' })
         const data = await response.json()
-        if (data.ready === true) { window.location.replace('/'); return }
-        if (data.boot && data.boot.state) note('state: ' + data.boot.state + (data.boot.reason ? ' — ' + data.boot.reason : ''))
-      } catch { /* still down */ }
+        if (data.ready !== true) { sawDown = true; note('harness is restarting…'); continue }
+        if (!sawDown && i < 8) { note('waiting for the harness to restart…'); continue }
+        // Settle briefly so the fresh shell is actually serving before we leave.
+        await new Promise((r) => setTimeout(r, 1500))
+        window.location.replace('/')
+        return
+      } catch { sawDown = true; note('harness is restarting…') }
     }
-    note('still down after 4 minutes — check the container')
+    note('gave up waiting after 4 minutes — check the container log')
   }
   const post = async (path, payload) => {
     const response = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload ?? {}) })
@@ -318,6 +333,54 @@ export async function handleRecovery(req, res, { log = console.log } = {}) {
         return send(200, { ok: true, ...selectSafe(env) }), true
       case 'restart':
         return send(200, restartSoon()), true
+      case 'page': {
+        // Served unconditionally — reached EITHER because the harness is down, or
+        // because a healthy harness could not compose its browser half and the
+        // page handed off (see the boot watchdog in proxy.mjs). The `from` query
+        // only changes the wording, never the actions.
+        const from = url.searchParams.get('from')
+        const reason = url.searchParams.get('reason')
+        // Record the client-side failure too. The harness is healthy, so the
+        // entrypoint never sees it — without this the next reload would look like
+        // a clean boot and lose the reason the user was sent here.
+        if (from === 'client') {
+          try {
+            const file = stateFile(env)
+            const previous = readJson(file) ?? {}
+            writeJsonAtomic(file, {
+              ...previous,
+              state: 'client-failed',
+              reason: reason === 'client-failed'
+                ? 'the browser half of this profile failed to load'
+                : 'the interface never finished loading',
+              detail: 'the server is healthy — the failure is in the browser side of the plugin tree',
+              profile: previous.profile ?? activeName(env),
+              at: new Date().toISOString(),
+            })
+          } catch { /* the page must render even if the record cannot be written */ }
+        }
+        const snapshot = recoverySnapshot(env)
+        const page = recoveryPage({
+          ...snapshot,
+          boot: from === 'client'
+            ? {
+                ...snapshot.boot,
+                state: 'client-failed',
+                reason: reason === 'client-failed'
+                  ? 'The harness started, but its browser half failed to load'
+                  : 'The harness started, but the interface never finished loading',
+                detail: 'The server is healthy (its API answers) — the failure is in the browser side of the plugin tree, which is exactly what a profile switch or Safe Mode clears.',
+              }
+            : snapshot.boot,
+        })
+        res.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+          'content-length': Buffer.byteLength(page),
+        })
+        res.end(page)
+        return true
+      }
       default:
         return send(404, { ok: false, error: `unknown recovery action "${action}"` }), true
     }

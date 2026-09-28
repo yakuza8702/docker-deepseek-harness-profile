@@ -160,15 +160,58 @@ function upstreamUnavailable(res, upgrade, req) {
   }
 }
 
+/**
+ * Client-boot watchdog, injected into every served HTML document.
+ *
+ * THE GAP THIS CLOSES: when a profile boots but its BROWSER half cannot compose
+ * (a client bundle that fails to parse, a plugin that breaks the module loader),
+ * the harness is HEALTHY — `/api/*` answers, the proxy is fine — while the page
+ * the user is looking at renders "Failed to load plugins" with no controls at
+ * all. The upstream-unavailable path never fires, and the profile switcher cannot
+ * render because it is one of the bundles that failed. The user is stuck.
+ *
+ * So the document itself watches for that: if the harness shell has not taken
+ * over the page within a few seconds, or it rendered its plugin-failure screen,
+ * we hand off to the recovery surface, which can still switch the profile or boot
+ * Safe Mode. The check is deliberately conservative: it only fires when the app
+ * clearly did NOT boot, never on a slow-but-working load.
+ */
+const BOOT_WATCHDOG = `<script>(function(){
+  var RECOVERY = "/__recovery/page?from=client";
+  var fired = false;
+  // The shell renders this card when the composed client bundle aborts. It is the
+  // authoritative signal: a FAILED shell must never be mistaken for a working one.
+  function failed() {
+    var text = (document.body && document.body.innerText) || "";
+    return /Failed to load plugins/i.test(text) || /did not activate/i.test(text);
+  }
+  // A working shell renders the app chrome. Checked only when failure is absent.
+  function booted() {
+    if (document.querySelector('[class*="footArea"]')) return true;
+    if (document.querySelector('[class*="sidebarCol"] button')) return true;
+    return document.querySelectorAll("button").length >= 5;
+  }
+  function handoff(why) {
+    if (fired || failed() === false && booted()) return;
+    fired = true;
+    window.location.replace(RECOVERY + "&reason=" + encodeURIComponent(failed() ? "client-failed" : (why || "client-timeout")));
+  }
+  // The plugin-failure card can appear as soon as the shell renders it.
+  var observer = new MutationObserver(function(){ if (failed()) handoff("client-failed"); });
+  try { observer.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+  // Give a healthy shell real time to mount before the timeout path can fire.
+  setTimeout(function(){ observer.disconnect(); handoff("client-timeout"); }, 12000);
+})();</script>`;
+
 function injectPolyfill(html) {
   const headIdx = html.search(/<head(\s[^>]*)?>/i);
   if (headIdx >= 0) {
     const tagEnd = html.indexOf(">", headIdx);
     if (tagEnd >= 0) {
-      return html.slice(0, tagEnd + 1) + POLYFILL + html.slice(tagEnd + 1);
+      return html.slice(0, tagEnd + 1) + POLYFILL + BOOT_WATCHDOG + html.slice(tagEnd + 1);
     }
   }
-  return POLYFILL + html;
+  return POLYFILL + BOOT_WATCHDOG + html;
 }
 
 function pipeSockets(client, upstream, head) {
