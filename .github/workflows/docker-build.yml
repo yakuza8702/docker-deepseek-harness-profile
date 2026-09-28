@@ -33,8 +33,12 @@ name: docker-build
 on:
   # A push to main builds the image immediately (this fork carries the
   # profile-aware launcher, so its image must exist as soon as the code lands).
+  # Feature branches listed here also build, so a feature can be tested as a real
+  # image before it is merged — and the branch stays revertable on its own.
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/profile-management
   workflow_dispatch:
     inputs:
       dsh_version:
