@@ -1,0 +1,33 @@
+# Workspace file manager (dsh-workspace-browser) as a launcher overlay.
+#
+# Mounted into EVERY profile the same way as profile-switcher.overlay.yml and
+# browser-use.overlay.yml: `--patch`, applied AFTER the profile layer, so no
+# profile directory in $DSH_HOME is ever edited and removing this file (or
+# setting DSH_WORKSPACE_BROWSER_OVERLAY=) removes the feature at the next boot.
+#
+# What it adds: a "Files" entry in the sidebar footer and a full-screen panel with
+# directory navigation, breadcrumbs, size/mtime, bounded text preview, text
+# editing with Ctrl/Cmd+S, and create / rename / delete inside the configured root.
+#
+# READ THE SECURITY NOTE before enabling this on a shared deployment: it grants
+# WRITE access (including recursive delete) to whoever can reach the Harness UI.
+# Every path is resolved under `root` with realpath checks, `..` and root-escaping
+# symlinks are rejected, symlinks cannot be mutated, and mutations must be
+# same-origin JSON — but the UI's own auth is the only boundary above that, so keep
+# the Harness behind Pangolin/Badger, Basic Auth, or a trusted network.
+#
+# Switches (read at boot):
+#   DSH_WORKSPACE_BROWSER_ENABLED=0   no file manager at all
+#   DSH_WORKSPACE_ROOT=/workspace     the only directory it can touch
+#   DSH_WORKSPACE_MAX_ENTRIES         directory listing cap (default 2000)
+#   DSH_WORKSPACE_MAX_PREVIEW_BYTES   text preview cap (default 512 KiB)
+#   DSH_WORKSPACE_MAX_WRITE_BYTES     single write cap (default 1 MiB)
+- insert:
+    - id: workspace-browser
+      name: 'dsh-workspace-browser'
+      disabled: !!js "process.env.DSH_WORKSPACE_BROWSER_ENABLED === '0'"
+      config:
+        root: !!js "(process.env.DSH_WORKSPACE_ROOT || '/workspace')"
+        maxEntries: !!js "Number(process.env.DSH_WORKSPACE_MAX_ENTRIES || 2000)"
+        maxPreviewBytes: !!js "Number(process.env.DSH_WORKSPACE_MAX_PREVIEW_BYTES || 524288)"
+        maxWriteBytes: !!js "Number(process.env.DSH_WORKSPACE_MAX_WRITE_BYTES || 1048576)"

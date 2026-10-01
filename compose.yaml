@@ -78,6 +78,17 @@ services:
       DSH_CDP_PORT: "${DSH_CDP_PORT:-9222}"
       DSH_DESKTOP_WIDTH: "${DSH_DESKTOP_WIDTH:-1440}"
       DSH_DESKTOP_HEIGHT: "${DSH_DESKTOP_HEIGHT:-900}"
+      # --- workspace file manager (dsh-workspace-browser) ---
+      # A "Files" entry in the sidebar footer with directory navigation, text
+      # preview and editing, and create / rename / delete inside the root below.
+      # It WRITES, including recursive delete, so the UI's own auth is the
+      # boundary: keep the Harness behind Pangolin/Badger or Basic Auth and mount
+      # only the workspace you are willing to expose. Set to 0 to remove it.
+      DSH_WORKSPACE_BROWSER_ENABLED: "${DSH_WORKSPACE_BROWSER_ENABLED:-1}"
+      DSH_WORKSPACE_ROOT: "${DSH_WORKSPACE_ROOT:-/workspace}"
+      DSH_WORKSPACE_MAX_ENTRIES: "${DSH_WORKSPACE_MAX_ENTRIES:-2000}"
+      DSH_WORKSPACE_MAX_PREVIEW_BYTES: "${DSH_WORKSPACE_MAX_PREVIEW_BYTES:-524288}"
+      DSH_WORKSPACE_MAX_WRITE_BYTES: "${DSH_WORKSPACE_MAX_WRITE_BYTES:-1048576}"
     env_file:
       - path: .env
         required: false

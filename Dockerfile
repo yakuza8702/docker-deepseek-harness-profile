@@ -298,30 +298,36 @@ RUN printf '%s\n' \
  && chmod 0755 /usr/local/bin/brave-desktop \
  && brave-desktop --version
 
-# In-app profile control (dsh-profile-switcher) + the visible browser desktop
-# (dsh-browser-desktop, vendored from runzhliu because that package is NOT
-# published to npm — see plugins/dsh-browser-desktop/README.md).
-# Both packages are placed in the DSH installation's node_modules so the launcher
-# can mount them by name from ANY profile; the overlay patches that mount them sit
-# beside the entrypoint that applies them (`--patch`, AFTER the profile layer) — no
-# profile directory in $DSH_HOME is ever edited. Uninstall = remove the overlay
-# (or set DSH_PROFILE_OVERLAY= / DSH_BROWSER_USE_OVERLAY=).
+# In-app profile control (dsh-profile-switcher), the visible browser desktop
+# (dsh-browser-desktop) and the workspace file manager (dsh-workspace-browser).
+# The last two are vendored from runzhliu — neither is published to npm; see each
+# plugin's README for its provenance and port notes.
+# All three packages are placed in the DSH installation's node_modules so the
+# launcher can mount them by name from ANY profile; the overlay patches that mount
+# them sit beside the entrypoint that applies them (`--patch`, AFTER the profile
+# layer) — no profile directory in $DSH_HOME is ever edited. Uninstall = remove the
+# overlay (or set DSH_PROFILE_OVERLAY= / DSH_BROWSER_USE_OVERLAY= /
+# DSH_WORKSPACE_BROWSER_OVERLAY=).
 COPY plugins/dsh-profile-switcher /opt/dsh-profile-switcher
 COPY plugins/dsh-browser-desktop /opt/dsh-browser-desktop
+COPY plugins/dsh-workspace-browser /opt/dsh-workspace-browser
 RUN set -eux; \
     installed=0; \
     for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
       if [ -d "$target" ]; then \
         cp -a /opt/dsh-profile-switcher "$target/dsh-profile-switcher"; \
         cp -a /opt/dsh-browser-desktop "$target/dsh-browser-desktop"; \
+        cp -a /opt/dsh-workspace-browser "$target/dsh-workspace-browser"; \
         installed=1; \
       fi; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
-    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop; \
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser; \
     chmod -R a+rX \
-      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop \
-      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop 2>/dev/null || true
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser 2>/dev/null || true
+# The workspace plugin's own suite, kept in the image so the ported host logic can
+# be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
 
 
 # Declare the plugins in the DSH installation's own manifest. This is what makes
@@ -335,10 +341,11 @@ RUN set -eux; \
       anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
       [ -d "$root/dsh-browser-desktop" ] || continue; \
-      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
+COPY --chmod=0644 docker/workspace-browser.overlay.yml /opt/seek-harness/workspace-browser.overlay.yml
 
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \

@@ -213,6 +213,14 @@ if [[ -n "$BROWSER_OVERLAY" && -f "$BROWSER_OVERLAY" ]]; then
   overlay_args+=(--patch "$BROWSER_OVERLAY")
   log "overlay: $BROWSER_OVERLAY"
 fi
+# Workspace file manager. Same convention: the row carries its own `disabled`
+# condition (DSH_WORKSPACE_BROWSER_ENABLED), so the feature is switched off in
+# config rather than by removing the file.
+WORKSPACE_OVERLAY="${DSH_WORKSPACE_BROWSER_OVERLAY-/opt/seek-harness/workspace-browser.overlay.yml}"
+if [[ -n "$WORKSPACE_OVERLAY" && -f "$WORKSPACE_OVERLAY" ]]; then
+  overlay_args+=(--patch "$WORKSPACE_OVERLAY")
+  log "overlay: $WORKSPACE_OVERLAY"
+fi
 
 # ---------------------------------------------------------------------
 # Browser Use + the visible desktop (this fork).

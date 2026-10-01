@@ -97,6 +97,43 @@ with plain `docker run`, add `--shm-size=1g` — the entrypoint detects a small 
 and falls back to `--disable-dev-shm-usage` automatically, but the properly sized path
 is faster.
 
+## Workspace file manager — the "Files" entry in the sidebar footer
+
+The image also carries **`dsh-workspace-browser`**, a file manager for `/workspace`
+that the Harness Web UI does not otherwise have. DSH's built-in file sidebar is
+read-oriented (tree, previews, open-in-local-app, diff review of Agent changes); this
+adds the write half:
+
+| In the panel | Detail |
+|---|---|
+| Navigate | Directory listing with breadcrumbs, size and modification time |
+| Preview | Bounded text preview, 512 KiB by default |
+| Edit | In-UI text editing with `Ctrl`/`Cmd`+`S`, and an mtime precondition so a save refuses to silently overwrite an outside change |
+| Create / rename / delete | Files and directories; deleting a non-empty directory asks first and is explicit about being recursive |
+
+**It writes, so read this before enabling it.** Every path is resolved under the
+configured root with `realpath` checks; `..` traversal and symlinks escaping the root
+are rejected, symlinks cannot be mutated, mutations must be same-origin JSON, and
+single writes are capped. But above that, the only boundary is who can reach the UI:
+anyone who can open the Harness can create, edit, rename and recursively delete inside
+`/workspace`. Keep it behind Pangolin/Badger, Basic Auth, or a trusted network, and
+mount only the directory you are willing to expose. `DSH_WORKSPACE_BROWSER_ENABLED=0`
+removes it entirely.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DSH_WORKSPACE_BROWSER_ENABLED` | `1` | `0` = no file manager row at boot |
+| `DSH_WORKSPACE_ROOT` | `/workspace` | The only directory it can touch |
+| `DSH_WORKSPACE_MAX_ENTRIES` | `2000` | Directory listing cap |
+| `DSH_WORKSPACE_MAX_PREVIEW_BYTES` | `524288` | Text preview cap |
+| `DSH_WORKSPACE_MAX_WRITE_BYTES` | `1048576` | Single write cap |
+
+Vendored from runzhliu's **unmerged** `feat/workspace-browser-crud` branch (the package
+is not on npm) and ported from the 0.1.0-rc.6 client runtime to `dsh-client-modules` for
+DSH 0.2.0 — see [`plugins/dsh-workspace-browser/README.md`](plugins/dsh-workspace-browser/README.md).
+Its own suite covers the host logic and runs in the image:
+`docker exec <container> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js`.
+
 ## Why a reverse proxy? (the 0.0.0.0 fix)
 
 `dsh web` serves `http://127.0.0.1:3080` and the CLI **intentionally refuses `--host 0.0.0.0`** (anti unauthenticated-RCE measure). A container port forward needs a non-loopback listener, so this image keeps DSH on `127.0.0.1:$DSH_PORT` inside the container and exposes a zero-dependency Node reverse proxy on `$PROXY_HOST:$PROXY_PORT` (smanx approach) that provides:
