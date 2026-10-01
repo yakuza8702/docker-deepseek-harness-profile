@@ -185,6 +185,10 @@ if [[ -f "$SAFE_MODE_FLAG" ]]; then
   mkdir -p "$SAFE_HOME"
   [[ -f "$DSH_REAL_HOME/.credentials.yaml" ]] && cp -a "$DSH_REAL_HOME/.credentials.yaml" "$SAFE_HOME/.credentials.yaml"
   HARNESS_HOME="$SAFE_HOME"
+  # Safe Mode is a STOCK environment (dsh-next semantics): the real home's
+  # selection must not leak into the temporary one — only the shipped `web`
+  # profile has a template, so only it can be materialized in a fresh home.
+  PROFILE="web"
   log "SAFE MODE: booting a temporary environment (DSH_HOME=$SAFE_HOME) — the real home is untouched; only .credentials.yaml was carried over"
   write_boot_state starting "booting Safe Mode (temporary environment)"
 fi
