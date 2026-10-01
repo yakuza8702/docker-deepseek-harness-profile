@@ -953,7 +953,7 @@ export function recoveryPage(snapshot) {
     wrap.innerHTML = rows.map(function (p) {
       var meta = p.status === 'disabled' ? 'Still installed, not loaded' : (p.owner === 'core' ? 'Built in' : (p.owner === 'profile' ? 'Directly installed plugin' : 'Not directly removable'));
       var buttons = '';
-      if (p.status === 'disabled') buttons += '<span class="badge">Disabled</span>';
+      if (p.status === 'disabled') buttons += '<button class="btn" disabled title="This plugin is disabled — it is still installed, but the harness will not load it.">Disabled</button>';
       if (p.toggle === 'disable') buttons += '<button class="btn" data-act="disable" data-name="' + p.packageName.replace(/"/g, '&quot;') + '"><svg class="ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18.36 6.25a9 9 0 1 1-12.72.04"/><path d="M12 2v10"/><line x1="2" x2="22" y1="2" y2="22"/></svg>Disable</button>';
       if (p.toggle === 'enable') buttons += '<button class="btn primary" data-act="enable" data-name="' + p.packageName.replace(/"/g, '&quot;') + '"><svg class="ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></svg>Enable</button>';
       if (p.action === 'uninstall') buttons += '<button class="btn destructive" data-act="uninstall" data-name="' + p.packageName.replace(/"/g, '&quot;') + '">Uninstall</button>';

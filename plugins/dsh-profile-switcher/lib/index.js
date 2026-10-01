@@ -48,8 +48,18 @@ const LOCKED = new Set(['web'])
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/iu
 const RESERVED = new Set(['node_modules', 'con', 'prn', 'aux', 'nul', 'com1', 'com2', 'com3', 'com4', 'lpt1', 'lpt2', 'lpt3'])
 
-/** Harness home; the launcher exports DSH_HOME, the default matches the image. */
-const home = () => process.env.DSH_HOME ?? '/home/node/.dsh'
+/** The REAL harness home. In Safe Mode the launcher exports DSH_REAL_HOME (the
+ * entrypoint keeps it pointing at the real home while the harness itself runs
+ * on a throwaway tmpfs home) — the panel must always manage the REAL profiles
+ * and the REAL selection, never the temporary environment. */
+const home = () => process.env.DSH_REAL_HOME ?? process.env.DSH_HOME ?? '/home/node/.dsh'
+
+/** True while this harness process is running on the temporary Safe Mode home. */
+const isSafeModeActive = () => {
+  const real = process.env.DSH_REAL_HOME
+  const current = process.env.DSH_HOME
+  return typeof real === 'string' && real !== '' && typeof current === 'string' && current !== '' && real !== current
+}
 const profilesRoot = () => join(home(), 'profiles')
 const selectionFile = () => join(home(), 'active-profile.json')
 /** Cosmetic layer: display labels + the user's ordering. Never the folder name. */
@@ -316,7 +326,7 @@ export function apply(ctx) {
           case 'list':
             return send(res, 200, {
               ok: true, home: home(), active: activeName(), profiles: listProfiles(),
-              locked: [...LOCKED], boot: bootState(),
+              safeModeActive: isSafeModeActive(), locked: [...LOCKED], boot: bootState(),
             })
           case 'select':
             return send(res, 200, { ok: true, ...select(String(body.name ?? '')), restartRequired: true })

@@ -308,6 +308,7 @@ function DeleteButton({ disabled, onDelete, name, style }) {
       const [busy, setBusy] = React.useState(false)
       const [draft, setDraft] = React.useState('')
       const [boot, setBoot] = React.useState(null)
+      const [safeModeActive, setSafeModeActive] = React.useState(false)
       const [renaming, setRenaming] = React.useState(null)
       const [renameDraft, setRenameDraft] = React.useState('')
       const [elapsed, setElapsed] = React.useState(null)
@@ -339,6 +340,7 @@ function DeleteButton({ disabled, onDelete, name, style }) {
           setProfiles(Array.isArray(data.profiles) ? data.profiles : [])
           setActive(typeof data.active === 'string' ? data.active : null)
           setBoot(data.boot ?? null)
+          setSafeModeActive(data.safeModeActive === true)
           setNote(null)
         } catch (error) {
           setNote(`cannot read profiles: ${error.message}`)
@@ -504,13 +506,15 @@ function DeleteButton({ disabled, onDelete, name, style }) {
       const applyAndWait = async (action, body, label, confirmMessage) => {
         if (!window.confirm(confirmMessage ?? `Switch to “${label}” and restart the harness?\n\nThe interface disconnects for about 20 seconds. Sessions, settings and credentials are kept — only the plugin set changes.`)) return
         setBusy(true)
-        setNote(`switching to “${label}”…`)
+        setNote(action === 'restart' ? 'restarting the harness…' : `switching to “${label}”…`)
         setElapsed(0)
         const started = Date.now()
         const ticker = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 1000)
         try {
           await call(action, body)
-          await call('restart', {})
+          // 'restart' IS the action when exiting Safe Mode — calling it twice
+          // races the harness exit and can abort the reload wait.
+          if (action !== 'restart') await call('restart', {})
           let down = false
           for (let attempt = 0; attempt < 180; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 1000))
@@ -722,17 +726,35 @@ function DeleteButton({ disabled, onDelete, name, style }) {
           ref: buttonRef,
           className: 'dsh-ps__trigger',
           style: S.trigger,
-          title: `Profile: ${active ?? 'unknown'} — switch the plugin set this harness boots`,
-          'aria-label': `Profile: ${active ?? 'unknown'}`,
-          'aria-expanded': open,
-          onClick: () => { if (open) hide(); else show() },
+          ...(safeModeActive
+            ? {
+                title: 'Exit Safe Mode — restart into your last chosen profile' + (active ? ` (${active})` : ''),
+                'aria-label': 'Exit Safe Mode',
+                onClick: () => void applyAndWait('restart', {}, 'Exit Safe Mode',
+                  `You are exiting Safe Mode.\n\nThe harness restarts into your last chosen profile${active ? ` (“${active}”)` : ''}. Everything done inside the temporary environment is removed with it; your real Profiles, settings and sessions were never touched.`),
+                // The panel would only show the temporary environment, which is
+                // not what the user needs mid-exit — keep the offer one-click.
+              }
+            : {
+                title: `Profile: ${active ?? 'unknown'} — switch the plugin set this harness boots`,
+                'aria-label': `Profile: ${active ?? 'unknown'}`,
+                'aria-expanded': open,
+                onClick: () => { if (open) hide(); else show() },
+              }),
         },
-          React.createElement('svg', {
-            'aria-hidden': true, focusable: false, width: 18, height: 18, viewBox: '0 0 16 16',
-            fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
-          },
-            React.createElement('circle', { cx: 8, cy: 5.4, r: 2.6 }),
-            React.createElement('path', { d: 'M3.3 13.3c.75-2.4 2.6-3.7 4.7-3.7s3.95 1.3 4.7 3.7' }))))
+          safeModeActive
+            ? React.createElement('svg', {
+                'aria-hidden': true, focusable: false, width: 18, height: 18, viewBox: '0 0 16 16',
+                fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+              },
+                React.createElement('path', { d: 'M8 1.6 13 3.4v3.4c0 3.4-2.1 5.4-5 6.6-2.9-1.2-5-3.2-5-6.6V3.4Z' }),
+                React.createElement('path', { d: 'M5.8 7.9 7.4 9.5l2.9-2.9' }))
+            : React.createElement('svg', {
+                'aria-hidden': true, focusable: false, width: 18, height: 18, viewBox: '0 0 16 16',
+                fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+              },
+                React.createElement('circle', { cx: 8, cy: 5.4, r: 2.6 }),
+                React.createElement('path', { d: 'M3.3 13.3c.75-2.4 2.6-3.7 4.7-3.7s3.95 1.3 4.7 3.7' }))))
 
       /**
        * The panel and the backdrop are SIBLINGS of the wrapper (not children: the
