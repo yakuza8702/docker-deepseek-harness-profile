@@ -424,11 +424,20 @@ function DeleteButton({ disabled, onDelete, name, style }) {
         let attrs = null
         let scheduled = false
 
-        /** Mirror the real trigger's live state onto the copy. */
+        /** Mirror the real trigger's live state onto the copy. The icon is
+         * synced too: Safe Mode swaps the person glyph for the Shield
+         * (Exit Safe Mode), and a stale icon beside a fresh title is exactly
+         * the kind of lie a copy must not tell. */
         const sync = (from, to) => {
           for (const name of ATTRS) {
             const value = from.getAttribute(name)
             if (value !== null && to.getAttribute(name) !== value) to.setAttribute(name, value)
+          }
+          const fromSvg = from.querySelector('svg')
+          const toSvg = to.querySelector('svg')
+          if (fromSvg !== null && toSvg !== null && fromSvg.innerHTML !== toSvg.innerHTML) {
+            const replacement = fromSvg.cloneNode(true)
+            toSvg.replaceWith(replacement)
           }
         }
 
