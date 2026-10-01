@@ -11,7 +11,9 @@
 #   * runzhliu          : security hardening (non-root UID 1000, tini, fixed
 #                         pnpm, build-time version pin+verify, HOME=/workspace
 #                         dir-selector fix, --expose-internals only for the DSH
-#                         main process). NO Chromium/Xvfb/noVNC browser stack.
+#                         main process). Its Chromium/Xvfb/noVNC desktop stack is
+#                         adopted here (see "browser desktop" below), with Brave
+#                         instead of Chromium and a SINGLE public port.
 #   * This repo         : Docker access — pass a mounted docker.sock (with
 #                         group_add) OR a Docker proxy over TCP via
 #                         DOCKER_HOST env var. docker CLI + compose plugin
@@ -75,7 +77,7 @@ ARG DSH_SOURCE_REF
 ARG PNPM_VERSION=10
 ARG TARGETARCH=amd64
 LABEL org.opencontainers.image.title="seek-harness" \
-      org.opencontainers.image.description="Hardened DeepSeek Harness container — smanx devtools + 0.0.0.0 reverse-proxy fix + runzhliu hardening + docker.sock/TCP support, no browser" \
+      org.opencontainers.image.description="Hardened DeepSeek Harness container — smanx devtools + 0.0.0.0 reverse-proxy fix + runzhliu hardening + docker.sock/TCP support + official Browser Use with a visible Brave desktop on the SAME port (path-routed, human takeover)" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="https://github.com/yakuza8702/docker-deepseek-harness" \
       org.opencontainers.image.version="${DSH_VERSION}"
@@ -92,6 +94,12 @@ ENV NPM_CONFIG_CACHE=/tmp/.npm-cache \
 #   this build            : docker-ce-cli + docker-compose-plugin (socket/TCP
 #                           engine access), tini (init, orphan reaping),
 #                           bubblewrap (DSH Linux bwrap sandbox backend)
+#   browser desktop       : the virtual display + VNC stack the visible browser
+#                           runs on (Xvfb -> openbox -> x11vnc -> websockify +
+#                           noVNC). Same set runzhliu ships: x11-utils provides
+#                           xdpyinfo (the entrypoint waits for the display with
+#                           it) and the fonts keep real web pages readable,
+#                           including CJK.
 RUN set -eux; \
     install -m 0755 -d /etc/apt/keyrings; \
     curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
@@ -102,8 +110,30 @@ RUN set -eux; \
       nano jq unzip vim zip htop tmux tree openssl python3 bash-completion \
       less ripgrep rsync procps ca-certificates \
       tini bubblewrap \
-      docker-ce-cli docker-compose-plugin; \
+      docker-ce-cli docker-compose-plugin \
+      xvfb x11vnc x11-utils openbox websockify novnc \
+      fonts-liberation fonts-noto-cjk; \
     rm -rf /var/lib/apt/lists/*
+
+# Brave — the browser the desktop runs (user's choice; it is also the browser
+# they use locally). Installed from Brave's official APT repository, added here
+# explicitly with its keyring rather than via a curl|bash installer.
+#   * Shields do ad blocking natively, so no ad-block extension is needed
+#   * Chrome Web Store extensions still install normally
+#   * ANY Debian Chromium fork would work; swap this block for
+#     `apt-get install chromium` to drop the third-party repo.
+ARG BRAVE_APT_URL=https://brave-browser-apt-release.s3.brave.com
+RUN set -eux; \
+    install -m 0755 -d /usr/share/keyrings; \
+    curl -fsSL --retry 3 -o /usr/share/keyrings/brave-browser-archive-keyring.gpg \
+      "${BRAVE_APT_URL}/brave-browser-archive-keyring.gpg"; \
+    chmod 0644 /usr/share/keyrings/brave-browser-archive-keyring.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] ${BRAVE_APT_URL}/ stable main" \
+      > /etc/apt/sources.list.d/brave-browser-release.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends brave-browser; \
+    rm -rf /var/lib/apt/lists/*; \
+    brave-browser --version
 
 # uv (static binary) — many community DSH MCP servers launch via "uvx"
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh \
@@ -127,6 +157,58 @@ RUN if [ -f /opt/dsh/node_modules/.bin/dsh ]; then \
     fi \
  && dsh --version
 
+# ---------------------------------------------------------------------
+# Official Browser Use — the model-facing half of the browser stack.
+#
+# The browser-use packages are published SEPARATELY from the core and carry
+# their own dist-tags, so they are installed at the CORE's resolved version:
+# their `latest` tag lags the core (0.1.6-alpha.1 while the core is 0.2.0-rc.2),
+# and installing a mismatched pair fails at load time. If a future core release
+# has no matching browser-use release yet, the build falls back to the package's
+# `next` tag and says so loudly instead of failing — which is what keeps the
+# unpinned, auto-following build in the workflow working.
+#
+# PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 is load-bearing: @playwright/mcp depends on
+# the full `playwright` package, whose install script downloads Chromium,
+# Firefox and WebKit (~500 MB) that this image never uses — the provider runs in
+# ATTACH mode against the desktop browser over CDP.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# The packages are installed into a SCRATCH prefix and then merged in, rather
+# than `npm install --prefix /opt/dsh ...`: a plain install re-resolves the
+# installation's whole dependency tree, which would silently upgrade the very
+# core version stage 1 pinned and verified. Packages the core already provides
+# are kept at the core's version (the peers are satisfied by it by construction);
+# only genuinely new packages are copied in.
+RUN set -eux; \
+    if [ -f /opt/dsh/.dsh-version ]; then T=/opt/dsh; else T=/opt/dsh-src; fi; \
+    V="$(cat "$T/.dsh-version")"; \
+    BU="$V"; \
+    if ! npm view "@deepseek-ai/dsh-browser-use@${BU}" version >/dev/null 2>&1; then \
+      BU="$(npm view '@deepseek-ai/dsh-browser-use' dist-tags.next 2>/dev/null || true)"; \
+      echo "WARNING: @deepseek-ai/dsh-browser-use@${V} is not published; falling back to the 'next' tag (${BU}) — the browser integration may not match the core runtime"; \
+    fi; \
+    [ -n "$BU" ] || { echo "ERROR: could not resolve any browser-use version"; exit 1; }; \
+    echo "browser-use ${BU} (core ${V}) -> ${T}/node_modules"; \
+    SB=/tmp/browser-use-install; rm -rf "$SB"; mkdir -p "$SB"; \
+    cd "$SB"; \
+    npm init -y >/dev/null 2>&1; \
+    npm install --omit=dev --no-audit --no-fund \
+      "@deepseek-ai/dsh-browser-use@${BU}" \
+      "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp@${BU}"; \
+    for p in "$SB"/node_modules/* "$SB"/node_modules/@*/*; do \
+      [ -e "$p" ] || continue; \
+      rel="${p#"$SB"/node_modules/}"; \
+      if [ -e "$T/node_modules/$rel" ]; then \
+        echo "kept the core copy of $rel"; \
+      else \
+        mkdir -p "$(dirname "$T/node_modules/$rel")"; \
+        cp -a "$p" "$T/node_modules/$rel"; \
+        echo "added $rel"; \
+      fi; \
+    done; \
+    rm -rf "$SB"; \
+    node -e 'const p=process.argv[1];for(const n of ["@deepseek-ai/dsh-browser-use","@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]){console.log("installed",n,require(p+"/node_modules/"+n+"/package.json").version)}' "$T"
+
 # Landlock launcher binary. The source-channel monorepo links the workspace
 # package native/landlock-run/packages/linux-<arch> but its bin/ only ships in
 # the published platform npm package (the npm channel gets it automatically via
@@ -140,8 +222,13 @@ RUN if [ -f /opt/dsh/node_modules/.bin/dsh ]; then \
 # never matched and the step silently skipped on every amd64 build, leaving
 # images without the launcher (sandbox "no backend usable" error). Map the
 # arch explicitly and FAIL THE BUILD if the binary cannot be provided.
+# NOTE for local builds: `ARG DSH_SOURCE_REF` has no default, so under BuildKit
+# it is genuinely UNSET unless you pass it — and `set -u` below would abort with
+# "DSH_SOURCE_REF: parameter not set". CI always passes it (empty for the npm
+# channel), which is why this only ever bit hand-run `docker build`. Hence the
+# `${DSH_SOURCE_REF:-}` form.
 RUN set -eux; \
-    if [ -n "${DSH_SOURCE_REF}" ]; then \
+    if [ -n "${DSH_SOURCE_REF:-}" ]; then \
       case "${TARGETARCH}" in \
         amd64) P="linux-x64" ;; \
         arm64) P="linux-arm64" ;; \
@@ -171,21 +258,44 @@ COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs /opt/seek-harness
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
  && ln -sfn /opt/seek-harness/entrypoint.sh /usr/local/bin/entrypoint.sh
 
-# In-app profile control (dsh-profile-switcher). The package is placed in the
-# DSH installation's node_modules so the launcher can mount it by name from any
-# profile; the overlay patch that mounts it sits beside the entrypoint that
-# applies it (`--patch`, AFTER the profile layer) — no profile directory in
-# $DSH_HOME is ever edited. Uninstall = remove the overlay (or set
-# DSH_PROFILE_OVERLAY=) .
+# Browser launcher. The container drops every capability and sets
+# no-new-privileges, so Brave's setuid/user-namespace sandbox cannot initialise
+# and the browser would refuse to start. Keep the exception scoped to the
+# already-isolated browser process instead of weakening the container.
+RUN printf '%s\n' \
+      '#!/bin/sh' \
+      '# Brave inside this container: the container IS the sandbox boundary' \
+      '# (cap_drop ALL + no-new-privileges), so the in-process sandbox cannot be' \
+      '# used. Call this wrapper, never brave-browser directly.' \
+      'exec /usr/bin/brave-browser --no-sandbox "$@"' \
+      > /usr/local/bin/brave-desktop \
+ && chmod 0755 /usr/local/bin/brave-desktop \
+ && brave-desktop --version
+
+# In-app profile control (dsh-profile-switcher) + the visible browser desktop
+# (dsh-browser-desktop, vendored from runzhliu because that package is NOT
+# published to npm — see plugins/dsh-browser-desktop/README.md).
+# Both packages are placed in the DSH installation's node_modules so the launcher
+# can mount them by name from ANY profile; the overlay patches that mount them sit
+# beside the entrypoint that applies them (`--patch`, AFTER the profile layer) — no
+# profile directory in $DSH_HOME is ever edited. Uninstall = remove the overlay
+# (or set DSH_PROFILE_OVERLAY= / DSH_BROWSER_USE_OVERLAY=).
 COPY plugins/dsh-profile-switcher /opt/dsh-profile-switcher
+COPY plugins/dsh-browser-desktop /opt/dsh-browser-desktop
 RUN set -eux; \
     installed=0; \
     for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
-      if [ -d "$target" ]; then cp -a /opt/dsh-profile-switcher "$target/dsh-profile-switcher"; installed=1; fi; \
+      if [ -d "$target" ]; then \
+        cp -a /opt/dsh-profile-switcher "$target/dsh-profile-switcher"; \
+        cp -a /opt/dsh-browser-desktop "$target/dsh-browser-desktop"; \
+        installed=1; \
+      fi; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
-    rm -rf /opt/dsh-profile-switcher; \
-    chmod -R a+rX /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-profile-switcher 2>/dev/null || true
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop; \
+    chmod -R a+rX \
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop 2>/dev/null || true
 
 
 # Declare the plugins in the DSH installation's own manifest. This is what makes
@@ -195,11 +305,14 @@ RUN set -eux; \
 # "failed to import"), and `client-modules` scans loader entries for packages
 # declaring `dsh.client`, which needs the specifier to be a package name.
 RUN set -eux; \
-    for anchor in /opt/dsh/node_modules/@deepseek-ai/dsh/package.json /opt/dsh-src/apps/cli/package.json; do \
+    for spec in "/opt/dsh/node_modules/@deepseek-ai/dsh/package.json:/opt/dsh/node_modules" "/opt/dsh-src/apps/cli/package.json:/opt/dsh-src/node_modules"; do \
+      anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
-      node -e 'const fs = require("node:fs"); const p = process.argv[1]; const m = JSON.parse(fs.readFileSync(p, "utf8")); m.dependencies = { ...(m.dependencies ?? {}), "dsh-profile-switcher": "0.1.0" }; fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n"); console.log("declared the profile switcher in", p);' "$anchor"; \
+      [ -d "$root/dsh-browser-desktop" ] || continue; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
+COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
 
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \
@@ -207,7 +320,15 @@ ENV NODE_ENV=production \
     DSH_PORT=3079 \
     PROXY_PORT=3080 \
     PROXY_HOST=0.0.0.0 \
-    DSH_TELEMETRY_DISABLED=1
+    DSH_TELEMETRY_DISABLED=1 \
+    DSH_DESKTOP_ENABLED=1 \
+    DSH_BROWSER_USE_ENABLED=1 \
+    DSH_DESKTOP_PREFIX=desktop \
+    DSH_NOVNC_PORT=6080 \
+    DSH_CDP_PORT=9222 \
+    DSH_DESKTOP_WIDTH=1440 \
+    DSH_DESKTOP_HEIGHT=900 \
+    DISPLAY=:99
 
 WORKDIR /workspace
 RUN mkdir -p /workspace /home/node/.dsh \

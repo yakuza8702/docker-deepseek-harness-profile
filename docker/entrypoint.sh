@@ -205,6 +205,154 @@ if [[ -n "$OVERLAY" && -f "$OVERLAY" ]]; then
   overlay_args+=(--patch "$OVERLAY")
   log "overlay: $OVERLAY"
 fi
+# Browser Use + desktop bundle rows. Applied unconditionally when the file is
+# present: the rows carry their own `disabled` conditions (DSH_DESKTOP_ENABLED /
+# DSH_BROWSER_USE_ENABLED), so switching the feature off never needs a rebuild.
+BROWSER_OVERLAY="${DSH_BROWSER_USE_OVERLAY-/opt/seek-harness/browser-use.overlay.yml}"
+if [[ -n "$BROWSER_OVERLAY" && -f "$BROWSER_OVERLAY" ]]; then
+  overlay_args+=(--patch "$BROWSER_OVERLAY")
+  log "overlay: $BROWSER_OVERLAY"
+fi
+
+# ---------------------------------------------------------------------
+# Browser Use + the visible desktop (this fork).
+#
+# The desktop is a second local service, NOT a second published port: Xvfb ->
+# openbox -> x11vnc -> websockify/noVNC all bind 127.0.0.1, Brave exposes CDP on
+# 127.0.0.1:$DSH_CDP_PORT, and the reverse proxy path-routes
+# /${DSH_DESKTOP_PREFIX}/ to the noVNC port. One public port stays the whole
+# story, which is what makes an https reverse proxy (Pangolin/nginx) able to
+# embed the panel instead of being blocked by mixed content.
+#
+# DSH_DESKTOP_ENABLED=0 skips the whole stack; the overlay rows are disabled too.
+# ---------------------------------------------------------------------
+DESKTOP_ENABLED="${DSH_DESKTOP_ENABLED:-1}"
+DSH_NOVNC_PORT="${DSH_NOVNC_PORT:-6080}"
+DSH_CDP_PORT="${DSH_CDP_PORT:-9222}"
+DSH_DESKTOP_WIDTH="${DSH_DESKTOP_WIDTH:-1440}"
+DSH_DESKTOP_HEIGHT="${DSH_DESKTOP_HEIGHT:-900}"
+DSH_DESKTOP_PREFIX="${DSH_DESKTOP_PREFIX:-desktop}"
+DISPLAY="${DISPLAY:-:99}"
+export DISPLAY
+# Persistent browser profile: cookies, logins and installed extensions live in
+# $DSH_HOME (the dsh-home volume), so they survive a restart/recreate — that is
+# the point of human takeover. Everything else (caches, XDG state) goes to /tmp
+# so the read-only rootfs stays read-only.
+DESKTOP_PROFILE="${DSH_DESKTOP_USER_DATA_DIR:-$DSH_REAL_HOME/brave-profile}"
+DESKTOP_TMP="${DSH_DESKTOP_TMP:-/tmp/dsh-desktop}"
+declare -a desktop_pids=()
+
+# Run a desktop process with a writable XDG/HOME environment. Deliberately NOT
+# exported globally: HOME is /workspace and XDG_CONFIG_HOME must keep pointing at
+# the real home for the harness and its tools.
+desktop_env() {
+  env HOME="$DESKTOP_TMP/home" \
+      XDG_CONFIG_HOME="$DESKTOP_TMP/config" \
+      XDG_CACHE_HOME="$DESKTOP_TMP/cache" \
+      XDG_DATA_HOME="$DESKTOP_TMP/data" \
+      XDG_RUNTIME_DIR="$DESKTOP_TMP/runtime" \
+      "$@"
+}
+
+write_desktop_state() {  # write_desktop_state <state> <detail>
+  node -e '
+    const fs = require("fs");
+    fs.writeFileSync(process.argv[1], JSON.stringify({ state: process.argv[2], detail: process.argv[3] || null, at: new Date().toISOString() }, null, 2) + "\n");
+  ' /tmp/dsh-desktop-state.json "$1" "${2:-}" 2>/dev/null || true
+}
+
+start_desktop() {
+  mkdir -p "$DESKTOP_TMP"/{home,config,cache,data,runtime,logs} "$DESKTOP_PROFILE"
+  chmod 0700 "$DESKTOP_TMP/runtime" 2>/dev/null || true
+  # A container killed mid-write leaves Chromium singleton locks in the
+  # persistent profile, and the browser then refuses to start.
+  rm -f "$DESKTOP_PROFILE"/Singleton{Cookie,Lock,Socket}
+
+  desktop_env Xvfb "$DISPLAY" -screen 0 "${DSH_DESKTOP_WIDTH}x${DSH_DESKTOP_HEIGHT}x24" \
+    -ac -nolisten tcp >"$DESKTOP_TMP/logs/xvfb.log" 2>&1 &
+  local xvfb_pid=$!
+  desktop_pids+=("$xvfb_pid")
+
+  local attempt=0
+  until xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; do
+    if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+      log "WARNING: Xvfb exited before ${DISPLAY} was ready:"
+      sed 's/^/    /' "$DESKTOP_TMP/logs/xvfb.log" >&2 || true
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    if [[ "$attempt" -ge 50 ]]; then
+      log "WARNING: timed out waiting for the virtual display ${DISPLAY}"
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  desktop_env openbox >"$DESKTOP_TMP/logs/openbox.log" 2>&1 &
+  desktop_pids+=("$!")
+
+  # x11vnc stays on loopback and without a password: it is reachable only
+  # through websockify, which is reachable only through the auth-protected
+  # proxy. -repeat keeps the framebuffer flowing so a long-lived VNC socket
+  # never looks idle to an intermediate proxy.
+  desktop_env x11vnc -display "$DISPLAY" -forever -shared -repeat -noxdamage \
+    -rfbport 5900 -localhost -nopw >"$DESKTOP_TMP/logs/x11vnc.log" 2>&1 &
+  desktop_pids+=("$!")
+
+  desktop_env websockify --web=/usr/share/novnc \
+    "127.0.0.1:${DSH_NOVNC_PORT}" 127.0.0.1:5900 >"$DESKTOP_TMP/logs/novnc.log" 2>&1 &
+  desktop_pids+=("$!")
+
+  # /dev/shm defaults to 64 MB. Chromium uses it for renderer shared memory and
+  # crashes under load without it; when the host did not size it generously
+  # (compose does: shm_size), fall back to /tmp storage automatically instead of
+  # making it the user's problem.
+  declare -a browser_extra=()
+  local shm_kb
+  shm_kb="$(df -k /dev/shm 2>/dev/null | awk 'NR==2 {print $2}')"
+  if [[ -n "$shm_kb" && "$shm_kb" -lt 262144 ]]; then
+    browser_extra+=(--disable-dev-shm-usage)
+    log "desktop: /dev/shm is only $((shm_kb / 1024)) MB — starting the browser with --disable-dev-shm-usage (set shm_size on the service to remove this)"
+  fi
+
+  # Supervise the browser: a crash must not take the desktop (and with it the
+  # panel and the model's browser tools) down for the rest of the container's
+  # life.
+  (
+    while :; do
+      desktop_env brave-desktop \
+        --user-data-dir="$DESKTOP_PROFILE" \
+        --password-store=basic \
+        --remote-debugging-address=127.0.0.1 \
+        --remote-debugging-port="$DSH_CDP_PORT" \
+        --window-position=0,0 \
+        --window-size="${DSH_DESKTOP_WIDTH},${DSH_DESKTOP_HEIGHT}" \
+        --no-first-run --no-default-browser-check --hide-crash-restore-bubble \
+        ${browser_extra[@]+"${browser_extra[@]}"} \
+        "${DSH_DESKTOP_START_URL:-about:blank}" >>"$DESKTOP_TMP/logs/brave.log" 2>&1
+      log "desktop: browser exited (status=$?) — restarting"
+      sleep 1
+    done
+  ) &
+  desktop_pids+=("$!")
+  write_desktop_state up "display ${DISPLAY} ${DSH_DESKTOP_WIDTH}x${DSH_DESKTOP_HEIGHT}, noVNC on 127.0.0.1:${DSH_NOVNC_PORT}, CDP on 127.0.0.1:${DSH_CDP_PORT}, profile ${DESKTOP_PROFILE}"
+  return 0
+}
+
+# Reached only for the `web` command: every other form exec'd above.
+DESKTOP_ACTIVE=0
+if [[ "$DESKTOP_ENABLED" != "0" ]]; then
+  if start_desktop; then
+    DESKTOP_ACTIVE=1
+    log "browser desktop ready — served by the proxy at /${DSH_DESKTOP_PREFIX}/ (no extra port published)"
+  else
+    write_desktop_state failed "the desktop stack did not start"
+    log "WARNING: the browser desktop failed to start — the harness boots without it, and /${DSH_DESKTOP_PREFIX}/ returns 502 until it is fixed"
+  fi
+else
+  write_desktop_state disabled "DSH_DESKTOP_ENABLED=0"
+  log "browser desktop disabled (DSH_DESKTOP_ENABLED=0)"
+fi
 
 # The harness child gets the (possibly temporary) DSH_HOME; every other process
 # — the proxy, the recovery surface, the entrypoint — keeps the real home.
@@ -221,9 +369,15 @@ node "$PROXY_SCRIPT" &
 PROXY_PID=$!
 
 terminate() {
-  log "signal received — stopping DSH (${DSH_PID}) and proxy (${PROXY_PID})"
+  log "signal received — stopping DSH (${DSH_PID}), proxy (${PROXY_PID}) and the desktop"
   : > /tmp/dsh-stopping
   kill -TERM "$DSH_PID" "$PROXY_PID" ${TAIL_PID:+"$TAIL_PID"} ${WATCHDOG_PID:+"$WATCHDOG_PID"} 2>/dev/null || true
+  # The browser lives under a restart supervisor: stop the supervisor first,
+  # otherwise it simply brings the browser back while we are tearing down.
+  for pid in ${desktop_pids[@]+"${desktop_pids[@]}"}; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  pkill -TERM -f '/usr/bin/brave-browser' 2>/dev/null || true
 }
 trap terminate TERM INT
 
@@ -319,11 +473,17 @@ record_ready_log
 WATCHDOG_PID=$!
 
 log "=============================================================="
-log " DeepSeek Harness is ready (no browser stack included)"
+log " DeepSeek Harness is ready"
 log "   local : http://127.0.0.1:${PROXY_PORT}/"
 log "   LAN   : http://<host-ip>:${PROXY_PORT}/   (basic auth: ${AUTH_STATE})"
 log "   token : ${DSH_TOKEN_URL:-pending (background capture)}   (append to your LAN URL; auto-login usually makes it unnecessary)"
 log "   WS channels are forwarded automatically by the proxy"
+if [[ "$DESKTOP_ACTIVE" == "1" ]]; then
+  log "   browser desktop (Browser Use + human takeover):"
+  log "     same port, no extra publish:  http://<host-ip>:${PROXY_PORT}/${DSH_DESKTOP_PREFIX}/vnc.html"
+else
+  log "   browser desktop: not running (see the warning above)"
+fi
 log "   DSH pid=${DSH_PID}  proxy pid=${PROXY_PID}"
 log "=============================================================="
 

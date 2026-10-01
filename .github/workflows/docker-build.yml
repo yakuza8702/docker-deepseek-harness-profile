@@ -76,8 +76,15 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
   # Upstream DSH release this image is built from when the run has no inputs
   # (push and schedule events). A manual run may override `dsh_version`.
-  # Pinned to the same release the deployment runs today: 0.1.7-rc.2.
-  DSH_VERSION_PIN: "0.1.7-rc.2"
+  #
+  # EMPTY = follow npm's `latest` dist-tag automatically: push and cron runs
+  # resolve whatever upstream publishes (today 0.2.0-rc.2) with no commit here.
+  # Set a version string to freeze the image instead.
+  #
+  # The browser-use packages are installed at the version this resolves to (see
+  # the Dockerfile), so a core release with no matching browser-use release yet
+  # falls back to that package's `next` tag and says so in the build log.
+  DSH_VERSION_PIN: ""
 
 jobs:
   check:
@@ -113,10 +120,11 @@ jobs:
                [ -n "${{ github.event.inputs.dsh_version }}" ]; then
               VER="${{ github.event.inputs.dsh_version }}"
             else
-              # push/schedule runs carry no inputs: prefer the repo's pinned
-              # release, fall back to npm latest only when the pin is empty.
+              # push/schedule runs carry no inputs: follow npm `latest` unless
+              # DSH_VERSION_PIN (workflow env) freezes a release.
               if [ -n "${DSH_VERSION_PIN:-}" ]; then
                 VER="$DSH_VERSION_PIN"
+                echo "version frozen by DSH_VERSION_PIN"
               else
                 VER="$(curl -fsSL 'https://registry.npmjs.org/@deepseek-ai%2Fdsh' \
                   | python3 -c "import json,sys;print(json.load(sys.stdin)['dist-tags']['latest'])")"

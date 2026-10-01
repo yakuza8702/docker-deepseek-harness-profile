@@ -1,0 +1,41 @@
+# Browser Use + the visible browser desktop, mounted into EVERY profile as a
+# launcher overlay (`--patch`, applied AFTER the profile layer) — the same
+# mechanism as profile-switcher.overlay.yml. No profile directory in $DSH_HOME is
+# ever edited, and removing this file (or setting DSH_BROWSER_USE_OVERLAY=)
+# removes the whole browser integration at the next boot without a rebuild.
+#
+# The three rows:
+#   browser-use                  official Browser Use service
+#   browser-use-playwright-mcp   official provider, ATTACHED over CDP to the same
+#                                visible browser, so the model and the human share
+#                                tabs, cookies and logins (no second browser, no
+#                                Playwright browser download)
+#   browser-desktop              the noVNC panel + the browser_open bridge
+#
+# Switches (all read at boot):
+#   DSH_DESKTOP_ENABLED=0        no desktop stack (the image keeps the packages)
+#   DSH_BROWSER_USE_ENABLED=0    no model-facing browser tools
+#   DSH_DESKTOP_PREFIX=desktop   path the reverse proxy serves the desktop on
+#   DSH_CDP_PORT=9222            browser DevTools port inside the container
+- insert:
+    - id: browser-use
+      name: '@deepseek-ai/dsh-browser-use'
+      disabled: !!js "process.env.DSH_BROWSER_USE_ENABLED === '0' || process.env.DSH_DESKTOP_ENABLED === '0'"
+    - id: browser-use-playwright-mcp
+      name: '@deepseek-ai/dsh-experimental-browser-use-playwright-mcp'
+      disabled: !!js "process.env.DSH_BROWSER_USE_ENABLED === '0' || process.env.DSH_DESKTOP_ENABLED === '0'"
+      config:
+        mode: attach
+        endpoint: !!js "'http://127.0.0.1:' + (process.env.DSH_CDP_PORT || '9222')"
+    - id: browser-desktop
+      name: 'dsh-browser-desktop'
+      disabled: !!js "process.env.DSH_DESKTOP_ENABLED === '0'"
+      config:
+        cdpBaseUrl: !!js "'http://127.0.0.1:' + (process.env.DSH_CDP_PORT || '9222')"
+        # 0 = same origin as the Harness page. The desktop is path-routed by the
+        # reverse proxy, so it is reached through whatever authority the UI was
+        # opened on (http://lan-ip:3080 or https://host behind Pangolin) and the
+        # container never publishes a second port.
+        desktopPort: 0
+        desktopPath: !!js "'/' + (process.env.DSH_DESKTOP_PREFIX || 'desktop') + '/vnc.html?autoconnect=1&resize=scale&view_only=0&reconnect=1'"
+        pollIntervalMs: 750

@@ -8,8 +8,69 @@ It packages the **official npm release** of [`@deepseek-ai/dsh`](https://github.
 |---|---|
 | **official** [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | `@deepseek-ai/dsh` npm package, pinned + verified at build time |
 | **smanx** [`devtools-latest`](https://hub.docker.com/r/smanx/deepseek-harness) | complete devtools package set **+ the "0.0.0.0 fix"**: built-in Node reverse proxy (`0.0.0.0:3080 → 127.0.0.1:DSH_PORT`) with HTTP+WS forwarding, optional Basic Auth, `crypto.randomUUID` polyfill for non-secure LAN pages |
-| **runzhliu** [deepseek-harness-docker](https://github.com/runzhliu/deepseek-harness-docker) | security hardening: non-root UID 1000, `tini` init, fixed pnpm, build-time version verification, `HOME=/workspace` dir-selector fix, `--expose-internals` only on the DSH main process, cap_drop ALL / no-new-privileges / read-only rootfs in compose. **NOT taken:** Chromium / Xvfb / noVNC / `@runzhliu/dsh-browser-desktop` (no browser) |
+| **runzhliu** [deepseek-harness-docker](https://github.com/runzhliu/deepseek-harness-docker) | security hardening: non-root UID 1000, `tini` init, fixed pnpm, build-time version verification, `HOME=/workspace` dir-selector fix, `--expose-internals` only on the DSH main process, cap_drop ALL / no-new-privileges / read-only rootfs in compose. **Also taken:** its visible-desktop stack (Xvfb → openbox → x11vnc → websockify/noVNC) and its `dsh-browser-desktop` plugin — vendored, since it is not on npm — but running **Brave** instead of Chromium, with the panel on the **same port** as the UI |
 | **this repo** | Docker engine access: mounted `docker.sock` **or** Docker proxy over TCP via `DOCKER_HOST`; docker CLI + compose plugin inside the image; GitHub workflow that auto-follows the official repo and keeps `:latest` current |
+
+## Browser Use + a visible browser desktop — on ONE port
+
+The image carries a real browser: **official Browser Use** for the model and a
+**noVNC desktop** you can take over by hand. Both are the same browser instance —
+same tabs, same cookies, same logins — because the Playwright MCP provider runs in
+**attach mode** against it over CDP.
+
+```
+        your browser
+             │  https://seek-harness.dfm.homes   ← one host, one port, one login
+             ▼
+   Pangolin / nginx / bare LAN :3080
+             │
+   ┌─────────┴──────────────────────────────────────────────┐
+   │ container: proxy.mjs on 0.0.0.0:3080                   │
+   │   /                 → 127.0.0.1:3079  dsh web          │
+   │   /desktop/...      → 127.0.0.1:6080  noVNC  ─────┐    │
+   │   /websockify       → 127.0.0.1:6080  (its WS)     │   │
+   └────────────────────────────────────────────────────┼───┘
+                                                        ▼
+   Xvfb :99 → openbox → x11vnc :5900 → websockify :6080
+                    ▲
+                    └── Brave ── CDP 127.0.0.1:9222 ◄── Browser Use tools
+```
+
+**No second port is published.** That is not just tidiness: a plain `http://host:6080`
+panel would be blocked as mixed content inside an https UI, and it would sit outside
+your reverse proxy's auth. Path-routing it through the same port means the panel is
+same-origin, shares the cert and the login, and needs nothing new forwarded in
+Pangolin/nginx/Cloudflare.
+
+What you get:
+
+* `browser_open` — the model can reveal a page in the visible desktop for you to take over;
+* the desktop button in the sidebar footer, and the noVNC panel at `/desktop/vnc.html`;
+* a **persistent browser profile** at `$DSH_HOME/brave-profile`, inside the `dsh-home`
+  volume: cookies, logins, saved sessions and Chrome-Web-Store extensions
+  (Bitwarden-style password managers, uBlock-style blockers) survive
+  `restart` / `up` / `recreate`. Only `docker compose down -v` wipes them. Brave's
+  Shields block ads natively, so no ad-block extension is required at all;
+* Brave is launched with `--no-sandbox` through the `brave-desktop` wrapper — the
+  container itself is the sandbox boundary (`cap_drop: ALL` + `no-new-privileges`), so
+  the in-process setuid sandbox cannot be used. Never call `brave-browser` directly.
+
+Switches:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DSH_DESKTOP_ENABLED` | `1` | `0` = no desktop stack, no browser rows at boot (packages stay in the image) |
+| `DSH_BROWSER_USE_ENABLED` | `1` | `0` = no model-facing browser tools, panel still available |
+| `DSH_DESKTOP_PREFIX` | `desktop` | path the proxy serves the desktop on (`/desktop/…`) |
+| `DSH_NOVNC_PORT` | `6080` | internal noVNC/websockify port (loopback only) |
+| `DSH_CDP_PORT` | `9222` | internal DevTools port the Browser Use provider attaches to |
+| `DSH_DESKTOP_WIDTH` / `DSH_DESKTOP_HEIGHT` | `1440` / `900` | virtual display size |
+| `DSH_DESKTOP_START_URL` | `about:blank` | first page the browser opens |
+
+Compose already sets `shm_size: "1g"` for renderer shared memory. If you run the image
+with plain `docker run`, add `--shm-size=1g` — the entrypoint detects a small `/dev/shm`
+and falls back to `--disable-dev-shm-usage` automatically, but the properly sized path
+is faster.
 
 ## Why a reverse proxy? (the 0.0.0.0 fix)
 
@@ -129,9 +190,13 @@ docker run -d --name seek-harness \
   -p 3080:3080 \
   -v seek-harness-home:/home/node/.dsh \
   -v "$PWD":/workspace \
+  --shm-size=1g \
   --restart unless-stopped \
   ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest
 ```
+
+`--shm-size=1g` is for the browser (renderer shared memory); the entrypoint copes
+without it by falling back to `--disable-dev-shm-usage`, just more slowly.
 
 Other entrypoint forms:
 
@@ -195,13 +260,24 @@ Inside the container: `docker ps`, `docker compose version`, `docker build ...` 
 
 `git` `curl` `wget` `nano` `jq` `less` `ripgrep` `rsync` `procps` `ca-certificates` `unzip` `vim` `zip` `htop` `tmux` `tree` `openssl` `python3` `bash-completion` `build-essential` (via base image) · npm globals: **pnpm** (pinned) · **uv** (`uvx` for MCP servers) · **docker CLI + compose plugin** · `tini` · `bubblewrap` (DSH Linux sandbox backend)
 
-No browser: no Chromium, no Xvfb, no noVNC, no `dsh-browser-desktop` plugin. DSH is launched with `--no-open` so it never tries to open a host browser.
+No browser is *forced* on you: the desktop is started only for a `web` boot
+(`DSH_DESKTOP_ENABLED=0` turns it off entirely) and DSH still runs with `--no-open`
+so it never tries to open a host browser. The image does ship the browser stack now —
+**Brave**, Xvfb, openbox, x11vnc, websockify and noVNC — because that is what Browser
+Use and human takeover run on.
 
 ## Auto-update workflow
 
 `.github/workflows/docker-build.yml` keeps `:latest` in sync with the official project:
 
 - **every 6h** (cron) it resolves the newest release on the selected **channel** and compares it against what's already on GHCR
+- **the version pin is empty by default**: push and cron runs follow npm's `latest`
+  dist-tag, so an upstream release lands in `:latest` with no commit here. Set the
+  `DSH_VERSION_PIN` workflow env to a version string to freeze the image instead
+  (that is how this repo ran while it was deliberately held on `0.1.7-rc.2`).
+  The browser-use packages follow whatever version is resolved — if upstream ever
+  publishes a core release before the matching browser-use release, the build
+  falls back to that package's `next` tag and says so in the log
 - build key = `dsh <version>` + this repo's commit SHA → rebuilds only when **either** upstream releases a new version **or** this repo's Dockerfile changes
 - pushes `linux/amd64` (default; arm64 opt-in via workflow input or `vars.DSH_PLATFORMS`) to `ghcr.io/<owner>/<repo>` with tags `latest`, `dsh-<version>`, `build-<version>-<sha8>`
 - manual **Run workflow** button always available (`force_build` to bypass the skip check)
@@ -225,6 +301,7 @@ Example reality check (Aug 2026): npm `latest` = `0.1.1-rc.2`; GitHub has `dsh-v
 - **Non-root** (uid/gid 1000), rootfs read-only, `cap_drop: ALL`, `no-new-privileges`, `/tmp` tmpfs — in the provided `compose.yaml`
 - DSH state (profiles/credentials/sessions/plugins) persists in the `dsh-home` volume at `/home/node/.dsh`; only `/workspace` (the agent's world) is a bind mount
 - The Web UI runs `dsh web`, which has **its own per-boot token auth** (printed to the container log as `dsh web: http://…/?token=…`); the proxy auto-mints sessions for browsers (zero-auth LAN). **Consequence: any device on the LAN can open the UI** — it executes code, so add Basic Auth (`PROXY_USERNAME` + `PROXY_PASSWORD`) if that is not acceptable, and never expose to the public internet
+- **The browser desktop is the same trust boundary as the UI.** It is served on the UI's port, behind the same auth, and it drives a real browser holding your logins — whoever reaches the URL reaches the browser. Keep it behind Pangolin/Badger or Basic Auth, and treat the `dsh-home` volume as credential material (the browser profile lives in it)
 - Docker socket access is opt-in and widens the trust boundary — prefer the filtered TCP proxy
 
 ## Debugging with the read-only rootfs
@@ -267,8 +344,15 @@ upstream image without rebuilding it. These survive image updates.
 
 | File | Mount target | Fix |
 |---|---|---|
-| `overrides/proxy.mjs` | `/opt/seek-harness/proxy.mjs:ro` | Full-chain regex for the "unlock remote settings" JS rewrite (narrow regex left dangling `ctx.remote.` prefix → SyntaxError) |
 | `overrides/settings-index.js` | `/opt/dsh-src/packages/settings/settings/lib/index.js:ro` | Re-exports `settingsNamespace` (made internal in 0.1.2-alpha.3) so third-party plugins that still import it keep loading |
+
+> **Removed 2026-10-01:** `overrides/proxy.mjs` (and its compose bind-mount). It
+> carried the 2026-09-01 dotted-chain regex fix as a runtime patch over the image
+> copy — but `docker/proxy.mjs` in the image has owned that fix since, plus the
+> recovery surface, the client-boot watchdog and the `/desktop` route, so the stale
+> 415-line copy was silently shadowing every later proxy change. The image copy is
+> authoritative again; drop any `./overrides/proxy.mjs` line from an existing
+> deployment or the browser desktop path will 404.
 
 To remove: delete the file, remove the `- ./overrides/...` line from compose.yaml,
 and (for settings-index.js) re-enable the `disabled: true` rows in

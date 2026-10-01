@@ -14,6 +14,11 @@
 #     (zero-auth LAN). Set PROXY_USERNAME+PROXY_PASSWORD to require Basic
 #     Auth if other LAN devices should stay out.
 #   * cap_drop ALL / no-new-privileges / read-only rootfs / tmpfs /tmp.
+#   * The browser desktop (official Browser Use + noVNC human takeover) shares
+#     the SAME published port: the proxy path-routes /desktop/ to a loopback
+#     noVNC, so there is no second port to forward and the panel inherits the
+#     proxy's auth. The browser profile (cookies, logins, extensions) persists
+#     in the dsh-home volume.
 #   * Only the workspace bind is writable. Never mount ~, .ssh, cloud
 #     credentials, or docker.sock into the BASE compose file — use the
 #     compose.docker.yaml override for docker access.
@@ -53,17 +58,38 @@ services:
       DSH_TELEMETRY_DISABLED: "${DSH_TELEMETRY_DISABLED:-1}"
       DSH_PERMISSION_MODE: "${DSH_PERMISSION_MODE:-}"
       DSH_TOOLS_MODE: "${DSH_TOOLS_MODE:-}"
+      # --- browser desktop (Browser Use + human takeover) ---
+      # There is deliberately NO desktop port here: Xvfb/x11vnc/websockify and
+      # the browser all bind 127.0.0.1 inside the container and the reverse
+      # proxy path-routes /${DSH_DESKTOP_PREFIX:-desktop}/ to noVNC on the SAME
+      # published port. That is what lets an https reverse proxy (Pangolin /
+      # nginx) embed the panel — a separately published http://host:6080 would
+      # be blocked as mixed content on an https UI, and would bypass the proxy's
+      # Basic Auth.
+      DSH_DESKTOP_ENABLED: "${DSH_DESKTOP_ENABLED:-1}"
+      DSH_BROWSER_USE_ENABLED: "${DSH_BROWSER_USE_ENABLED:-1}"
+      DSH_DESKTOP_PREFIX: "${DSH_DESKTOP_PREFIX:-desktop}"
+      DSH_NOVNC_PORT: "${DSH_NOVNC_PORT:-6080}"
+      DSH_CDP_PORT: "${DSH_CDP_PORT:-9222}"
+      DSH_DESKTOP_WIDTH: "${DSH_DESKTOP_WIDTH:-1440}"
+      DSH_DESKTOP_HEIGHT: "${DSH_DESKTOP_HEIGHT:-900}"
     env_file:
       - path: .env
         required: false
     volumes:
       # DSH state: profiles / settings / credentials / sessions / storage
+      # The browser profile lives here too ($DSH_HOME/brave-profile), which is
+      # what makes logins, cookies and installed extensions survive a restart.
       - dsh-home:/home/node/.dsh
       # Agent workspace (the Web UI dir-selector treats /workspace as HOME)
       - ${DSH_WORKSPACE:-./workspace}:/workspace
-      # FIX 2026-09-01: patched reverse proxy (full dotted-chain regex fix)
-      # overrides the read-only image copy at /opt/seek-harness/proxy.mjs
-      - ./overrides/proxy.mjs:/opt/seek-harness/proxy.mjs:ro
+      # NOTE 2026-10-01: the ./overrides/proxy.mjs bind-mount was REMOVED. It
+      # carried the 2026-09-01 dotted-chain regex fix as a runtime patch over the
+      # image copy — but the image's docker/proxy.mjs has owned that fix (plus
+      # the recovery surface, the client-boot watchdog and the /desktop route)
+      # since the diagnostic-screen work, so the stale 415-line copy silently
+      # shadowed every later proxy change. The image copy is now authoritative.
+      #
       # FIX 2026-09-01: re-export settingsNamespace (made internal upstream in
       # 0.1.2-alpha.3) so ecosystem plugins that still import it keep loading.
       # Remove once the plugins ship alpha3-compatible releases.
@@ -74,12 +100,18 @@ services:
       # the image already bundles it: the mount shadows it with the same
       # contract binary. Remove once all your nodes run a fixed image.
       - ./overrides/landlock-run/linux-x64/landlock-run:/opt/dsh-src/native/landlock-run/packages/linux-x64/bin/landlock-run:ro
-    # Writable temp space. NOT for a browser (there is none) — this exists
-    # because of `read_only: true` below: Node, npm/pnpm caches, python,
-    # uv/uvx temp venvs (MCP servers) and gcc all need /tmp, and `exec`
-    # lets them execute files placed there. size=1g caps RAM usage.
+    # Chromium-derived browsers use /dev/shm for renderer shared memory; the
+    # 64 MB default makes heavy pages crash the renderer. The entrypoint detects
+    # a small /dev/shm and falls back to --disable-dev-shm-usage, so this is the
+    # fast path rather than a requirement.
+    shm_size: "1g"
+    # Writable temp space, required because of `read_only: true` below: Node,
+    # npm/pnpm caches, python, uv/uvx temp venvs (MCP servers), gcc — and the
+    # browser's XDG config/cache/runtime plus its display logs. `exec` lets them
+    # execute files placed there. size=2g caps RAM usage (1g was tight once the
+    # browser shares this tmpfs).
     tmpfs:
-      - /tmp:exec,size=1g
+      - /tmp:exec,size=2g
     cap_drop:
       - ALL
     security_opt:

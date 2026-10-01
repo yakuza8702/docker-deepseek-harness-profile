@@ -33,6 +33,21 @@ const PROXY_HOST = process.env.PROXY_HOST || "0.0.0.0";
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || "3080", 10);
 const DSH_HOST = process.env.DSH_HOST || "127.0.0.1";
 const DSH_PORT = parseInt(process.env.DSH_PORT || "3079", 10);
+// ---------------------------------------------------------------------
+// Browser desktop (this fork): noVNC is served on the SAME public port as the
+// harness by path-routing, so the browser stack needs no second port forward —
+// and, more importantly, an https page can actually embed it. A separately
+// published http://host:6080 panel is blocked as mixed content on an https UI,
+// which is exactly the case behind Pangolin/Cloudflare.
+//   /<prefix>/...      noVNC static assets (prefix stripped for the upstream)
+//   /websockify        noVNC's default websocket endpoint, kept at the root
+//                      because that is what the shipped vnc.html asks for
+//   /<prefix>/websockify  same thing behind the prefix, for completeness
+// ---------------------------------------------------------------------
+const DESKTOP_ENABLED = (process.env.DSH_DESKTOP_ENABLED ?? "1") !== "0";
+const DESKTOP_PREFIX = `/${(process.env.DSH_DESKTOP_PREFIX || "desktop").replace(/^\/+|\/+$/g, "")}`;
+const DESKTOP_PORT = parseInt(process.env.DSH_NOVNC_PORT || "6080", 10);
+const DESKTOP_WS_PATH = "/websockify";
 const AUTH_USER = process.env.PROXY_USERNAME || "";
 const AUTH_PASS = process.env.PROXY_PASSWORD || "";
 const AUTH_ENABLED = AUTH_USER !== "" && AUTH_PASS !== "";
@@ -120,6 +135,102 @@ function deny(res, upgrade) {
     });
     res.end(body);
   }
+}
+
+// ---------------------------------------------------------------------
+// Browser desktop routing (constants at the top of this file).
+// ---------------------------------------------------------------------
+const DESKTOP_INDEX = `${DESKTOP_PREFIX}/vnc.html?autoconnect=1&resize=scale&view_only=0&reconnect=1`;
+
+/**
+ * Map a public request path onto the desktop upstream.
+ *   null                 -> not a desktop request (fall through to DSH)
+ *   { redirect }         -> send the browser to the canonical panel URL
+ *   { path }             -> proxy/tunnel this upstream path
+ */
+function desktopRoute(rawUrl) {
+  if (!DESKTOP_ENABLED) return null;
+  const path = String(rawUrl || "/").split("?")[0];
+  if (path === DESKTOP_PREFIX) return { redirect: DESKTOP_INDEX };
+  if (path === DESKTOP_WS_PATH) return { path: DESKTOP_WS_PATH };
+  if (path.startsWith(`${DESKTOP_PREFIX}/`)) {
+    const rest = path.slice(DESKTOP_PREFIX.length);
+    return { path: rest === DESKTOP_WS_PATH ? DESKTOP_WS_PATH : rest };
+  }
+  return null;
+}
+
+function desktopUnavailable(res, upgrade) {
+  const body = [
+    `browser desktop is not answering on 127.0.0.1:${DESKTOP_PORT}`,
+    "",
+    "It is started by the container entrypoint:",
+    "  Xvfb -> openbox -> x11vnc -> websockify(noVNC) -> the browser",
+    "",
+    "Check:  docker logs <container> | grep -i desktop",
+    "        docker exec <container> cat /tmp/dsh-desktop-state.json",
+    "",
+    "If DSH_DESKTOP_ENABLED=0 is set, this path is intentionally unserved.",
+  ].join("\n");
+  if (upgrade) {
+    res.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    res.destroy();
+    return;
+  }
+  res.writeHead(502, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+// noVNC is a plain static app: nothing is rewritten, only the authority is
+// translated so websockify's own Origin check sees a match (same reason the
+// harness path rewrites Origin for DSH's /api fence).
+function desktopOriginOverride(originHeader, publicHost) {
+  if (typeof originHeader !== "string" || originHeader === "null") return null;
+  try {
+    if (new URL(originHeader).host !== publicHost) return null;
+  } catch {
+    return null;
+  }
+  return `http://${DSH_HOST}:${DESKTOP_PORT}`;
+}
+
+function forwardToDesktop(req, res, upstreamPath) {
+  const headers = { ...req.headers };
+  headers.host = `${DSH_HOST}:${DESKTOP_PORT}`;
+  const override = desktopOriginOverride(req.headers.origin, req.headers.host || "");
+  if (override) headers.origin = override;
+  const upstream = http.request(
+    { host: DSH_HOST, port: DESKTOP_PORT, method: req.method, path: upstreamPath, headers },
+    (upRes) => {
+      res.writeHead(upRes.statusCode, upRes.headers);
+      upRes.pipe(res);
+    }
+  );
+  upstream.on("error", () => desktopUnavailable(res, false));
+  req.pipe(upstream);
+}
+
+function tunnelToDesktop(req, socket, head, upstreamPath) {
+  const upstream = net.connect(DESKTOP_PORT, DSH_HOST, () => {
+    const lines = [`${req.method} ${upstreamPath} HTTP/1.1`];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const name = req.rawHeaders[i];
+      const lower = name.toLowerCase();
+      let value = req.rawHeaders[i + 1];
+      if (lower === "host") value = `${DSH_HOST}:${DESKTOP_PORT}`;
+      else if (lower === "origin") {
+        value = desktopOriginOverride(value, req.headers.host || "") || value;
+      }
+      lines.push(`${name}: ${value}`);
+    }
+    upstream.write(lines.join("\r\n") + "\r\n\r\n");
+    pipeSockets(socket, upstream, head);
+  });
+  upstream.on("error", () => desktopUnavailable(socket, true));
 }
 
 function upstreamUnavailable(res, upgrade, req) {
@@ -450,6 +561,23 @@ function forwardToUpstream(req, res, autoAuthTried) {
 
 const server = http.createServer((req, res) => {
   if (!checkAuth(req, false)) return deny(res, false);
+  // The browser desktop is a separate loopback service. It is routed before
+  // everything else because it must NOT be touched by the DSH-specific HTML/JS
+  // rewriting below (noVNC is a static client and the harness recovery surface
+  // and API have nothing to say about it).
+  const desktop = desktopRoute(req.url);
+  if (desktop !== null) {
+    if (desktop.redirect) {
+      res.writeHead(302, {
+        Location: desktop.redirect,
+        "Cache-Control": "no-store",
+        "Content-Length": 0,
+      });
+      res.end();
+      return;
+    }
+    return forwardToDesktop(req, res, desktop.path);
+  }
   // The recovery API answers even while DSH is down, so it must be routed before
   // anything else. It needs no writable upstream — only $DSH_HOME.
   handleRecovery(req, res, { log: console.log })
@@ -464,6 +592,11 @@ const server = http.createServer((req, res) => {
 // incl. the Authorization header already validated above).
 server.on("upgrade", (req, socket, head) => {
   if (!checkAuth(req, true)) return deny(socket, true);
+  // noVNC's websocket goes to the desktop service, not to the harness.
+  const desktop = desktopRoute(req.url);
+  if (desktop !== null && desktop.path !== undefined) {
+    return tunnelToDesktop(req, socket, head, desktop.path);
+  }
   // Same-origin Origin translation for WS handshakes: DSH's /api fence also
   // gates upgrades (browsers attach Origin to them). Translate the public
   // authority to the loopback one only when the handshake is same-origin at
