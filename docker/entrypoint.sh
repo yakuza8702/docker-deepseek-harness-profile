@@ -53,9 +53,13 @@ write_boot_state() {   # write_boot_state <state> <reason> [detail]
 record_ready_log() {
   (
     for _ in $(seq 1 30); do
-      grep -q "DeepSeek Harness is ready" /tmp/dsh-web.log 2>/dev/null && break
-      [[ -f /tmp/dsh-stopping || -f /tmp/dsh-restart-requested ]] && exit 0
-      sleep 1
+      CURRENT="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(j.state||"")}catch{}' "$BOOT_STATE_FILE" 2>/dev/null || true)"
+      [[ "$CURRENT" == "failed" || "$CURRENT" == "client-failed" ]] && exit 0
+      # dsh itself prints little on stdout; the harness output is what it is.
+      # Give the boot a settle window, then refresh the tail (degraded boots
+      # accumulate their error lines during it).
+      sleep 10
+      break
     done
     if grep -qE "warning: [0-9]+ entr(y|ies) did not activate|failed to import" /tmp/dsh-web.log 2>/dev/null; then
       DEGRADED="$(grep -E "did not activate|failed to import|skipping profile bundle|Error:" /tmp/dsh-web.log 2>/dev/null | head -12 | paste -sd ' | ' - || true)"
