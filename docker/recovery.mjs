@@ -907,6 +907,20 @@ export function recoveryPage(snapshot) {
       .catch(function (error) { clearBusy(); ask('Action failed', String(error.message || error), 'Close', false, function () {}); });
   }
 
+  // Re-pull the snapshot after a mutating action so re-renders show the real
+  // state, not the copy embedded at page load.
+  function refreshState(after) {
+    fetch('/__recovery/state', { headers: { accept: 'application/json' }, cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        BOOT.plugins = data.plugins; BOOT.profiles = data.profiles; BOOT.checkpoints = data.checkpoints;
+        BOOT.active = data.active; BOOT.boot = data.boot;
+        renderPlugins(); renderProfiles(); renderCheckpoints();
+        if (after) after();
+      })
+      .catch(function () { if (after) after(); });
+  }
+
   // ---- plugin management ----------------------------------------------
   function renderPlugins() {
     var wrap = document.getElementById('plugin-rows');
@@ -928,15 +942,15 @@ export function recoveryPage(snapshot) {
   function pluginAction(act, name) {
     if (act === 'disable') {
       ask('Disable this plugin?', 'Nothing is deleted. The plugin, its version declaration and its configuration all stay in the current Profile — the harness simply will not load it on the next start. You can enable it again here at any time.', 'Disable plugin', false, function () {
-        run('Disabling ' + name + '…', post('/__recovery/plugin/disable', { name: name }), function () { renderPlugins(); ask('Plugin disabled', 'The plugin is disabled and still installed. Restart the harness to start without it; nothing was removed from the Profile.', 'Quit and restart', false, function () { post('/__recovery/restart', {}); waitAndReload(); }); });
+        run('Disabling ' + name + '…', post('/__recovery/plugin/disable', { name: name }), function () { refreshState(function () { ask('Plugin disabled', 'The plugin is disabled and still installed. Restart the harness to start without it; nothing was removed from the Profile.', 'Quit and restart', false, function () { post('/__recovery/restart', {}); waitAndReload(); }); }); });
       });
     } else if (act === 'enable') {
       ask('Enable this plugin?', 'The harness will load this plugin again on the next start. If this plugin caused the startup failure, the recovery assistant will open again and you can disable it once more.', 'Enable plugin', false, function () {
-        run('Enabling ' + name + '…', post('/__recovery/plugin/enable', { name: name }), function () { renderPlugins(); ask('Plugin enabled', 'The plugin is enabled again. Restart the harness to load it.', 'Quit and restart', false, function () { post('/__recovery/restart', {}); waitAndReload(); }); });
+        run('Enabling ' + name + '…', post('/__recovery/plugin/enable', { name: name }), function () { refreshState(function () { ask('Plugin enabled', 'The plugin is enabled again. Restart the harness to load it.', 'Quit and restart', false, function () { post('/__recovery/restart', {}); waitAndReload(); }); }); });
       });
     } else if (act === 'uninstall') {
       ask('Uninstall this plugin?', 'Uninstall this plugin from the current Profile and update plugin dependencies. The files in the profile store are pruned on the next plugin operation.', 'Uninstall', true, function () {
-        run('Uninstalling ' + name + '…', post('/__recovery/plugin/uninstall', { name: name }), function () { renderPlugins(); ask('Plugin uninstalled', 'The plugin was removed from the current Profile. Restart the harness to use the updated plugin configuration.', 'Quit and restart', false, function () { post('/__recovery/restart', {}); waitAndReload(); }); });
+        run('Uninstalling ' + name + '…', post('/__recovery/plugin/uninstall', { name: name }), function () { refreshState(function () { ask('Plugin uninstalled', 'The plugin was removed from the current Profile. Restart the harness to use the updated plugin configuration.', 'Quit and restart', false, function () { post('/__recovery/restart', {}); waitAndReload(); }); }); });
       });
     }
   }
