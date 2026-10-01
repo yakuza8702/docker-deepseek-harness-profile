@@ -61,11 +61,36 @@ Switches:
 |---|---|---|
 | `DSH_DESKTOP_ENABLED` | `1` | `0` = no desktop stack, no browser rows at boot (packages stay in the image) |
 | `DSH_BROWSER_USE_ENABLED` | `1` | `0` = no model-facing browser tools, panel still available |
+| `DSH_BROWSER_USE_EXCLUSIVE` | `0` | `0` = **every** Session drives the same visible browser (this image's default, see below); `1` = upstream's single-owner attachment |
 | `DSH_DESKTOP_PREFIX` | `desktop` | path the proxy serves the desktop on (`/desktop/…`) |
 | `DSH_NOVNC_PORT` | `6080` | internal noVNC/websockify port (loopback only) |
 | `DSH_CDP_PORT` | `9222` | internal DevTools port the Browser Use provider attaches to |
 | `DSH_DESKTOP_WIDTH` / `DSH_DESKTOP_HEIGHT` | `1440` / `900` | virtual display size |
 | `DSH_DESKTOP_START_URL` | `about:blank` | first page the browser opens |
+
+### One browser, every Session (this fork patches upstream)
+
+Upstream's attach mode reserves the attached browser for **one** live Session:
+`exclusive: config.mode === "attach"`. Its own runtime README calls this out under
+*Known Limitations* — *“a busy attachment skips startup permanently for that live
+activation”* and *“releasing the attachment does not retry skipped activations”*.
+In a container that boots with sessions already open, the winner of that race is
+whichever activation happens first, which is frequently **not** the session you are
+looking at; every other session then shows no browser tools at all, silently and
+permanently, and closing the “owner” does not bring them back.
+
+This image patches that expression off (see `tools/patch-browser-use-exclusivity.mjs`
+and the Dockerfile step that applies it), so **every** Session gets its own MCP client
+attached to the same browser. The patch is content-anchored and idempotent, and it
+**fails the build** if upstream changes that line — an upstream refactor must never
+silently restore the behaviour this fork removed.
+
+The trade-off is explicit: there is one browser, so **cookies, logins, tabs and
+installed extensions are shared between Sessions**, and two Sessions driving it at the
+same time compete for the active tab. That is inherent to “one visible browser with
+your logins” — it was already true before the patch, when it simply travelled with
+ownership. Set `DSH_BROWSER_USE_EXCLUSIVE=1` to get upstream's single-owner semantics
+back (useful if you want a strict one-session-at-a-time browser).
 
 Compose already sets `shm_size: "1g"` for renderer shared memory. If you run the image
 with plain `docker run`, add `--shm-size=1g` — the entrypoint detects a small `/dev/shm`

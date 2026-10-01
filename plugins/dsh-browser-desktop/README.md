@@ -49,7 +49,11 @@ The reference image mounts the official Playwright MCP provider in attachment mo
     endpoint: 'http://127.0.0.1:9222'
 ```
 
-The model and the noVNC panel therefore operate the same Chromium tabs, cookies, and persisted login state. DSH currently gives one live Session exclusive ownership of an attached browser within one provider instance. Other Sessions continue without Browser Use until the owner releases it; `browser_open` and manual desktop access remain available. If Chromium restarts, create or resume a Session after the CDP endpoint is healthy because the experimental provider does not reconnect a disconnected Session automatically.
+The model and the noVNC panel therefore operate the same Chromium tabs, cookies, and persisted login state.
+
+> **This image patches the one-Session rule.** Upstream attach mode reserves the browser for a single live Session, and a Session that finds it busy is skipped *permanently for that activation* (runtime README → Known Limitations): a busy attachment is never retried, so in a container that boots with sessions open, browser tools can vanish from every session but an arbitrary one. `tools/patch-browser-use-exclusivity.mjs` removes that reservation at build time, so **every** Session attaches to the same visible browser; `DSH_BROWSER_USE_EXCLUSIVE=1` restores upstream. The consequence to know: cookies, logins and tabs are shared between Sessions.
+
+If the browser restarts, create or resume a Session once the CDP endpoint is healthy — the experimental provider does not reconnect a disconnected Session automatically.
 
 ## Install
 

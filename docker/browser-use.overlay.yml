@@ -17,6 +17,16 @@
 #   DSH_BROWSER_USE_ENABLED=0    no model-facing browser tools
 #   DSH_DESKTOP_PREFIX=desktop   path the reverse proxy serves the desktop on
 #   DSH_CDP_PORT=9222            browser DevTools port inside the container
+#   DSH_BROWSER_USE_EXCLUSIVE    Upstream's attach mode reserves the browser for
+#                                ONE live Session; every other Session is skipped
+#                                silently and permanently, and in a container the
+#                                winner of that race is often not the session you
+#                                are using. This image patches that off by
+#                                default (see the Dockerfile), so EVERY Session
+#                                attaches to the same visible browser — cookies,
+#                                logins and tabs are therefore shared between
+#                                Sessions. DSH_BROWSER_USE_EXCLUSIVE=1 restores
+#                                upstream's single-owner behaviour.
 - insert:
     - id: browser-use
       name: '@deepseek-ai/dsh-browser-use'

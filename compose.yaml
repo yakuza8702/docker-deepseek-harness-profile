@@ -68,6 +68,11 @@ services:
       # Basic Auth.
       DSH_DESKTOP_ENABLED: "${DSH_DESKTOP_ENABLED:-1}"
       DSH_BROWSER_USE_ENABLED: "${DSH_BROWSER_USE_ENABLED:-1}"
+      # 0 (default) = every Session drives the SAME visible browser, so browser
+      # tools are always present; cookies/logins/tabs are shared between
+      # Sessions. 1 = upstream's single-owner attachment, where one Session
+      # reserves the browser and the rest silently never get the tools.
+      DSH_BROWSER_USE_EXCLUSIVE: "${DSH_BROWSER_USE_EXCLUSIVE:-0}"
       DSH_DESKTOP_PREFIX: "${DSH_DESKTOP_PREFIX:-desktop}"
       DSH_NOVNC_PORT: "${DSH_NOVNC_PORT:-6080}"
       DSH_CDP_PORT: "${DSH_CDP_PORT:-9222}"

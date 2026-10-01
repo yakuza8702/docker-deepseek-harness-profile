@@ -209,6 +209,32 @@ RUN set -eux; \
     rm -rf "$SB"; \
     node -e 'const p=process.argv[1];for(const n of ["@deepseek-ai/dsh-browser-use","@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]){console.log("installed",n,require(p+"/node_modules/"+n+"/package.json").version)}' "$T"
 
+# ---------------------------------------------------------------------
+# Make the attached browser usable from EVERY Session instead of exactly one.
+#
+# Upstream passes `exclusive: config.mode === "attach"`, which reserves the
+# browser for a single live Session; every other Session is skipped silently and
+# permanently ("A busy attachment skips startup permanently for that live
+# activation" — runtime README, Known Limitations). In a container that boots with
+# sessions already open, the winner of that race is whichever activation happens
+# first, often not the session you are looking at, so browser tools appear to be
+# missing at random and closing the "owner" does not bring them back.
+#
+# The patch makes the provider non-exclusive: each live Session gets its own MCP
+# client attached to the SAME visible browser, so the tools are always present and
+# human takeover still works. The honest trade-off: it is one browser, so cookies,
+# logins and tabs are shared between Sessions, and two Sessions driving it at once
+# compete for the active tab. DSH_BROWSER_USE_EXCLUSIVE=1 restores upstream.
+#
+# Content-anchored and idempotent, and it FAILS THE BUILD if upstream changes that
+# expression — an upstream refactor must never silently restore the behaviour this
+# fork removed. Same philosophy as tools/apply-profile-patch.mjs.
+# ---------------------------------------------------------------------
+COPY tools/patch-browser-use-exclusivity.mjs /tmp/patch-browser-use-exclusivity.mjs
+RUN set -eux; \
+    node /tmp/patch-browser-use-exclusivity.mjs /opt/dsh/node_modules /opt/dsh-src/node_modules; \
+    rm -f /tmp/patch-browser-use-exclusivity.mjs
+
 # Landlock launcher binary. The source-channel monorepo links the workspace
 # package native/landlock-run/packages/linux-<arch> but its bin/ only ships in
 # the published platform npm package (the npm channel gets it automatically via
@@ -323,6 +349,7 @@ ENV NODE_ENV=production \
     DSH_TELEMETRY_DISABLED=1 \
     DSH_DESKTOP_ENABLED=1 \
     DSH_BROWSER_USE_ENABLED=1 \
+    DSH_BROWSER_USE_EXCLUSIVE=0 \
     DSH_DESKTOP_PREFIX=desktop \
     DSH_NOVNC_PORT=6080 \
     DSH_CDP_PORT=9222 \
