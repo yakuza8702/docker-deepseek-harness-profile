@@ -1027,6 +1027,13 @@ export function recoveryPage(snapshot) {
       .catch(function (error) { document.getElementById('newprofile-name').value = ''; alert(error.message || String(error)); });
   });
 
+  // ---- safe mode ----------------------------------------------------------
+  document.getElementById('safe').addEventListener('click', function () {
+    ask('Enter Safe Mode?', 'Restart with a temporary environment? The harness will use a separate temporary profile without reading or changing existing Profiles or data. Leaving Safe Mode restores the original selection on the next restart.', 'Restart in Safe Mode', false, function () {
+      run('Preparing Safe Mode…', post('/__recovery/safe', {}).then(function () { return post('/__recovery/restart', {}); }), function () { waitAndReload(); });
+    });
+  });
+
   // ---- reset & data ------------------------------------------------------
   document.getElementById('factory-reset').addEventListener('click', function () {
     ask('Factory reset the harness?', 'The following directory will be moved aside:\\n\\n' + (BOOT.dataDirectory || '') + '\\n\\nProfiles, plugins, settings, credentials, sessions and workspace records stored there are removed. The harness restarts and creates a clean default Profile.', 'Reset data and restart', true, function () {
