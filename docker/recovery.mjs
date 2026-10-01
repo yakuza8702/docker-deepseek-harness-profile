@@ -865,7 +865,11 @@ export function recoveryPage(snapshot) {
     if (el) el.textContent = text;
     document.body.classList.add('busy');
   }
-  function clearBusy() { document.body.classList.remove('busy'); }
+  function clearBusy() {
+    document.body.classList.remove('busy');
+    var el = document.getElementById('busy-note');
+    if (el) el.textContent = '';
+  }
 
   // ---- tabs -----------------------------------------------------------
   function openTab(name) {
