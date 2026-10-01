@@ -226,6 +226,11 @@ if grep -qE "warning: [0-9]+ entr(y|ies) did not activate|failed to import" "$DS
   log "WARNING: degraded boot — see the recovery panel for details"
 else
   write_boot_state ready "" ""
+  # Healthy boot: capture a startup checkpoint for the recovery screen's
+  # Rollback tab (3 rotating slots in $DSH_HOME/.recovery-checkpoints).
+  # A degraded boot is NOT checkpointed — it is the configuration itself
+  # that may need rolling back. Failures here must never block the boot.
+  node -e 'import("/opt/seek-harness/recovery.mjs").then((m) => { const r = m.captureCheckpoint(process.env); if (r) console.log("[seek-harness] startup checkpoint captured into", r.slot); }).catch(() => {})' || true
 fi
 # Late-death watchdog: if the harness dies AFTER the ready banner (a plugin that
 # crashes on its first request, an OOM), flip the state to failed so the recovery
