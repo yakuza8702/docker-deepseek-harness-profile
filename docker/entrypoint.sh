@@ -161,6 +161,35 @@ log "active profile: ${PROFILE}"
 write_boot_state starting "booting profile ${PROFILE}"
 
 # ---------------------------------------------------------------------
+# Safe Mode — a TRUE temporary environment (dsh-next parity).
+# The recovery surface (or the in-app panel) writes $DSH_HOME/.safe-mode-request
+# and restarts. This boot consumes the flag and starts the harness with a
+# THROWAWAY tmpfs DSH_HOME: existing profiles, settings, sessions and
+# credentials are never read or changed. ONLY the official DeepSeek API key
+# credential (.credentials.yaml) is carried over so the harness still works.
+# /tmp is tmpfs, so leaving Safe Mode is simply the next restart.
+# DSH_REAL_HOME keeps pointing at the real home for tools that need it (the
+# in-app panel's Safe Mode button writes the flag there even while running on
+# the temporary home).
+# ---------------------------------------------------------------------
+DSH_REAL_HOME="${DSH_HOME:-/home/node/.dsh}"
+export DSH_REAL_HOME
+SAFE_MODE_FLAG="$DSH_REAL_HOME/.safe-mode-request"
+SAFE_MODE=0
+HARNESS_HOME="$DSH_REAL_HOME"
+if [[ -f "$SAFE_MODE_FLAG" ]]; then
+  rm -f "$SAFE_MODE_FLAG"
+  SAFE_MODE=1
+  SAFE_HOME="/tmp/dsh-safe-home"
+  rm -rf "$SAFE_HOME"
+  mkdir -p "$SAFE_HOME"
+  [[ -f "$DSH_REAL_HOME/.credentials.yaml" ]] && cp -a "$DSH_REAL_HOME/.credentials.yaml" "$SAFE_HOME/.credentials.yaml"
+  HARNESS_HOME="$SAFE_HOME"
+  log "SAFE MODE: booting a temporary environment (DSH_HOME=$SAFE_HOME) — the real home is untouched; only .credentials.yaml was carried over"
+  write_boot_state starting "booting Safe Mode (temporary environment)"
+fi
+
+# ---------------------------------------------------------------------
 # In-app profile control (dsh-profile-switcher) as a launcher overlay.
 # Applied AFTER the profile layer, so no profile directory is ever edited: the
 # pill in the Web UI comes from this file. DSH_PROFILE_OVERLAY=<path> overrides
@@ -173,7 +202,9 @@ if [[ -n "$OVERLAY" && -f "$OVERLAY" ]]; then
   log "overlay: $OVERLAY"
 fi
 
-node "${node_flags[@]}" "$DSH_BIN" --profile "${PROFILE}" \
+# The harness child gets the (possibly temporary) DSH_HOME; every other process
+# — the proxy, the recovery surface, the entrypoint — keeps the real home.
+DSH_HOME="$HARNESS_HOME" node "${node_flags[@]}" "$DSH_BIN" --profile "${PROFILE}" \
   ${overlay_args[@]+"${overlay_args[@]}"} \
   --no-open --host 127.0.0.1 --port "$DSH_PORT" \
   ${trusted_args[@]+"${trusted_args[@]}"} "$@" >"$DSH_LOG" 2>&1 &
@@ -255,7 +286,13 @@ else
   # Rollback tab (3 rotating slots in $DSH_HOME/.recovery-checkpoints).
   # A degraded boot is NOT checkpointed — it is the configuration itself
   # that may need rolling back. Failures here must never block the boot.
-  node -e 'import("/opt/seek-harness/recovery.mjs").then((m) => { const r = m.captureCheckpoint(process.env); if (r) console.log("[seek-harness] startup checkpoint captured into", r.slot); }).catch(() => {})' || true
+  # A Safe Mode boot captures nothing either: it is the temporary
+  # environment, not the configuration anyone would want to roll back to.
+  if [[ "$SAFE_MODE" == "1" ]]; then
+    log "SAFE MODE: checkpoint capture skipped (temporary environment)"
+  else
+    node -e 'import("/opt/seek-harness/recovery.mjs").then((m) => { const r = m.captureCheckpoint(process.env); if (r) console.log("[seek-harness] startup checkpoint", r.skipped ? "skipped after restore (slots preserved)" : "captured into " + r.slot); }).catch(() => {})' || true
+  fi
 fi
 # Re-record the ready/degraded state with the FULL boot log once the banner
 # lands (see record_ready_log above) — without this the Diagnostics tab shows

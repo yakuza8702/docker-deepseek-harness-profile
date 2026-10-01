@@ -46,6 +46,18 @@ window.__ModuleLoader__.load({
     const INLINE_ID = 'dsh-ps-trigger-inline'
     const INLINE_CLASS = 'dsh-ps--beside-settings'
 
+    /** Inline lucide icons (dsh-desktop's Recovery Mode / Safe Mode glyphs). */
+    const ICONS = {
+      recovery: '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/><path d="m4.9 4.9 4.2 4.2"/><path d="m19.1 4.9-4.2 4.2"/><path d="m4.9 19.1 4.2-4.2"/><path d="m19.1 19.1-4.2-4.2"/>',
+      safeMode: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+    }
+    const iconSvg = (paths) => React.createElement('span', {
+      style: { display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' },
+      dangerouslySetInnerHTML: {
+        __html: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`,
+      },
+    })
+
     /** Small JSON client for the host half. */
     const call = async (action, body) => {
       const response = await fetch(`${ROUTE}/${action}`, body === undefined
@@ -277,7 +289,6 @@ function DeleteButton({ disabled, onDelete, name, style }) {
     const describe = (profile) => {
       if (profile.bundles === null) return 'no package.json — not switchable'
       if (!profile.webCapable) return `${profile.bundleCount} bundles — not web-capable`
-      if (profile.safeMode) return 'Safe Mode — stock bundles'
       const thirdParty = profile.bundleCount - 2
       return thirdParty > 0 ? `${profile.bundleCount} bundles (${thirdParty} added)` : 'stock (dsh-base + web-app)'
     }
@@ -490,8 +501,8 @@ function DeleteButton({ disabled, onDelete, name, style }) {
         }
       }, [])
       /** Confirm, apply, restart, then wait for the harness to come back. */
-      const applyAndWait = async (action, body, label) => {
-        if (!window.confirm(`Switch to “${label}” and restart the harness?\n\nThe interface disconnects for about 20 seconds. Sessions, settings and credentials are kept — only the plugin set changes.`)) return
+      const applyAndWait = async (action, body, label, confirmMessage) => {
+        if (!window.confirm(confirmMessage ?? `Switch to “${label}” and restart the harness?\n\nThe interface disconnects for about 20 seconds. Sessions, settings and credentials are kept — only the plugin set changes.`)) return
         setBusy(true)
         setNote(`switching to “${label}”…`)
         setElapsed(0)
@@ -747,10 +758,25 @@ function DeleteButton({ disabled, onDelete, name, style }) {
           mobile && React.createElement('div', { style: S.sheetGrabber }),
           React.createElement('div', { style: S.header },
             React.createElement('div', { style: S.title }, 'Available Profiles'),
-            React.createElement('button', {
-              type: 'button', className: 'dsh-ps__close', style: S.close, title: 'Close', 'aria-label': 'Close',
-              onClick: hide,
-            }, '✕')),
+            React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 2, flex: '0 0 auto' } },
+              React.createElement('button', {
+                type: 'button', className: 'dsh-ps__close', style: { ...S.close, marginRight: 0 },
+                title: 'Restart in Recovery Mode', 'aria-label': 'Restart in Recovery Mode', disabled: busy,
+                onClick: () => {
+                  if (!window.confirm('Restart in Recovery Mode?\n\nThis opens the recovery screen — the diagnostic assistant with plugin management, checkpoints, profiles, reset and a full diagnostic archive. It is served even while the harness is down, so nothing is lost by opening it.')) return
+                  window.location.assign('/__recovery/page')
+                },
+              }, iconSvg(ICONS.recovery)),
+              React.createElement('button', {
+                type: 'button', className: 'dsh-ps__close', style: { ...S.close, marginRight: 0 },
+                title: 'Enter Safe Mode', 'aria-label': 'Enter Safe Mode', disabled: busy,
+                onClick: () => void applyAndWait('safe', {}, 'Safe Mode',
+                  'Enter Safe Mode and restart the harness?\n\nThe harness will use a separate temporary data directory: existing Profiles, plugins, settings and conversations are not read or changed, and the temporary data is removed on the next restart. Only the official DeepSeek API key, if you saved one, is carried over.'),
+              }, iconSvg(ICONS.safeMode)),
+              React.createElement('button', {
+                type: 'button', className: 'dsh-ps__close', style: S.close, title: 'Close', 'aria-label': 'Close',
+                onClick: hide,
+              }, '✕'))),
           React.createElement('div', { style: S.subtitle }, 'Switch to another Web-compatible Profile, create or delete one. Switching restarts the harness.'),
           boot !== null && boot.state === 'degraded' && React.createElement('div', {
             style: {
@@ -786,13 +812,6 @@ function DeleteButton({ disabled, onDelete, name, style }) {
               type: 'button', className: 'dsh-ps__action', style: { ...S.action, opacity: draft.trim() === '' || busy ? .5 : 1 },
               disabled: draft.trim() === '' || busy, onClick: () => void createProfile(),
             }, '+ New Profile')),
-          React.createElement('button', {
-            type: 'button',
-            className: 'dsh-ps__action',
-            style: { ...S.action, width: '100%', marginTop: 10, borderRadius: 10, minHeight: mobile ? 48 : 0, opacity: busy ? .5 : 1 },
-            disabled: busy,
-            onClick: () => void applyAndWait('safe', {}, 'Safe Mode'),
-          }, 'Safe Mode — boot stock bundles only'),
           note !== null && React.createElement('div', {
             style: { ...S.note, color: 'var(--dsw-alias-label-secondary, inherit)' },
           }, elapsed === null ? note : `${note} (${elapsed}s)`)))

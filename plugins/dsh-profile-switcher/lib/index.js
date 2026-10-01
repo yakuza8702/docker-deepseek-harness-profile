@@ -3,13 +3,15 @@
  *
  * The Web UI half renders the pill; this half owns the profile facts:
  *
- *   GET  /api/dsh-profile-switcher/list      -> { ok, active, profiles[], safeProfile, locked[] }
+ *   GET  /api/dsh-profile-switcher/list      -> { ok, active, profiles[], locked[] }
  *   POST /api/dsh-profile-switcher/select    { name }             -> writes the selection
  *   POST /api/dsh-profile-switcher/create    { name, from? }      -> copies a profile
  *   POST /api/dsh-profile-switcher/delete    { name }             -> deletes a profile
  *   POST /api/dsh-profile-switcher/rename    { name, label }      -> display label only
  *   POST /api/dsh-profile-switcher/move      { name, direction }  -> reorder the list
- *   POST /api/dsh-profile-switcher/safe      {}                   -> ensure + select Safe Mode
+ *   POST /api/dsh-profile-switcher/safe      {}                   -> request a temporary-environment
+ *                                                                   boot (flag + restart); the
+ *                                                                   entrypoint boots a tmpfs home
  *   POST /api/dsh-profile-switcher/restart   {}                   -> exit; the container policy reboots
  *   GET  /api/dsh-profile-switcher/state     -> last boot outcome (for the recovery view)
  *
@@ -41,7 +43,6 @@ import { join } from 'node:path'
 
 const ROUTE = '/api/dsh-profile-switcher'
 const WEB_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
-const SAFE_PROFILE = 'shell-safe'
 /** Profiles that must always exist: `web` is the entrypoint's fallback. */
 const LOCKED = new Set(['web'])
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/iu
@@ -150,7 +151,6 @@ function listProfiles() {
         bundleCount: bundles?.length ?? 0,
         webCapable: webCapable(bundles),
         active: entry.name === active,
-        safeMode: entry.name === SAFE_PROFILE,
         locked: LOCKED.has(entry.name),
         deletable: !LOCKED.has(entry.name) && entry.name !== active && bundles !== undefined,
       }
@@ -226,20 +226,24 @@ function move(name, direction) {
   return { order: next, moved: true }
 }
 
-/** Safe Mode: the shipped bundles only, so a broken third-party plugin can be removed. */
-function ensureSafeProfile() {
-  const target = join(profilesRoot(), SAFE_PROFILE)
-  if (!existsSync(join(target, 'package.json'))) {
-    create(SAFE_PROFILE, 'web')
-    const patchPath = join(target, 'cordis.patch.yml')
-    writeFileSync(patchPath, '# Safe Mode: the shipped bundles only, no user patch layer.\n[]\n')
-    log(`created ${SAFE_PROFILE} (stock bundles only)`)
-  }
-  const manifestPath = join(target, 'package.json')
-  const manifest = readJson(manifestPath) ?? {}
-  manifest.dsh = { ...(manifest.dsh ?? {}), profile: { bundles: [...WEB_BUNDLES] } }
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
-  return select(SAFE_PROFILE)
+/**
+ * Safe Mode — a TRUE temporary environment (dsh-next parity).
+ *
+ * Writes $DSH_REAL_HOME/.safe-mode-request; the entrypoint consumes it on the
+ * next boot and starts the harness with a throwaway tmpfs DSH_HOME, so existing
+ * profiles, settings and sessions are never read or changed. Only the official
+ * DeepSeek API key credential is carried over, and the temporary data vanishes
+ * with the following restart (tmpfs). DSH_REAL_HOME is exported by the
+ * entrypoint and ALWAYS points at the real home — even while this harness is
+ * itself running on the temporary one.
+ */
+function requestSafeMode() {
+  const realHome = process.env.DSH_REAL_HOME ?? home()
+  const flag = join(realHome, '.safe-mode-request')
+  mkdirSync(realHome, { recursive: true })
+  writeJsonAtomic(flag, { version: 1, at: new Date().toISOString(), requestedBy: 'panel' })
+  log('requested Safe Mode (temporary environment) via ' + flag)
+  return { safeModeRequested: true }
 }
 
 /**
@@ -312,7 +316,7 @@ export function apply(ctx) {
           case 'list':
             return send(res, 200, {
               ok: true, home: home(), active: activeName(), profiles: listProfiles(),
-              safeProfile: SAFE_PROFILE, locked: [...LOCKED], boot: bootState(),
+              locked: [...LOCKED], boot: bootState(),
             })
           case 'select':
             return send(res, 200, { ok: true, ...select(String(body.name ?? '')), restartRequired: true })
@@ -329,7 +333,7 @@ export function apply(ctx) {
             return send(res, 200, { ok: true, ...deleted, profiles: listProfiles() })
           }
           case 'safe':
-            return send(res, 200, { ok: true, ...ensureSafeProfile(), restartRequired: true })
+            return send(res, 200, restartSoon({ ...requestSafeMode() }))
           case 'state':
             return send(res, 200, { ok: true, boot: bootState(), active: activeName(), profiles: listProfiles() })
           case 'restart':

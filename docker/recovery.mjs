@@ -14,10 +14,15 @@
  *   Quick recovery · Plugin management · Rollback · Switch Profile ·
  *   Reset & data · Diagnostics
  *
- * Deliberate Docker differences (the only ones):
- *   - "Browse files" (checkpoint), "Change data directory" and "Open Profile
- *     folder" are disabled — a Docker container has no folder GUI.
- *   - "Quit" is disabled — the container restart policy owns the lifecycle.
+ * Deliberate Docker differences:
+ *   - "Browse files" was REPLACED by a per-slot "Remove checkpoint" button
+ *     (a Docker container has no folder GUI); "Change data directory" and
+ *     "Open Profile folder" are disabled for the same reason; "Quit" is gone —
+ *     the container restart policy owns the process lifecycle.
+ * Safe Mode boots the harness with a THROWAWAY tmpfs DSH_HOME (the entrypoint
+ * consumes the $DSH_HOME/.safe-mode-request flag), so existing profiles,
+ * settings and sessions are untouched; only the DeepSeek API key credential is
+ * carried over, and the temporary data disappears with the next restart.
  * Everything else works against the real filesystem: disable/enable/uninstall
  * plugins, restore checkpoints, switch/create profiles, factory reset, edit the
  * three configuration files, export the diagnostic archive.
@@ -36,7 +41,6 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, s
 import { join } from 'node:path'
 
 const WEB_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
-const SAFE_PROFILE = 'shell-safe'
 const LOCKED = new Set(['web'])
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/iu
 const RESERVED = new Set(['node_modules', 'con', 'prn', 'aux', 'nul', 'com1', 'com2', 'com3', 'com4', 'lpt1', 'lpt2', 'lpt3'])
@@ -204,12 +208,27 @@ const checkpointFiles = [
   { from: (env) => join(home(env), 'settings.yaml'), to: 'settings.yaml' },
 ]
 
-/** Capture the current configuration into slot-1, rotating 1→2→3. Safe to fail. */
+/**
+ * Capture the current configuration — dsh-next retention semantics:
+ *   - exactly SLOTS.length slots, NO time-based expiry;
+ *   - an empty slot is filled first, otherwise the OLDEST (by capturedAt) is
+ *     overwritten;
+ *   - the first healthy boot after a restore consumes a skip marker instead of
+ *     a slot, so a restored checkpoint is not immediately displaced.
+ * Safe to fail — never blocks the boot.
+ */
 export function captureCheckpoint(env = process.env) {
   try {
+    const root = checkpointsRoot(env)
+    // The skip marker written by restoreCheckpoint: preserve all slots once.
+    const skipFile = join(root, '.skip-after-restore')
+    if (existsSync(skipFile)) {
+      const skip = readJson(skipFile)
+      rmSync(skipFile, { force: true })
+      return { skipped: true, restoredSlotId: typeof skip?.restoredSlotId === 'string' ? skip.restoredSlotId : null }
+    }
     const profile = currentProfile(env)
     if (!existsSync(join(profilesRoot(env), profile, 'package.json'))) return null
-    const root = checkpointsRoot(env)
     const source = (spec) => join(root, 'incoming', spec.to)
     rmSync(join(root, 'incoming'), { recursive: true, force: true })
     mkdirSync(join(root, 'incoming', 'profile'), { recursive: true })
@@ -223,24 +242,29 @@ export function captureCheckpoint(env = process.env) {
       totalBytes += statSync(from).size
     }
     if (fileCount === 0) return null
+    const capturedAt = new Date().toISOString()
     writeFileSync(join(root, 'incoming', 'meta.json'), `${JSON.stringify({
-      capturedAt: new Date().toISOString(),
+      capturedAt,
       profile,
       appVersion: dshVersion(),
       fileCount,
       totalBytes,
     }, null, 2)}\n`)
-    const oldest = join(root, SLOTS[SLOTS.length - 1])
-    rmSync(oldest, { recursive: true, force: true })
-    for (let index = SLOTS.length - 1; index > 0; index -= 1) {
-      const target = join(root, SLOTS[index])
-      const previous = join(root, SLOTS[index - 1])
-      rmSync(target, { recursive: true, force: true })
-      if (existsSync(previous)) renameSync(previous, target)
+    const rows = checkpointRows(env)
+    const empty = rows.find((row) => row.status === 'empty')
+    let target
+    if (empty !== undefined) {
+      target = empty.slotId
+    } else {
+      target = [...rows].sort((left, right) => {
+        const leftTime = Date.parse(left.capturedAt ?? '') || 0
+        const rightTime = Date.parse(right.capturedAt ?? '') || 0
+        return leftTime - rightTime || left.slotId.localeCompare(right.slotId)
+      })[0].slotId
     }
-    rmSync(join(root, 'slot-1'), { recursive: true, force: true })
-    renameSync(join(root, 'incoming'), join(root, 'slot-1'))
-    return { slot: 'slot-1', capturedAt: new Date().toISOString() }
+    rmSync(join(root, target), { recursive: true, force: true })
+    renameSync(join(root, 'incoming'), join(root, target))
+    return { slot: target, capturedAt }
   } catch (error) {
     console.log('[recovery] checkpoint capture failed:', error instanceof Error ? error.message : error)
     return null
@@ -266,7 +290,7 @@ function checkpointRows(env) {
   })
 }
 
-function restoreCheckpoint(env, slotId) {
+export function restoreCheckpoint(env, slotId) {
   if (!SLOTS.includes(slotId)) throw new Error(`unknown checkpoint slot: ${slotId}`)
   const root = join(checkpointsRoot(env), slotId)
   if (!existsSync(join(root, 'meta.json'))) throw new Error(`slot ${slotId} has no checkpoint to restore`)
@@ -285,7 +309,19 @@ function restoreCheckpoint(env, slotId) {
   copy(join(root, 'profile/cordis.patch.yml'), join(profileDir, 'cordis.patch.yml'))
   copy(join(root, 'profile/cordis.yml'), join(profileDir, 'cordis.yml'))
   copy(join(root, 'settings.yaml'), join(home(env), 'settings.yaml'))
+  // dsh-next semantics: the first healthy start after a restore must NOT
+  // consume a slot — otherwise the just-restored checkpoint would be rotated
+  // out by the very boot that proves the restore worked.
+  writeJsonAtomic(join(checkpointsRoot(env), '.skip-after-restore'), { version: 1, restoredSlotId: slotId })
   return { restored, slot: slotId }
+}
+
+export function removeCheckpoint(env, slotId) {
+  if (!SLOTS.includes(slotId)) throw new Error(`unknown checkpoint slot: ${slotId}`)
+  const root = join(checkpointsRoot(env), slotId)
+  if (!existsSync(join(root, 'meta.json'))) throw new Error(`slot ${slotId} has no checkpoint to remove`)
+  rmSync(root, { recursive: true, force: true })
+  return { removed: slotId }
 }
 
 // ---------------------------------------------------------------------
@@ -400,7 +436,6 @@ export function recoverySnapshot(env = process.env) {
       bundleCount: bundles?.length ?? 0,
       webCapable: webCapable(bundles),
       active: name === active,
-      safeMode: name === SAFE_PROFILE,
       locked: LOCKED.has(name),
     }
   }).sort((a, b) => {
@@ -417,7 +452,6 @@ export function recoverySnapshot(env = process.env) {
     active,
     version: dshVersion(),
     profiles,
-    safeProfile: SAFE_PROFILE,
     boot,
     plugins: active === null ? undefined : pluginRows(env, active),
     checkpoints: checkpointRows(env),
@@ -478,27 +512,15 @@ export function selectProfile(env, name) {
   return { active: name }
 }
 
-/** Safe Mode: create `shell-safe` from `web` if needed, then select it. */
-export function selectSafe(env) {
-  const target = join(profilesRoot(env), SAFE_PROFILE)
-  if (!existsSync(join(target, 'package.json'))) {
-    const source = join(profilesRoot(env), 'web')
-    if (!existsSync(join(source, 'package.json'))) throw new Error('cannot create Safe Mode: the shipped `web` profile is missing')
-    mkdirSync(target, { recursive: true })
-    for (const entry of readdirSync(source, { withFileTypes: true })) {
-      if (entry.name === 'node_modules') continue
-      const from = join(source, entry.name)
-      const to = join(target, entry.name)
-      if (entry.isDirectory()) continue
-      writeFileSync(to, readFileSync(from))
-    }
-    const manifestPath = join(target, 'package.json')
-    const manifest = readJson(manifestPath) ?? {}
-    manifest.dsh = { ...(manifest.dsh ?? {}), profile: { bundles: [...WEB_BUNDLES] } }
-    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
-    writeFileSync(join(target, 'cordis.patch.yml'), '# Safe Mode: the shipped bundles only, no user patch layer.\n[]\n')
-  }
-  return selectProfile(env, SAFE_PROFILE)
+/** Safe Mode: request a temporary-environment boot. The flag lives in the REAL
+ * home (the proxy's env never points at the temp home), the entrypoint consumes
+ * it at the next boot and starts the harness with a throwaway tmpfs DSH_HOME.
+ * Nothing else is written — the real home stays untouched. */
+export function requestSafeMode(env = process.env) {
+  const flag = join(home(env), '.safe-mode-request')
+  mkdirSync(home(env), { recursive: true })
+  writeJsonAtomic(flag, { version: 1, at: new Date().toISOString() })
+  return { safeModeRequested: true }
 }
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/gu, (char) => (
@@ -665,7 +687,7 @@ export function recoveryPage(snapshot) {
     <div class="card">
       <div class="card-head">
         <h3 class="card-title">${icon('shield-check', 18)}Safe Mode</h3>
-        <p class="card-desc">Use a temporary environment without the original plugins, patches or credentials. Leaving Safe Mode removes temporary data and returns to the original Profile.</p>
+        <p class="card-desc">Use a temporary environment without the original plugins, patches, settings or conversations. Only the official DeepSeek API key, if you saved one, is carried over. The temporary data is removed on the next normal startup.</p>
       </div>
       <div class="card-foot"><button class="btn primary" id="safe">${icon('shield-check')}Enter Safe Mode</button></div>
     </div>
@@ -783,7 +805,6 @@ export function recoveryPage(snapshot) {
         <button class="btn" data-edit="settings">${icon('file-pen')}Open settings.yaml</button>
         <button class="btn" data-edit="patch">${icon('file-pen')}Edit Profile patch</button>
         <button class="btn" data-edit="manifest">${icon('file-pen')}Edit plugin manifest</button>
-        <button class="btn" disabled title="Not available in the Docker environment — there is no folder GUI.">${icon('folder-open')}Open Profile folder</button>
       </div>
     </div>
   </section>
@@ -793,7 +814,6 @@ export function recoveryPage(snapshot) {
 <div class="footbar">
   <span class="spacer"><a class="escape" href="/?skipRecovery=1">Open the main page anyway</a></span>
   <button class="btn primary" id="restart">${icon('refresh-cw')}Quit and restart</button>
-  <button class="btn" disabled title="Quit is not available in the Docker environment — the container restart policy owns the process lifecycle.">${icon('power')}Quit</button>
 </div>
 
 <div class="modal-backdrop" id="modal-backdrop">
@@ -979,7 +999,7 @@ export function recoveryPage(snapshot) {
         '<div class="fact"><dt>Configuration files</dt><dd>' + (c.fileCount ?? 0) + '</dd></div>' +
         '<div class="fact"><dt>Checkpoint size</dt><dd>' + fmtSize(c.totalBytes || 0) + '</dd></div></dl>';
       var foot = empty ? '' : '<div class="card-foot top">' +
-        '<button class="btn" disabled title="Not available in the Docker environment — there is no folder GUI.">Browse files</button>' +
+        '<button class="btn destructive" data-remove="' + c.slotId + '">Remove</button>' +
         '<button class="btn primary" data-restore="' + c.slotId + '">Restore this checkpoint</button></div>';
       return '<div class="card"><div class="card-head"><div class="pills" style="justify-content:space-between"><h3 class="card-title">Slot ' + slot + '</h3><span class="badge">' + badge + '</span></div>' +
         '<p class="card-desc">' + when + '</p>' + facts + '</div>' + foot + '</div>';
@@ -992,6 +1012,18 @@ export function recoveryPage(snapshot) {
         ask('Restore this checkpoint?', 'This immediately restores the current Profile plus the checkpointed settings.yaml and Harness-home patch captured at ' + when + '. After restarting, the harness will use the rolled-back configuration.', 'Restore configuration', false, function () {
           run('Restoring ' + slot + '…', post('/__recovery/rollback', { slot: slot }), function () {
             ask('Checkpoint restored', 'Rolled back to ' + slot + '. Restart the harness to use this configuration.', 'Quit and restart', false, function () { post('/__recovery/restart', {}); waitAndReload(); });
+          });
+        });
+      });
+    });
+    wrap.querySelectorAll('button[data-remove]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var slot = b.dataset.remove;
+        var captured = (BOOT.checkpoints || []).find(function (c) { return c.slotId === slot; });
+        var when = captured && captured.capturedAt ? new Date(captured.capturedAt).toLocaleString() : slot;
+        ask('Remove this checkpoint?', 'The checkpoint captured at ' + when + ' is deleted. Its configuration cannot be restored afterwards.', 'Remove checkpoint', true, function () {
+          run('Removing ' + slot + '…', post('/__recovery/checkpoint/remove', { slot: slot }), function () {
+            refreshState(function () {});
           });
         });
       });
@@ -1033,7 +1065,7 @@ export function recoveryPage(snapshot) {
 
   // ---- safe mode ----------------------------------------------------------
   document.getElementById('safe').addEventListener('click', function () {
-    ask('Enter Safe Mode?', 'Restart with a temporary environment? The harness will use a separate temporary profile without reading or changing existing Profiles or data. Leaving Safe Mode restores the original selection on the next restart.', 'Restart in Safe Mode', false, function () {
+    ask('Enter Safe Mode?', 'Restart with a temporary environment? The harness will use a separate temporary data directory: existing Profiles, plugins, settings and conversations are not read or changed. Only the official DeepSeek API key is carried over. The temporary environment is removed on the next restart.', 'Restart in Safe Mode', false, function () {
       run('Preparing Safe Mode…', post('/__recovery/safe', {}).then(function () { return post('/__recovery/restart', {}); }), function () { waitAndReload(); });
     });
   });
@@ -1186,7 +1218,7 @@ export async function handleRecovery(req, res, { log = console.log } = {}) {
         return send(200, { ok: true, ...result }), true
       }
       case 'safe':
-        return send(200, { ok: true, ...selectSafe(env) }), true
+        return send(200, { ok: true, ...requestSafeMode(env) }), true
       case 'restart':
         return send(200, restartSoon()), true
       case 'plugin/disable': {
@@ -1200,6 +1232,10 @@ export async function handleRecovery(req, res, { log = console.log } = {}) {
       case 'plugin/uninstall': {
         const body = await readBody()
         return send(200, { ok: true, ...uninstallPlugin(env, String(body.name ?? '')) }), true
+      }
+      case 'checkpoint/remove': {
+        const body = await readBody()
+        return send(200, { ok: true, ...removeCheckpoint(env, String(body.slot ?? '')) }), true
       }
       case 'rollback': {
         const body = await readBody()
