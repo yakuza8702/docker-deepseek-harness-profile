@@ -1015,7 +1015,7 @@ export function recoveryPage(snapshot) {
 
   // ---- reset & data ------------------------------------------------------
   document.getElementById('factory-reset').addEventListener('click', function () {
-    ask('Factory reset the harness?', 'The following directory will be moved aside:\n\n' + (BOOT.dataDirectory || '') + '\n\nProfiles, plugins, settings, credentials, sessions and workspace records stored there are removed. The harness restarts and creates a clean default Profile.', 'Reset data and restart', true, function () {
+    ask('Factory reset the harness?', 'The following directory will be moved aside:\\n\\n' + (BOOT.dataDirectory || '') + '\\n\\nProfiles, plugins, settings, credentials, sessions and workspace records stored there are removed. The harness restarts and creates a clean default Profile.', 'Reset data and restart', true, function () {
       run('Resetting data…', post('/__recovery/factory-reset', {}), function () { waitAndReload(); });
     });
   });

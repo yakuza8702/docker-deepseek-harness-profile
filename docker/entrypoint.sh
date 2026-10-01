@@ -37,12 +37,33 @@ write_boot_state() {   # write_boot_state <state> <reason> [detail]
     try {
       const full = fs.readFileSync("/tmp/dsh-web.log", "utf8");
       // The whole log is what a user needs to hand to an agent (DSH NEXT shows a
-      // full, copyable report). Keep a generous tail rather than a teaser.
-      const lines = full.split("\n");
+      // full, copyable report). Keep a generous tail rather than a teaser, and
+      // REDACT boot tokens the way DSH NEXT does (?token=****) — the tail is
+      // shown in a browser and exported in the diagnostic archive.
+      const lines = full.split("\n").map((l) => l.replace(/(\?token=)[A-Za-z0-9_-]+/g, "$1****"));
       logTail = lines.slice(-400).join("\n").trim();
     } catch {}
     fs.writeFileSync(file, JSON.stringify({ state, reason: reason || null, detail: detail || null, profile: profile || null, at: new Date().toISOString(), logTail: logTail || null }, null, 2) + "\n");
   ' "$BOOT_STATE_FILE" "$1" "$2" "${3:-}" "${PROFILE:-}"
+}
+# The ready state is written the moment the HTTP listener answers — long before
+# the harness banner (and most of the boot log) lands. Re-record the ready state
+# once the banner appears so the Diagnostics tab and the exported archive carry
+# the REAL boot log, not a single token line. Deliberate exits skip it.
+record_ready_log() {
+  (
+    for _ in $(seq 1 30); do
+      grep -q "DeepSeek Harness is ready" /tmp/dsh-web.log 2>/dev/null && break
+      [[ -f /tmp/dsh-stopping || -f /tmp/dsh-restart-requested ]] && exit 0
+      sleep 1
+    done
+    if grep -qE "warning: [0-9]+ entr(y|ies) did not activate|failed to import" /tmp/dsh-web.log 2>/dev/null; then
+      DEGRADED="$(grep -E "did not activate|failed to import|skipping profile bundle|Error:" /tmp/dsh-web.log 2>/dev/null | head -12 | paste -sd ' | ' - || true)"
+      write_boot_state degraded "the harness started with errors" "${DEGRADED:-see the log tail}"
+    else
+      write_boot_state ready "" ""
+    fi
+  ) &
 }
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
@@ -232,6 +253,10 @@ else
   # that may need rolling back. Failures here must never block the boot.
   node -e 'import("/opt/seek-harness/recovery.mjs").then((m) => { const r = m.captureCheckpoint(process.env); if (r) console.log("[seek-harness] startup checkpoint captured into", r.slot); }).catch(() => {})' || true
 fi
+# Re-record the ready/degraded state with the FULL boot log once the banner
+# lands (see record_ready_log above) — without this the Diagnostics tab shows
+# a single token line for healthy boots.
+record_ready_log
 # Late-death watchdog: if the harness dies AFTER the ready banner (a plugin that
 # crashes on its first request, an OOM), flip the state to failed so the recovery
 # page shows the real reason instead of an empty 502. A deliberate stop writes the
