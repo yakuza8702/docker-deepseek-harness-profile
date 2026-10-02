@@ -273,66 +273,92 @@ seed_browser_mcp_bundle() {
 
   [[ "${DSH_BROWSER_MCP:-1}" == "0" ]] && { log "browser MCP: not selected (DSH_BROWSER_MCP=0) — it stays available in the Plugins page"; return 0; }
 
-  # Where the bundle lives in this image — the profile gets a `link:` dependency on
-  # it (see below).
+  # Where the bundle lives in this image.
   local bundle_link=""
   for root in /opt/dsh /opt/dsh-src; do
     if [[ -d "$root/node_modules/$BROWSER_MCP_BUNDLE" ]]; then bundle_link="link:$root/node_modules/$BROWSER_MCP_BUNDLE"; break; fi
   done
+
+  # THE PROFILE MUST NOT *DEPEND* ON THIS BUNDLE — only SELECT it.
+  #
+  # An earlier image added a `link:` dependency here so the bundle would show up as
+  # a card on the Plugins page (that page lists a bundle only when it is a profile
+  # dependency or a shipped optional bundle). That page now keeps the integrated
+  # bundles out of its list BY NAME (tools/patch-plugin-manager-page.mjs), so the
+  # dependency no longer buys anything — and it costs something: the community
+  # Market's own "Installed" tab lists the profile manifest's `dependencies` and
+  # filters only `@deepseek-ai/dsh-base|dsh-web-app|dsh-headless`
+  # (`INBOX_BUNDLES` in dshmarket/lib/profile.js), so an image-shipped native add-on
+  # showed up there as an installable/uninstallable community plugin. In DSH
+  # Desktop the native add-ons (Remote Control, Computer Use) never appear there.
+  #
+  # Removing it is safe: bundle resolution tries the dsh INSTALLATION anchor before
+  # the profile (resolveBundleDir in @deepseek-ai/dsh-app-boot), and this image
+  # declares the package in the installation's own package.json. Selection — the
+  # half that composes the row — lives in `dsh.profile.bundles` and is untouched.
+  #
+  # Only OUR `link:` into the image is dropped: a user who pinned the package
+  # themselves keeps their pin. Runs BEFORE the DSH_BROWSER_MCP=0 return so a home
+  # that opted out is cleaned up too, and it runs on every boot, so a home seeded by
+  # an earlier image is repaired the first time it starts on this one.
+  if [[ -n "$bundle_link" ]]; then
+    local dropped
+    dropped="$(node -e '
+      const fs = require("fs");
+      const [manifest, name] = process.argv.slice(1);
+      let parsed;
+      try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+      const dependencies = parsed.dependencies;
+      if (dependencies === null || typeof dependencies !== "object" || !Object.hasOwn(dependencies, name)) { process.stdout.write("absent"); process.exit(0); }
+      const spec = dependencies[name];
+      const ours = typeof spec === "string" && spec.startsWith("link:") && spec.replace(/\/+$/, "").endsWith("/node_modules/" + name);
+      if (!ours) { process.stdout.write("foreign"); process.exit(0); }
+      delete dependencies[name];
+      fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+      fs.renameSync(manifest + ".tmp", manifest);
+      process.stdout.write("dropped");
+    ' "$manifest" "$BROWSER_MCP_BUNDLE" 2>/dev/null || true)"
+    case "$dropped" in
+      dropped) log "browser MCP: dropped the profile dependency an earlier image added — the bundle stays selected, and \"$BROWSER_MCP_BUNDLE\" no longer shows up in the Market's Installed list" ;;
+      foreign) log "browser MCP: the profile pins \"$BROWSER_MCP_BUNDLE\" itself ($dropped spec) — left exactly as the user set it" ;;
+    esac
+  fi
+
+  [[ "${DSH_BROWSER_MCP:-1}" == "0" ]] && { log "browser MCP: not selected (DSH_BROWSER_MCP=0) — it stays available in the Plugins page"; return 0; }
+
   [[ -n "$bundle_link" ]] || { log "WARN: $BROWSER_MCP_BUNDLE is not in this image's node_modules — the browser tools will not be offered"; return 0; }
 
   local marker="$DSH_REAL_HOME/.browser-mcp-bundle-seeded"
-  local repair=0
-  [[ -f "$marker" ]] && repair=1
+  local seeded=0
+  [[ -f "$marker" ]] && seeded=1
 
-  # Select the bundle — exactly what the Plugins page's switch writes — AND give
-  # the profile a dependency on it. Both halves matter, for different reasons:
-  #   * `dsh.profile.bundles` is what composes the row (enabled/disabled);
-  #   * the DEPENDENCY is what makes the bundle visible on the Plugins page at
-  #     all: that page lists `installed || optional` bundles (installed = a profile
-  #     dependency; optional = one of the shipped optional bundles), so an
-  #     installation-provided bundle with neither is silently filtered out —
-  #     measured, and the reason this feature "did not show up in the sidebar".
-  # On a home seeded by an earlier image (marker present, dependency missing) the
-  # dependency is repaired; the SELECTION is never re-applied, so a bundle the user
-  # switched off stays off.
+  # Select the bundle — exactly what the Plugins page's switch writes. `dsh.profile
+  # .bundles` is the ONLY half that matters: it is what composes the MCP row. On a
+  # home an earlier image already seeded the selection is never re-applied, so a
+  # bundle the user switched off stays off.
   local how
   how="$(node -e '
     const fs = require("fs");
-    const [manifest, name, link, repairOnly] = process.argv.slice(1);
+    const [manifest, name, seeded] = process.argv.slice(1);
     let parsed;
     try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
     const profile = parsed?.dsh?.profile;
     if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
     const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
-    const dependencies = parsed.dependencies !== null && typeof parsed.dependencies === "object" ? parsed.dependencies : {};
-    const selected = bundles.includes(name);
-    const linked = Object.hasOwn(dependencies, name);
-    if (repairOnly === "1" && linked) { process.stdout.write("nothing-to-repair"); process.exit(0); }
-    if (repairOnly === "1" && !linked) {
-      parsed.dependencies = { ...dependencies, [name]: link };
-      fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
-      fs.renameSync(manifest + ".tmp", manifest);
-      process.stdout.write("dependency-repaired");
-      process.exit(0);
-    }
-    if (selected && linked) { process.stdout.write("already-selected"); process.exit(0); }
-    parsed.dependencies = linked ? dependencies : { ...dependencies, [name]: link };
-    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: selected ? bundles : [...bundles, name] } };
+    if (seeded === "1") { process.stdout.write("existing-home"); process.exit(0); }
+    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
     fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
     fs.renameSync(manifest + ".tmp", manifest);
     process.stdout.write("selected");
-  ' "$manifest" "$BROWSER_MCP_BUNDLE" "$bundle_link" "$repair" 2>/dev/null || true)"
+  ' "$manifest" "$BROWSER_MCP_BUNDLE" "$seeded" 2>/dev/null || true)"
 
   case "$how" in
     selected|already-selected)
       printf '%s\n' "$how" > "$marker" 2>/dev/null || true
       log "browser MCP: \"$BROWSER_MCP_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page when you do not want the browser tools"
       ;;
-    dependency-repaired)
-      log "browser MCP: added the profile dependency an earlier image left out — \"$BROWSER_MCP_BUNDLE\" now appears in the Plugins page (its selection is untouched)"
-      ;;
-    nothing-to-repair)
+    existing-home)
       ;;
     unreadable|no-profile-block)
       log "WARN: could not select \"$BROWSER_MCP_BUNDLE\" ($how) — enable it by hand in the Plugins page"
