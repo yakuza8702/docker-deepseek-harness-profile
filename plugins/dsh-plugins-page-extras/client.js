@@ -78,13 +78,16 @@ window.__ModuleLoader__.load({
       tertiary: 'var(--dsw-alias-label-tertiary, #8b949e)',
       caption: 'var(--dsw-alias-label-caption, #8b949e)',
       error: 'var(--dsw-alias-state-error-primary, #f28b82)',
-      success: 'var(--dsw-alias-state-success-primary, #2ea043)',
       line: 'var(--dsw-alias-border-l3, rgba(255,255,255,.14))',
       hover: 'var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.06))',
       radiusSm: 'var(--dsw-radius-sm, 6px)',
       radiusMd: 'var(--dsw-radius-md, 8px)',
       radiusLg: 'var(--dsw-radius-lg, 10px)',
-      radiusXl: 'var(--dsw-radius-xl, 14px)'
+      radiusXl: 'var(--dsw-radius-xl, 14px)',
+      /* The page's own switch tokens — theme-aware, so light mode works too. */
+      switchOff: 'var(--dsw-alias-border-l3, rgba(0,0,0,.2))',
+      switchOn: 'var(--dsw-alias-brand-primary, #2b7fff)',
+      knob: 'var(--dsw-alias-label-primary-foreground, #fff)'
     }
 
     const S = {
@@ -131,22 +134,25 @@ window.__ModuleLoader__.load({
       hint: { fontSize: 12, lineHeight: '18px', color: T.caption }
     }
 
-    /* The page's switch: a compact pill, sized like the official cards' controls. */
+    /*
+     * The page's own Switch, mirrored: 36x20 capsule, 2px padding, thumb
+     * translated 16px when on. Same tokens as @deepseek-ai/dsh-client-ui-primitives,
+     * which a third-party client bundle cannot import.
+     */
     const Toggle = ({ on, onToggle, label, disabled }) => React.createElement('button', {
       type: 'button', role: 'switch', 'aria-checked': on ? 'true' : 'false', 'aria-label': label,
       disabled, title: label,
       style: {
-        position: 'relative', flex: 'none', width: 34, height: 20, padding: 0, border: 0,
-        borderRadius: 999, cursor: disabled ? 'default' : 'pointer', boxSizing: 'border-box',
-        opacity: disabled ? 0.5 : 1,
-        background: on ? T.success : 'var(--dsw-alias-bg-layer-3, rgba(255,255,255,.18))',
-        transition: 'background 140ms ease'
+        boxSizing: 'border-box', position: 'relative', flex: '0 0 auto', width: 36, height: 20,
+        padding: 2, border: 0, borderRadius: 999, opacity: disabled ? 0.5 : 1,
+        background: on ? T.switchOn : T.switchOff,
+        cursor: disabled ? 'default' : 'pointer'
       },
       onClick: () => onToggle(!on)
     }, React.createElement('span', {
       style: {
-        position: 'absolute', top: 2, left: on ? 16 : 2, width: 16, height: 16, borderRadius: '50%',
-        background: '#fff', transition: 'left 140ms ease'
+        display: 'block', width: 16, height: 16, borderRadius: '50%', background: T.knob,
+        transform: on ? 'translateX(16px)' : 'none', transition: 'transform 120ms ease'
       }
     }))
 
@@ -171,7 +177,9 @@ window.__ModuleLoader__.load({
     function Extras() {
       const [bundles, setBundles] = useState(null)
       const [busy, setBusy] = useState(null)
+      /* `{ text, tone }`: informational lines must not wear the error colour. */
       const [message, setMessage] = useState(null)
+      const say = useCallback((text, tone = 'info') => setMessage({ text, tone }), [])
       const [selected, setSelected] = useState('dsh-market')
 
       const state = (name) => bundles?.find((entry) => entry.name === name) ?? null
@@ -190,7 +198,7 @@ window.__ModuleLoader__.load({
           const payload = await call('state')
           setBundles(payload.bundles ?? [])
         } catch (error) {
-          setMessage(String(error?.message ?? error))
+          say(String(error?.message ?? error), 'error')
         }
       }, [call])
 
@@ -200,9 +208,9 @@ window.__ModuleLoader__.load({
         setBusy(name); setMessage(null)
         try {
           await call('bundle', { name, enabled })
-          setMessage(`${name} ${enabled ? 'enabled' : 'disabled'}.`)
+          say(`${name} ${enabled ? 'enabled' : 'disabled'}.`)
         } catch (error) {
-          setMessage(String(error?.message ?? error))
+          say(String(error?.message ?? error), 'error')
         } finally {
           setBusy(null)
           void refresh()
@@ -212,18 +220,18 @@ window.__ModuleLoader__.load({
       const enableMarket = useCallback(async (market) => {
         setSelected(market.id)
         if (market.installable !== true) {
-          setMessage(market.note)
+          say(market.note)
           return
         }
         setBusy(market.name)
-        setMessage(state(market.name)?.installed === true ? null : `Installing ${market.spec}\u2026`)
+        if (state(market.name)?.installed !== true) say(`Installing ${market.spec}\u2026`)
         try {
           const payload = await call('market', { id: market.id })
-          setMessage(payload.installed === true
+          say(payload.installed === true
             ? `${market.title} installed and enabled \u2014 it loads on the next restart.`
             : `${market.title} is on.`)
         } catch (error) {
-          setMessage(String(error?.message ?? error))
+          say(String(error?.message ?? error), 'error')
         } finally {
           setBusy(null)
           void refresh()
@@ -276,8 +284,8 @@ window.__ModuleLoader__.load({
                 }
                 setBusy('market-off'); setMessage(null)
                 void call('market-off')
-                  .then(() => setMessage('Plugin market off.'))
-                  .catch((error) => setMessage(String(error?.message ?? error)))
+                  .then(() => say('Plugin market off.'))
+                  .catch((error) => say(String(error?.message ?? error), 'error'))
                   .finally(() => { setBusy(null); void refresh() })
               }
             })
@@ -309,8 +317,12 @@ window.__ModuleLoader__.load({
         ),
 
         message !== null && React.createElement('p', {
-          style: { margin: 0, fontSize: 12, lineHeight: '18px', color: T.error }
-        }, message)
+          role: message.tone === 'error' ? 'alert' : 'status',
+          style: {
+            margin: 0, fontSize: 12, lineHeight: '18px',
+            color: message.tone === 'error' ? T.error : T.caption
+          }
+        }, message.text)
       )
     }
 
