@@ -91,6 +91,15 @@ window.__ModuleLoader__.load({
     }
 
     const S = {
+      /*
+       * The page's own column, repeated here: `.page > *` sets `width:100%` and
+       * `max-width:960px`, but the slot renderer wraps every registered entry in a
+       * `display:contents` element, which generates no box — so those two
+       * declarations are dropped and a block that does not repeat them stretches
+       * to the full page width instead of lining up with the Official group.
+       * `.page` centres its items, so the 960px column lands on the same gutter.
+       */
+      root: { display: 'flex', flexDirection: 'column', gap: 24, width: '100%', maxWidth: 960, boxSizing: 'border-box' },
       /* One group of the page: the same 8px rhythm as `.group`. */
       group: { display: 'flex', flexDirection: 'column', gap: 8, width: '100%' },
       /* Heading + explanation on the left, the master control on the right. */
@@ -112,7 +121,7 @@ window.__ModuleLoader__.load({
         fontSize: 10, lineHeight: '16px', padding: '0 6px', borderRadius: 999, fontWeight: 500,
         border: `0.5px solid ${T.line}`, color: T.caption
       },
-      link: { color: 'inherit', textDecoration: 'none', borderBottom: `1px solid ${T.line}` },
+      link: { color: 'inherit', textDecoration: 'none' },
 
       /* A package-shaped row: `.cardHead` of the official cards, verbatim metrics. */
       row: { display: 'flex', alignItems: 'center', gap: 14, padding: 8, margin: '0 -8px', borderRadius: T.radiusXl },
@@ -265,7 +274,7 @@ window.__ModuleLoader__.load({
 
       return React.createElement('div', {
         'data-plugin-section': 'plugins-page-extras',
-        style: { display: 'flex', flexDirection: 'column', gap: 24, width: '100%', marginBottom: 4 }
+        style: S.root
       },
         /* ---- Plugin market: first, exactly like Desktop -------------------- */
         React.createElement('section', { style: S.group, 'data-extra-section': 'market' },
