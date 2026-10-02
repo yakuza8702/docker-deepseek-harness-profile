@@ -96,34 +96,49 @@ window.__ModuleLoader__.load({
       return !dirty || window.confirm(messages.discard)
     }
 
-    function WorkspaceButton({ wide }) {
+    /**
+     * The sidebar entry: an ICON ONLY control at the trailing edge of the Settings
+     * row, through the `sidebar.footer.trailing` slot this image adds — see
+     * tools/patch-sidebar-footer.mjs, which also supplies its styling.
+     *
+     * Icon-only on purpose. It is the same 36x36 box, the same radius token and the
+     * same theme variables as the profile control beside it, and its glyph is drawn
+     * on the same 16x16 grid at the same 1.5 stroke, so the row reads as one set of
+     * controls. The name lives in `title`/`aria-label`; a text label in that row
+     * would push the Settings label aside for a button that only opens a panel.
+     *
+     * `data-dsh-sidebar-glyph` is the styling contract: the patched stylesheet
+     * carries the size, the radius, the hover/active/focus states, and in the
+     * collapsed rail it selects this icon's place in the column.
+     */
+    function WorkspaceGlyph() {
       return React.createElement(
         'button',
         {
           type: 'button',
           title: messages.open,
           'aria-label': messages.open,
-          onClick: () => updateOverlayState({ opened: true }),
-          style: {
-            boxSizing: 'border-box',
-            width: wide ? '100%' : '36px',
-            height: '36px',
-            margin: '2px 0',
-            padding: wide ? '0 12px' : '0',
-            border: 0,
-            borderRadius: '10px',
-            background: 'transparent',
-            color: 'var(--dsw-alias-label-primary)',
-            cursor: 'pointer',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: wide ? 'flex-start' : 'center',
-            gap: '9px',
-            fontSize: '14px'
-          }
+          'data-dsh-sidebar-glyph': 'folder',
+          onClick: () => updateOverlayState({ opened: true })
         },
-        React.createElement('span', { style: { fontSize: '18px', lineHeight: 1 } }, '📁'),
-        wide ? React.createElement('span', null, messages.files) : null
+        React.createElement(
+          'svg',
+          {
+            'aria-hidden': 'true',
+            focusable: 'false',
+            width: '18',
+            height: '18',
+            viewBox: '0 0 16 16',
+            fill: 'none',
+            stroke: 'currentColor',
+            strokeWidth: '1.5',
+            strokeLinecap: 'round',
+            strokeLinejoin: 'round'
+          },
+          React.createElement('path', {
+            d: 'M2 5.1A1.1 1.1 0 0 1 3.1 4h2.6l1.4 1.6h5.8A1.1 1.1 0 0 1 14 6.7v4.9A1.1 1.1 0 0 1 12.9 12.7H3.1A1.1 1.1 0 0 1 2 11.6Z'
+          })
+        )
       )
     }
 
@@ -753,12 +768,16 @@ window.__ModuleLoader__.load({
     const inject = ['slots']
 
     function apply(ctx) {
-      ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
-        name: 'sidebar.footer.action',
+      // At the trailing edge of the Settings row (`order` 10: the folder sits left of
+      // the browser glyph), not in `sidebar.footer.action` — that area belongs to
+      // whatever panel registers there, and a footer action would sit above Settings
+      // in a row of its own instead of beside it.
+      ctx.slots.inject('sidebar.footer.trailing', () => ctx.slots.register({
+        name: 'sidebar.footer.trailing',
         id: 'workspace-browser',
-        order: 40,
+        order: 10,
         label: messages.files
-      }, WorkspaceButton))
+      }, WorkspaceGlyph))
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay',

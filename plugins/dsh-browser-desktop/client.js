@@ -115,34 +115,50 @@ window.__ModuleLoader__.load({
       return target.toString()
     }
 
-    function BrowserButton({ wide }) {
+    /**
+     * The sidebar entry: an ICON ONLY control at the trailing edge of the Settings
+     * row, through the `sidebar.footer.trailing` slot this image adds — see
+     * tools/patch-sidebar-footer.mjs, which also supplies its styling.
+     *
+     * Icon-only on purpose. It is the same 36x36 box, the same radius token and the
+     * same theme variables as the profile control beside it, and its glyph is drawn
+     * on the same 16x16 grid at the same 1.5 stroke, so the row reads as one set of
+     * controls. The name lives in `title`/`aria-label`; a text label in that row
+     * would push the Settings label aside for a button that only opens a panel.
+     *
+     * `data-dsh-sidebar-glyph` is the styling contract: the patched stylesheet
+     * carries the size, the radius, the hover/active/focus states, and in the
+     * collapsed rail it selects this icon's place in the column.
+     */
+    function BrowserGlyph() {
       return React.createElement(
         'button',
         {
           type: 'button',
-          title: messages.openTitle,
-          'aria-label': messages.openTitle,
-          onClick: () => setOpened(true),
-          style: {
-            boxSizing: 'border-box',
-            width: wide ? '100%' : '36px',
-            height: '36px',
-            margin: wide ? '2px 0' : '2px 0',
-            padding: wide ? '0 12px' : '0',
-            border: '0',
-            borderRadius: '10px',
-            background: 'transparent',
-            color: 'var(--dsw-alias-label-primary)',
-            cursor: 'pointer',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: wide ? 'flex-start' : 'center',
-            gap: '9px',
-            fontSize: '14px'
-          }
+          title: messages.browser,
+          'aria-label': messages.browser,
+          'data-dsh-sidebar-glyph': 'browser',
+          onClick: () => setOpened(true)
         },
-        React.createElement('span', { style: { fontSize: '18px', lineHeight: 1 } }, '🌐'),
-        wide ? React.createElement('span', null, messages.browser) : null
+        React.createElement(
+          'svg',
+          {
+            'aria-hidden': 'true',
+            focusable: 'false',
+            width: '18',
+            height: '18',
+            viewBox: '0 0 16 16',
+            fill: 'none',
+            stroke: 'currentColor',
+            strokeWidth: '1.5',
+            strokeLinecap: 'round',
+            strokeLinejoin: 'round'
+          },
+          React.createElement('circle', { cx: '8', cy: '8', r: '5.8' }),
+          React.createElement('path', { d: 'M2.2 8h11.6' }),
+          React.createElement('path', { d: 'M8 2.2c1.75 2.05 1.75 9.55 0 11.6' }),
+          React.createElement('path', { d: 'M8 2.2c-1.75 2.05-1.75 9.55 0 11.6' })
+        )
       )
     }
 
@@ -432,12 +448,16 @@ window.__ModuleLoader__.load({
     const inject = ['slots']
 
     function apply(ctx) {
-      ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
-        name: 'sidebar.footer.action',
+      // At the END of the Settings row (`order` 20: after the file browser's folder
+      // glyph), not in `sidebar.footer.action` — that area belongs to whatever
+      // panel registers there, and a footer action would sit above Settings in a
+      // row of its own instead of beside it.
+      ctx.slots.inject('sidebar.footer.trailing', () => ctx.slots.register({
+        name: 'sidebar.footer.trailing',
         id: 'browser-desktop',
-        order: 50,
+        order: 20,
         label: messages.browser
-      }, BrowserButton))
+      }, BrowserGlyph))
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay',

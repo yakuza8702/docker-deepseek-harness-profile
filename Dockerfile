@@ -335,6 +335,19 @@ COPY tools/patch-plugin-manager-page.mjs /tmp/patch-plugin-manager-page.mjs
 RUN node /tmp/patch-plugin-manager-page.mjs /opt/dsh/node_modules /opt/dsh-src/node_modules \
  && rm -f /tmp/patch-plugin-manager-page.mjs
 
+# Give the sidebar's Settings row a trailing LIST slot, so the file browser and
+# browser-desktop controls can sit BESIDE Settings at the far right instead of in
+# the footer action area — which belongs to whatever panel registers there (the
+# provider-usage panel), and where they used to overlap it and each other in the
+# collapsed rail. The shipped `sidebar.settings` slot is `kind: "single"`, so
+# there is no second seat to use. The step also appends the glyph and rail layout
+# rules to the package's own stylesheet, resolved from that file's own class map,
+# and FAILS THE BUILD if upstream moves an anchor. See
+# tools/patch-sidebar-footer.mjs and plugins/dsh-browser-desktop/README.md.
+COPY tools/patch-sidebar-footer.mjs /tmp/patch-sidebar-footer.mjs
+RUN node /tmp/patch-sidebar-footer.mjs /opt/dsh/node_modules /opt/dsh-src/node_modules \
+ && rm -f /tmp/patch-sidebar-footer.mjs
+
 # Browser launcher. The container drops every capability and sets
 # no-new-privileges, so Brave's setuid/user-namespace sandbox cannot initialise
 # and the browser would refuse to start. Keep the exception scoped to the
