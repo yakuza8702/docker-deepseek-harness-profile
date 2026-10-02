@@ -503,13 +503,17 @@ fi
 # already in the profile's own manifest — backs the lockfile up first, and never
 # blocks the boot. DSH_LOCKFILE_REPAIR=0 switches it off; =dry reports only.
 # ---------------------------------------------------------------------
-case "${DSH_LOCKFILE_REPAIR:-1}" in
+# `set -u` is on for this whole script, so every read of the switch goes through
+# the :-default form — an unset DSH_LOCKFILE_REPAIR must mean "on", not a fatal
+# "unbound variable" in the boot path (it did exactly that on the first ship).
+guard_mode="${DSH_LOCKFILE_REPAIR:-1}"
+case "$guard_mode" in
   0 | off | false)
-    log "lockfile integrity guard: disabled (DSH_LOCKFILE_REPAIR=${DSH_LOCKFILE_REPAIR:-1})"
+    log "lockfile integrity guard: disabled (DSH_LOCKFILE_REPAIR=$guard_mode)"
     ;;
   *)
     guard_args=(--home "$HARNESS_HOME")
-    [[ "${DSH_LOCKFILE_REPAIR}" == "dry" ]] && guard_args+=(--dry-run)
+    if [[ "$guard_mode" == "dry" ]]; then guard_args+=(--dry-run); fi
     node /opt/seek-harness/lockfile-integrity.mjs "${guard_args[@]}" \
       || log "lockfile integrity guard: see the message above — the boot continues"
     ;;
