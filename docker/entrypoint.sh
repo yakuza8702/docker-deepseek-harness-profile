@@ -273,30 +273,66 @@ seed_browser_mcp_bundle() {
 
   [[ "${DSH_BROWSER_MCP:-1}" == "0" ]] && { log "browser MCP: not selected (DSH_BROWSER_MCP=0) — it stays available in the Plugins page"; return 0; }
 
-  local marker="$DSH_REAL_HOME/.browser-mcp-bundle-seeded"
-  [[ -f "$marker" ]] && return 0
+  # Where the bundle lives in this image — the profile gets a `link:` dependency on
+  # it (see below).
+  local bundle_link=""
+  for root in /opt/dsh /opt/dsh-src; do
+    if [[ -d "$root/node_modules/$BROWSER_MCP_BUNDLE" ]]; then bundle_link="link:$root/node_modules/$BROWSER_MCP_BUNDLE"; break; fi
+  done
+  [[ -n "$bundle_link" ]] || { log "WARN: $BROWSER_MCP_BUNDLE is not in this image's node_modules — the browser tools will not be offered"; return 0; }
 
-  # Select the bundle — exactly what the Plugins page's switch writes.
+  local marker="$DSH_REAL_HOME/.browser-mcp-bundle-seeded"
+  local repair=0
+  [[ -f "$marker" ]] && repair=1
+
+  # Select the bundle — exactly what the Plugins page's switch writes — AND give
+  # the profile a dependency on it. Both halves matter, for different reasons:
+  #   * `dsh.profile.bundles` is what composes the row (enabled/disabled);
+  #   * the DEPENDENCY is what makes the bundle visible on the Plugins page at
+  #     all: that page lists `installed || optional` bundles (installed = a profile
+  #     dependency; optional = one of the shipped optional bundles), so an
+  #     installation-provided bundle with neither is silently filtered out —
+  #     measured, and the reason this feature "did not show up in the sidebar".
+  # On a home seeded by an earlier image (marker present, dependency missing) the
+  # dependency is repaired; the SELECTION is never re-applied, so a bundle the user
+  # switched off stays off.
   local how
   how="$(node -e '
     const fs = require("fs");
-    const [manifest, name] = process.argv.slice(1);
+    const [manifest, name, link, repairOnly] = process.argv.slice(1);
     let parsed;
     try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
     const profile = parsed?.dsh?.profile;
     if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
     const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
-    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
-    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
+    const dependencies = parsed.dependencies !== null && typeof parsed.dependencies === "object" ? parsed.dependencies : {};
+    const selected = bundles.includes(name);
+    const linked = Object.hasOwn(dependencies, name);
+    if (repairOnly === "1" && linked) { process.stdout.write("nothing-to-repair"); process.exit(0); }
+    if (repairOnly === "1" && !linked) {
+      parsed.dependencies = { ...dependencies, [name]: link };
+      fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+      fs.renameSync(manifest + ".tmp", manifest);
+      process.stdout.write("dependency-repaired");
+      process.exit(0);
+    }
+    if (selected && linked) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dependencies = linked ? dependencies : { ...dependencies, [name]: link };
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: selected ? bundles : [...bundles, name] } };
     fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
     fs.renameSync(manifest + ".tmp", manifest);
     process.stdout.write("selected");
-  ' "$manifest" "$BROWSER_MCP_BUNDLE" 2>/dev/null || true)"
+  ' "$manifest" "$BROWSER_MCP_BUNDLE" "$bundle_link" "$repair" 2>/dev/null || true)"
 
   case "$how" in
     selected|already-selected)
       printf '%s\n' "$how" > "$marker" 2>/dev/null || true
       log "browser MCP: \"$BROWSER_MCP_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page when you do not want the browser tools"
+      ;;
+    dependency-repaired)
+      log "browser MCP: added the profile dependency an earlier image left out — \"$BROWSER_MCP_BUNDLE\" now appears in the Plugins page (its selection is untouched)"
+      ;;
+    nothing-to-repair)
       ;;
     unreadable|no-profile-block)
       log "WARN: could not select \"$BROWSER_MCP_BUNDLE\" ($how) — enable it by hand in the Plugins page"
