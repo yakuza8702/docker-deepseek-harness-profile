@@ -1,0 +1,28 @@
+{
+  "name": "dsh-plugins-page-extras",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Two sections at the top of the Plugins page, above the official group: the container's integrated browser tooling (switch + desktop panel) and a plugin-market selector where only one market can be on at a time.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "files": [
+    "client.js",
+    "index.js",
+    "README.md"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  }
+}

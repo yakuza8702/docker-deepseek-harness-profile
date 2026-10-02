@@ -75,6 +75,38 @@ Switches:
 | `DSH_DESKTOP_WIDTH` / `DSH_DESKTOP_HEIGHT` | `1440` / `900` | virtual display size |
 | `DSH_DESKTOP_START_URL` | `about:blank` | first page the browser opens |
 
+## The top of the Plugins page — integrated feature + market selector
+
+Two sections render **above the "Official" group**, arranged the way DSH Desktop
+arranges its own features there (`dsh-plugins-page-extras`):
+
+```
+Integrated            Shipped with this container
+  Browser tools                                [Open panel]  (on)
+Plugin market         Only one can be enabled at a time            (on)
+  ┌ dsh-community-market  Beta ┐   ┌ dsh-market ┐
+  └───────────────────────────┘   └────────────┘
+Official 8
+```
+
+* **Integrated → Browser tools** — the `dsh-browser-mcp` bundle with its switch and
+  an **Open panel** button (the noVNC desktop), the same shape as Desktop's
+  "Remote Control" row. The switch writes the same state the "Installed" card
+  shows, because both go through the plugin manager's `selectBundle`.
+* **Plugin market** — a master switch plus one card per market, only one of which
+  can be on at a time; mirrors Desktop's `MARKET_OPTIONS` and links the same
+  repositories. `dsh-market` (npm `dshmarket`) is fully wired — the card installs
+  it into the profile (pnpm) and enables it. `dsh-community-market` is listed with
+  its Desktop provenance, but its card explains rather than pretends: npm carries
+  only a 719-byte reserved-name stub, the real package being a Desktop-only
+  TypeScript workspace that is not published.
+
+The upstream page offers **no extension point above its groups** (you can only
+contribute a card INTO "Official"), so `tools/patch-plugin-manager-page.mjs` adds
+the `plugins.page.top` slot to `@deepseek-ai/dsh-client-ui-plugin-manager` at image
+build time — content-anchored, idempotent, and it **fails the build** if upstream
+moves either anchor. Desktop patches the same package for the same reason.
+
 ## Browser tools as a switchable plugin
 
 The model-facing browser tools are **one plugin you switch on and off** — on the

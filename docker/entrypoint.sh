@@ -514,6 +514,14 @@ if [[ -n "$WORKSPACE_OVERLAY" && -f "$WORKSPACE_OVERLAY" ]]; then
   overlay_args+=(--patch "$WORKSPACE_OVERLAY")
   log "overlay: $WORKSPACE_OVERLAY"
 fi
+# Plugins-page extras: the integrated browser tooling and the plugin-market
+# selector, rendered above the official group (the page gets a slot for them from
+# tools/patch-plugin-manager-page.mjs at image-build time).
+PAGE_EXTRAS_OVERLAY="${DSH_PLUGINS_PAGE_OVERLAY-/opt/seek-harness/plugins-page.overlay.yml}"
+if [[ -n "$PAGE_EXTRAS_OVERLAY" && -f "$PAGE_EXTRAS_OVERLAY" ]]; then
+  overlay_args+=(--patch "$PAGE_EXTRAS_OVERLAY")
+  log "overlay: $PAGE_EXTRAS_OVERLAY"
+fi
 
 # ---------------------------------------------------------------------
 # Browser Use + the visible desktop (this fork).

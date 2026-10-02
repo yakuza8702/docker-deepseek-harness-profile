@@ -315,6 +315,15 @@ COPY tools/check-recovery-page.mjs /tmp/check-recovery-page.mjs
 RUN node /tmp/check-recovery-page.mjs /opt/seek-harness/recovery.mjs \
  && rm -f /tmp/check-recovery-page.mjs
 
+# Give the Plugins page a slot ABOVE its groups, so this image can put its
+# integrated feature and the market selector there the way DSH Desktop does (see
+# plugins/dsh-plugins-page-extras/README.md). Desktop patches the same package for
+# the same reason; here it is content-anchored, idempotent and FAILS THE BUILD if
+# upstream moves either anchor.
+COPY tools/patch-plugin-manager-page.mjs /tmp/patch-plugin-manager-page.mjs
+RUN node /tmp/patch-plugin-manager-page.mjs /opt/dsh/node_modules /opt/dsh-src/node_modules \
+ && rm -f /tmp/patch-plugin-manager-page.mjs
+
 # Browser launcher. The container drops every capability and sets
 # no-new-privileges, so Brave's setuid/user-namespace sandbox cannot initialise
 # and the browser would refuse to start. Keep the exception scoped to the
@@ -343,6 +352,7 @@ COPY plugins/dsh-profile-switcher /opt/dsh-profile-switcher
 COPY plugins/dsh-browser-desktop /opt/dsh-browser-desktop
 COPY plugins/dsh-workspace-browser /opt/dsh-workspace-browser
 COPY plugins/dsh-browser-mcp /opt/dsh-browser-mcp
+COPY plugins/dsh-plugins-page-extras /opt/dsh-plugins-page-extras
 RUN set -eux; \
     installed=0; \
     for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
@@ -351,14 +361,15 @@ RUN set -eux; \
         cp -a /opt/dsh-browser-desktop "$target/dsh-browser-desktop"; \
         cp -a /opt/dsh-workspace-browser "$target/dsh-workspace-browser"; \
         cp -a /opt/dsh-browser-mcp "$target/dsh-browser-mcp"; \
+        cp -a /opt/dsh-plugins-page-extras "$target/dsh-plugins-page-extras"; \
         installed=1; \
       fi; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
-    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp; \
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-plugins-page-extras; \
     chmod -R a+rX \
-      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp \
-      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp 2>/dev/null || true
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-plugins-page-extras \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras 2>/dev/null || true
 # The workspace plugin's own suite, kept in the image so the ported host logic can
 # be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
 
@@ -380,11 +391,12 @@ RUN set -eux; \
       anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
       [ -d "$root/dsh-browser-desktop" ] || continue; \
-      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-plugins-page-extras", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
 COPY --chmod=0644 docker/workspace-browser.overlay.yml /opt/seek-harness/workspace-browser.overlay.yml
+COPY --chmod=0644 docker/plugins-page.overlay.yml /opt/seek-harness/plugins-page.overlay.yml
 
 # The browser tooling as ONE switchable MCP row. The fragment is what the
 # entrypoint splices into a profile's own patch layer (the layer the Plugin
