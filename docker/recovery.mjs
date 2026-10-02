@@ -1179,7 +1179,15 @@ export function recoveryPage(snapshot) {
 
   // ---- reset & data ------------------------------------------------------
   document.getElementById('factory-reset').addEventListener('click', function () {
-    ask('Factory reset the harness?', 'Everything inside this directory will be DELETED:\n\n' + (BOOT.dataDirectory || '') + '\n\nRemoved: conversations, other Profiles, settings, plugin installs, the browser profile, logs and caches.\nKept: .credentials.yaml (so the harness can still reach a model), the shipped web Profile, and a checkpoint captured first — the Rollback tab can restore settings and Profiles from it.\n\nThe harness restarts and creates a clean default Profile. Files outside this directory are kept.', 'Reset data and restart', true, function () {
+    // Two traps live here, both fatal to the WHOLE page because this script is
+    // one inline block: (a) a backtick anywhere in this region ends the template
+    // literal the page is built from; (b) an escape meant for this client-side
+    // string must be double-escaped (write two backslashes + n, never one), or
+    // the template literal consumes it and the served page gets a RAW newline
+    // inside a single-quoted string - a SyntaxError that kills every button.
+    // tools/check-recovery-page.mjs parses the emitted script and fails the
+    // build if either happens again.
+    ask('Factory reset the harness?', 'Everything inside this directory will be DELETED:\\n\\n' + (BOOT.dataDirectory || '') + '\\n\\nRemoved: conversations, other Profiles, settings, plugin installs, the browser profile, logs and caches.\\nKept: .credentials.yaml (so the harness can still reach a model), the shipped web Profile, and a checkpoint captured first — the Rollback tab can restore settings and Profiles from it.\\n\\nThe harness restarts and creates a clean default Profile. Files outside this directory are kept.', 'Reset data and restart', true, function () {
       run('Resetting data…', post('/__recovery/factory-reset', {}), function () { waitAndReload(); });
     });
   });

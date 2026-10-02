@@ -301,6 +301,20 @@ COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs /opt/seek-harness
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
  && ln -sfn /opt/seek-harness/entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# Gate the recovery page's inline JavaScript BEFORE it can ship.
+#
+# The page is emitted from a template literal, so one mistake in it (an escape
+# that is not double-escaped, or a stray backtick) is not cosmetic: the served
+# page carries a SyntaxError in its single inline script, no listener is attached,
+# and EVERY button on the surface a user needs when the harness is down stops
+# working. That regression shipped on 2026-10-02 and this build step makes the
+# class unshippable: it renders the page in every boot state, parses what the
+# browser would receive, and fails the build on a syntax error or a control that
+# lost its wiring.
+COPY tools/check-recovery-page.mjs /tmp/check-recovery-page.mjs
+RUN node /tmp/check-recovery-page.mjs /opt/seek-harness/recovery.mjs \
+ && rm -f /tmp/check-recovery-page.mjs
+
 # Browser launcher. The container drops every capability and sets
 # no-new-privileges, so Brave's setuid/user-namespace sandbox cannot initialise
 # and the browser would refuse to start. Keep the exception scoped to the
