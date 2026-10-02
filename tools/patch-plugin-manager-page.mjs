@@ -18,9 +18,17 @@
  *
  * `dsh-plugins-page-extras` then registers the component that fills it.
  *
- * Exactly two anchors, both asserted present and unique; the patch is idempotent
- * and FAILS THE BUILD if upstream moves either one — an upstream refactor must
- * never silently drop the section (same philosophy as
+ * It also adds this installation's INTEGRATED bundles to the page's own
+ * `BUILTIN_PROFILE_BUNDLES` set, so a feature that has moved into the top section
+ * stops having a card of its own underneath: a bundle is listed only when it is a
+ * profile dependency or a shipped optional bundle, and the page already excludes
+ * the names in that set. Without this the same feature appears twice — as the
+ * top row and again under "Installed" — which is not the layout of the Desktop
+ * page this mirrors.
+ *
+ * Every anchor is asserted present and unique; the patch is idempotent and FAILS
+ * THE BUILD if upstream moves one — an upstream refactor must never silently drop
+ * the section or resurrect the duplicate card (same philosophy as
  * tools/patch-browser-use-exclusivity.mjs).
  *
  * Usage: node tools/patch-plugin-manager-page.mjs <node_modules-root> [...]
@@ -47,6 +55,18 @@ const ANCHOR_DECL = /([ \t]*)"plugins\.item": \{\s*\n\s*kind: "list",\s*\n\s*sco
 const ANCHOR_RENDER = 'renderGroup("official", t("officialTitle"), officialCards)';
 const REPLACE_RENDER = `renderSlot("${MARKER}", {}), ${ANCHOR_RENDER}`;
 
+// 3. The page's own exclusion list: names that stay out of it even when the
+//    profile declares them as dependencies.
+const ANCHOR_BUILTIN = /const BUILTIN_PROFILE_BUNDLES = new Set\(\[([\s\S]*?)\]\)/u;
+
+/**
+ * The bundles this installation surfaces in the top section instead of as cards:
+ * the browser tooling (plugins/dsh-browser-mcp) and the market the market
+ * selector installs. Both keep their own switch up there, so nothing becomes
+ * uncontrollable — they simply stop being listed twice.
+ */
+const INTEGRATED_BUNDLES = ["dsh-browser-mcp", "dshmarket"];
+
 /** Occurrences of a literal, counted without regex escaping. */
 const count = (text, needle) => text.split(needle).length - 1;
 /** Occurrences of a pattern. */
@@ -69,29 +89,57 @@ for (const root of roots) {
   }
   const before = fs.readFileSync(file, "utf8");
 
-  if (before.includes(MARKER)) {
+  const slotsDone = before.includes(MARKER);
+  const builtinDone = INTEGRATED_BUNDLES.every((name) => before.includes(`"${name}"`));
+  if (slotsDone && builtinDone) {
     console.log(`[plugins-page] already patched: ${file}`);
     skipped += 1;
     continue;
   }
 
-  const declCount = countRe(before, ANCHOR_DECL);
-  const renderCount = count(before, ANCHOR_RENDER);
-  if (declCount !== 1 || renderCount !== 1) {
-    console.error(
-      `[plugins-page] ERROR: anchors moved in ${file} (slot declaration seen ${declCount}x, render site seen ${renderCount}x, expected 1 each).\n` +
-        `  The Plugins page cannot be extended above its groups without them, so the image refuses to build. Re-anchor this script against the new upstream code.`,
-    );
-    process.exit(1);
+  let after = before;
+
+  if (!slotsDone) {
+    const declCount = countRe(after, ANCHOR_DECL);
+    const renderCount = count(after, ANCHOR_RENDER);
+    if (declCount !== 1 || renderCount !== 1) {
+      console.error(
+        `[plugins-page] ERROR: anchors moved in ${file} (slot declaration seen ${declCount}x, render site seen ${renderCount}x, expected 1 each).\n` +
+          `  The Plugins page cannot be extended above its groups without them, so the image refuses to build. Re-anchor this script against the new upstream code.`,
+      );
+      process.exit(1);
+    }
+    const declaration = ANCHOR_DECL.exec(after)[0];
+    const clone = declaration.replace('"plugins.item"', `"${MARKER}"`);
+    after = after
+      .replace(declaration, `${clone}\n${declaration}`)
+      .replace(ANCHOR_RENDER, REPLACE_RENDER);
   }
 
-  const declaration = ANCHOR_DECL.exec(before)[0];
-  const clone = declaration.replace('"plugins.item"', `"${MARKER}"`);
-  const after = before
-    .replace(declaration, `${clone}\n${declaration}`)
-    .replace(ANCHOR_RENDER, REPLACE_RENDER);
+  if (!builtinDone) {
+    const found = ANCHOR_BUILTIN.exec(after);
+    if (found === null) {
+      console.error(
+        `[plugins-page] ERROR: the exclusion list anchor is gone from ${file} (BUILTIN_PROFILE_BUNDLES not found).\n` +
+          `  ${INTEGRATED_BUNDLES.join(", ")} would come back as duplicate cards, so the image refuses to build. Re-anchor this script against the new upstream code.`,
+      );
+      process.exit(1);
+    }
+    const body = found[1];
+    const indent = (body.match(/\n([^\S\n]+)["']/u) ?? [null, "  "])[1];
+    const missing = INTEGRATED_BUNDLES.filter((name) => !body.includes(`"${name}"`) && !body.includes(`'${name}'`));
+    // Keep the original trailing whitespace so the closing bracket lands on its
+    // own indentation, and supply the separator: upstream's last entry carries no
+    // trailing comma (the built bundle and the source agree).
+    const tail = /\s*$/u.exec(body)[0];
+    const head = body.slice(0, body.length - tail.length);
+    const separator = /,[ \t]*$/u.test(head) ? "" : ",";
+    const grown = `${head}${separator}${missing.map((name) => `\n${indent}"${name}",`).join("")}${tail}`;
+    after = after.replace(found[0], `const BUILTIN_PROFILE_BUNDLES = new Set([${grown}])`);
+  }
+
   fs.writeFileSync(file, after);
-  console.log(`[plugins-page] patched: ${file}`);
+  console.log(`[plugins-page] patched: ${file} (slots ${slotsDone ? "kept" : "added"}, exclusion list ${builtinDone ? "kept" : "extended"})`);
   patched += 1;
 }
 
