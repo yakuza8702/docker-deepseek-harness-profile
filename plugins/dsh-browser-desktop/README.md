@@ -18,6 +18,32 @@ plus one rename:
 Everything else — the `browser_open` tool, the state endpoint, the panel, the persistent
 profile, the takeover behaviour — is upstream's and unmodified.
 
+## Sidebar entry (this image only)
+
+Upstream's sidebar control is a labelled button in `sidebar.footer.action`. Here it is
+an **icon-only 36×36 glyph at the trailing edge of the Settings row**, registered in
+`sidebar.footer.trailing` — a slot this image adds to the sidebar at build time (see
+`tools/patch-sidebar-footer.mjs`).
+
+Two reasons, both about that area being shared:
+
+- `sidebar.footer.action` is one flex **row** that every footer action shares. A second
+  registration there (the provider-usage panel, in this deployment) competes with it for
+  width, and in the ~56px collapsed rail the row overflows and the icons land on top of
+  each other.
+- `sidebar.settings` is `kind: "single"` upstream, so there is no second seat in the
+  Settings row to use; the trailing slot is what creates one.
+
+The glyph follows the profile control beside it: the same 36×36 box, the same
+`--dsw-radius-md` radius, the same theme variables, and a 16×16 grid at a 1.5 stroke.
+`data-dsh-sidebar-glyph` is the styling contract the patched stylesheet keys off — it
+carries the size, the states, and the icon's place in the collapsed rail column.
+
+| Sidebar | Layout |
+|---|---|
+| Expanded | `[profile] Settings …………… [folder] [browser]` — the footer area above is left entirely to whatever panel registered there |
+| Collapsed | one centred rail column: usage panel, **browser**, **folder**, profile, Settings |
+
 This plugin complements the official browser features instead of replacing them:
 
 | Layer | Responsibility |

@@ -30,6 +30,21 @@ host half: `node --test plugins/dsh-workspace-browser/workspace.test.js` — 8/8
 covering traversal, escaping symlinks, root protection, write limits, optimistic
 mtime conflict detection and recursive-delete confirmation.
 
+### Sidebar entry (this image only)
+
+The client half's `sidebar.footer.action` registration is the one part that is **not**
+upstream's any more. Here the control is an **icon-only 36×36 folder glyph at the
+trailing edge of the Settings row**, registered in `sidebar.footer.trailing` — a slot
+this image adds to the sidebar at build time (see `tools/patch-sidebar-footer.mjs`).
+The workspace overlay itself, and every endpoint below, are untouched.
+
+`sidebar.footer.action` is one flex row shared by every footer action, so a second
+registration there (the provider-usage panel in this deployment) competes for width and
+the icons overlap in the ~56px collapsed rail; and `sidebar.settings` is `kind: "single"`
+upstream, so the trailing slot is what creates the seat beside Settings. The glyph
+matches the profile control next to it. See
+`plugins/dsh-browser-desktop/README.md` for the full table of both states.
+
 The Host half serves these endpoints:
 
 - `GET /workspace-browser/list?path=<relative-path>` lists a directory.
