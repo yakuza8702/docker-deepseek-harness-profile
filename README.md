@@ -753,3 +753,21 @@ docker exec <container> node /opt/seek-harness/lockfile-integrity.mjs --home "$D
   rewrites the entry without an integrity.
 * The guard only pins; it never deletes a dependency or installs anything.
 
+### Installing a GitHub plugin — use a git spec, not a release asset
+
+```bash
+# safe: pnpm resolves it through codeload with `gitHosted: true` + an integrity
+docker exec <container> dsh plugin --profile web add github:owner/repo
+docker exec <container> dsh plugin --profile web add github:owner/repo#v1.2.3
+```
+
+A **release asset** URL (`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>.tgz`,
+`.tar.gz` is the same) is the shape pnpm refuses when it carries no integrity —
+and pnpm writes it that way itself. Measured on pnpm 10.34.6 against a fresh
+profile with this image's workspace file: the add fails with
+`ERR_PNPM_MISSING_TARBALL_INTEGRITY`, the manifest change is rolled back (nothing
+is half-installed), and an orphan entry is left in the lockfile — which the next
+pnpm command prunes, so an install that follows it still succeeds. The boot guard
+is what covers the other order, where such a plugin *does* land and every later
+install would otherwise be blocked.
+
