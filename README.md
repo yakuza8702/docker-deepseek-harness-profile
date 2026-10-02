@@ -472,6 +472,30 @@ and (for settings-index.js) re-enable the `disabled: true` rows in
 `dsh-home/profiles/web/cordis.patch.yml` if the upstream plugins have been
 updated.
 
+## Factory reset — what it actually does
+
+The recovery page (`/__recovery/page`, reachable whenever the harness is down or
+its browser half fails to load) has a **Reset data and restart** action. Because
+the data directory is a **mount**, it cannot be moved aside — `rename()` of a
+mount point fails with `EBUSY`, and `/tmp` is a different filesystem (`EXDEV`).
+The reset therefore clears the data directory **in place**, one top-level entry
+at a time, and then restarts the stack (a wiped home is only adopted by a new
+process):
+
+| Removed | Kept |
+|---|---|
+| conversations (`sessions/`), other profiles, `settings.yaml`, plugin installs (`node_modules`, `dependencies`), the browser profile, logs, caches, plugin stores | `.credentials.yaml` (so the harness still reaches a model — Safe Mode carries the same file over), `.recovery-checkpoints/` including a checkpoint taken just before the reset, and the shipped `web` profile |
+
+Inside the shipped profile, the **authored** files survive
+(`cordis.patch.yml`, `cordis.yml`, `pnpm-workspace.yaml` — your patch layer and
+pnpm settings) while `package.json` is rebuilt to the shipped default and
+generated artefacts (`pnpm-lock.yaml`) are dropped: plugin installs live in
+`dependencies` + `dsh.profile.bundles`, and their `node_modules` is gone, so a
+manifest kept as-is would advertise bundles that no longer exist. Everything is
+recoverable *as configuration* through the Rollback tab; the data itself is not
+recoverable, which is what the confirmation dialog says. Project files outside
+the data directory (the workspace mount) are never touched.
+
 ## Troubleshooting
 
 ### A host-side edit "does not reflect" in the container, or a plugin installs but never appears

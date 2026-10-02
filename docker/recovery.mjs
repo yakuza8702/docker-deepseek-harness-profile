@@ -37,7 +37,7 @@
  * inline CSS/JS so it renders even when nothing else on the host works.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, copyFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const WEB_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
@@ -367,31 +367,128 @@ function createProfile(env, name) {
 }
 
 // ---------------------------------------------------------------------
-// Factory reset — move the whole data directory aside (Docker has no
-// Trash), preserve the shipped `web` profile, and let the next boot
-// create a clean environment.
+// Factory reset — clear the data directory IN PLACE.
+//
+// The previous implementation renamed `$DSH_HOME` to `/tmp/dsh-factory-reset-*`.
+// That can never work inside a container: the data directory is a MOUNT (a named
+// volume or a bind mount), and Linux refuses to rename a mount point — `EBUSY`,
+// measured on a throwaway container — on top of `/tmp` being a tmpfs on a
+// different filesystem, which would fail a rename with `EXDEV` even if it were
+// not a mount. So the button could only ever produce an error, and no deployment
+// ever reset anything.
+//
+// The honest operation is to delete the CONTENTS of the mount — never the mount
+// itself — one top-level entry at a time, so one busy or odd entry is reported
+// instead of aborting the sweep half-way. Kept on purpose:
+//
+//   * `.credentials.yaml` — the harness must still be able to reach a model
+//     afterwards. Safe Mode carries exactly this file over for the same reason,
+//     and the confirmation dialog says so.
+//   * `.recovery-checkpoints/` — a checkpoint of the configuration that was in
+//     place is captured FIRST, so the Rollback tab can bring settings, profiles
+//     and their patch layers back. Without it a reset would be a one-way door.
+//   * the shipped `web` profile — the launcher falls back to it, so a home
+//     without it cannot boot. Inside it, the AUTHORED files survive
+//     (`cordis.patch.yml`, `cordis.yml`, `pnpm-workspace.yaml` — the user's
+//     configuration and pnpm settings) while `package.json` is REBUILT to the
+//     shipped shape: plugin installs live in `dependencies` +
+//     `dsh.profile.bundles`, and their `node_modules` is wiped with everything
+//     else, so a kept manifest would advertise bundles that no longer exist.
+//     Generated artefacts (`pnpm-lock.yaml`) are dropped with them.
+//
+// Everything else goes: sessions, other profiles, settings, plugin installs, the
+// browser profile, logs and caches. The selection is rewritten to `web` so the
+// next boot is deterministic — and the caller restarts the stack, because no
+// already-running process can adopt a wiped home.
 // ---------------------------------------------------------------------
 
-function factoryReset(env) {
+/** Files of the shipped profile that are authored configuration and survive a reset. */
+const KEEP_PROFILE_FILES = ['cordis.patch.yml', 'cordis.yml', 'pnpm-workspace.yaml']
+/** What a clean default Profile is made of (the shipped `web` template). */
+const SHIPPED_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
+
+/** Remove one entry, never following a symlink out of the data directory. */
+function removeEntrySafely(path) {
+  if (lstatSync(path).isDirectory()) rmSync(path, { recursive: true, force: true })
+  else unlinkSync(path)
+}
+
+export function factoryReset(env) {
   const root = home(env)
+  // A reset must never be able to target "/" or another bare root.
+  if (!root || root === '/' || root.length < 2) throw new Error(`refusing to reset an unsafe data directory: ${JSON.stringify(root)}`)
+  if (!existsSync(root)) return { root, cleared: [], kept: [], failed: [], checkpoint: null }
+
+  // The only undo a reset can still offer once the data itself is gone.
+  const capture = captureCheckpoint(env)
+  const checkpoint = capture?.slot ?? capture?.restoredSlotId ?? null
+
+  const cleared = []
+  const kept = []
+  const failed = []
+  const KEEP = ['.credentials.yaml', '.recovery-checkpoints']
+
+  // Hold the shipped profile's authored files in memory: they live one level
+  // down, inside a directory that is about to be deleted.
   const webProfile = join(root, 'profiles', 'web')
-  const keep = []
-  if (existsSync(join(webProfile, 'package.json'))) {
-    mkdirSync('/tmp/dsh-factory-keep/profiles/web', { recursive: true })
-    for (const entry of readdirSync(webProfile, { withFileTypes: true })) {
-      if (entry.isDirectory() || entry.name.startsWith('.')) continue
-      copyFileSync(join(webProfile, entry.name), join('/tmp/dsh-factory-keep/profiles/web', entry.name))
-      keep.push(entry.name)
+  const manifestPath = join(webProfile, 'package.json')
+  const hadShippedProfile = existsSync(manifestPath)
+  let profileName = 'dsh-profile-web'
+  let manifestReadable = false
+  if (hadShippedProfile) {
+    try {
+      const parsed = JSON.parse(readFileSync(manifestPath, 'utf8'))
+      if (typeof parsed?.name === 'string' && parsed.name.trim() !== '') profileName = parsed.name
+      manifestReadable = true
+    } catch (error) {
+      failed.push(`profiles/web/package.json: ${error?.code ?? 'unreadable'}`)
     }
   }
-  const trash = `/tmp/dsh-factory-reset-${Date.now()}`
-  renameSync(root, trash)
-  mkdirSync(root, { recursive: true })
-  mkdirSync(join(root, 'profiles', 'web'), { recursive: true })
-  for (const name of keep) copyFileSync(join('/tmp/dsh-factory-keep/profiles/web', name), join(root, 'profiles', 'web', name))
-  rmSync('/tmp/dsh-factory-keep', { recursive: true, force: true })
+  const preserved = []
+  if (hadShippedProfile) {
+    for (const entry of readdirSync(webProfile, { withFileTypes: true })) {
+      if (entry.isDirectory() || entry.name.startsWith('.') || !KEEP_PROFILE_FILES.includes(entry.name)) continue
+      try {
+        preserved.push({ name: entry.name, content: readFileSync(join(webProfile, entry.name)) })
+      } catch (error) {
+        failed.push(`profiles/web/${entry.name}: ${error?.code ?? 'unreadable'}`)
+      }
+    }
+  }
+  // A home whose shipped profile could not be read is NOT safe to delete:
+  // `profiles/` stays, so the next boot still has something to boot.
+  const preserveFailed = hadShippedProfile && !manifestReadable
+  if (preserveFailed) kept.push('profiles (kept: the shipped web profile could not be read)')
+
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (KEEP.includes(entry.name)) {
+      kept.push(entry.name)
+      continue
+    }
+    // Already reported above: `profiles/` was deliberately left in place.
+    if (preserveFailed && entry.name === 'profiles') continue
+    try {
+      removeEntrySafely(join(root, entry.name))
+      cleared.push(entry.name)
+    } catch (error) {
+      failed.push(`${entry.name}: ${error?.code ?? error?.message ?? 'unknown error'}`)
+    }
+  }
+
+  // Rebuild the skeleton a boot can start from: the home, the shipped profile
+  // (authored files kept, manifest reset), and an explicit selection.
+  mkdirSync(webProfile, { recursive: true })
+  for (const file of preserved) writeFileSync(join(webProfile, file.name), file.content)
+  writeFileSync(manifestPath, `${JSON.stringify({
+    name: profileName,
+    private: true,
+    dependencies: {},
+    dsh: { profile: { bundles: [...SHIPPED_BUNDLES] } },
+  }, null, 2)}\n`)
+  kept.push(`profiles/web/{package.json (shipped default)${preserved.length > 0 ? `,${preserved.map((file) => file.name).join(',')}` : ''}}`)
   writeJsonAtomic(selectionFile(env), { version: 1, active: 'web' })
-  return { trash, kept: keep }
+
+  return { root, cleared, kept, failed, checkpoint }
 }
 
 // ---------------------------------------------------------------------
@@ -785,7 +882,7 @@ export function recoveryPage(snapshot) {
     <div class="card" style="border-color:rgba(242,139,130,.4)">
       <div class="card-head">
         <h3 class="card-title" style="color:var(--danger)">${icon('trash-2', 18)}Factory reset</h3>
-        <p class="card-desc">Move the current DSH data directory aside, then restart and create a new default Profile. Project files outside this directory are kept.</p>
+        <p class="card-desc">Delete the contents of the DSH data directory and restart into a clean default Profile. The directory itself is a mount, so it cannot be moved aside — this is a real deletion. Kept: your API credential, the shipped <code>web</code> profile, and a rollback checkpoint captured just before the reset. Files outside the data directory are untouched.</p>
       </div>
       <div class="card-foot"><button class="btn destructive" id="factory-reset">${icon('trash-2')}Reset data and restart</button></div>
     </div>
@@ -1082,7 +1179,7 @@ export function recoveryPage(snapshot) {
 
   // ---- reset & data ------------------------------------------------------
   document.getElementById('factory-reset').addEventListener('click', function () {
-    ask('Factory reset the harness?', 'The following directory will be moved aside:\\n\\n' + (BOOT.dataDirectory || '') + '\\n\\nProfiles, plugins, settings, credentials, sessions and workspace records stored there are removed. The harness restarts and creates a clean default Profile.', 'Reset data and restart', true, function () {
+    ask('Factory reset the harness?', 'Everything inside this directory will be DELETED:\n\n' + (BOOT.dataDirectory || '') + '\n\nRemoved: conversations, other Profiles, settings, plugin installs, the browser profile, logs and caches.\nKept: .credentials.yaml (so the harness can still reach a model), the shipped web Profile, and a checkpoint captured first — the Rollback tab can restore settings and Profiles from it.\n\nThe harness restarts and creates a clean default Profile. Files outside this directory are kept.', 'Reset data and restart', true, function () {
       run('Resetting data…', post('/__recovery/factory-reset', {}), function () { waitAndReload(); });
     });
   });
@@ -1255,8 +1352,15 @@ export async function handleRecovery(req, res, { log = console.log } = {}) {
         const body = await readBody()
         return send(200, { ok: true, ...createProfile(env, String(body.name ?? '')) }), true
       }
-      case 'factory-reset':
-        return send(200, { ok: true, ...factoryReset(env) }), true
+      case 'factory-reset': {
+        const result = factoryReset(env)
+        log(`[recovery] factory reset: removed ${result.cleared.length} entr${result.cleared.length === 1 ? 'y' : 'ies'}, kept ${result.kept.join(', ') || 'nothing'}, checkpoint ${result.checkpoint ?? 'none'}${result.failed.length > 0 ? `, ${result.failed.length} FAILED: ${result.failed.join('; ')}` : ''}`)
+        // A wiped home is only adopted by a NEW process: this one still holds the
+        // old one in memory (open stores, cached settings, the composed plugin
+        // tree). Exit so the container policy boots a clean stack — the same
+        // deliberate-exit path as /restart, which the page's polling expects.
+        return send(200, { ok: true, ...result, ...restartSoon() }), true
+      }
       case 'file': {
         const key = url.searchParams.get('key') ?? ''
         return send(200, { ok: true, ...readConfigFile(env, key) }), true
