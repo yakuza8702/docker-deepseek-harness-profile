@@ -98,9 +98,27 @@ function webCapable(bundles) {
   return bundles !== undefined && WEB_BUNDLES.every((name) => bundles.includes(name))
 }
 
+/**
+ * The profile this harness actually BOOTED — resolved exactly the way the
+ * image's entrypoint resolves it, because the two must never disagree.
+ *
+ * The entrypoint reads `$DSH_HOME/active-profile.json` and falls back to the
+ * shipped `web` profile when the file is missing, malformed, or names a profile
+ * that cannot boot the Web app. Resolving the fallback here as well is what
+ * makes a FRESH volume behave: without it the panel reported the active profile
+ * as `unknown`, showed no "Current Profile", and offered a "Switch" button for
+ * `web` — the profile that was already running, and the only one that exists.
+ *
+ * A stored name is honoured only when it can boot this build; anything else
+ * reports the effective fallback (`web`), or `null` in the degenerate case where
+ * even `web` is missing — the panel then has nothing true to say about it.
+ */
 function activeName() {
   const saved = readJson(selectionFile())
-  return typeof saved?.active === 'string' ? saved.active : null
+  const savedName = typeof saved?.active === 'string' ? saved.active : null
+  if (savedName !== null && validName(savedName) && webCapable(bundlesOf(savedName))) return savedName
+  if (validName('web') && webCapable(bundlesOf('web'))) return 'web'
+  return null
 }
 
 function validName(name) {

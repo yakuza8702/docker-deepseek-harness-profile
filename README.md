@@ -171,6 +171,14 @@ Rules applied at every boot (see `docker/entrypoint.sh`):
 * anything missing, malformed or not web-capable falls back to **`web`** — a bad
   selection can never leave the container without a Web UI;
 * the boot log states the outcome: `[seek-harness] active profile: <name>`;
+* **fresh start: the fallback is written down.** The first boot of an empty
+  `$DSH_HOME` stores `{ "active": "web" }`, so the in-app panel and the recovery
+  page show `web` as the *current* profile (its row is inert — no "Switch"
+  button) instead of reporting the active profile as `unknown`. The file is
+  visible on the host inside the mounted data directory, so the selection is a
+  fact you can read and edit, not an inference. A *stale* stored name that
+  cannot boot this build never rewrites your file: the boot falls back to `web`,
+  logs a warning, and the recovery page is where you repair it;
 * profiles share one `$DSH_HOME` (settings, sessions, credentials, skills,
   workspace); only the **composed plugin tree** differs.
 
@@ -195,6 +203,36 @@ docker restart seek-harness && docker logs --tail=5 seek-harness
 from upstream (idempotent, content-anchored: it refuses an absent or ambiguous
 anchor). A companion Electron shell that manages profiles and restarts the
 container lives outside this repo.
+
+## Where your data lives — `~/.dsh`, `$DSH_HOME` and `/workspace`
+
+DSH resolves its user data as `--dsh-home` > `$DSH_HOME` > `~/.dsh`
+(`@deepseek-ai/dsh-home-paths`). This image keeps **two** spellings of "home":
+
+| Spelling | Container path | What it is |
+|---|---|---|
+| `$DSH_HOME` | `/home/node/.dsh` | the harness home — profiles, settings, sessions, credentials, skills, the browser profile |
+| `$HOME` | `/workspace` | the **agent workspace** (the mounted project), because the Web UI's directory picker treats `HOME` as the starting point |
+
+Every guide, README and community recipe in the ecosystem says
+`~/.dsh/profiles/<name>/pnpm-workspace.yaml`, so the two spellings must be the
+same directory — and the entrypoint makes them so: it symlinks
+`$HOME/.dsh -> /home/node/.dsh` at every boot. `~/.dsh`, `/home/node/.dsh` and
+the host-side `dsh-home/profiles/...` you edit through the mount are therefore
+**one directory**, whichever way you reach it.
+
+A shell that starts without the image environment (`su -`, an ssh login, a
+console that scrubs the env) also gets `DSH_HOME` from
+`/etc/profile.d/10-dsh-home.sh` and `/etc/bash.bashrc`.
+
+> ⚠️ **Upgrading from an image built before 2026-10-02:** that alias did not
+> exist yet, so a `dsh plugin … add` run from such a shell installed into a
+> *phantom* home at `/workspace/.dsh` that the launcher never reads (symptom:
+> the plugin installs "successfully", the plugin market never appears, and a
+> `pnpm-workspace.yaml` you edit there changes nothing). On the first boot with
+> the alias in place, an existing real `/workspace/.dsh` directory is **parked**
+> as `/workspace/.dsh.orphan-<UTC>` (never deleted) and logged — inspect it, move
+> anything you still want into `profiles/<name>/`, and re-run the install.
 
 ## In-app profile control — the pill beside Settings
 
@@ -314,7 +352,7 @@ Inside the container: `docker ps`, `docker compose version`, `docker build ...` 
 | `DSH_BIND` | `127.0.0.1` | Compose-only: host publish address (`0.0.0.0` = LAN) |
 | `DEEPSEEK_API_KEY` | unset | Runtime credential (or configure in the Web UI settings) |
 | `DSH_TELEMETRY_DISABLED` | `1` | Hard-disabled locally by default (empty = upstream default) |
-| `DSH_PERMISSION_MODE` | unset | `read-only` / `workspace-write` / `danger-full-access` — confined modes use the bundled Landlock launcher (kernel ≥ 5.13); on kernels without it use `danger-full-access` |
+| `DSH_PERMISSION_MODE` | unset | `read-only` / `workspace-write` / `danger-full-access` — confined modes use the Landlock launcher that ships **inside the image** (kernel ≥ 5.13) and is probe-verified at build time; nothing to mount. `bwrap` is installed too but cannot create user namespaces under this hardening, so Landlock is the backend that runs |
 | `DSH_TOOLS_MODE` | unset | `native` / `ptc` / `both` |
 | `DSH_NODE_FLAGS` | `--expose-internals` | Node flags for the DSH main process only (agent children don't inherit) |
 
@@ -416,7 +454,82 @@ upstream image without rebuilding it. These survive image updates.
 > authoritative again; drop any `./overrides/proxy.mjs` line from an existing
 > deployment or the browser desktop path will 404.
 
+> **Removed 2026-10-02:** `overrides/landlock-run/` (the hand-built static
+> `landlock-run` binary) and its compose bind-mount. The launcher now comes from
+> the published platform package
+> `@deepseek-ai/node-addon-system-<platform>-<arch>` — the exact package and path
+> the runtime resolves through `launcherPath()` — and
+> `tools/ensure-landlock-launcher.mjs` guarantees it during the build and **fails
+> the build** unless `landlock-run --probe` reports `full`/`partial`. The old
+> mount pointed at a source-channel path (`/opt/dsh-src/native/landlock-run/…`)
+> that does not exist in an npm-channel image, so it shadowed nothing while
+> making a fresh start look like it needed a manual download. Delete the
+> `./overrides/landlock-run/…` line from an existing compose file: confined
+> permission modes (`read-only`, `workspace-write`) work with no mount at all.
+
 To remove: delete the file, remove the `- ./overrides/...` line from compose.yaml,
 and (for settings-index.js) re-enable the `disabled: true` rows in
 `dsh-home/profiles/web/cordis.patch.yml` if the upstream plugins have been
 updated.
+
+## Troubleshooting
+
+### A host-side edit "does not reflect" in the container, or a plugin installs but never appears
+
+Both symptoms are usually the **same** mistake: editing (or installing into) the
+wrong home. `~/.dsh` and `$DSH_HOME` are one directory in this image (see
+[Where your data lives](#where-your-data-lives--dsh-dsh_home-and-workspace)), so
+check *which* path you touched:
+
+```bash
+# what the launcher actually boots, and where its data lives
+docker exec <container> sh -c 'echo DSH_HOME=$DSH_HOME; readlink -f ~/.dsh; ls -la ~/.dsh/profiles/*/'
+# the same directory, seen from the host (the mounted data dir)
+cat <data-dir>/dsh-home/active-profile.json
+```
+
+* A file is only real if it exists under **`$DSH_HOME`** (`/home/node/.dsh`,
+  i.e. `<data-dir>/dsh-home/` on the host). A `pnpm-workspace.yaml` under
+  `/workspace/.dsh/...` is a phantom home from an image built before the alias —
+  it is parked as `/workspace/.dsh.orphan-<UTC>` on the first boot with the
+  alias, and the fix is to re-run the install so it lands in the real home.
+* Profile/plugin state changes only take effect on the **next boot** (`dsh
+  --profile` is a launcher input): `docker restart <container>`, then read the
+  boot log.
+
+### `dsh plugin --profile web add dshmarket` warns about a missing peer
+
+```
+WARN  Issues with peer dependencies found
+└─┬ dshmarket 1.66.8
+  └── ✕ missing peer @deepseek-ai/cordis@^4.0.1
+```
+
+That warning is **cosmetic** in this image and does not stop the plugin from
+loading: pnpm resolves the profile's own workspace (`nodeLinker: hoisted`,
+`autoInstallPeers: false` — DSH's shipped template) and therefore cannot see
+`@deepseek-ai/cordis`, `@deepseek-ai/dsh-settings` and `@deepseek-ai/schemastery`,
+which the *core installation* provides at runtime. To silence the warning without
+installing a second copy of the core:
+
+```yaml
+# $DSH_HOME/profiles/web/pnpm-workspace.yaml  (host: <data-dir>/dsh-home/profiles/web/)
+packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+
+peerDependencyRules:
+  ignoreMissing:
+    - "@deepseek-ai/*"
+```
+
+The install is not what makes the market appear — the **restart** is: `dsh
+plugin add` writes the dependency *and* appends the package to
+`dsh.profile.bundles`, and the loader composes that list at boot. So: install →
+`docker restart` → the Market section shows up. `autoInstallPeers: false` stays:
+it is upstream's own setting and prevents a duplicate copy of the core's
+framework packages from being installed into the profile (which is what makes
+`dshmarket`, or any other bundle, fail to load with two competing runtimes).
+

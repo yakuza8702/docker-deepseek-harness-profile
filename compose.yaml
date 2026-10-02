@@ -110,12 +110,16 @@ services:
       # 0.1.2-alpha.3) so ecosystem plugins that still import it keep loading.
       # Remove once the plugins ship alpha3-compatible releases.
       - ./overrides/settings-index.js:/opt/dsh-src/packages/settings/settings/lib/index.js:ro
-      # FIX 2026-09-01: guarantee the Landlock launcher even if the image was
-      # built before the Dockerfile fix (arch mapping bug left source-channel
-      # images without the binary — sandbox modes failed closed). Harmless when
-      # the image already bundles it: the mount shadows it with the same
-      # contract binary. Remove once all your nodes run a fixed image.
-      - ./overrides/landlock-run/linux-x64/landlock-run:/opt/dsh-src/native/landlock-run/packages/linux-x64/bin/landlock-run:ro
+      # NOTE (2026-10-02): the Landlock launcher bind-mount was REMOVED. The
+      # image now bundles the launcher (the platform package
+      # @deepseek-ai/node-addon-system-<platform>-<arch>) and the build PROVES it
+      # with the real `--probe`, so confined permission modes work on a fresh
+      # deployment with nothing downloaded or mounted. The old mount pointed at
+      # a source-channel path (/opt/dsh-src/native/landlock-run/...) that does
+      # not exist in an npm-channel image, so it shadowed nothing and only made
+      # a fresh start look like it needed a manual setup step. Remove any
+      # `./overrides/landlock-run/...` line from an existing compose file; the
+      # mount is harmless but redundant.
     # Chromium-derived browsers use /dev/shm for renderer shared memory; the
     # 64 MB default makes heavy pages crash the renderer. The entrypoint detects
     # a small /dev/shm and falls back to --disable-dev-shm-usage, so this is the

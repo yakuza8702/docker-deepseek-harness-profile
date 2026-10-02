@@ -69,6 +69,101 @@ record_ready_log() {
     fi
   ) &
 }
+# ---------------------------------------------------------------------
+# `~/.dsh` must BE the harness home (fresh-start trap).
+#
+# This image keeps HOME=/workspace on purpose (the Web UI's directory picker
+# treats the mounted workspace as home) while the harness home is
+# DSH_HOME=/home/node/.dsh. But DSH resolves its user data as
+# `--dsh-home` > `$DSH_HOME` > `~/.dsh` (@deepseek-ai/dsh-home-paths), and every
+# guide, README and community recipe in the ecosystem says
+# `~/.dsh/profiles/<name>/…`. Whenever a shell runs WITHOUT the image env (a
+# `su -`, an ssh login, a console/exec with a scrubbed environment, an agent
+# tool that starts from a bare env), the two spellings point at DIFFERENT
+# directories, and everything that follows the documented path —
+# `dsh plugin --profile web add dshmarket`, a hand-edited pnpm-workspace.yaml,
+# a config copied out of a guide — lands in a phantom home the launcher never
+# reads. That presents exactly as "my host-side edit does not reflect" and
+# "the plugin market never appears", no matter how often the container is
+# restarted.
+#
+# The alias makes both spellings one directory. A pre-existing REAL directory
+# under $HOME/.dsh is PARKED (never deleted) — it is not the harness home and
+# its contents are the user's own installs, so they are kept for inspection.
+# ---------------------------------------------------------------------
+ensure_home_alias() {
+  local link="${HOME:-/workspace}/.dsh"
+  [[ -n "${DSH_REAL_HOME:-}" ]] || return 0
+  [[ "$link" != "$DSH_REAL_HOME" ]] || return 0
+  mkdir -p "$DSH_REAL_HOME"
+  local real
+  real="$(readlink -f "$DSH_REAL_HOME" 2>/dev/null || printf '%s' "$DSH_REAL_HOME")"
+  if [[ -L "$link" ]]; then
+    local target
+    target="$(readlink -f "$link" 2>/dev/null || true)"
+    if [[ "$target" == "$real" ]]; then
+      log "home alias: $link -> $DSH_REAL_HOME (already linked)"
+      return 0
+    fi
+    log "home alias: $link pointed at ${target:-<broken link>} — relinking to $DSH_REAL_HOME"
+    rm -f "$link"
+  elif [[ -e "$link" ]]; then
+    local parked="${link}.orphan-$(date -u +%Y%m%dT%H%M%SZ)"
+    if mv "$link" "$parked" 2>/dev/null; then
+      log "home alias: $link was a REAL directory (a phantom home, not the harness home)"
+      log "            parked as $parked — reinstall anything found there once ~/.dsh is linked"
+    else
+      log "WARN: $link is a real directory and could not be parked — '~/.dsh' stays a phantom home"
+      return 1
+    fi
+  fi
+  if ln -s "$DSH_REAL_HOME" "$link" 2>/dev/null; then
+    log "home alias: $link -> $DSH_REAL_HOME (one directory, so every '~/.dsh' recipe works)"
+  else
+    log "WARN: could not create the $link -> $DSH_REAL_HOME alias"
+  fi
+}
+
+# ---------------------------------------------------------------------
+# Fresh start: materialize the profile selection.
+#
+# A DSH profile is a BOOT-TIME launcher input read from
+# $DSH_HOME/active-profile.json, and this entrypoint falls back to the shipped
+# `web` profile when that file is missing or names a profile that cannot boot
+# the Web app. That fallback used to be INVISIBLE: a fresh volume had no file at
+# all, so the in-app panel and the recovery page reported the active profile as
+# "unknown" and offered a "Switch" button for `web` — the profile already
+# running. Recording the effective selection makes it a fact instead of an
+# inference: the first boot of a fresh volume stores `web`, the panel greys that
+# row out as the current profile, and the selection is inspectable (and
+# editable) on the host, inside the mounted data directory.
+# ---------------------------------------------------------------------
+seed_profile_selection() {
+  # NOTE: `node -e` evaluates a plain script — top-level `return` is a syntax
+  # error there, so the branches below are if/else, not early returns.
+  node -e '
+    const fs = require("fs"), path = require("path");
+    const [home, profile] = process.argv.slice(1);
+    const file = path.join(home, "active-profile.json");
+    let saved = null;
+    try { saved = JSON.parse(fs.readFileSync(file, "utf8")); } catch { saved = null; }
+    const current = typeof saved?.active === "string" && saved.active !== "" ? saved.active : null;
+    if (current === profile) {
+      console.log("[seek-harness] profile selection: " + profile + " (stored)");
+    } else if (current !== null) {
+      // The stored name cannot boot this build (no such profile, or no web
+      // bundles). The fallback WAS used, but the user file is left untouched on
+      // purpose: the intent survives and is repairable from the recovery page.
+      console.log("[seek-harness] WARNING: active-profile.json selects \"" + current + "\" but it cannot boot the Web app — booted \"" + profile + "\"; the file is unchanged");
+    } else {
+      const temporary = file + ".tmp";
+      fs.writeFileSync(temporary, JSON.stringify({ version: 1, active: profile }, null, 2) + "\n");
+      fs.renameSync(temporary, file);
+      console.log("[seek-harness] profile selection: seeded \"" + profile + "\" (fresh home, no selection file)");
+    }
+  ' "$DSH_REAL_HOME" "$PROFILE" || log "WARN: could not seed the profile selection"
+}
+
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
   write_boot_state failed "$*" "the harness process exited during startup"
@@ -191,6 +286,21 @@ if [[ -f "$SAFE_MODE_FLAG" ]]; then
   PROFILE="web"
   log "SAFE MODE: booting a temporary environment (DSH_HOME=$SAFE_HOME) — the real home is untouched; only .credentials.yaml was carried over"
   write_boot_state starting "booting Safe Mode (temporary environment)"
+fi
+
+# `~/.dsh` is aliased to the harness home BEFORE anything else can write to the
+# wrong one (see ensure_home_alias): every process started later — the harness,
+# a shell the user opens, an agent tool that runs `dsh plugin …` — must resolve
+# `~/.dsh` and `$DSH_HOME` to the same directory.
+ensure_home_alias || true
+
+# Make the boot-time selection explicit on a fresh volume (see
+# seed_profile_selection). Safe Mode runs on a throwaway home and must never
+# touch the real selection: the user is coming back to it.
+if [[ "$SAFE_MODE" == "1" ]]; then
+  log "profile selection: Safe Mode — the real home's selection is left untouched"
+else
+  seed_profile_selection
 fi
 
 # ---------------------------------------------------------------------

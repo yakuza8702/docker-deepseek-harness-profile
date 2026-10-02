@@ -235,47 +235,64 @@ RUN set -eux; \
     node /tmp/patch-browser-use-exclusivity.mjs /opt/dsh/node_modules /opt/dsh-src/node_modules; \
     rm -f /tmp/patch-browser-use-exclusivity.mjs
 
-# Landlock launcher binary. The source-channel monorepo links the workspace
-# package native/landlock-run/packages/linux-<arch> but its bin/ only ships in
-# the published platform npm package (the npm channel gets it automatically via
-# optionalDependencies). Without this file DSH's sandbox probes unusable and
-# workspace-write/read-only permission modes fail closed. Fetching the binary
-# restores real sandboxing WITHOUT relaxing the container seccomp profile.
+# ---------------------------------------------------------------------
+# Landlock launcher — the confinement backend DSH's sandbox modes need.
 #
-# FIX 2026-09-01: this step previously computed the package dir as
-# "linux-${TARGETARCH}" — Docker's TARGETARCH is amd64/arm64 while the package
-# dirs (and npm platform packages) use NODE arch names x64/arm64, so the dir
-# never matched and the step silently skipped on every amd64 build, leaving
-# images without the launcher (sandbox "no backend usable" error). Map the
-# arch explicitly and FAIL THE BUILD if the binary cannot be provided.
-# NOTE for local builds: `ARG DSH_SOURCE_REF` has no default, so under BuildKit
-# it is genuinely UNSET unless you pass it — and `set -u` below would abort with
-# "DSH_SOURCE_REF: parameter not set". CI always passes it (empty for the npm
-# channel), which is why this only ever bit hand-run `docker build`. Hence the
-# `${DSH_SOURCE_REF:-}` form.
+# DSH's Linux runner chain is `bwrap` then `landlock` (probed in order). bwrap
+# needs unprivileged user namespaces, which this container refuses BY DESIGN
+# (`cap_drop: ALL` + `no-new-privileges` + the daemon's seccomp profile), so the
+# chain always falls through to the Landlock launcher — and without that binary
+# every confined permission mode fails closed ("no backend usable").
+#
+# The binary ships in the per-platform npm package
+# `@deepseek-ai/node-addon-system-<platform>-<arch>` and is resolved by
+# `launcherPath()`. It is an OPTIONAL dependency of the install, so a build that
+# skipped optional deps, or a source-channel monorepo build that only linked the
+# workspace copy, can be missing it. tools/ensure-landlock-launcher.mjs provides
+# it in EITHER channel, then proves it with the real functional probe
+# (`landlock-run --probe` builds and enforces a maximal ruleset, so a kernel that
+# has the syscalls but refuses enforcement reads as unusable) and FAILS THE BUILD
+# otherwise. The path is never spelled out here — it is derived from
+# `launcherPath()` — so an upstream layout change cannot silently skip this step
+# (the old step computed `native/landlock-run/packages/linux-${TARGETARCH}`,
+# which stopped matching upstream, and Docker's `TARGETARCH` (amd64/arm64) never
+# matched the package names (x64/arm64) either).
+#
+# CONSEQUENCE FOR DEPLOYMENTS: nothing to download and nothing to mount. The
+# compose file no longer asks for a Landlock bind-mount; images built before this
+# change can keep their mount (it is simply redundant now).
+# ---------------------------------------------------------------------
+COPY tools/ensure-landlock-launcher.mjs /tmp/ensure-landlock-launcher.mjs
 RUN set -eux; \
-    if [ -n "${DSH_SOURCE_REF:-}" ]; then \
-      case "${TARGETARCH}" in \
-        amd64) P="linux-x64" ;; \
-        arm64) P="linux-arm64" ;; \
-        *) echo "ERROR: no landlock platform package for TARGETARCH=${TARGETARCH}"; exit 1 ;; \
-      esac; \
-      D="/opt/dsh-src/native/landlock-run/packages/$P"; \
-      if [ ! -x "$D/bin/landlock-run" ]; then \
-        V=$(node -p "require('$D/package.json').version" 2>/dev/null || echo latest); \
-        cd /tmp; \
-        T=$(npm pack --silent "@deepseek-ai/node-addon-landlock-run-$P@${V}" | tail -n1); \
-        tar xzf "$T" package/bin/landlock-run; \
-        mkdir -p "$D/bin"; \
-        install -m 755 package/bin/landlock-run "$D/bin/landlock-run"; \
-        rm -rf /tmp/package "/tmp/$T"; \
-        "$D/bin/landlock-run" --probe; \
-        echo "landlock launcher installed ($P ${V})"; \
-      else \
-        "$D/bin/landlock-run" --probe; \
-        echo "landlock launcher already present ($P)"; \
-      fi; \
-    fi
+    node /tmp/ensure-landlock-launcher.mjs /opt/dsh /opt/dsh-src; \
+    rm -f /tmp/ensure-landlock-launcher.mjs
+
+# ---------------------------------------------------------------------
+# The harness home must be unambiguous in EVERY shell.
+#
+# DSH resolves its user data as `--dsh-home` > `$DSH_HOME` > `~/.dsh`
+# (@deepseek-ai/dsh-home-paths) while this image sets HOME=/workspace (the Web
+# UI's directory picker treats the mounted workspace as home) and the harness
+# home is /home/node/.dsh. A shell that starts WITHOUT the image environment
+# (su -, ssh, a console with a scrubbed env) therefore resolves `~/.dsh` to a
+# phantom home, and a `dsh plugin … add` run there installs into a directory the
+# launcher never reads. The entrypoint also symlinks ~/.dsh to the real home;
+# these two files make the env itself consistent for interactive and login
+# shells, so the documented path works even before the alias is in place.
+# ---------------------------------------------------------------------
+RUN printf '%s\n' \
+      '# DeepSeek Harness home — see the image docs. `~/.dsh` is symlinked to this' \
+      '# directory by the entrypoint, so both spellings are the same place.' \
+      ': "${DSH_HOME:=/home/node/.dsh}"' \
+      'export DSH_HOME' \
+      > /etc/profile.d/10-dsh-home.sh \
+ && chmod 0644 /etc/profile.d/10-dsh-home.sh \
+ && printf '%s\n' \
+      '' \
+      '# DeepSeek Harness home (see /etc/profile.d/10-dsh-home.sh).' \
+      ': "${DSH_HOME:=/home/node/.dsh}"' \
+      'export DSH_HOME' \
+      >> /etc/bash.bashrc
 
 # Reverse proxy ("0.0.0.0 fix", smanx pattern) + entrypoint + recovery surface.
 # recovery.mjs is imported by the proxy: it renders the boot-failure screen and
@@ -365,7 +382,16 @@ ENV NODE_ENV=production \
     DISPLAY=:99
 
 WORKDIR /workspace
-RUN mkdir -p /workspace /home/node/.dsh \
+# Build residue in /tmp must not ship root-owned. The npm cache and Node's
+# compile cache were created by the BUILD (running as root) and stay inside the
+# image layer; with the compose tmpfs on /tmp that is invisible, but under a plain
+# `docker run` (documented below) or any mount that exposes the image's /tmp,
+# every npm/npx call for uid 1000 dies with EACCES — "Your cache folder contains
+# root-owned files" — which breaks `dsh plugin add`, npx-launched MCP servers and
+# `npm pack` at runtime. npm recreates both caches as the running user when it
+# needs them, so removing them is free.
+RUN rm -rf /tmp/.npm-cache /tmp/node-compile-cache \
+ && mkdir -p /workspace /home/node/.dsh \
  && chown -R node:node /home/node/.dsh /workspace /opt/seek-harness
 
 # Non-root (runzhliu hardening): uid/gid 1000 = image "node" user

@@ -82,9 +82,19 @@ function bundlesOf(env, name) {
 
 const webCapable = (bundles) => bundles !== undefined && WEB_BUNDLES.every((name) => bundles.includes(name))
 
+/**
+ * The profile this boot actually used — resolved the way the entrypoint
+ * resolves it, including its `web` fallback. A FRESH volume has no selection
+ * file at all, and reporting `unknown` there would contradict the launcher:
+ * `web` is what booted (it is the only profile, and the only one that can boot
+ * the Web app), so that is what this surface must say.
+ */
 function activeName(env) {
   const saved = readJson(selectionFile(env))
-  return typeof saved?.active === 'string' ? saved.active : null
+  const savedName = typeof saved?.active === 'string' ? saved.active : null
+  const usable = (name) => typeof name === 'string' && NAME_RE.test(name) && !RESERVED.has(name.toLowerCase()) && webCapable(bundlesOf(env, name))
+  if (usable(savedName)) return savedName
+  return usable('web') ? 'web' : null
 }
 
 /** The profile everything plugin/config/checkpoint work targets. Never null:
