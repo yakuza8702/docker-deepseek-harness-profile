@@ -165,38 +165,40 @@ seed_profile_selection() {
 }
 
 # ---------------------------------------------------------------------
-# Browser tools as ONE switchable MCP row (see plugins/dsh-browser-mcp).
+# Browser tools as ONE switchable BUNDLE (see plugins/dsh-browser-mcp).
 #
-# WHY THE PROFILE LAYER: a row mounted by a launcher overlay is applied AFTER the
-# profile layer, so it re-declares itself enabled and the Plugin list's switch
-# can never win (measured: a profile-level `disabled: false` override is ignored
-# for an overlay row). Seeding the row into the profile's OWN patch file puts it
-# in the last layer, which is exactly the file the Plugin list writes to — so the
-# switch works, and it works LIVE (the file is watched; measured: toggling
-# removes/starts the MCP server without a restart).
+# WHY A BUNDLE AND NOT A ROW: the Plugins page lists BUNDLES. It builds that list
+# from `dsh.profile.bundles` ∪ the profile's dependencies ∪ the DSH
+# installation's dependencies, and every entry with a `dsh.bundle.patch` gets a
+# switch that adds/removes it from `dsh.profile.bundles` (plugin-manager
+# `listBundles()` / `selectBundle()`). A row spliced into the profile patch shows
+# up nowhere — which is exactly what happened with the first version of this
+# feature. Shipping the row INSIDE a bundle puts it on that page, next to the
+# shipped plugins, with the same switch as everything else.
 #
-# SEEDED ONCE per home, marker-guarded, so switching the row off is a decision
-# this image never overrides. Nothing is written in Safe Mode, and
-# DSH_BROWSER_MCP=0 skips it entirely.
+# Seeding therefore means "select the bundle for the active profile", done once
+# per home (marker), and never again — so switching it off is a decision this
+# image never overrides. Nothing is written in Safe Mode.
+#
+# MIGRATION: the previous version spliced the same row straight into the profile
+# patch. That block is removed here (exact text match, idempotent) because the
+# bundle now provides the row — leaving both would be a duplicate entry id.
 # ---------------------------------------------------------------------
+BROWSER_MCP_BUNDLE="dsh-browser-mcp"
 BROWSER_MCP_PATCH="${DSH_BROWSER_MCP_PATCH:-/opt/seek-harness/browser-mcp.patch.yml}"
-seed_browser_mcp_row() {
-  [[ "${DSH_BROWSER_MCP:-1}" == "0" ]] && { log "browser MCP: not seeded (DSH_BROWSER_MCP=0)"; return 0; }
+seed_browser_mcp_bundle() {
   [[ "${SAFE_MODE:-0}" == "1" ]] && { log "browser MCP: Safe Mode — the real profile is left untouched"; return 0; }
-  [[ -f "$BROWSER_MCP_PATCH" ]] || { log "WARN: $BROWSER_MCP_PATCH is missing — the browser tools will not be offered"; return 0; }
 
   local dir="$DSH_REAL_HOME/profiles/$PROFILE"
   local manifest="$dir/package.json"
   local patch="$dir/cordis.patch.yml"
-  local marker="$DSH_REAL_HOME/.browser-mcp-row-seeded"
-  [[ -f "$marker" ]] && return 0
 
   # A fresh home has no profile yet: create the shipped `web` profile with DSH's
-  # OWN initialiser (no template knowledge is duplicated here), so the row exists
-  # when the harness composes its first tree instead of waiting for a 2nd boot.
+  # OWN initialiser (no template knowledge is duplicated here), so the bundle can
+  # be selected before the harness composes its first tree.
   if [[ ! -f "$manifest" ]]; then
     if [[ "$PROFILE" != "web" ]]; then
-      log "browser MCP: profile \"$PROFILE\" does not exist yet — the row will be seeded on the next boot"
+      log "browser MCP: profile \"$PROFILE\" does not exist yet — it will be selected on the next boot"
       return 0
     fi
     local appboot=""
@@ -204,51 +206,105 @@ seed_browser_mcp_row() {
       if [[ -f "$root/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js" ]]; then appboot="$root/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js"; break; fi
     done
     if [[ -z "$appboot" ]]; then
-      log "WARN: dsh-app-boot not found — cannot initialise the profile early; the row will be seeded on the next boot"
+      log "WARN: dsh-app-boot not found — cannot initialise the profile early; it will be selected on the next boot"
       return 0
     fi
     if node -e 'import(process.argv[1]).then((m) => { m.initProfile(process.argv[2], ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]); console.log("initialised") })' "$appboot" "$dir" >/dev/null 2>&1; then
       log "browser MCP: initialised the shipped \"web\" profile early (DSH would create it a moment later anyway)"
     else
-      log "WARN: could not initialise the profile early — the row will be seeded on the next boot"
+      log "WARN: could not initialise the profile early — it will be selected on the next boot"
       return 0
     fi
   fi
 
-  # Never seed twice, and never edit a profile patch that already mentions the row
-  # (the user may have switched it off, or written their own version).
-  if grep -q 'browser-mcp' "$patch" 2>/dev/null; then
-    printf '%s\n' "already present" > "$marker" 2>/dev/null || true
-    log "browser MCP: the profile patch already mentions browser-mcp — leaving it as it is"
-    return 0
+  # Migration: drop a patch block an earlier image spliced in, so the bundle is
+  # the single source of the row. Idempotent — absent text is a no-op — and it
+  # runs even when the bundle is switched off, or re-selecting it later would
+  # produce two entries with the same id.
+  #
+  # The result is PARSED before it is written (js-yaml, the same parser the
+  # launcher uses; `!!js` tags neutralised, since only the structure is at stake).
+  # If the edit would leave a file the launcher cannot read, the original is
+  # restored and the boot continues: a broken profile patch costs the whole
+  # harness, so a migration must never be able to produce one.
+  if [[ -f "$patch" && -f "$BROWSER_MCP_PATCH" ]]; then
+    local removed
+    removed="$(node -e '
+      const fs = require("fs");
+      const [file, fragment] = process.argv.slice(1);
+      let text = "";
+      try { text = fs.readFileSync(file, "utf8"); } catch { process.stdout.write("absent"); process.exit(0); }
+      const body = fs.readFileSync(fragment, "utf8").replace(/\s*$/, "") + "\n";
+      if (!text.includes(body)) { process.stdout.write("absent"); process.exit(0); }
+      let next = text.replace(body, "").replace(/\s*$/, "\n");
+      const significant = next.split("\n").filter((line) => line.trim() !== "" && !line.trim().startsWith("#"));
+      if (significant.length === 0) next = "# Your patch layer for this dsh profile, applied after every bundle layer.\n[]\n";
+      let load = null;
+      try { load = require("/opt/dsh/node_modules/js-yaml").load; } catch { /* validation is best-effort */ }
+      const parses = (candidate) => {
+        if (load === null) return true;
+        try { return Array.isArray(load(candidate.replace(/!!js\s+/g, ""))); } catch { return false; }
+      };
+      if (!parses(next)) {
+        // The block was appended after a lone `[]` flow sequence by some earlier
+        // state, which no longer parses at all — the harness is already down.
+        // Dropping that leftover `[]` is what repairs it; if that does not parse
+        // either, the file is left exactly as it was.
+        const repaired = next.replace(/^[ \t]*\[\][ \t]*$/mu, "").replace(/\n{3,}/gu, "\n\n");
+        if (parses(repaired)) {
+          fs.writeFileSync(file + ".tmp", repaired);
+          fs.renameSync(file + ".tmp", file);
+          process.stdout.write("removed-and-repaired");
+          process.exit(0);
+        }
+        process.stdout.write("would-not-parse");
+        process.exit(0);
+      }
+      fs.writeFileSync(file + ".tmp", next);
+      fs.renameSync(file + ".tmp", file);
+      process.stdout.write("removed");
+    ' "$patch" "$BROWSER_MCP_PATCH" 2>/dev/null || true)"
+    case "$removed" in
+      removed) log "browser MCP: removed the row an earlier image had spliced into $patch (the bundle provides it now)" ;;
+      removed-and-repaired) log "browser MCP: removed the row an earlier image had spliced into $patch, and repaired a leftover empty sequence in the same file" ;;
+      would-not-parse) log "WARN: $patch still carries the row an earlier image spliced in, and removing it would leave a file the launcher cannot read — left untouched (remove the block by hand: it duplicates the bundle's row)" ;;
+    esac
   fi
 
-  # Splice the fragment in. `[]` (the shipped template, comments aside) is
-  # REPLACED — appending after a flow sequence would make a second YAML document
-  # and the launcher would refuse the file. Anything else is an existing block
-  # sequence, where appending one more item is valid YAML. A file we cannot read
-  # is left alone: a broken profile patch costs the whole harness.
+  [[ "${DSH_BROWSER_MCP:-1}" == "0" ]] && { log "browser MCP: not selected (DSH_BROWSER_MCP=0) — it stays available in the Plugins page"; return 0; }
+
+  local marker="$DSH_REAL_HOME/.browser-mcp-bundle-seeded"
+  [[ -f "$marker" ]] && return 0
+
+  # Select the bundle — exactly what the Plugins page's switch writes.
   local how
   how="$(node -e '
     const fs = require("fs");
-    const [file, fragment] = process.argv.slice(1);
-    let text = "";
-    try { text = fs.readFileSync(file, "utf8"); } catch { text = ""; }
-    const body = fs.readFileSync(fragment, "utf8").replace(/\s*$/, "") + "\n";
-    const significant = text.split("\n").filter((line) => line.trim() !== "" && !line.trim().startsWith("#"));
-    const empty = significant.length === 0 || (significant.length === 1 && significant[0].trim() === "[]");
-    const next = empty ? body : text.replace(/\s*$/, "") + "\n\n" + body;
-    fs.writeFileSync(file + ".tmp", next);
-    fs.renameSync(file + ".tmp", file);
-    process.stdout.write(empty ? "replaced-empty" : "appended");
-  ' "$patch" "$BROWSER_MCP_PATCH" 2>/dev/null || true)"
+    const [manifest, name] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const profile = parsed?.dsh?.profile;
+    if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
+    const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
+    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("selected");
+  ' "$manifest" "$BROWSER_MCP_BUNDLE" 2>/dev/null || true)"
 
-  if [[ -n "$how" ]] && grep -q 'id: browser-mcp' "$patch" 2>/dev/null; then
-    printf '%s\n' "seeded ($how)" > "$marker" 2>/dev/null || true
-    log "browser MCP: seeded the switchable row into $patch ($how) — switch it off in the Plugin list when you do not want it"
-  else
-    log "WARN: could not seed the browser MCP row — the browser tools will not be offered (Plugin list stays clean)"
-  fi
+  case "$how" in
+    selected|already-selected)
+      printf '%s\n' "$how" > "$marker" 2>/dev/null || true
+      log "browser MCP: \"$BROWSER_MCP_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page when you do not want the browser tools"
+      ;;
+    unreadable|no-profile-block)
+      log "WARN: could not select \"$BROWSER_MCP_BUNDLE\" ($how) — enable it by hand in the Plugins page"
+      ;;
+    *)
+      log "WARN: could not select \"$BROWSER_MCP_BUNDLE\" — enable it by hand in the Plugins page"
+      ;;
+  esac
 }
 
 fatal() {
@@ -388,10 +444,10 @@ if [[ "$SAFE_MODE" == "1" ]]; then
   log "profile selection: Safe Mode — the real home's selection is left untouched"
 else
   seed_profile_selection
-  # Offer the browser tooling as a switchable MCP row (see seed_browser_mcp_row):
-  # seeded into the profile's own patch layer, once, so the Plugin list's switch
-  # is what decides whether the browser tools exist at all.
-  seed_browser_mcp_row
+  # Offer the browser tooling as a switchable bundle (see seed_browser_mcp_bundle):
+  # selected for the active profile once, so the Plugins page's switch is what
+  # decides whether the browser tools exist at all.
+  seed_browser_mcp_bundle
 fi
 
 # ---------------------------------------------------------------------

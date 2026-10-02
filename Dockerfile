@@ -342,6 +342,7 @@ RUN printf '%s\n' \
 COPY plugins/dsh-profile-switcher /opt/dsh-profile-switcher
 COPY plugins/dsh-browser-desktop /opt/dsh-browser-desktop
 COPY plugins/dsh-workspace-browser /opt/dsh-workspace-browser
+COPY plugins/dsh-browser-mcp /opt/dsh-browser-mcp
 RUN set -eux; \
     installed=0; \
     for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
@@ -349,14 +350,15 @@ RUN set -eux; \
         cp -a /opt/dsh-profile-switcher "$target/dsh-profile-switcher"; \
         cp -a /opt/dsh-browser-desktop "$target/dsh-browser-desktop"; \
         cp -a /opt/dsh-workspace-browser "$target/dsh-workspace-browser"; \
+        cp -a /opt/dsh-browser-mcp "$target/dsh-browser-mcp"; \
         installed=1; \
       fi; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
-    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser; \
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp; \
     chmod -R a+rX \
-      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser \
-      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser 2>/dev/null || true
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp 2>/dev/null || true
 # The workspace plugin's own suite, kept in the image so the ported host logic can
 # be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
 
@@ -367,12 +369,18 @@ RUN set -eux; \
 # merely sits in node_modules is invisible to the loader — it fails with
 # "failed to import"), and `client-modules` scans loader entries for packages
 # declaring `dsh.client`, which needs the specifier to be a package name.
+#
+# It is ALSO what puts a bundle on the Plugins page: the plugin manager builds that
+# list from `dsh.profile.bundles` ∪ the profile's dependencies ∪ the INSTALLATION's
+# dependencies, and gives every entry with a `dsh.bundle.patch` a switch that
+# selects/deselects it. `dsh-browser-mcp` relies on exactly that — declare it here
+# or it is invisible in the UI no matter what else is done.
 RUN set -eux; \
     for spec in "/opt/dsh/node_modules/@deepseek-ai/dsh/package.json:/opt/dsh/node_modules" "/opt/dsh-src/apps/cli/package.json:/opt/dsh-src/node_modules"; do \
       anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
       [ -d "$root/dsh-browser-desktop" ] || continue; \
-      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml

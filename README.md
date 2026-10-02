@@ -75,36 +75,42 @@ Switches:
 | `DSH_DESKTOP_WIDTH` / `DSH_DESKTOP_HEIGHT` | `1440` / `900` | virtual display size |
 | `DSH_DESKTOP_START_URL` | `about:blank` | first page the browser opens |
 
-## Browser tools as a switchable plugin row
+## Browser tools as a switchable plugin
 
-The model-facing browser tools are **one plugin row you can switch off**:
+The model-facing browser tools are **one plugin you switch on and off** — on the
+**Plugins page**, next to the shipped plugins:
 
 ```
-Plugin list → browser-mcp → off        # server gone, tools gone, tokens gone
-Plugin list → browser-mcp → on         # 24 browser_* tools, attached to the visible Brave
+Plugins page → Browser tools → off      # server gone, tools gone, tokens gone
+Plugins page → Browser tools → on       # 24 browser_* tools, attached to the visible Brave
 ```
 
 | | |
 |---|---|
-| Row id / module | `browser-mcp` / `@deepseek-ai/dsh-mcp-client` |
+| Bundle / package | `dsh-browser-mcp` (title "Browser tools") |
+| Plugin row it mounts | `browser-mcp` → `@deepseek-ai/dsh-mcp-client` |
 | Server name | `playwright-mcp` → tools `mcp__playwright-mcp__browser_*` |
 | Attaches to | the visible Brave desktop, over CDP (`127.0.0.1:$DSH_CDP_PORT`) |
-| Toggle | live — the profile patch is watched, so **no restart** is needed |
+| Applies | at the next boot (bundle selection is read when the tree is composed) |
 
-**Why this matters:** the tool definitions cost roughly 10k tokens of static context
-in every Session, and they used to be unavoidable — a row mounted by a launcher
-overlay is applied *after* the profile layer, so it re-declares itself enabled and
-the Plugin list's switch can never turn it off (measured: a profile-level
-`disabled: false` override on an overlay row is ignored, `--dump-config` shows why).
-The row now lives in the **profile's own patch layer** — the same file the switch
-writes to — seeded once per home by the entrypoint (`plugins/dsh-browser-mcp/`,
-marker `.browser-mcp-row-seeded`), so the image never re-enables what you switched
-off.
+**Why this matters:** the tool definitions cost roughly 10k tokens of static
+context in every Session, and they used to be unavoidable — a row mounted by a
+launcher **overlay** is applied *after* the profile layer, so it re-declares itself
+enabled and no switch can turn it off (measured: a profile-level `disabled: false`
+override on an overlay row is ignored, `--dump-config` shows why). The row now
+ships **inside a bundle**, which is the unit the Plugins page lists and toggles
+(`listBundles()` builds that list from `dsh.profile.bundles` ∪ the profile's
+dependencies ∪ the **installation's** dependencies, and gives every entry with a
+`dsh.bundle.patch` a switch). Two further wins: **one** MCP process for the whole
+harness instead of one per activated Session (~110-130 MB each), and no need for
+the exclusivity patch below — a plain MCP client has no single-owner attach mode.
 
-Two further wins on this path: **one** MCP process for the whole harness instead of
-one per activated Session (that was ~110-130 MB each), and no need for the
-exclusivity patch below — a plain MCP client has no single-owner attach mode, so
-every Session sees the tools.
+The bundle is selected for the active profile **once per home** by the entrypoint
+(marker `.browser-mcp-bundle-seeded`), so switching it off is a decision the image
+never overrides. `DSH_BROWSER_MCP=0` skips the selection entirely — the plugin
+then shows up as *available* (off) rather than selected. A profile patch that
+still carries the row an earlier image spliced in is migrated away automatically
+(exact text match, validated with the launcher's own YAML parser before writing).
 
 The official provider is still in the image and still one flag away
 (`DSH_BROWSER_USE_PROVIDER=1`), for anyone who wants per-Session tools.

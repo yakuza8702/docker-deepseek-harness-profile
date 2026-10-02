@@ -1,65 +1,75 @@
-# dsh-browser-mcp — the browser tooling as one switchable MCP row
+# dsh-browser-mcp — the browser tools as a switchable plugin
 
-The container's browser automation, exposed the way every other tool source in
-DSH is: **one `@deepseek-ai/dsh-mcp-client` row** that you can see and switch off
-in the Plugin list.
+The container's browser automation, packaged the way DSH expects a plugin to be:
+a **bundle** with a `dsh.bundle.patch`, so it appears on the **Plugins page** next
+to the shipped plugins and can be switched on and off there.
 
 | | |
 |---|---|
-| Row id | `browser-mcp` |
-| Module | `@deepseek-ai/dsh-mcp-client` |
+| Bundle / package | `dsh-browser-mcp` |
+| Plugin row it mounts | `browser-mcp` → `@deepseek-ai/dsh-mcp-client` |
 | Server name | `playwright-mcp` (this is the tool namespace) |
-| Tools | `mcp__playwright-mcp__browser_*` — **identical names** to the old provider |
+| Tools | `mcp__playwright-mcp__browser_*` — 24 tools, identical names to the old provider |
 | Attaches to | the visible Brave desktop this image runs, over CDP (`127.0.0.1:$DSH_CDP_PORT`) |
+| Switch | **Plugins page → Browser tools → off/on** (writes `dsh.profile.bundles`) |
 
-## Why it exists
+## Why it is a bundle
 
-The browser tools used to come from
-`@deepseek-ai/dsh-browser-use` + `@deepseek-ai/dsh-experimental-browser-use-playwright-mcp`,
-mounted by a **launcher overlay** — and a row mounted that way can never be
-switched off: the overlay is applied *after* the profile layer, so it re-declares
-the row enabled no matter what the user (or the Plugin list) writes into their
-own profile patch. Measured with `dsh --profile web --patch … --dump-config`: a
-profile-level `- id: browser-use` / `disabled: false` override is simply ignored.
+The Plugins page does not list loader rows — it lists **bundles**. The plugin
+manager builds that list from
 
-The consequences were real: ~10k tokens of static context in **every** Session,
-one MCP process per activated Session (~110–130 MB each), and upstream's attach
-mode reserving the browser for a single Session — which this fork had to patch
-out of the provider's code.
+```
+dsh.profile.bundles  ∪  the profile's dependencies  ∪  the DSH installation's dependencies
+```
 
-Going through `dsh-mcp-client` instead fixes all four at once:
+and every entry with a `dsh.bundle.patch` gets a switch
+(`listBundles()` / `selectBundle()`: selecting writes the name into
+`dsh.profile.bundles`, deselecting removes it). Anything that is *not* a bundle is
+invisible there, however it was mounted:
 
-* the row is an ordinary **plugin row** in the Plugin list, with a switch;
-* switching it off removes the server, the tools and the token cost entirely —
-  and it is **live** (the profile patch is watched), so no restart is needed;
-* it costs **one** MCP process for the whole harness, not one per Session;
-* a plain MCP client has no exclusive attach mode, so the upstream patch is no
-  longer needed on this path.
+* a **launcher overlay** row can never be switched off at all — the overlay is
+  applied after the profile layer, so it re-declares itself enabled (measured with
+  `dsh --profile web --patch … --dump-config`);
+* a row **spliced into the profile patch** works as a switch target but does not
+  appear on the Plugins page — that was this feature's first attempt, and the
+  reason it "did not show up in the sidebar".
 
-## How it is installed
+Shipping the row *inside a bundle* fixes both: the row exists exactly while the
+bundle is selected, and the bundle is what the page lists and toggles.
 
-`docker/entrypoint.sh` seeds this directory's `cordis.patch.yml` into the
-profile's own patch layer (`$DSH_HOME/profiles/<name>/cordis.patch.yml`) **once
-per home**, marker-guarded (`.browser-mcp-row-seeded`). Seeding into the profile
-layer is the whole point: that is the file the Plugin list writes to, so the
-switch wins.
+## Why it exists at all
 
-A fresh home gets it on the first boot — the entrypoint initialises the shipped
-`web` profile with DSH's own `initProfile()` before the harness starts, so the
-row exists when the tree is first composed.
+The tool definitions cost roughly 10k tokens of static context in **every**
+Session, and the provider path they came from ran one MCP process per activated
+Session (~110–130 MB each) and needed an upstream patch for its single-owner
+attach mode. Going through `dsh-mcp-client` instead gives:
+
+* one switchable plugin entry, off when you do not want it — server, tools and
+  their context all gone;
+* **one** MCP process for the whole harness instead of one per Session;
+* no exclusive attach mode, so the upstream exclusivity patch is not needed on
+  this path (the provider stays available, see below).
+
+## How it is selected
+
+`docker/entrypoint.sh` (`seed_browser_mcp_bundle`) selects the bundle for the
+active profile **once per home**, marker-guarded (`.browser-mcp-bundle-seeded`),
+so switching it off is a decision the image never overrides. A fresh home gets it
+on the first boot — the entrypoint initialises the shipped `web` profile with
+DSH's own `initProfile()` before the harness starts.
+
+It also **migrates** the previous attempt away: a profile patch that still carries
+the row spliced in by an earlier image has that block removed (exact text match,
+idempotent), because the bundle now provides the same row id.
 
 ## Switches
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DSH_BROWSER_MCP` | `1` | `0` = do not seed the row at all (no browser tools) |
+| `DSH_BROWSER_MCP` | `1` | `0` = do not select the bundle (it stays visible in the Plugins page as available) |
 | `DSH_DESKTOP_ENABLED` | `1` | `0` = no desktop stack, and the row is disabled with it |
 | `DSH_CDP_PORT` | `9222` | the browser's DevTools port inside the container |
 | `DSH_BROWSER_MCP_TIMEOUT` | `60000` | per-tool-call timeout in ms |
-
-Runtime switch: **Plugin list → `browser-mcp` → off/on.** The plugin manager
-writes `- id: browser-mcp` / `disabled: true|false` into the same profile patch,
-and the loader recomposes immediately.
 
 ## Alternative: the official provider
 

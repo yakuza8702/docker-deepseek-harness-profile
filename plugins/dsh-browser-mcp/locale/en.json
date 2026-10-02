@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Browser tools",
+    "description": "Let the model drive the container's visible browser: navigate, read pages, click, type and screenshot through the Playwright MCP server attached over CDP. Switch it off to save the tool definitions' context."
+  }
+}
