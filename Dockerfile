@@ -297,9 +297,20 @@ RUN printf '%s\n' \
 # Reverse proxy ("0.0.0.0 fix", smanx pattern) + entrypoint + recovery surface.
 # recovery.mjs is imported by the proxy: it renders the boot-failure screen and
 # serves its API while the harness itself is down.
-COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs /opt/seek-harness/
+# lockfile-integrity.mjs runs from the entrypoint BEFORE dsh starts (see the
+# guard block there): pnpm refuses a lockfile tarball resolution without an
+# integrity unless the URL is git-hosted, so one Market install of a curated
+# release-archive plugin bricks every install in that profile.
+COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs docker/lockfile-integrity.mjs /opt/seek-harness/
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
  && ln -sfn /opt/seek-harness/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# The lockfile guard must recognise exactly the shapes pnpm accepts without an
+# integrity (and refuse everything else). A wrong predicate either misses the
+# bricked profile or rewrites an entry pnpm was happy with, so its decision table
+# is a build gate: well-formed fixtures in, expected classifications out, plus
+# the exact rewritten line pnpm itself writes. Offline — no network in the gate.
+RUN node /opt/seek-harness/lockfile-integrity.mjs --self-test
 
 # Gate the recovery page's inline JavaScript BEFORE it can ship.
 #

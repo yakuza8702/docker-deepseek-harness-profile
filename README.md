@@ -698,3 +698,58 @@ it is upstream's own setting and prevents a duplicate copy of the core's
 framework packages from being installed into the profile (which is what makes
 `dshmarket`, or any other bundle, fail to load with two competing runtimes).
 
+### The Plugin Market's Install button fails for every plugin (pnpm refuses the lockfile)
+
+```
+Install  <any plugin>
+…node_modules/pnpm/dist/pnpm.cjs:168629:34)
+ at Array.map (<anonymous>)
+ at resolveDependenciesOfImporters (…/pnpm/dist/pnpm.cjs:168195:58)
+ at async _installInContext (…/pnpm/dist/pnpm.cjs:175355:232)
+```
+
+The stack names no package, and the plugin you were installing is usually not the
+problem. pnpm verifies a profile's **whole** lockfile before any `add`/`remove`,
+and refuses a tarball resolution that carries no `integrity` unless it can
+recognise the URL as git-hosted itself (`codeload.github.com/…tar.gz`,
+`bitbucket.org`, `gitlab.com`):
+
+```
+ERR_PNPM_MISSING_TARBALL_INTEGRITY: Cannot install package
+"<name>@https://github.com/<owner>/<repo>/releases/…/<file>.tgz":
+its lockfile entry has no "integrity" field
+```
+
+A GitHub **release asset** is not one of those shapes — and pnpm *writes* that
+shape when such a URL is added, then refuses it on the next operation that has to
+materialise the package. The Market installs curated catalog entries that ship a
+prebuilt release archive from exactly that URL (about 70 of them), so one such
+install is enough to stop every later install and uninstall in that profile —
+including perfectly compatible plugins. The market's own log names the culprit:
+
+```bash
+docker exec <container> tail -5 /home/node/.dsh/profiles/web/.dsh-market/log.ndjson
+# {"event":"install","detail":"<plugin> exit=1 err=ERR_PNPM_MISSING_TARBALL_INTEGRITY: … <culprit> …"}
+```
+
+This image repairs it at boot (`docker/lockfile-integrity.mjs`, called by the
+entrypoint before `dsh` starts): it finds tarball resolutions pnpm would reject,
+downloads each tarball once, and pins `integrity: sha512-…` on that line — the
+hash pnpm itself computes for the URL, which is already in the profile's own
+manifest. The lockfile is backed up to `$DSH_HOME/.lockfile-repair-<UTC>/` first,
+the repair is idempotent, and a failed download changes nothing.
+
+```bash
+# what the guard did on this boot
+docker logs <container> 2>&1 | grep lockfile-integrity
+# run it by hand (dry-run = report only, no download, no write)
+docker exec <container> node /opt/seek-harness/lockfile-integrity.mjs --home "$DSH_HOME" --dry-run
+```
+
+* `DSH_LOCKFILE_REPAIR=0` switches the guard off; `=dry` reports without writing.
+* pnpm may re-resolve once and drop the pinned integrity on the **first** install
+  after a failed run — the next boot re-applies it. Two `pnpm install` passes are
+  enough by hand; `--lockfile-only` must **not** be used to check a repair, it
+  rewrites the entry without an integrity.
+* The guard only pins; it never deletes a dependency or installs anything.
+

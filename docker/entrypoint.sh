@@ -487,6 +487,35 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# Lockfile integrity guard (see docker/lockfile-integrity.mjs).
+#
+# pnpm verifies a profile's lockfile BEFORE any add/remove, and rejects a
+# tarball resolution that carries no `integrity` unless it can recognise the URL
+# as git-hosted itself. A GitHub RELEASE ASSET is not one of those shapes — and
+# pnpm writes exactly that shape when such a URL is installed (the Plugin Market
+# installs curated entries that ship a prebuilt release archive, ~70 of them).
+# One such entry therefore stops every install and uninstall in that profile:
+# the Market's Install button fails even for plugins that are perfectly fine,
+# with a pnpm stack that names none of this. Measured 2026-10-02 on
+# seek-harness-browser-test.
+#
+# The guard pins the integrity of the entries pnpm would refuse — the URL is
+# already in the profile's own manifest — backs the lockfile up first, and never
+# blocks the boot. DSH_LOCKFILE_REPAIR=0 switches it off; =dry reports only.
+# ---------------------------------------------------------------------
+case "${DSH_LOCKFILE_REPAIR:-1}" in
+  0 | off | false)
+    log "lockfile integrity guard: disabled (DSH_LOCKFILE_REPAIR=${DSH_LOCKFILE_REPAIR:-1})"
+    ;;
+  *)
+    guard_args=(--home "$HARNESS_HOME")
+    [[ "${DSH_LOCKFILE_REPAIR}" == "dry" ]] && guard_args+=(--dry-run)
+    node /opt/seek-harness/lockfile-integrity.mjs "${guard_args[@]}" \
+      || log "lockfile integrity guard: see the message above — the boot continues"
+    ;;
+esac
+
+# ---------------------------------------------------------------------
 # In-app profile control (dsh-profile-switcher) as a launcher overlay.
 # Applied AFTER the profile layer, so no profile directory is ever edited: the
 # pill in the Web UI comes from this file. DSH_PROFILE_OVERLAY=<path> overrides
