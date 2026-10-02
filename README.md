@@ -403,13 +403,69 @@ Inside the container: `docker ps`, `docker compose version`, `docker build ...` 
 
 ## What's inside (smanx devtools-latest set)
 
-`git` `curl` `wget` `nano` `jq` `less` `ripgrep` `rsync` `procps` `ca-certificates` `unzip` `vim` `zip` `htop` `tmux` `tree` `openssl` `python3` `bash-completion` `build-essential` (via base image) · npm globals: **pnpm** (pinned) · **uv** (`uvx` for MCP servers) · **docker CLI + compose plugin** · `tini` · `bubblewrap` (DSH Linux sandbox backend)
+`git` `curl` `wget` `nano` `jq` `less` `ripgrep` `rsync` `procps` `ca-certificates` `unzip` `vim` `zip` `htop` `tmux` `tree` `openssl` `python3` `bash-completion` `build-essential` (via base image) · npm globals: **pnpm** (pinned) · **uv** (`uvx` for MCP servers) · **docker CLI + compose plugin** · `tini` · `bubblewrap` (DSH Linux sandbox backend) · **APK/Android reverse-engineering toolchain** (JDK, jadx, apktool, Hermes, frida, androguard, Android SDK — see the section below)
 
 No browser is *forced* on you: the desktop is started only for a `web` boot
 (`DSH_DESKTOP_ENABLED=0` turns it off entirely) and DSH still runs with `--no-open`
 so it never tries to open a host browser. The image does ship the browser stack now —
 **Brave**, Xvfb, openbox, x11vnc, websockify and noVNC — because that is what Browser
 Use and human takeover run on.
+
+## APK / Android reverse-engineering toolchain
+
+The image answers "what does this .apk actually do?" offline — no toolchain to
+download at runtime, no phone, no account. This is what the agent reaches for when
+it is handed an APK (or an `.apks`/`.xapk` split bundle), and it is the difference
+between reading a DEX string table and reading the app's actual logic.
+
+```bash
+docker run --rm --entrypoint apk-tools ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest   # inventory + versions
+docker exec seek-harness apk-tools --check        # re-run the build-time probe of every tool
+docker exec seek-harness apk-unpack /workspace/app.apk          # -> /workspace/app-unpacked/
+docker exec seek-harness apk-unpack /workspace/app.apks ./out   # split bundle: analyses base.apk
+```
+
+| Tool | Version | What it answers |
+|---|---|---|
+| JDK | 21 (Debian) | jadx, apktool, apksigner, sdkmanager and apkanalyzer are all JVM programs |
+| `jadx` | 1.5.6 | DEX → Java source (`jadx/sources/`) — the readable half of an APK |
+| `apktool` | 3.0.3 | binary `AndroidManifest.xml` + `resources.arsc` → real XML, smali decode, **and rebuild** (a decompiler cannot produce an APK) |
+| `hbctool`, `hermes-dec` | 0.1.5 / 0.1.7 | React-Native `assets/index.android.bundle` is Hermes **bytecode**, invisible to jadx and to `strings` |
+| `androguard`, `apkid` | 4.1.4 / 3.1.0 | scriptable APK/DEX/AXML analysis without a JVM, and packer/obfuscator detection |
+| `frida`, `frida-dexdump`, `objection` | 17.20.0 / 2.0.1 / 1.12.5 | dynamic instrumentation (needs a device — the container has no USB) |
+| Android SDK | cmdline-tools `16111833`, build-tools `36.1.0`, `android-36` | `apksigner`, `zipalign`, `aapt2`, `apkanalyzer`, `sdkmanager` — sign and inspect a rebuilt APK |
+| `adb` | Debian package | talks to a device/emulator over TCP. Debian's on purpose: Google's platform-tools zip has no aarch64 build |
+
+`apk-unpack` produces a layout meant to be read, not re-derived:
+`raw/` (the archive as-is), `base/` (the inner `base.apk` of a split bundle, unpacked),
+`apktool/` (decoded resources + smali), `jadx/` (Java sources), `AndroidManifest.xml`
+(apkanalyzer's print), `apk-summary.txt`, `SUMMARY.txt` (dex count, native libs,
+Hermes/Flutter/Unity hints) and `logs/` — every step's failure is kept in a log instead
+of being thrown away, because `jadx` reports errors on almost every obfuscated app and
+that must not stop you from reading the manifest.
+
+Three things worth knowing before trusting a result:
+
+- **Hermes revisions differ.** `hbctool` refuses bytecode revisions it does not know
+  (v98, which current React Native/Expo apps ship, is one of them); `hermes-dec`
+  (`hbc-disassembler`, `hbc-decompiler`) handles those with a warning. Try both, and
+  report which one worked instead of guessing at the bytecode.
+- **The rootfs is read-only** (`read_only: true` in the compose file), so
+  `sdkmanager --install "platforms;android-35"` cannot write into `$ANDROID_HOME`.
+  Android *projects* usually only need their own `./gradlew` (it downloads its Gradle
+  into `$HOME`); for extra SDK packages, use a `compose.override.yaml` with
+  `read_only: false` or point `ANDROID_HOME` at a writable path.
+- **Static by default.** Nothing here calls out, and no device is touched unless you
+  connect one (`adb connect host:port` + `frida-server` on the target).
+
+Cost, stated plainly: this section adds roughly **0.7 GB** to the image (mostly the JDK
+and the Android SDK). Versions are pinned in [`docker/apk-toolchain.sh`](docker/apk-toolchain.sh)
+and every download is checksum-verified against the vendor's own digest, so an analysis
+can be reproduced later; [`tools/check-apk-toolchain.mjs`](tools/check-apk-toolchain.mjs)
+**executes** all 27 checks at build time and fails the build if any tool cannot run —
+a container that boots is a container whose toolchain works. The in-image guide
+(`/opt/apk-tools/README.md`, also in the repo as [`docker/apk-tools.md`](docker/apk-tools.md))
+carries the full workflow: Hermes bundles, repack/sign, native libs, and the limits.
 
 ## Auto-update workflow
 
@@ -468,6 +524,8 @@ services:
 docker run --rm --entrypoint dsh ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest --version   # prints pinned DSH version
 docker run --rm --entrypoint bash ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest -c \
   'docker --version && docker compose version && pnpm --version && uv --version && bwrap --version'
+docker run --rm --entrypoint bash ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest -c \
+  'apk-tools --check'                       # APK toolchain: 27/27 checks passed
 docker compose up -d && curl -fsS http://127.0.0.1:3080/ && docker compose ps   # healthy
 ```
 

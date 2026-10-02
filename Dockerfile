@@ -412,6 +412,86 @@ RUN set -eux; \
     [ -n "$found" ] || { echo "ERROR: @playwright/mcp is missing — the switchable browser MCP row would fail to start"; exit 1; }; \
     echo "browser MCP: @playwright/mcp present in $found"
 
+# ---------------------------------------------------------------------
+# APK / Android reverse-engineering toolchain.
+#
+# WHY IT IS IN THE IMAGE
+# The harness gets pointed at an .apk ("what does this app actually do, and
+# where does my data go?") and the honest answer without this layer is
+# `unzip` + `strings`: enough for the DEX string table, useless for the real
+# logic — which for a React-Native app is not in the DEX at all, it is a
+# Hermes BYTECODE bundle that neither jadx nor strings can read.
+#
+# WHAT EACH PIECE BUYS
+#   JDK                 jadx, apktool, apksigner, sdkmanager and
+#                       apkanalyzer are all JVM programs
+#   jadx                DEX -> Java source: the readable half of an APK
+#   apktool             binary AndroidManifest + resources.arsc -> real XML,
+#                       plus smali decode/rebuild — the only sane repack path
+#                       (a decompiler cannot produce an APK; this can)
+#   hbctool, hermes-dec Hermes HBC bytecode -> disassembly/decompilation,
+#                       covering different HBC revisions so both ship
+#   frida-tools,        dynamic instrumentation on a target device, dexdump
+#   frida-dexdump,      from memory, and objection's wrapper on top
+#   objection
+#   androguard, apkid   scriptable APK/DEX/AXML analysis WITHOUT a JVM, and
+#                       packer/obfuscator detection
+#   Android SDK         apksigner + zipalign + aapt2 + apkanalyzer: sign,
+#                       align and inspect a rebuilt APK
+#   adb                 talks to a device/emulator when there is one. Taken
+#                       from Debian on purpose: Google's platform-tools zip
+#                       has no aarch64 build, and this image builds for arm64
+#                       too.
+#
+# Nothing here runs at container start and nothing needs a phone, an account
+# or a network call at runtime — it is static-analysis capability for the
+# agent's shell. `apk-tools` prints the inventory from inside a running
+# container; `apk-unpack` is the one-shot entry point.
+#
+# Versions are pinned in docker/apk-toolchain.sh (and every download is
+# checksum-verified against the vendor's own digest), because a silent
+# upstream change would make yesterday's analysis unreproducible. The build
+# then EXECUTES all of it — tools/check-apk-toolchain.mjs fails the build if
+# a tool cannot run, so a broken toolchain cannot ship as a working one.
+#
+# SIZE WARNING: this section adds roughly 0.7 GB to the image (mostly the
+# JDK and the Android SDK). It is the price of being able to answer the
+# question offline instead of downloading a toolchain per session.
+# ---------------------------------------------------------------------
+ARG JADX_VERSION=1.5.6
+ARG APKTOOL_VERSION=3.0.3
+ARG ANDROID_CMDLINE_TOOLS_BUILD=16111833
+ARG ANDROID_BUILD_TOOLS=36.1.0
+ARG ANDROID_PLATFORM=android-36
+
+COPY --chmod=0755 docker/apk-toolchain.sh /tmp/apk-toolchain.sh
+COPY --chmod=0755 docker/apk-tools.sh /usr/local/bin/apk-tools
+COPY --chmod=0755 docker/apk-unpack.sh /usr/local/bin/apk-unpack
+RUN set -eux; \
+    APK_JADX_VERSION="${JADX_VERSION}" \
+    APK_APKTOOL_VERSION="${APKTOOL_VERSION}" \
+    APK_CMDLINE_TOOLS_BUILD="${ANDROID_CMDLINE_TOOLS_BUILD}" \
+    APK_BUILD_TOOLS="${ANDROID_BUILD_TOOLS}" \
+    APK_PLATFORM="${ANDROID_PLATFORM}" \
+      /tmp/apk-toolchain.sh; \
+    rm -f /tmp/apk-toolchain.sh
+
+# JAVA_HOME is /opt/java because the real JDK path carries the architecture
+# (java-21-openjdk-amd64 / -arm64) and tools like Gradle and sdkmanager
+# refuse to guess; the installer points that symlink at whatever apt
+# installed. The tool venv comes FIRST on PATH so `python3` and `pip` stay
+# the same interpreter — `pip install X` then `python3 -c "import X"` must
+# not disagree with itself.
+ENV JAVA_HOME=/opt/java \
+    ANDROID_HOME=/opt/android-sdk \
+    ANDROID_SDK_ROOT=/opt/android-sdk \
+    PATH=/opt/apk-tools/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The build-time proof (also runnable in a live container: `apk-tools --check`).
+COPY --chmod=0644 docker/apk-tools.md /opt/apk-tools/README.md
+COPY --chmod=0644 tools/check-apk-toolchain.mjs /opt/apk-tools/check.mjs
+RUN node /opt/apk-tools/check.mjs
+
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \
     HOME=/workspace \
