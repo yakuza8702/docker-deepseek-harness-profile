@@ -369,6 +369,92 @@ seed_browser_mcp_bundle() {
   esac
 }
 
+# Browser Use as a switchable BUNDLE (see plugins/dsh-browser-desktop).
+#
+# The row lives in the bundle's own patch, NOT in browser-use.overlay.yml. An
+# overlay is applied after the profile layer, so a row mounted there is re-declared
+# on every boot and the Plugins page's switch can never turn it off — measured with
+# `--dump-config` for the MCP row, and the same shadowing applies here. This host
+# half registers the `browser_open` TOOL and a `tool:browser_open` system-prompt
+# SECTION, so "always on" means a context cost in every Session. On the profile
+# layer the plugin manager's `setPluginEnabled('browser-desktop', …)` writes an
+# id-targeted override into the profile patch and the loader recomposes live.
+#
+# Seeding therefore means "select the bundle for the active profile", once per home
+# (marker), and never again: switching it off in the Plugins page is a decision this
+# image does not override. Nothing is written in Safe Mode.
+#
+# The bundle is SELECTED, never DEPENDED ON, for the same reasons as the MCP bundle
+# above — a profile dependency is what puts an integrated feature into the Plugins
+# list and the community Market's Installed tab.
+BROWSER_DESKTOP_BUNDLE="dsh-browser-desktop"
+seed_browser_desktop_bundle() {
+  [[ "${SAFE_MODE:-0}" == "1" ]] && { log "browser desktop: Safe Mode — the real profile is left untouched"; return 0; }
+  [[ "${DSH_DESKTOP_ENABLED:-1}" == "0" ]] && { log "browser desktop: not selected (DSH_DESKTOP_ENABLED=0)"; return 0; }
+
+  local dir="$DSH_REAL_HOME/profiles/$PROFILE"
+  local manifest="$dir/package.json"
+
+  # The profile is created by the MCP seeder above (or by DSH itself); if it is not
+  # there yet there is nothing to select into, and the next boot picks it up.
+  [[ -f "$manifest" ]] || { log "browser desktop: profile \"$PROFILE\" does not exist yet — it will be selected on the next boot"; return 0; }
+
+  local bundle_dir=""
+  for root in /opt/dsh /opt/dsh-src; do
+    if [[ -d "$root/node_modules/$BROWSER_DESKTOP_BUNDLE" ]]; then bundle_dir="$root/node_modules/$BROWSER_DESKTOP_BUNDLE"; break; fi
+  done
+  [[ -n "$bundle_dir" ]] || { log "WARN: $BROWSER_DESKTOP_BUNDLE is not in this image's node_modules — the browser desktop will not be offered"; return 0; }
+
+  # Drop OUR `link:` dependency if an earlier image ever added one, so the package
+  # cannot linger as a card. A user's own pin is left alone.
+  node -e '
+    const fs = require("fs");
+    const [manifest, name] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.exit(0); }
+    const dependencies = parsed.dependencies;
+    if (dependencies === null || typeof dependencies !== "object" || !Object.hasOwn(dependencies, name)) process.exit(0);
+    const spec = dependencies[name];
+    if (!(typeof spec === "string" && spec.startsWith("link:") && spec.replace(/\/+$/, "").endsWith("/node_modules/" + name))) process.exit(0);
+    delete dependencies[name];
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    console.log("dropped");
+  ' "$manifest" "$BROWSER_DESKTOP_BUNDLE" 2>/dev/null | grep -q dropped \
+    && log "browser desktop: dropped the profile dependency an earlier image added — the bundle stays selected" || true
+
+  local marker="$DSH_REAL_HOME/.browser-desktop-bundle-seeded"
+  local seeded=0
+  [[ -f "$marker" ]] && seeded=1
+
+  local how
+  how="$(node -e '
+    const fs = require("fs");
+    const [manifest, name, seeded] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const profile = parsed?.dsh?.profile;
+    if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
+    const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
+    if (seeded === "1") { process.stdout.write("existing-home"); process.exit(0); }
+    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("selected");
+  ' "$manifest" "$BROWSER_DESKTOP_BUNDLE" "$seeded" 2>/dev/null || true)"
+
+  case "$how" in
+    selected|already-selected)
+      printf '%s\n' "$how" > "$marker" 2>/dev/null || true
+      log "browser desktop: \"$BROWSER_DESKTOP_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page under \"Browser Use\" to release the browser_open tool and its prompt section"
+      ;;
+    existing-home) ;;
+    unreadable|no-profile-block) log "WARN: could not select \"$BROWSER_DESKTOP_BUNDLE\" ($how) — enable it by hand in the Plugins page" ;;
+    *) log "WARN: could not select \"$BROWSER_DESKTOP_BUNDLE\" — enable it by hand in the Plugins page" ;;
+  esac
+}
+
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
   write_boot_state failed "$*" "the harness process exited during startup"
@@ -510,6 +596,12 @@ else
   # selected for the active profile once, so the Plugins page's switch is what
   # decides whether the browser tools exist at all.
   seed_browser_mcp_bundle
+  # …and the visible desktop + browser_open bridge as a SECOND, independent one
+  # (see seed_browser_desktop_bundle): one switch releases the MCP tool
+  # definitions, the other releases the browser_open tool and its prompt section.
+  # It runs after the MCP seeder because that one creates the profile on a fresh
+  # home.
+  seed_browser_desktop_bundle
 fi
 
 # ---------------------------------------------------------------------

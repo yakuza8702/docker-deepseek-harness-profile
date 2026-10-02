@@ -35,9 +35,35 @@ window.__ModuleLoader__.load({
     /** Route prefix of this plugin's own host half. */
     const ROUTE = '/dsh-plugins-page-extras'
 
-    /** The integrated browser tooling this image ships (plugins/dsh-browser-mcp). */
-    const BROWSER_BUNDLE = 'dsh-browser-mcp'
+    /** The visible browser desktop the "Open panel" action points at. */
     const DESKTOP_PATH = '/desktop/vnc.html?autoconnect=1&resize=scale&view_only=0&reconnect=1'
+
+    /**
+     * The two integrated browser features, one row each — and one switch each.
+     *
+     * They are deliberately separate because they cost DIFFERENT things: the MCP row
+     * is 24 tool definitions, the desktop row is one tool (`browser_open`) plus a
+     * system-prompt section. One switch for both meant releasing the cheaper one to
+     * drop the expensive one, and there was no way to keep the visible desktop while
+     * dropping its prompt cost.
+     *
+     * `row` is the loader entry id the host route toggles.
+     */
+    const FEATURES = [
+      {
+        row: 'browser-mcp',
+        glyph: 'tools',
+        title: 'Browser tools',
+        body: 'Let the model drive this container\u2019s visible browser \u2014 navigate, read pages, click, type and screenshot \u2014 through the Playwright MCP server attached over CDP. This is the whole tool surface: turn it off to stop paying for it in every request.'
+      },
+      {
+        row: 'browser-desktop',
+        glyph: 'desktop',
+        title: 'Browser Use',
+        body: 'The visible Chromium desktop itself, plus the browser_open hand-off tool and its system-prompt section that let the model reveal a page to you for human takeover. Its own cost is small but constant \u2014 turn it off to release it while Browser tools stays on.',
+        panel: true
+      }
+    ]
 
     /**
      * The markets — Desktop's MARKET_OPTIONS (its copy and repositories), minus its
@@ -170,8 +196,8 @@ window.__ModuleLoader__.load({
       onClick: (event) => event.stopPropagation()
     }, children)
 
-    /** The browser glyph, stroked like the page's own icon set. */
-    const BrowserIcon = () => React.createElement('svg', {
+    /** The first feature's glyph: a browser window over a page. */
+    const ToolsIcon = () => React.createElement('svg', {
       width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
       strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true
     },
@@ -183,7 +209,18 @@ window.__ModuleLoader__.load({
       React.createElement('path', { d: 'M9 14.3h6M12 11.3c1.55 1.65 1.55 4.35 0 6M12 11.3c-1.55 1.65-1.55 4.35 0 6' })
     )
 
+    /** The second feature's glyph: the display the human sits in front of. */
+    const DesktopIcon = () => React.createElement('svg', {
+      width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+      strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true
+    },
+      React.createElement('rect', { x: 2.5, y: 4, width: 19, height: 12.5, rx: 2.2 }),
+      React.createElement('path', { d: 'M9.5 20.5h5M12 16.5v4' }),
+      React.createElement('path', { d: 'M8.6 12.4l2.1-2.6 1.9 1.6 2.3-3' })
+    )
+
     function Extras() {
+      const [rows, setRows] = useState(null)
       const [bundles, setBundles] = useState(null)
       const [busy, setBusy] = useState(null)
       /* `{ text, tone }`: informational lines must not wear the error colour. */
@@ -191,7 +228,9 @@ window.__ModuleLoader__.load({
       const say = useCallback((text, tone = 'info') => setMessage({ text, tone }), [])
       const [selected, setSelected] = useState('dsh-market')
 
-      const state = (name) => bundles?.find((entry) => entry.name === name) ?? null
+      const bundle = (name) => bundles?.find((entry) => entry.name === name) ?? null
+      const row = (id) => rows?.find((entry) => entry.id === id) ?? null
+      const loaded = rows !== null && bundles !== null
 
       const call = useCallback(async (action, body) => {
         const response = await fetch(`${ROUTE}/${action}`, body === undefined
@@ -205,6 +244,7 @@ window.__ModuleLoader__.load({
       const refresh = useCallback(async () => {
         try {
           const payload = await call('state')
+          setRows(payload.rows ?? [])
           setBundles(payload.bundles ?? [])
         } catch (error) {
           say(String(error?.message ?? error), 'error')
@@ -213,11 +253,12 @@ window.__ModuleLoader__.load({
 
       useEffect(() => { void refresh() }, [refresh])
 
-      const setBundle = useCallback(async (name, enabled) => {
-        setBusy(name); setMessage(null)
+      /** Switch one integrated feature's loader row — live, and independent of the other. */
+      const setRow = useCallback(async (feature, enabled) => {
+        setBusy(feature.row); setMessage(null)
         try {
-          await call('bundle', { name, enabled })
-          say(`${name} ${enabled ? 'enabled' : 'disabled'}.`)
+          await call('row', { id: feature.row, enabled })
+          say(`${feature.title} ${enabled ? 'on' : 'off'}.`)
         } catch (error) {
           say(String(error?.message ?? error), 'error')
         } finally {
@@ -233,7 +274,7 @@ window.__ModuleLoader__.load({
           return
         }
         setBusy(market.name)
-        if (state(market.name)?.installed !== true) say(`Installing ${market.spec}\u2026`)
+        if (bundle(market.name)?.installed !== true) say(`Installing ${market.spec}\u2026`)
         try {
           const payload = await call('market', { id: market.id })
           say(payload.installed === true
@@ -247,12 +288,11 @@ window.__ModuleLoader__.load({
         }
       }, [call, refresh, bundles])
 
-      const activeMarket = MARKETS.find((market) => state(market.name)?.enabled === true) ?? null
-      const browser = state(BROWSER_BUNDLE)
+      const activeMarket = MARKETS.find((market) => bundle(market.name)?.enabled === true) ?? null
       const busyAny = busy !== null
 
       const marketCard = (market) => {
-        const entry = state(market.name)
+        const entry = bundle(market.name)
         const isActive = activeMarket?.id === market.id
         return React.createElement('div', {
           key: market.id, 'data-market': market.id, 'data-active': isActive ? 'true' : 'false',
@@ -272,6 +312,35 @@ window.__ModuleLoader__.load({
         )
       }
 
+      const featureRow = (feature) => {
+        const entry = row(feature.row)
+        return React.createElement('div', {
+          key: feature.row, 'data-feature': feature.row, style: S.row
+        },
+          React.createElement('span', { style: S.tile, 'aria-hidden': true },
+            feature.glyph === 'desktop' ? React.createElement(DesktopIcon) : React.createElement(ToolsIcon)),
+          React.createElement('div', { style: S.rowMain },
+            React.createElement('div', { style: S.rowTitle }, feature.title),
+            React.createElement('div', { style: S.rowBody }, feature.body)
+          ),
+          React.createElement('div', { style: S.end },
+            feature.panel === true && React.createElement('button', {
+              type: 'button', style: S.button,
+              title: 'Open the visible browser desktop in a new tab for human takeover',
+              onClick: () => window.open(DESKTOP_PATH, '_blank', 'noopener')
+            }, 'Open panel'),
+            React.createElement(Toggle, {
+              on: entry?.enabled === true, label: `Enable ${feature.title}`,
+              // `present === false` means this image did not compose the row at all
+              // (DSH_BROWSER_MCP=0, DSH_DESKTOP_ENABLED=0, or an unseeded profile):
+              // a switch that could only fail is greyed out instead.
+              disabled: !loaded || busyAny || entry?.present === false,
+              onToggle: (next) => void setRow(feature, next)
+            })
+          )
+        )
+      }
+
       return React.createElement('div', {
         'data-plugin-section': 'plugins-page-extras',
         style: S.root
@@ -285,7 +354,7 @@ window.__ModuleLoader__.load({
             ),
             React.createElement(Toggle, {
               on: activeMarket !== null, label: 'Enable a plugin market',
-              disabled: bundles === null || busyAny,
+              disabled: !loaded || busyAny,
               onToggle: (next) => {
                 if (next) {
                   void enableMarket(MARKETS.find((market) => market.id === selected) ?? MARKETS[1])
@@ -302,27 +371,9 @@ window.__ModuleLoader__.load({
           React.createElement('div', { style: S.cards }, ...MARKETS.map(marketCard))
         ),
 
-        /* ---- The integrated feature: a row, no heading (Desktop's shape) ---- */
-        React.createElement('section', { style: S.group, 'data-extra-section': 'browser-tools' },
-          React.createElement('div', { style: S.row },
-            React.createElement('span', { style: S.tile, 'aria-hidden': true }, React.createElement(BrowserIcon)),
-            React.createElement('div', { style: S.rowMain },
-              React.createElement('div', { style: S.rowTitle }, 'Browser tools'),
-              React.createElement('div', { style: S.rowBody },
-                'Let the model drive this container\u2019s visible browser \u2014 navigate, read pages, click, type and screenshot \u2014 through the Playwright MCP server attached over CDP. Turn it off to stop paying for the tool definitions in every request.')
-            ),
-            React.createElement('div', { style: S.end },
-              React.createElement('button', {
-                type: 'button', style: S.button, title: 'Open the browser desktop for human takeover',
-                onClick: () => window.open(DESKTOP_PATH, '_blank', 'noopener')
-              }, 'Open panel'),
-              React.createElement(Toggle, {
-                on: browser?.enabled === true, label: 'Enable Browser tools',
-                disabled: bundles === null || busyAny,
-                onToggle: (next) => void setBundle(BROWSER_BUNDLE, next)
-              })
-            )
-          )
+        /* ---- The integrated features: rows, no heading (Desktop's shape) ---- */
+        React.createElement('section', { style: S.group, 'data-extra-section': 'browser' },
+          ...FEATURES.map(featureRow)
         ),
 
         message !== null && React.createElement('p', {

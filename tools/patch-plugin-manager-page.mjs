@@ -61,11 +61,12 @@ const ANCHOR_BUILTIN = /const BUILTIN_PROFILE_BUNDLES = new Set\(\[([\s\S]*?)\]\
 
 /**
  * The bundles this installation surfaces in the top section instead of as cards:
- * the browser tooling (plugins/dsh-browser-mcp) and the market the market
- * selector installs. Both keep their own switch up there, so nothing becomes
+ * the browser tooling (plugins/dsh-browser-mcp), the visible browser desktop with
+ * its browser_open bridge (plugins/dsh-browser-desktop) and the market the market
+ * selector installs. All of them keep their own switch up there, so nothing becomes
  * uncontrollable — they simply stop being listed twice.
  */
-const INTEGRATED_BUNDLES = ["dsh-browser-mcp", "dshmarket"];
+const INTEGRATED_BUNDLES = ["dsh-browser-mcp", "dsh-browser-desktop", "dshmarket"];
 
 /** Occurrences of a literal, counted without regex escaping. */
 const count = (text, needle) => text.split(needle).length - 1;

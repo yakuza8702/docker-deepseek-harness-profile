@@ -1,3 +1,47 @@
+# dsh-browser-desktop — the visible browser desktop and its browser_open bridge,
+# as ONE switchable row.
+#
+# WHY A ROW INSIDE A BUNDLE, AND NOT A LAUNCHER OVERLAY
+# -----------------------------------------------------
+# This row used to be mounted by `docker/browser-use.overlay.yml`. An overlay is
+# applied AFTER the profile layer, so it re-declares the row on every boot and no
+# profile-level `disabled:` override can ever win: the feature was always on, and
+# an always-on plugin is an always-on context cost. This host half registers
+#
+#   * the `browser_open` TOOL, and
+#   * a `tool:browser_open` system-prompt SECTION,
+#
+# and both sit in the model's context in every Session whether or not the browser
+# is ever used. Shipping the row inside the bundle puts it on the profile layer,
+# where the plugin manager's own `setPluginEnabled('browser-desktop', …)` writes an
+# id-targeted `disabled:` override into the SAME profile patch file and the loader
+# recomposes live.
+#
+# That is what the Plugins page's "Browser Use" switch drives, independently of
+# "Browser tools" (which drives the browser-mcp row): one switch releases the MCP
+# tool definitions, the other releases `browser_open` and its prompt section.
+#
+# The bundle is SELECTED, never DEPENDED ON — see `seed_browser_desktop_bundle` in
+# docker/entrypoint.sh. Selection is the half that composes this row; a profile
+# dependency would only make the package show up as a card on the Plugins page and
+# in the community Market's Installed tab, which is exactly what an integrated
+# feature must not do.
+#
+# SWITCHES
+# --------
+#   DSH_DESKTOP_ENABLED=0   no desktop stack at all => the row is disabled
+#   DSH_CDP_PORT=9222       the browser's DevTools port inside the container
+#   DSH_DESKTOP_PREFIX      path the reverse proxy serves the desktop on
 - insert:
     - id: browser-desktop
       name: 'dsh-browser-desktop'
+      disabled: !!js "process.env.DSH_DESKTOP_ENABLED === '0'"
+      config:
+        cdpBaseUrl: !!js "'http://127.0.0.1:' + (process.env.DSH_CDP_PORT || '9222')"
+        # 0 = same origin as the Harness page. The desktop is path-routed by the
+        # reverse proxy, so it is reached through whatever authority the UI was
+        # opened on (http://lan-ip:3080 or https://host behind Pangolin) and the
+        # container never publishes a second port.
+        desktopPort: 0
+        desktopPath: !!js "'/' + (process.env.DSH_DESKTOP_PREFIX || 'desktop') + '/vnc.html?autoconnect=1&resize=scale&view_only=0&reconnect=1'"
+        pollIntervalMs: 750

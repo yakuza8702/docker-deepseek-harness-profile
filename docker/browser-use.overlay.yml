@@ -20,7 +20,17 @@
 #                                visible browser, so the model and the human share
 #                                tabs, cookies and logins (no second browser, no
 #                                Playwright browser download)
-#   browser-desktop              the noVNC panel + the browser_open bridge
+#
+# WHAT IS *NOT* HERE ANY MORE — the browser-desktop row
+# -----------------------------------------------------
+# `dsh-browser-desktop` (the noVNC panel + the browser_open bridge) moved into the
+# bundle's own patch (plugins/dsh-browser-desktop/cordis.patch.yml) and is SELECTED
+# as a bundle instead of mounted here. An overlay is applied after the profile
+# layer, so while the row lived here the feature was always on and no profile-level
+# `disabled:` override could win — but that host half registers a TOOL and a
+# SYSTEM-PROMPT SECTION, i.e. a context cost paid in every Session. On the profile
+# layer the Plugins page's "Browser Use" switch can release it, live and
+# reversibly. Removing it from here is also what keeps the entry id unique.
 #
 # Switches (all read at boot):
 #   DSH_BROWSER_USE_PROVIDER=1   use the provider rows instead of the MCP row
@@ -49,15 +59,3 @@
       config:
         mode: attach
         endpoint: !!js "'http://127.0.0.1:' + (process.env.DSH_CDP_PORT || '9222')"
-    - id: browser-desktop
-      name: 'dsh-browser-desktop'
-      disabled: !!js "process.env.DSH_DESKTOP_ENABLED === '0'"
-      config:
-        cdpBaseUrl: !!js "'http://127.0.0.1:' + (process.env.DSH_CDP_PORT || '9222')"
-        # 0 = same origin as the Harness page. The desktop is path-routed by the
-        # reverse proxy, so it is reached through whatever authority the UI was
-        # opened on (http://lan-ip:3080 or https://host behind Pangolin) and the
-        # container never publishes a second port.
-        desktopPort: 0
-        desktopPath: !!js "'/' + (process.env.DSH_DESKTOP_PREFIX || 'desktop') + '/vnc.html?autoconnect=1&resize=scale&view_only=0&reconnect=1'"
-        pollIntervalMs: 750
