@@ -1,0 +1,12 @@
+{
+  "name": "dsh-browser-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The container's browser tooling as ONE switchable MCP row: Playwright MCP attached to the visible Brave desktop over CDP, togglable (live) from the Plugin list so it costs no tokens when it is not wanted.",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "cordis.patch.yml",
+    "README.md"
+  ]
+}

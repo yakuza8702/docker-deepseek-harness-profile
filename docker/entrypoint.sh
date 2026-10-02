@@ -164,6 +164,93 @@ seed_profile_selection() {
   ' "$DSH_REAL_HOME" "$PROFILE" || log "WARN: could not seed the profile selection"
 }
 
+# ---------------------------------------------------------------------
+# Browser tools as ONE switchable MCP row (see plugins/dsh-browser-mcp).
+#
+# WHY THE PROFILE LAYER: a row mounted by a launcher overlay is applied AFTER the
+# profile layer, so it re-declares itself enabled and the Plugin list's switch
+# can never win (measured: a profile-level `disabled: false` override is ignored
+# for an overlay row). Seeding the row into the profile's OWN patch file puts it
+# in the last layer, which is exactly the file the Plugin list writes to — so the
+# switch works, and it works LIVE (the file is watched; measured: toggling
+# removes/starts the MCP server without a restart).
+#
+# SEEDED ONCE per home, marker-guarded, so switching the row off is a decision
+# this image never overrides. Nothing is written in Safe Mode, and
+# DSH_BROWSER_MCP=0 skips it entirely.
+# ---------------------------------------------------------------------
+BROWSER_MCP_PATCH="${DSH_BROWSER_MCP_PATCH:-/opt/seek-harness/browser-mcp.patch.yml}"
+seed_browser_mcp_row() {
+  [[ "${DSH_BROWSER_MCP:-1}" == "0" ]] && { log "browser MCP: not seeded (DSH_BROWSER_MCP=0)"; return 0; }
+  [[ "${SAFE_MODE:-0}" == "1" ]] && { log "browser MCP: Safe Mode — the real profile is left untouched"; return 0; }
+  [[ -f "$BROWSER_MCP_PATCH" ]] || { log "WARN: $BROWSER_MCP_PATCH is missing — the browser tools will not be offered"; return 0; }
+
+  local dir="$DSH_REAL_HOME/profiles/$PROFILE"
+  local manifest="$dir/package.json"
+  local patch="$dir/cordis.patch.yml"
+  local marker="$DSH_REAL_HOME/.browser-mcp-row-seeded"
+  [[ -f "$marker" ]] && return 0
+
+  # A fresh home has no profile yet: create the shipped `web` profile with DSH's
+  # OWN initialiser (no template knowledge is duplicated here), so the row exists
+  # when the harness composes its first tree instead of waiting for a 2nd boot.
+  if [[ ! -f "$manifest" ]]; then
+    if [[ "$PROFILE" != "web" ]]; then
+      log "browser MCP: profile \"$PROFILE\" does not exist yet — the row will be seeded on the next boot"
+      return 0
+    fi
+    local appboot=""
+    for root in /opt/dsh /opt/dsh-src; do
+      if [[ -f "$root/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js" ]]; then appboot="$root/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js"; break; fi
+    done
+    if [[ -z "$appboot" ]]; then
+      log "WARN: dsh-app-boot not found — cannot initialise the profile early; the row will be seeded on the next boot"
+      return 0
+    fi
+    if node -e 'import(process.argv[1]).then((m) => { m.initProfile(process.argv[2], ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]); console.log("initialised") })' "$appboot" "$dir" >/dev/null 2>&1; then
+      log "browser MCP: initialised the shipped \"web\" profile early (DSH would create it a moment later anyway)"
+    else
+      log "WARN: could not initialise the profile early — the row will be seeded on the next boot"
+      return 0
+    fi
+  fi
+
+  # Never seed twice, and never edit a profile patch that already mentions the row
+  # (the user may have switched it off, or written their own version).
+  if grep -q 'browser-mcp' "$patch" 2>/dev/null; then
+    printf '%s\n' "already present" > "$marker" 2>/dev/null || true
+    log "browser MCP: the profile patch already mentions browser-mcp — leaving it as it is"
+    return 0
+  fi
+
+  # Splice the fragment in. `[]` (the shipped template, comments aside) is
+  # REPLACED — appending after a flow sequence would make a second YAML document
+  # and the launcher would refuse the file. Anything else is an existing block
+  # sequence, where appending one more item is valid YAML. A file we cannot read
+  # is left alone: a broken profile patch costs the whole harness.
+  local how
+  how="$(node -e '
+    const fs = require("fs");
+    const [file, fragment] = process.argv.slice(1);
+    let text = "";
+    try { text = fs.readFileSync(file, "utf8"); } catch { text = ""; }
+    const body = fs.readFileSync(fragment, "utf8").replace(/\s*$/, "") + "\n";
+    const significant = text.split("\n").filter((line) => line.trim() !== "" && !line.trim().startsWith("#"));
+    const empty = significant.length === 0 || (significant.length === 1 && significant[0].trim() === "[]");
+    const next = empty ? body : text.replace(/\s*$/, "") + "\n\n" + body;
+    fs.writeFileSync(file + ".tmp", next);
+    fs.renameSync(file + ".tmp", file);
+    process.stdout.write(empty ? "replaced-empty" : "appended");
+  ' "$patch" "$BROWSER_MCP_PATCH" 2>/dev/null || true)"
+
+  if [[ -n "$how" ]] && grep -q 'id: browser-mcp' "$patch" 2>/dev/null; then
+    printf '%s\n' "seeded ($how)" > "$marker" 2>/dev/null || true
+    log "browser MCP: seeded the switchable row into $patch ($how) — switch it off in the Plugin list when you do not want it"
+  else
+    log "WARN: could not seed the browser MCP row — the browser tools will not be offered (Plugin list stays clean)"
+  fi
+}
+
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
   write_boot_state failed "$*" "the harness process exited during startup"
@@ -301,6 +388,10 @@ if [[ "$SAFE_MODE" == "1" ]]; then
   log "profile selection: Safe Mode — the real home's selection is left untouched"
 else
   seed_profile_selection
+  # Offer the browser tooling as a switchable MCP row (see seed_browser_mcp_row):
+  # seeded into the profile's own patch layer, once, so the Plugin list's switch
+  # is what decides whether the browser tools exist at all.
+  seed_browser_mcp_row
 fi
 
 # ---------------------------------------------------------------------

@@ -1,10 +1,20 @@
-# Browser Use + the visible browser desktop, mounted into EVERY profile as a
+# Browser tooling + the visible browser desktop, mounted into EVERY profile as a
 # launcher overlay (`--patch`, applied AFTER the profile layer) — the same
 # mechanism as profile-switcher.overlay.yml. No profile directory in $DSH_HOME is
 # ever edited, and removing this file (or setting DSH_BROWSER_USE_OVERLAY=)
 # removes the whole browser integration at the next boot without a rebuild.
 #
-# The three rows:
+# WHAT CARRIES THE TOOLS NOW
+# --------------------------
+# The model-facing browser tools are NOT here any more. They are one switchable
+# `@deepseek-ai/dsh-mcp-client` row (`browser-mcp`) seeded into the PROFILE's own
+# patch layer — see plugins/dsh-browser-mcp/README.md. Reason: an overlay row is
+# applied after the profile layer, so it re-declares itself enabled and the
+# Plugin list's switch can never turn it off (measured with --dump-config). The
+# profile layer is the file that switch writes to, so the row lives there and
+# toggles LIVE, without a restart.
+#
+# The rows below are the OFFICIAL PROVIDER, kept as an opt-in alternative:
 #   browser-use                  official Browser Use service
 #   browser-use-playwright-mcp   official provider, ATTACHED over CDP to the same
 #                                visible browser, so the model and the human share
@@ -13,8 +23,10 @@
 #   browser-desktop              the noVNC panel + the browser_open bridge
 #
 # Switches (all read at boot):
+#   DSH_BROWSER_USE_PROVIDER=1   use the provider rows instead of the MCP row
+#                                (do NOT enable both: same tool names twice)
 #   DSH_DESKTOP_ENABLED=0        no desktop stack (the image keeps the packages)
-#   DSH_BROWSER_USE_ENABLED=0    no model-facing browser tools
+#   DSH_BROWSER_USE_ENABLED=0    no model-facing browser tools at all
 #   DSH_DESKTOP_PREFIX=desktop   path the reverse proxy serves the desktop on
 #   DSH_CDP_PORT=9222            browser DevTools port inside the container
 #   DSH_BROWSER_USE_EXCLUSIVE    Upstream's attach mode reserves the browser for
@@ -30,10 +42,10 @@
 - insert:
     - id: browser-use
       name: '@deepseek-ai/dsh-browser-use'
-      disabled: !!js "process.env.DSH_BROWSER_USE_ENABLED === '0' || process.env.DSH_DESKTOP_ENABLED === '0'"
+      disabled: !!js "process.env.DSH_BROWSER_USE_PROVIDER !== '1' || process.env.DSH_BROWSER_USE_ENABLED === '0' || process.env.DSH_DESKTOP_ENABLED === '0'"
     - id: browser-use-playwright-mcp
       name: '@deepseek-ai/dsh-experimental-browser-use-playwright-mcp'
-      disabled: !!js "process.env.DSH_BROWSER_USE_ENABLED === '0' || process.env.DSH_DESKTOP_ENABLED === '0'"
+      disabled: !!js "process.env.DSH_BROWSER_USE_PROVIDER !== '1' || process.env.DSH_BROWSER_USE_ENABLED === '0' || process.env.DSH_DESKTOP_ENABLED === '0'"
       config:
         mode: attach
         endpoint: !!js "'http://127.0.0.1:' + (process.env.DSH_CDP_PORT || '9222')"

@@ -11,12 +11,16 @@ It packages the **official npm release** of [`@deepseek-ai/dsh`](https://github.
 | **runzhliu** [deepseek-harness-docker](https://github.com/runzhliu/deepseek-harness-docker) | security hardening: non-root UID 1000, `tini` init, fixed pnpm, build-time version verification, `HOME=/workspace` dir-selector fix, `--expose-internals` only on the DSH main process, cap_drop ALL / no-new-privileges / read-only rootfs in compose. **Also taken:** its visible-desktop stack (Xvfb → openbox → x11vnc → websockify/noVNC) and its `dsh-browser-desktop` plugin — vendored, since it is not on npm — but running **Brave** instead of Chromium, with the panel on the **same port** as the UI |
 | **this repo** | Docker engine access: mounted `docker.sock` **or** Docker proxy over TCP via `DOCKER_HOST`; docker CLI + compose plugin inside the image; GitHub workflow that auto-follows the official repo and keeps `:latest` current |
 
-## Browser Use + a visible browser desktop — on ONE port
+## Browser tools + a visible browser desktop — on ONE port
 
-The image carries a real browser: **official Browser Use** for the model and a
+The image carries a real browser: **the browser tools** for the model and a
 **noVNC desktop** you can take over by hand. Both are the same browser instance —
-same tabs, same cookies, same logins — because the Playwright MCP provider runs in
+same tabs, same cookies, same logins — because the tool server runs in
 **attach mode** against it over CDP.
+
+The model-facing tools are one **switchable MCP row** (`browser-mcp`), so they can
+be turned off when you do not want to pay for them — see
+[Browser tools as a switchable plugin row](#browser-tools-as-a-switchable-plugin-row).
 
 ```
         your browser
@@ -33,7 +37,7 @@ same tabs, same cookies, same logins — because the Playwright MCP provider run
                                                         ▼
    Xvfb :99 → openbox → x11vnc :5900 → websockify :6080
                     ▲
-                    └── Brave ── CDP 127.0.0.1:9222 ◄── Browser Use tools
+                    └── Brave ── CDP 127.0.0.1:9222 ◄── browser MCP row (`browser-mcp`)
 ```
 
 **No second port is published.** That is not just tidiness: a plain `http://host:6080`
@@ -60,15 +64,56 @@ Switches:
 | Variable | Default | Meaning |
 |---|---|---|
 | `DSH_DESKTOP_ENABLED` | `1` | `0` = no desktop stack, no browser rows at boot (packages stay in the image) |
+| `DSH_BROWSER_MCP` | `1` | `0` = do not offer the browser tools at all (the switchable row is never seeded) |
+| `DSH_BROWSER_USE_PROVIDER` | `0` | `1` = use the official Browser Use **provider** rows instead of the MCP row (do not enable both — same tool names twice) |
 | `DSH_BROWSER_USE_ENABLED` | `1` | `0` = no model-facing browser tools, panel still available |
-| `DSH_BROWSER_USE_EXCLUSIVE` | `0` | `0` = **every** Session drives the same visible browser (this image's default, see below); `1` = upstream's single-owner attachment |
+| `DSH_BROWSER_USE_EXCLUSIVE` | `0` | provider only: `0` = **every** Session drives the same visible browser (this image's default, see below); `1` = upstream's single-owner attachment |
+| `DSH_BROWSER_MCP_TIMEOUT` | `60000` | per-tool-call timeout for the browser MCP row, in ms |
 | `DSH_DESKTOP_PREFIX` | `desktop` | path the proxy serves the desktop on (`/desktop/…`) |
 | `DSH_NOVNC_PORT` | `6080` | internal noVNC/websockify port (loopback only) |
-| `DSH_CDP_PORT` | `9222` | internal DevTools port the Browser Use provider attaches to |
+| `DSH_CDP_PORT` | `9222` | internal DevTools port the browser tool server attaches to |
 | `DSH_DESKTOP_WIDTH` / `DSH_DESKTOP_HEIGHT` | `1440` / `900` | virtual display size |
 | `DSH_DESKTOP_START_URL` | `about:blank` | first page the browser opens |
 
-### One browser, every Session (this fork patches upstream)
+## Browser tools as a switchable plugin row
+
+The model-facing browser tools are **one plugin row you can switch off**:
+
+```
+Plugin list → browser-mcp → off        # server gone, tools gone, tokens gone
+Plugin list → browser-mcp → on         # 24 browser_* tools, attached to the visible Brave
+```
+
+| | |
+|---|---|
+| Row id / module | `browser-mcp` / `@deepseek-ai/dsh-mcp-client` |
+| Server name | `playwright-mcp` → tools `mcp__playwright-mcp__browser_*` |
+| Attaches to | the visible Brave desktop, over CDP (`127.0.0.1:$DSH_CDP_PORT`) |
+| Toggle | live — the profile patch is watched, so **no restart** is needed |
+
+**Why this matters:** the tool definitions cost roughly 10k tokens of static context
+in every Session, and they used to be unavoidable — a row mounted by a launcher
+overlay is applied *after* the profile layer, so it re-declares itself enabled and
+the Plugin list's switch can never turn it off (measured: a profile-level
+`disabled: false` override on an overlay row is ignored, `--dump-config` shows why).
+The row now lives in the **profile's own patch layer** — the same file the switch
+writes to — seeded once per home by the entrypoint (`plugins/dsh-browser-mcp/`,
+marker `.browser-mcp-row-seeded`), so the image never re-enables what you switched
+off.
+
+Two further wins on this path: **one** MCP process for the whole harness instead of
+one per activated Session (that was ~110-130 MB each), and no need for the
+exclusivity patch below — a plain MCP client has no single-owner attach mode, so
+every Session sees the tools.
+
+The official provider is still in the image and still one flag away
+(`DSH_BROWSER_USE_PROVIDER=1`), for anyone who wants per-Session tools.
+
+### One browser, every Session (provider path — this fork patches upstream)
+
+*Applies to the official provider, which is opt-in (`DSH_BROWSER_USE_PROVIDER=1`).
+The default MCP row has no exclusive attach mode at all, so this limitation simply
+does not exist on that path.*
 
 Upstream's attach mode reserves the attached browser for **one** live Session:
 `exclusive: config.mode === "attach"`. Its own runtime README calls this out under

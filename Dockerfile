@@ -378,6 +378,40 @@ COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
 COPY --chmod=0644 docker/workspace-browser.overlay.yml /opt/seek-harness/workspace-browser.overlay.yml
 
+# The browser tooling as ONE switchable MCP row. The fragment is what the
+# entrypoint splices into a profile's own patch layer (the layer the Plugin
+# list's switch writes to — an overlay row could never be switched off, see
+# plugins/dsh-browser-mcp/README.md), and the wrapper is what that row spawns.
+#
+# @playwright/mcp is the server behind those tools. It arrives as a dependency of
+# the browser-use provider, which is still installed (the provider remains an
+# opt-in alternative), and this step FAILS THE BUILD if it is ever missing: the
+# row would otherwise be seeded into profiles and then fail to start, which looks
+# exactly like a broken plugin.
+COPY --chmod=0644 plugins/dsh-browser-mcp/cordis.patch.yml /opt/seek-harness/browser-mcp.patch.yml
+RUN set -eux; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# The browser MCP server this image offers as the switchable row `browser-mcp`:' \
+      '# the pinned @playwright/mcp that ships inside the image, started in attach' \
+      '# mode against the visible Brave desktop over CDP. A stable path, so the row' \
+      '# never has to know whether DSH came from the npm channel (/opt/dsh) or the' \
+      '# source channel (/opt/dsh-src).' \
+      'for root in /opt/dsh /opt/dsh-src; do' \
+      '  cli="$root/node_modules/@playwright/mcp/cli.js"' \
+      '  if [ -f "$cli" ]; then exec node "$cli" "$@"; fi' \
+      'done' \
+      'echo "dsh-playwright-mcp: @playwright/mcp is not installed in this image" >&2' \
+      'exit 127' \
+      > /usr/local/bin/dsh-playwright-mcp; \
+    chmod 0755 /usr/local/bin/dsh-playwright-mcp; \
+    found=""; \
+    for root in /opt/dsh /opt/dsh-src; do \
+      if [ -f "$root/node_modules/@playwright/mcp/cli.js" ]; then found="$root"; fi; \
+    done; \
+    [ -n "$found" ] || { echo "ERROR: @playwright/mcp is missing — the switchable browser MCP row would fail to start"; exit 1; }; \
+    echo "browser MCP: @playwright/mcp present in $found"
+
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \
     HOME=/workspace \
