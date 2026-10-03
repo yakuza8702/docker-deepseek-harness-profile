@@ -376,6 +376,7 @@ COPY plugins/dsh-profile-switcher /opt/dsh-profile-switcher
 COPY plugins/dsh-browser-desktop /opt/dsh-browser-desktop
 COPY plugins/dsh-workspace-browser /opt/dsh-workspace-browser
 COPY plugins/dsh-browser-mcp /opt/dsh-browser-mcp
+COPY plugins/dsh-brave-devtools-mcp /opt/dsh-brave-devtools-mcp
 COPY plugins/dsh-plugins-page-extras /opt/dsh-plugins-page-extras
 RUN set -eux; \
     installed=0; \
@@ -385,15 +386,16 @@ RUN set -eux; \
         cp -a /opt/dsh-browser-desktop "$target/dsh-browser-desktop"; \
         cp -a /opt/dsh-workspace-browser "$target/dsh-workspace-browser"; \
         cp -a /opt/dsh-browser-mcp "$target/dsh-browser-mcp"; \
+        cp -a /opt/dsh-brave-devtools-mcp "$target/dsh-brave-devtools-mcp"; \
         cp -a /opt/dsh-plugins-page-extras "$target/dsh-plugins-page-extras"; \
         installed=1; \
       fi; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
-    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-plugins-page-extras; \
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras; \
     chmod -R a+rX \
-      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-plugins-page-extras \
-      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras 2>/dev/null || true
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras 2>/dev/null || true
 # The workspace plugin's own suite, kept in the image so the ported host logic can
 # be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
 
@@ -415,7 +417,7 @@ RUN set -eux; \
       anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
       [ -d "$root/dsh-browser-desktop" ] || continue; \
-      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-plugins-page-extras", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
@@ -455,6 +457,61 @@ RUN set -eux; \
     done; \
     [ -n "$found" ] || { echo "ERROR: @playwright/mcp is missing — the switchable browser MCP row would fail to start"; exit 1; }; \
     echo "browser MCP: @playwright/mcp present in $found"
+
+# The browser TROUBLESHOOTING row (`brave-devtools-mcp`, "Browser tools brave").
+#
+# `brave-mcp` (github.com/triuzzi/brave-devtools-mcp — a Brave-native fork of
+# Chrome DevTools MCP) is what turns "the page looks wrong" into evidence: the
+# console with source-mapped stacks, every network request and its status, the CSS
+# cascade, performance traces with insight sets, Lighthouse audits, heap
+# snapshots. It ATTACHES to the same visible Brave desktop over loopback CDP
+# (127.0.0.1:$DSH_CDP_PORT, which start_desktop already passes to Brave as
+# --remote-debugging-address/-port), so the model and the human share one browser
+# and nothing here ever launches or downloads a second one.
+#
+# WHY IT IS PINNED AND INSTALLED, RATHER THAN `npx -y brave-mcp@latest`
+#   * a boot would then depend on the npm registry being reachable: an offline or
+#     rate-limited container would lose 30 tools at random, which is
+#     indistinguishable from a broken plugin;
+#   * `@latest` moves under the user without a rebuild — the tool surface (and so
+#     its context cost) would change on a restart, and a bad upstream release
+#     would land on the next restart instead of the next build.
+# Bump BRAVE_MCP_VERSION and rebuild to move it; the gate below re-runs a real
+# handshake, so a broken bump cannot ship.
+#
+# It lives in its OWN prefix rather than in the DSH installation's node_modules:
+# upstream's rollup bundle makes `npm install brave-mcp` add exactly one package
+# with no transitive tree, and only BUNDLES have to be resolvable by the loader —
+# this one is a child process the row spawns.
+ARG BRAVE_MCP_VERSION=1.9.0
+RUN set -eux; \
+    npm install --prefix /opt/brave-mcp --omit=dev --no-audit --no-fund "brave-mcp@${BRAVE_MCP_VERSION}"; \
+    installed="$(node -p 'require("/opt/brave-mcp/node_modules/brave-mcp/package.json").version')"; \
+    [ "$installed" = "${BRAVE_MCP_VERSION}" ] || { echo "ERROR: installed brave-mcp ${installed}, expected ${BRAVE_MCP_VERSION}"; exit 1; }; \
+    [ -f /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js ] \
+      || { echo "ERROR: the brave-mcp package carries no build/src/bin/brave-devtools-mcp.js"; exit 1; }; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# The DevTools MCP server this image offers as the switchable row' \
+      '# `brave-devtools-mcp` ("Browser tools brave"): the pinned brave-mcp that' \
+      '# ships inside the image, started in attach mode against the visible Brave' \
+      '# desktop over loopback CDP. A stable path, so the row never has to know' \
+      '# where the package lives — and never runs npx.' \
+      'exec node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
+      > /usr/local/bin/dsh-brave-devtools-mcp; \
+    chmod 0755 /usr/local/bin/dsh-brave-devtools-mcp; \
+    echo "browser DevTools: brave-mcp ${installed} behind /usr/local/bin/dsh-brave-devtools-mcp"
+
+# The row works only while FOUR pieces agree — the server above, the bundle patch
+# that mounts the row, the Plugins-page switch (host table + client row) and the
+# page's duplicate-card suppression. One of them missing still produces a healthy
+# image and a dead switch, so this gate EXECUTES the server through the wrapper
+# (a real MCP handshake — brave-mcp connects to the browser lazily, so no browser
+# is needed at build time) and reads the other three out of the installed files.
+# See tools/check-brave-mcp.mjs.
+COPY --chmod=0644 tools/check-brave-mcp.mjs /tmp/check-brave-mcp.mjs
+RUN node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
+ && rm -f /tmp/check-brave-mcp.mjs
 
 # ---------------------------------------------------------------------
 # APK / Android reverse-engineering toolchain.

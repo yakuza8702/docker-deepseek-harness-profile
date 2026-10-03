@@ -455,6 +455,76 @@ seed_browser_desktop_bundle() {
   esac
 }
 
+# Browser troubleshooting as a switchable BUNDLE (see
+# plugins/dsh-brave-devtools-mcp).
+#
+# Same contract as its two siblings above, and for the same reason: its row lives
+# in the bundle's own patch (a row mounted by a launcher overlay re-declares itself
+# enabled every boot and no switch can win), and this host registers 30 MCP tool
+# definitions, i.e. a context cost in every Session while it is on.
+#
+# Two deliberate differences from the desktop seeder:
+#   * it runs on DSH_DESKTOP_ENABLED=0 too. This is a TOOL row, like `browser-mcp`:
+#     the row's own `disabled:` expression already covers "no desktop", and keeping
+#     the selection means the Plugins page still SHOWS the feature (off) instead of
+#     hiding it, so a user who later enables the desktop does not have to hunt for
+#     a bundle that was never selected.
+#   * there is no legacy migration. This bundle has never been shipped in another
+#     form, so there is no earlier row to strip and no earlier `link:` dependency to
+#     drop — the undo for a home that has one added by hand is the Plugins page.
+BROWSER_DEVTOOLS_BUNDLE="dsh-brave-devtools-mcp"
+seed_brave_devtools_bundle() {
+  [[ "${SAFE_MODE:-0}" == "1" ]] && { log "browser DevTools: Safe Mode — the real profile is left untouched"; return 0; }
+  [[ "${DSH_BRAVE_DEVTOOLS_MCP:-1}" == "0" ]] && { log "browser DevTools: not selected (DSH_BRAVE_DEVTOOLS_MCP=0) — it stays available in the Plugins page"; return 0; }
+
+  local dir="$DSH_REAL_HOME/profiles/$PROFILE"
+  local manifest="$dir/package.json"
+
+  # The profile is created by the MCP seeder above (or by DSH itself); if it is not
+  # there yet there is nothing to select into, and the next boot picks it up.
+  [[ -f "$manifest" ]] || { log "browser DevTools: profile \"$PROFILE\" does not exist yet — it will be selected on the next boot"; return 0; }
+
+  local bundle_dir=""
+  for root in /opt/dsh /opt/dsh-src; do
+    if [[ -d "$root/node_modules/$BROWSER_DEVTOOLS_BUNDLE" ]]; then bundle_dir="$root/node_modules/$BROWSER_DEVTOOLS_BUNDLE"; break; fi
+  done
+  [[ -n "$bundle_dir" ]] || { log "WARN: $BROWSER_DEVTOOLS_BUNDLE is not in this image's node_modules — the browser troubleshooting tools will not be offered"; return 0; }
+
+  local marker="$DSH_REAL_HOME/.brave-devtools-bundle-seeded"
+  local seeded=0
+  [[ -f "$marker" ]] && seeded=1
+
+  # Select the bundle — exactly what the Plugins page's switch writes. On a home an
+  # earlier boot already seeded, the selection is never re-applied, so a bundle the
+  # user switched off stays off.
+  local how
+  how="$(node -e '
+    const fs = require("fs");
+    const [manifest, name, seeded] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const profile = parsed?.dsh?.profile;
+    if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
+    const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
+    if (seeded === "1") { process.stdout.write("existing-home"); process.exit(0); }
+    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("selected");
+  ' "$manifest" "$BROWSER_DEVTOOLS_BUNDLE" "$seeded" 2>/dev/null || true)"
+
+  case "$how" in
+    selected|already-selected)
+      printf '%s\n' "$how" > "$marker" 2>/dev/null || true
+      log "browser DevTools: \"$BROWSER_DEVTOOLS_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page under \"Browser tools brave\" to release the 30 DevTools tools"
+      ;;
+    existing-home) ;;
+    unreadable|no-profile-block) log "WARN: could not select \"$BROWSER_DEVTOOLS_BUNDLE\" ($how) — enable it by hand in the Plugins page" ;;
+    *) log "WARN: could not select \"$BROWSER_DEVTOOLS_BUNDLE\" — enable it by hand in the Plugins page" ;;
+  esac
+}
+
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
   write_boot_state failed "$*" "the harness process exited during startup"
@@ -596,7 +666,13 @@ else
   # selected for the active profile once, so the Plugins page's switch is what
   # decides whether the browser tools exist at all.
   seed_browser_mcp_bundle
-  # …and the visible desktop + browser_open bridge as a SECOND, independent one
+  # …and the browser DIAGNOSTICS as a SECOND, independent one (see
+  # seed_brave_devtools_bundle): the console/network/performance/Lighthouse tool
+  # surface, with its own switch, so releasing the driving tools never releases the
+  # troubleshooting ones by accident. It runs after the MCP seeder for the same
+  # reason the desktop seeder does — that one creates the profile on a fresh home.
+  seed_brave_devtools_bundle
+  # …and the visible desktop + browser_open bridge as a THIRD, independent one
   # (see seed_browser_desktop_bundle): one switch releases the MCP tool
   # definitions, the other releases the browser_open tool and its prompt section.
   # It runs after the MCP seeder because that one creates the profile on a fresh

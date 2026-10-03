@@ -15,12 +15,15 @@ It packages the **official npm release** of [`@deepseek-ai/dsh`](https://github.
 
 The image carries a real browser: **the browser tools** for the model and a
 **noVNC desktop** you can take over by hand. Both are the same browser instance —
-same tabs, same cookies, same logins — because the tool server runs in
+same tabs, same cookies, same logins — because both tool servers run in
 **attach mode** against it over CDP.
 
-The model-facing tools are one **switchable MCP row** (`browser-mcp`), so they can
-be turned off when you do not want to pay for them — see
-[Browser tools as a switchable plugin row](#browser-tools-as-a-switchable-plugin-row).
+There are **two** model-facing tool surfaces, each with its own switch:
+`browser-mcp` (**Browser tools**) *drives* the page, and `brave-devtools-mcp`
+(**Browser tools brave**) *diagnoses* it — console, network, CSS, performance,
+Lighthouse, heap. Turn either off when you do not want to pay for its tools — see
+[Browser tools as a switchable plugin row](#browser-tools-as-a-switchable-plugin-row)
+and [Browser troubleshooting](#browser-troubleshooting-as-a-switchable-plugin).
 
 ```
         your browser
@@ -37,7 +40,8 @@ be turned off when you do not want to pay for them — see
                                                         ▼
    Xvfb :99 → openbox → x11vnc :5900 → websockify :6080
                     ▲
-                    └── Brave ── CDP 127.0.0.1:9222 ◄── browser MCP row (`browser-mcp`)
+                    └── Brave ── CDP 127.0.0.1:9222 ◄──┬─ `browser-mcp`         (drives)
+                                                     └─ `brave-devtools-mcp`  (diagnoses)
 ```
 
 **No second port is published.** That is not just tidiness: a plain `http://host:6080`
@@ -49,6 +53,9 @@ Pangolin/nginx/Cloudflare.
 What you get:
 
 * `browser_open` — the model can reveal a page in the visible desktop for you to take over;
+* the **DevTools troubleshooting tools** on that same browser — console, network,
+  CSS cascade, performance traces, Lighthouse, heap — from the `brave-devtools-mcp`
+  row, so "why is this page broken" is answered from evidence, not a screenshot;
 * the desktop button in the sidebar footer, and the noVNC panel at `/desktop/vnc.html`;
 * a **persistent browser profile** at `$DSH_HOME/brave-profile`, inside the `dsh-home`
   volume: cookies, logins, saved sessions and Chrome-Web-Store extensions
@@ -65,34 +72,33 @@ Switches:
 |---|---|---|
 | `DSH_DESKTOP_ENABLED` | `1` | `0` = no desktop stack, no browser rows at boot (packages stay in the image) |
 | `DSH_BROWSER_MCP` | `1` | `0` = do not offer the browser tools at all (the switchable row is never seeded) |
+| `DSH_BRAVE_DEVTOOLS_MCP` | `1` | `0` = a deployment-level opt-out: the bundle is never selected and the row is disabled by its own patch (the Plugins page still *shows* it, off) |
 | `DSH_BROWSER_USE_PROVIDER` | `0` | `1` = use the official Browser Use **provider** rows instead of the MCP row (do not enable both — same tool names twice) |
 | `DSH_BROWSER_USE_ENABLED` | `1` | `0` = no model-facing browser tools, panel still available |
 | `DSH_BROWSER_USE_EXCLUSIVE` | `0` | provider only: `0` = **every** Session drives the same visible browser (this image's default, see below); `1` = upstream's single-owner attachment |
 | `DSH_BROWSER_MCP_TIMEOUT` | `60000` | per-tool-call timeout for the browser MCP row, in ms |
+| `DSH_BRAVE_MCP_TIMEOUT` | `120000` | per-tool-call timeout for the DevTools row, in ms — longer on purpose, Lighthouse and performance traces legitimately run long |
 | `DSH_DESKTOP_PREFIX` | `desktop` | path the proxy serves the desktop on (`/desktop/…`) |
 | `DSH_NOVNC_PORT` | `6080` | internal noVNC/websockify port (loopback only) |
 | `DSH_CDP_PORT` | `9222` | internal DevTools port the browser tool server attaches to |
 | `DSH_DESKTOP_WIDTH` / `DSH_DESKTOP_HEIGHT` | `1440` / `900` | virtual display size |
 | `DSH_DESKTOP_START_URL` | `about:blank` | first page the browser opens |
 
-## The top of the Plugins page — integrated feature + market selector
+## The top of the Plugins page — the integrated features + the market selector
 
-Two sections render **above the "Official" group**, arranged the way DSH Desktop
+Two groups render **above the "Official" group**, arranged the way DSH Desktop
 arranges its own features there (`dsh-plugins-page-extras`):
 
 ```
-Integrated            Shipped with this container
-  Browser tools                                [Open panel]  (on)
 Plugin market         Only one can be enabled at a time            (on)
   ┌ dsh-community-market  Beta ┐   ┌ dsh-market ┐
   └───────────────────────────┘   └────────────┘
+  Browser tools                                                      (on)
+  Browser tools brave                                                (on)
+  Browser Use                                  [Open panel]          (on)
 Official 8
 ```
 
-* **Integrated → Browser tools** — the `dsh-browser-mcp` bundle with its switch and
-  an **Open panel** button (the noVNC desktop), the same shape as Desktop's
-  "Remote Control" row. The switch writes the same state the "Installed" card
-  shows, because both go through the plugin manager's `selectBundle`.
 * **Plugin market** — a master switch plus one card per market, only one of which
   can be on at a time; mirrors Desktop's `MARKET_OPTIONS` and links the same
   repositories. `dsh-market` (npm `dshmarket`) is fully wired — the card installs
@@ -100,6 +106,14 @@ Official 8
   its Desktop provenance, but its card explains rather than pretends: npm carries
   only a 719-byte reserved-name stub, the real package being a Desktop-only
   TypeScript workspace that is not published.
+* **Browser tools / Browser tools brave / Browser Use** — one row per feature, no
+  group heading (Desktop has none above its own rows), each with the 48px icon
+  tile, title, description and switch of the page's own official cards. They are
+  three rows and not one because they cost three different things: the Playwright
+  tools (24 definitions), the Brave DevTools tools (30) and the `browser_open`
+  hand-off (one tool + a prompt section). The **Open panel** button belongs to the
+  desktop row. Every switch writes the same state the page's own cards would,
+  because both go through the plugin manager.
 
 The upstream page offers **no extension point above its groups** (you can only
 contribute a card INTO "Official"), so `tools/patch-plugin-manager-page.mjs` adds
@@ -146,6 +160,57 @@ still carries the row an earlier image spliced in is migrated away automatically
 
 The official provider is still in the image and still one flag away
 (`DSH_BROWSER_USE_PROVIDER=1`), for anyone who wants per-Session tools.
+
+## Browser troubleshooting as a switchable plugin
+
+Driving a page and **diagnosing** one are different jobs, so they are different
+rows with different switches. The second one is `dsh-brave-devtools-mcp`, titled
+**Browser tools brave** on the Plugins page, sitting between the other two:
+
+```
+Plugins page → Browser tools brave → off   # 30 DevTools tools gone, server gone
+Plugins page → Browser tools brave → on    # console, network, CSS, perf, Lighthouse, heap
+```
+
+| | |
+|---|---|
+| Bundle / package | `dsh-brave-devtools-mcp` (title "Browser tools brave") |
+| Plugin row it mounts | `brave-devtools-mcp` → `@deepseek-ai/dsh-mcp-client` |
+| Server name | `brave-devtools` → tools `mcp__brave-devtools__*` |
+| Server behind them | [`brave-mcp`](https://github.com/triuzzi/brave-devtools-mcp) — Brave-native, full Chrome DevTools MCP parity, pinned in the image |
+| Attaches to | the same visible Brave desktop, over **loopback** CDP (`127.0.0.1:$DSH_CDP_PORT`) |
+| Switch | **Plugins page → Browser tools brave → off/on** (live, no restart) |
+
+**Why it is worth 30 more tool definitions.** The Playwright row can navigate and
+click; it cannot tell you *why* the result was wrong. This one reads the console
+(with source-mapped stacks), lists every request with its status and body, matches
+CSS rules and reports which one won the cascade, records a performance trace with
+insight sets, runs Lighthouse, and snapshots the heap. On a self-hosted stack
+behind a reverse proxy that is the difference between "the page looks broken" and
+"`/dsh-market/api/v1/updates` returned 502 because the upstream socket was reset".
+
+**Why "attach", and why loopback.** The row starts the server with
+`--browserUrl=http://127.0.0.1:$DSH_CDP_PORT`, i.e. against the browser this
+container already runs. `start_desktop` launches Brave with
+`--remote-debugging-address=127.0.0.1 --remote-debugging-port=$DSH_CDP_PORT`, so
+**CDP is on by default and bound to loopback**: the MCP can only reach a browser
+inside this container, nothing on the LAN can attach to it, no second browser is
+launched or downloaded, and the model shares your tabs, cookies and logins — you
+will see what it is doing in the noVNC panel. Both MCP rows attach to that same
+browser; Chrome accepts several CDP clients, and the two switches stay
+independent. If two sessions ever visibly fight over the active tab, turn one of
+the two rows off.
+
+**It is a pinned copy, not `npx`.** `/usr/local/bin/dsh-brave-devtools-mcp` execs
+the `brave-mcp` installed at build time (`BRAVE_MCP_VERSION`), so a boot cannot
+depend on the npm registry and `@latest` cannot move the tool surface under you.
+The privacy defaults are explicit: no usage statistics, no npm update check, and
+`--no-performance-crux` keeps a trace URL from being offered to Google's CrUX API
+(the lab trace, which is the part that finds your bug, is unaffected).
+
+**Selection, again, is once per home** (marker `.brave-devtools-bundle-seeded`),
+so switching it off is a decision the image never overrides;
+`DSH_BRAVE_DEVTOOLS_MCP=0` skips the selection entirely.
 
 ### One browser, every Session (provider path — this fork patches upstream)
 

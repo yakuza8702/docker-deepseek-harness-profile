@@ -6,11 +6,13 @@
  *   1. PLUGIN MARKET — heading + description with the master switch on the right,
  *      then one equal-width card per market, the active one outlined. Desktop's
  *      layout, copy and repository links.
- *   2. This container's integrated browser tooling — a single ROW with an icon
- *      tile, a title, a description and its controls at the end: exactly the shape
- *      of Desktop's "Remote Control" / "Computer Use" rows, and exactly the shape
- *      of this page's own official package rows. No group heading, because
- *      Desktop has none above them.
+ *   2. This container's integrated browser tooling — one ROW per feature, each
+ *      with an icon tile, a title, a description and its controls at the end:
+ *      exactly the shape of Desktop's "Remote Control" / "Computer Use" rows, and
+ *      exactly the shape of this page's own official package rows. No group
+ *      heading, because Desktop has none above them. Rows, in order:
+ *      "Browser tools" (the driving MCP), "Browser tools brave" (the diagnosing
+ *      one) and "Browser Use" (the visible desktop + the human hand-off).
  *
  * Both come before the page's own "Official" group, through the `plugins.page.top`
  * slot that tools/patch-plugin-manager-page.mjs adds to the upstream page at
@@ -39,13 +41,20 @@ window.__ModuleLoader__.load({
     const DESKTOP_PATH = '/desktop/vnc.html?autoconnect=1&resize=scale&view_only=0&reconnect=1'
 
     /**
-     * The two integrated browser features, one row each — and one switch each.
+     * The three integrated browser features, one row each — and one switch each.
      *
-     * They are deliberately separate because they cost DIFFERENT things: the MCP row
-     * is 24 tool definitions, the desktop row is one tool (`browser_open`) plus a
-     * system-prompt section. One switch for both meant releasing the cheaper one to
-     * drop the expensive one, and there was no way to keep the visible desktop while
-     * dropping its prompt cost.
+     * They are deliberately separate because they cost DIFFERENT things: the driving
+     * MCP row is 24 tool definitions, the diagnosing MCP row is 30 more, and the
+     * desktop row is one tool (`browser_open`) plus a system-prompt section. One
+     * switch for all of them meant releasing a cheaper one to drop an expensive one,
+     * with no way to keep, say, the visible desktop while dropping a tool surface.
+     *
+     * The two MCP rows overlap on purpose and are not alternatives to each other:
+     * `browser-mcp` DRIVES the page (navigate, click, type, screenshot), the
+     * `brave-devtools-mcp` row DIAGNOSES it (console, network, CSS cascade,
+     * performance traces, Lighthouse, heap). "Why is this site broken" needs the
+     * second one; "do this for me" needs the first. Both attach to the SAME visible
+     * browser over loopback CDP, so neither ever launches a browser of its own.
      *
      * `row` is the loader entry id the host route toggles.
      */
@@ -55,6 +64,12 @@ window.__ModuleLoader__.load({
         glyph: 'tools',
         title: 'Browser tools',
         body: 'Let the model drive this container\u2019s visible browser \u2014 navigate, read pages, click, type and screenshot \u2014 through the Playwright MCP server attached over CDP. This is the whole tool surface: turn it off to stop paying for it in every request.'
+      },
+      {
+        row: 'brave-devtools-mcp',
+        glyph: 'devtools',
+        title: 'Browser tools brave',
+        body: 'Troubleshoot a page the way a developer does, on the same browser: read the console, inspect every network request, match CSS rules, record a performance trace, run Lighthouse, take a heap snapshot \u2014 through the Brave DevTools MCP server attached over loopback CDP. Turn it off to release those 30 tools; the row above is unaffected.'
       },
       {
         row: 'browser-desktop',
@@ -209,7 +224,20 @@ window.__ModuleLoader__.load({
       React.createElement('path', { d: 'M9 14.3h6M12 11.3c1.55 1.65 1.55 4.35 0 6M12 11.3c-1.55 1.65-1.55 4.35 0 6' })
     )
 
-    /** The second feature's glyph: the display the human sits in front of. */
+    /** The second feature's glyph: the same window, with a DevTools console prompt in it. */
+    const DevtoolsIcon = () => React.createElement('svg', {
+      width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+      strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true
+    },
+      React.createElement('rect', { x: 2.5, y: 4, width: 19, height: 16, rx: 2.5 }),
+      React.createElement('path', { d: 'M2.5 8.5h19' }),
+      React.createElement('circle', { cx: 5.6, cy: 6.2, r: 0.65, fill: 'currentColor', stroke: 'none' }),
+      React.createElement('circle', { cx: 7.9, cy: 6.2, r: 0.65, fill: 'currentColor', stroke: 'none' }),
+      React.createElement('path', { d: 'M6.8 12.6l2.1 2.2-2.1 2.2' }),
+      React.createElement('path', { d: 'M11.8 17h5.7' })
+    )
+
+    /** The third feature's glyph: the display the human sits in front of. */
     const DesktopIcon = () => React.createElement('svg', {
       width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
       strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true
@@ -218,6 +246,9 @@ window.__ModuleLoader__.load({
       React.createElement('path', { d: 'M9.5 20.5h5M12 16.5v4' }),
       React.createElement('path', { d: 'M8.6 12.4l2.1-2.6 1.9 1.6 2.3-3' })
     )
+
+    /** The rows' glyphs, by the `glyph` key each FEATURE carries. */
+    const GLYPHS = { tools: ToolsIcon, devtools: DevtoolsIcon, desktop: DesktopIcon }
 
     function Extras() {
       const [rows, setRows] = useState(null)
@@ -318,7 +349,7 @@ window.__ModuleLoader__.load({
           key: feature.row, 'data-feature': feature.row, style: S.row
         },
           React.createElement('span', { style: S.tile, 'aria-hidden': true },
-            feature.glyph === 'desktop' ? React.createElement(DesktopIcon) : React.createElement(ToolsIcon)),
+            React.createElement(GLYPHS[feature.glyph] ?? ToolsIcon)),
           React.createElement('div', { style: S.rowMain },
             React.createElement('div', { style: S.rowTitle }, feature.title),
             React.createElement('div', { style: S.rowBody }, feature.body)

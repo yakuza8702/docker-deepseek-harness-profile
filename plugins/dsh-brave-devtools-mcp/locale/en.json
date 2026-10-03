@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Browser tools brave",
+    "description": "Troubleshoot a page the way a developer does: read the console, inspect every network request, record a performance trace, run Lighthouse, take a heap snapshot — through the brave-mcp (Brave DevTools) MCP server attached over CDP to this container's visible Brave. Switch it off to save the tool definitions' context."
+  }
+}

@@ -47,6 +47,14 @@ const ROWS = [
    */
   { id: 'browser-mcp', bundle: 'dsh-browser-mcp' },
   /**
+   * The Brave DevTools MCP server: the 30 `mcp__brave-devtools__*` tools that
+   * DIAGNOSE a page (console, network, CSS cascade, performance, Lighthouse, heap),
+   * from plugins/dsh-brave-devtools-mcp. A row of its own because it is a separate
+   * tool surface: releasing the driving tools must not have to release these, and
+   * the other way round.
+   */
+  { id: 'brave-devtools-mcp', bundle: 'dsh-brave-devtools-mcp' },
+  /**
    * The visible Chromium desktop and the `browser_open` hand-off bridge, from
    * plugins/dsh-browser-desktop.
    */
