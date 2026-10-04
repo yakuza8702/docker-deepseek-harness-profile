@@ -525,6 +525,73 @@ seed_brave_devtools_bundle() {
   esac
 }
 
+# Office documents as a switchable BUNDLE (see plugins/dsh-office).
+#
+# Same contract as its three siblings above, and for the same reason: the rows live
+# in the bundle's own patch (a row mounted by a launcher overlay re-declares itself
+# enabled every boot and no switch can win), and `skill-office` puts three skill
+# descriptions into every session's catalog, i.e. a context cost while it is on.
+#
+# The payload is the difference: this feature is useless without
+# /opt/dsh-office/primary-runtime, because the skills are instructed to run the
+# interpreter `load_workspace_dependencies` returns. The bundle's own rows refuse to
+# mount when runtime.json is missing (a boot-safety gate), so a home whose payload
+# is gone boots with the feature hidden instead of a skill that fails at first use.
+# This seeder only warns, it does not remove the selection — the payload is an image
+# layer, and a user who pointed DSH_OFFICE_RUNTIME somewhere else is fine.
+OFFICE_BUNDLE="dsh-office"
+seed_office_bundle() {
+  [[ "${SAFE_MODE:-0}" == "1" ]] && { log "office: Safe Mode — the real profile is left untouched"; return 0; }
+  [[ "${DSH_OFFICE:-1}" == "0" ]] && { log "office: not selected (DSH_OFFICE=0) — it stays available in the Plugins page"; return 0; }
+
+  local dir="$DSH_REAL_HOME/profiles/$PROFILE"
+  local manifest="$dir/package.json"
+
+  # The profile is created by the MCP seeder above (or by DSH itself); if it is not
+  # there yet there is nothing to select into, and the next boot picks it up.
+  [[ -f "$manifest" ]] || { log "office: profile \"$PROFILE\" does not exist yet — it will be selected on the next boot"; return 0; }
+
+  local bundle_dir=""
+  for root in /opt/dsh /opt/dsh-src; do
+    if [[ -d "$root/node_modules/$OFFICE_BUNDLE" ]]; then bundle_dir="$root/node_modules/$OFFICE_BUNDLE"; break; fi
+  done
+  [[ -n "$bundle_dir" ]] || { log "WARN: $OFFICE_BUNDLE is not in this image's node_modules — Office documents will not be offered"; return 0; }
+
+  local runtime="${DSH_OFFICE_RUNTIME:-/opt/dsh-office/primary-runtime}"
+  [[ -f "$runtime/runtime.json" ]] || log "WARN: office: no payload at $runtime — the Office rows will stay unmounted (see tools/build-office-payload.mjs)"
+
+  local marker="$DSH_REAL_HOME/.office-bundle-seeded"
+  local seeded=0
+  [[ -f "$marker" ]] && seeded=1
+
+  local how
+  how="$(node -e '
+    const fs = require("fs");
+    const [manifest, name, seeded] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const profile = parsed?.dsh?.profile;
+    if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
+    const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
+    if (seeded === "1") { process.stdout.write("existing-home"); process.exit(0); }
+    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("selected");
+  ' "$manifest" "$OFFICE_BUNDLE" "$seeded" 2>/dev/null || true)"
+
+  case "$how" in
+    selected|already-selected)
+      printf '%s\n' "$how" > "$marker" 2>/dev/null || true
+      log "office: \"$OFFICE_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page under \"Office documents\" to release the three Office skills"
+      ;;
+    existing-home) ;;
+    unreadable|no-profile-block) log "WARN: could not select \"$OFFICE_BUNDLE\" ($how) — enable it by hand in the Plugins page" ;;
+    *) log "WARN: could not select \"$OFFICE_BUNDLE\" — enable it by hand in the Plugins page" ;;
+  esac
+}
+
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
   write_boot_state failed "$*" "the harness process exited during startup"
@@ -630,6 +697,15 @@ write_boot_state starting "booting profile ${PROFILE}"
 # ---------------------------------------------------------------------
 DSH_REAL_HOME="${DSH_HOME:-/home/node/.dsh}"
 export DSH_REAL_HOME
+
+# The Office feature's extra skill root. The core skill filesystem reads
+# DSH_BUNDLED_SKILL_DIR when the row has no explicit `bundledSkillDir`, and treats it
+# as a trusted bundled root — the same rank as the skills that ship inside packages,
+# so `pdf-documents` (this image's own PDF skill, see office-skills/) is discovered
+# exactly like the three Office ones. An explicit value always wins.
+if [[ "${DSH_OFFICE:-1}" != "0" && -d /opt/dsh-office/office-skills ]]; then
+  export DSH_BUNDLED_SKILL_DIR="${DSH_BUNDLED_SKILL_DIR:-/opt/dsh-office/office-skills}"
+fi
 SAFE_MODE_FLAG="$DSH_REAL_HOME/.safe-mode-request"
 SAFE_MODE=0
 HARNESS_HOME="$DSH_REAL_HOME"
@@ -678,6 +754,11 @@ else
   # It runs after the MCP seeder because that one creates the profile on a fresh
   # home.
   seed_browser_desktop_bundle
+  # …and Office documents as a FOURTH (see seed_office_bundle): the harness's own
+  # office-docx/office-pptx/office-xlsx skills on the payload this image bakes in,
+  # with one card in the Plugins page. Same reason as the others — the skills are
+  # catalog context in every request, so the switch that releases them is the point.
+  seed_office_bundle
 fi
 
 # ---------------------------------------------------------------------

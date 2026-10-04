@@ -41,13 +41,19 @@ window.__ModuleLoader__.load({
     const DESKTOP_PATH = '/desktop/vnc.html?autoconnect=1&resize=scale&view_only=0&reconnect=1'
 
     /**
-     * The three integrated browser features, one row each — and one switch each.
+     * The integrated features, one row each — and one switch each.
      *
-     * They are deliberately separate because they cost DIFFERENT things: the driving
-     * MCP row is 24 tool definitions, the diagnosing MCP row is 30 more, and the
-     * desktop row is one tool (`browser_open`) plus a system-prompt section. One
-     * switch for all of them meant releasing a cheaper one to drop an expensive one,
-     * with no way to keep, say, the visible desktop while dropping a tool surface.
+     * Three of them are the browser features, and they are deliberately separate
+     * because they cost DIFFERENT things: the driving MCP row is 24 tool definitions,
+     * the diagnosing MCP row is 30 more, and the desktop row is one tool
+     * (`browser_open`) plus a system-prompt section. One switch for all of them meant
+     * releasing a cheaper one to drop an expensive one, with no way to keep, say, the
+     * visible desktop while dropping a tool surface.
+     *
+     * The fourth is the Office row: the harness's OWN skills (office-docx,
+     * office-pptx, office-xlsx) on the Python payload this image bakes in. It is here
+     * rather than always-on for the same reason — the skills are context in every
+     * request, so the person paying for it should be able to release it.
      *
      * The two MCP rows overlap on purpose and are not alternatives to each other:
      * `browser-mcp` DRIVES the page (navigate, click, type, screenshot), the
@@ -77,6 +83,12 @@ window.__ModuleLoader__.load({
         title: 'Browser Use',
         body: 'The visible Chromium desktop itself, plus the browser_open hand-off tool and its system-prompt section that let the model reveal a page to you for human takeover. Its own cost is small but constant \u2014 turn it off to release it while Browser tools stays on.',
         panel: true
+      },
+      {
+        row: 'skill-office',
+        glyph: 'office',
+        title: 'Office documents',
+        body: 'Word, PowerPoint and Excel work for the model: the harness\u2019s own office-docx, office-pptx and office-xlsx skills, running on a pinned Python payload, with the bundled LibreOffice engine rendering and converting when a page needs to be looked at or a PDF is asked for. Turn it off to release the three skills and their instructions from every request.'
       }
     ]
 
@@ -247,8 +259,20 @@ window.__ModuleLoader__.load({
       React.createElement('path', { d: 'M8.6 12.4l2.1-2.6 1.9 1.6 2.3-3' })
     )
 
+    /** The fourth feature's glyph: a document sheet with text on it. */
+    const OfficeIcon = () => React.createElement('svg', {
+      width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+      strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true
+    },
+      React.createElement('path', { d: 'M13.6 2.75H6.6a2.2 2.2 0 0 0-2.2 2.2v14.1a2.2 2.2 0 0 0 2.2 2.2h10.8a2.2 2.2 0 0 0 2.2-2.2V8.55z' }),
+      React.createElement('path', { d: 'M13.6 2.75v4.1a1.7 1.7 0 0 0 1.7 1.7h4.3' }),
+      React.createElement('path', { d: 'M8.4 12.4h7.2' }),
+      React.createElement('path', { d: 'M8.4 15.3h7.2' }),
+      React.createElement('path', { d: 'M8.4 18.2h4.4' })
+    )
+
     /** The rows' glyphs, by the `glyph` key each FEATURE carries. */
-    const GLYPHS = { tools: ToolsIcon, devtools: DevtoolsIcon, desktop: DesktopIcon }
+    const GLYPHS = { tools: ToolsIcon, devtools: DevtoolsIcon, desktop: DesktopIcon, office: OfficeIcon }
 
     function Extras() {
       const [rows, setRows] = useState(null)

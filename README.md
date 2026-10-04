@@ -245,6 +245,60 @@ with plain `docker run`, add `--shm-size=1g` — the entrypoint detects a small 
 and falls back to `--disable-dev-shm-usage` automatically, but the properly sized path
 is faster.
 
+## Office documents — Word, PowerPoint, Excel and PDF, as one switchable card
+
+DeepSeek Harness **already ships** the Office feature; a plain container mounts none of
+it. This image mounts it, supplies the interpreter it expects, and puts a switch on it:
+
+```
+Plugins page → Office documents → on    # office-docx / office-pptx / office-xlsx / pdf-documents
+Plugins page → Office documents → off   # the four skills released from every request
+```
+
+| | |
+|---|---|
+| Bundle / package | `dsh-office` (`plugins/dsh-office`) |
+| Rows it mounts | `skill-office` → `@deepseek-ai/dsh-skill-office` · `workspace-dependencies` → `@deepseek-ai/dsh-tool-workspace-dependencies` |
+| Skills | `office-docx`, `office-pptx`, `office-xlsx` (bundled upstream) + `pdf-documents` (this image) |
+| Interpreter | `/opt/dsh-office/primary-runtime` — Python 3.12.14, 15 distributions, ~282 MiB |
+| Engine | `@deepseek-ai/libreoffice-kit` — LibreOffice, prebuilt, WebAssembly backend on Linux |
+| Switches | `DSH_OFFICE=0` · `DSH_OFFICE_RUNTIME=<dir>` |
+| Selection | once per home (marker `.office-bundle-seeded`) |
+
+**Nothing here is a third-party plugin and nothing installs at runtime.** The skills and
+the engine are ordinary dependencies of the DSH release already in the image; what the
+image adds is the payload those skills are instructed to use — `python-docx`,
+`python-pptx`, `openpyxl`, `XlsxWriter`, `Pillow`, `lxml`, `numpy`, `pandas`, and two
+wheels this repo adds on purpose: `pypdf` and `PyMuPDF`.
+
+`docker/office-runtime.lock.json` is the upstream
+`scripts/primary-runtime/lock.json` for the shipped release, pinned by SHA-256
+everywhere. `tools/build-office-payload.mjs` downloads, verifies and unpacks it at build
+time (no repository checkout needed, no compiler on the build host); `tools/check-office.mjs`
+then **executes** the result — imports all ten libraries, writes a `.docx` with the
+payload's own interpreter, runs the real `check_office.py` over it, converts it to a real
+PDF and renders a page to a real PNG with the real engine, and reads the four declarations
+that put the card on the Plugins page.
+
+What the model can do, and what proves it works:
+
+| Capability | How |
+|---|---|
+| Create, read and edit `.docx` / `.pptx` / `.xlsx` | the three bundled skills on the payload's libraries |
+| Look at a page, slide or worksheet range | the engine renders it to PNG; the core `read_image` tool hands it to the model |
+| Extract embedded pictures | `word/media/`, `ppt/media/`, `xl/media/` from the package, or PyMuPDF inside a PDF |
+| Convert to PDF | `convert` — real PDF 1.7 (measured: a one-page document in ~3.2 s) |
+| Recalculate a workbook | `recalculate`, formulas preserved |
+| Read a PDF's text, images and pages | `pypdf` + `PyMuPDF` + the engine's PDFium render path |
+| Check before delivering | `check_office.py` — OOXML packages, relationships, structure |
+
+**What it is not:** the engine is LibreOffice, so pagination can differ from Word —
+previews are layout QA, not proof of print. A render is bounded to 100 pages and 16.7M
+pixels, and the engine is not resident (each operation starts it for ~2-3 s). PDF has no
+reflow: read, split, merge, rotate, stamp, render, or regenerate from the Office source.
+Missing fonts are reported (`missingFonts`), never silently substituted. Full detail and
+provenance: `plugins/dsh-office/README.md`.
+
 ## Workspace file manager — the "Files" entry in the sidebar footer
 
 The image also carries **`dsh-workspace-browser`**, a file manager for `/workspace`

@@ -378,6 +378,7 @@ COPY plugins/dsh-workspace-browser /opt/dsh-workspace-browser
 COPY plugins/dsh-browser-mcp /opt/dsh-browser-mcp
 COPY plugins/dsh-brave-devtools-mcp /opt/dsh-brave-devtools-mcp
 COPY plugins/dsh-plugins-page-extras /opt/dsh-plugins-page-extras
+COPY plugins/dsh-office /opt/dsh-office-bundle
 RUN set -eux; \
     installed=0; \
     for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
@@ -388,14 +389,15 @@ RUN set -eux; \
         cp -a /opt/dsh-browser-mcp "$target/dsh-browser-mcp"; \
         cp -a /opt/dsh-brave-devtools-mcp "$target/dsh-brave-devtools-mcp"; \
         cp -a /opt/dsh-plugins-page-extras "$target/dsh-plugins-page-extras"; \
+        cp -a /opt/dsh-office-bundle "$target/dsh-office"; \
         installed=1; \
       fi; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
-    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras; \
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras /opt/dsh-office-bundle; \
     chmod -R a+rX \
-      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras \
-      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras 2>/dev/null || true
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras /opt/dsh/node_modules/dsh-office \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras /opt/dsh-src/node_modules/dsh-office 2>/dev/null || true
 # The workspace plugin's own suite, kept in the image so the ported host logic can
 # be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
 
@@ -417,7 +419,7 @@ RUN set -eux; \
       anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
       [ -d "$root/dsh-browser-desktop" ] || continue; \
-      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "dsh-office", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
@@ -512,6 +514,65 @@ RUN set -eux; \
 COPY --chmod=0644 tools/check-brave-mcp.mjs /tmp/check-brave-mcp.mjs
 RUN node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
  && rm -f /tmp/check-brave-mcp.mjs
+
+# ---------------------------------------------------------------------
+# Office documents — Word, PowerPoint, Excel and PDF work for the model.
+#
+# WHY IT IS IN THE IMAGE
+# The harness ships the whole feature and mounts none of it in a plain container:
+# `@deepseek-ai/dsh-skill-office` carries the three skills (office-docx,
+# office-pptx, office-xlsx) plus the standard-library check_office.py structural
+# checker, and `@deepseek-ai/libreoffice-kit` carries the rendering engine
+# (LibreOffice compiled to WebAssembly — a prebuilt dependency, nothing to
+# apt-install and nothing to run as a service). What is missing is the interpreter
+# the skills are told to use: they call `load_workspace_dependencies` and run the
+# Python it returns, so a payload has to exist. That payload is what this step
+# assembles, from a lock file pinned by SHA-256.
+#
+# The packages are already in the installation's node_modules (they are ordinary
+# dependencies of the DSH release). What this image adds is:
+#   1. /opt/dsh-office/primary-runtime — the pinned Python 3.12.14 payload with
+#      python-docx, python-pptx, openpyxl, XlsxWriter, Pillow, lxml, numpy, pandas,
+#      and this image's two additions: pypdf and PyMuPDF, which are what make
+#      reading a PDF's text and embedded images possible.
+#   2. /opt/dsh-office/office-skills/pdf-documents — this repository's fourth skill,
+#      for PDFs, discovered through DSH_BUNDLED_SKILL_DIR (set in the entrypoint).
+#   3. the bundle that mounts both rows, so the Plugins page has one switch for it.
+#
+# BOTH ARCHITECTURES ARE COVERED: the lock carries linux-x64 and linux-arm64, and
+# the target is derived from the platform actually being built.
+#
+# The gate EXECUTES the payload and the engine — the interpreter imports every
+# library, the checker passes on a document the payload itself wrote, the engine
+# converts that document to a real PDF and renders a page to a real PNG, and the
+# four declarations that have to agree (bundle patch row, Plugins-page row host
+# table, duplicate-card suppression, entrypoint switch) are read out of the files.
+# See tools/check-office.mjs.
+COPY --chmod=0644 docker/office-runtime.lock.json tools/build-office-payload.mjs /tmp/office/
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      arm64) office_target=linux-arm64 ;; \
+      *) office_target=linux-x64 ;; \
+    esac; \
+    dsh_version="$(node -p "require('/opt/dsh/node_modules/@deepseek-ai/dsh/package.json').version" 2>/dev/null || echo unknown)"; \
+    node /tmp/office/build-office-payload.mjs \
+      --lock /tmp/office/office-runtime.lock.json \
+      --target "$office_target" \
+      --output /opt/dsh-office \
+      --cache /tmp/office-cache \
+      --version "dsh-$dsh_version"; \
+    rm -rf /tmp/office /tmp/office-cache
+COPY --chmod=0644 office-skills /opt/dsh-office/office-skills
+# The gate needs the four declarations, not the whole repository.
+COPY --chmod=0644 plugins/dsh-office/cordis.patch.yml /tmp/office-repo/dsh-office.cordis.patch.yml
+COPY --chmod=0644 plugins/dsh-plugins-page-extras/index.js /tmp/office-repo/plugins-page-extras.index.js
+COPY --chmod=0644 tools/patch-plugin-manager-page.mjs /tmp/office-repo/patch-plugin-manager-page.mjs
+COPY --chmod=0644 tools/check-office.mjs /tmp/check-office.mjs
+RUN node /tmp/check-office.mjs \
+      --payload /opt/dsh-office \
+      --repo /tmp/office-repo \
+      --install /opt/dsh/node_modules --install /opt/dsh-src/node_modules \
+ && rm -rf /tmp/check-office.mjs /tmp/office-repo
 
 # ---------------------------------------------------------------------
 # APK / Android reverse-engineering toolchain.

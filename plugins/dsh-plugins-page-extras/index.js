@@ -58,7 +58,15 @@ const ROWS = [
    * The visible Chromium desktop and the `browser_open` hand-off bridge, from
    * plugins/dsh-browser-desktop.
    */
-  { id: 'browser-desktop', bundle: 'dsh-browser-desktop' }
+  { id: 'browser-desktop', bundle: 'dsh-browser-desktop' },
+  /**
+   * The harness's own Office skills and the pinned Python payload they run on,
+   * from plugins/dsh-office. `skill-office` is the row that costs context (three
+   * skill descriptions in every catalog); the bundle's second row, the
+   * `load_workspace_dependencies` tool, is left mounted because it answers one
+   * question and does nothing on its own.
+   */
+  { id: 'skill-office', bundle: 'dsh-office' }
 ]
 
 /**

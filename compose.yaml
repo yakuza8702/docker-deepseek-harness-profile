@@ -89,6 +89,20 @@ services:
       DSH_WORKSPACE_MAX_ENTRIES: "${DSH_WORKSPACE_MAX_ENTRIES:-2000}"
       DSH_WORKSPACE_MAX_PREVIEW_BYTES: "${DSH_WORKSPACE_MAX_PREVIEW_BYTES:-524288}"
       DSH_WORKSPACE_MAX_WRITE_BYTES: "${DSH_WORKSPACE_MAX_WRITE_BYTES:-1048576}"
+      # --- Office documents (dsh-office) ---
+      # Word, PowerPoint, Excel and PDF work for the model: the harness's own
+      # office-docx/office-pptx/office-xlsx skills plus this image's PDF skill,
+      # running on the pinned Python payload baked into the image, with the bundled
+      # LibreOffice kit rendering pages to images (so a vision model can look at a
+      # document) and converting to PDF. It is a SWITCHABLE CARD in the Plugins
+      # page; this flag only decides whether a FRESH home selects it. 1 = select it
+      # once (recommended), 0 = keep the card but never select it.
+      DSH_OFFICE: "${DSH_OFFICE:-1}"
+      # Point the dependency tool at a different payload directory (one holding
+      # runtime.json + dependencies/). Empty = the image's own
+      # /opt/dsh-office/primary-runtime. The rows refuse to mount when the payload
+      # is missing, so a wrong path hides the feature instead of breaking the boot.
+      DSH_OFFICE_RUNTIME: "${DSH_OFFICE_RUNTIME:-}"
     env_file:
       - path: .env
         required: false
