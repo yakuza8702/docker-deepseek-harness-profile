@@ -27,6 +27,13 @@
  *   <output>/primary-runtime/dependencies/python/bin/python3
  *   <output>/primary-runtime/dependencies/python/lib/python3.X/site-packages/…
  *
+ * `<output>` is the CARRIER directory, and `primary-runtime/` is the payload inside
+ * it — upstream's own layout (`prepare.ts` writes `join(output, 'primary-runtime')`),
+ * and the one `DSH_PRIMARY_RUNTIME` / the tool's `source:` point at. The sibling
+ * `office-skills/` directory is where the extra skills live. Getting this depth wrong
+ * is not a cosmetic mistake: a `source:` that names the carrier instead of the
+ * payload finds no `runtime.json`, and the rows disable themselves.
+ *
  * The layout, the manifest fields and the `pythonPackages` distribution map are the
  * same shape upstream's `scripts/primary-runtime/prepare.ts` produces, because
  * `parsePrimaryRuntime` / `workspaceDependencyPaths` in
@@ -53,6 +60,9 @@
  *     [--cache /tmp/office-payload-cache] \
  *     [--version <string recorded as desktopVersion>]
  *
+ * `--output` is the carrier directory: the payload lands in `<output>/primary-runtime`
+ * and the extra skills are expected in `<output>/office-skills`.
+ *
  * Requires `tar` and `unzip` on PATH (both are in the image) and network access to
  * the pinned URLs. It deliberately uses those two system tools rather than an npm
  * archive library, so this step works in either release channel — the npm channel
@@ -62,6 +72,7 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 
@@ -154,10 +165,11 @@ async function main() {
   const arch = target.endsWith('-arm64') ? 'arm64' : 'x64'
   const sitePackages = join('python', 'lib', `python${lock.pythonVersion.split('.').slice(0, 2).join('.')}`, 'site-packages')
 
-  const cache = resolve(values.cache ?? join(output, '.cache'))
+  const cache = resolve(values.cache ?? join(tmpdir(), 'dsh-office-payload-cache'))
   mkdirSync(cache, { recursive: true })
 
-  const runtime = resolve(output)
+  // The payload directory itself, inside the carrier — upstream's depth.
+  const runtime = join(resolve(output), 'primary-runtime')
   const staging = `${runtime}.staging`
   rmSync(staging, { recursive: true, force: true })
   mkdirSync(join(staging, 'dependencies'), { recursive: true })

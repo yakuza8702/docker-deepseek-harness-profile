@@ -567,10 +567,12 @@ COPY --chmod=0644 office-skills /opt/dsh-office/office-skills
 COPY --chmod=0644 plugins/dsh-office/cordis.patch.yml /tmp/office-repo/dsh-office.cordis.patch.yml
 COPY --chmod=0644 plugins/dsh-plugins-page-extras/index.js /tmp/office-repo/plugins-page-extras.index.js
 COPY --chmod=0644 tools/patch-plugin-manager-page.mjs /tmp/office-repo/patch-plugin-manager-page.mjs
+COPY --chmod=0644 docker/entrypoint.sh /tmp/office-repo/entrypoint.sh
 COPY --chmod=0644 tools/check-office.mjs /tmp/check-office.mjs
 RUN node /tmp/check-office.mjs \
       --payload /opt/dsh-office \
       --repo /tmp/office-repo \
+      --entrypoint /tmp/office-repo/entrypoint.sh \
       --install /opt/dsh/node_modules --install /opt/dsh-src/node_modules \
  && rm -rf /tmp/check-office.mjs /tmp/office-repo
 

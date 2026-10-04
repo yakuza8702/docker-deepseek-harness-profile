@@ -28,10 +28,13 @@
  * USAGE
  * -----
  *   node tools/check-office.mjs --payload /opt/dsh-office --repo /tmp/office-repo \
- *     --install /opt/dsh/node_modules /opt/dsh-src/node_modules
+ *     --entrypoint /tmp/office-repo/entrypoint.sh \
+ *     --install /opt/dsh/node_modules --install /opt/dsh-src/node_modules
  *
- * `--repo` may be omitted; the declaration checks are then skipped with a warning
- * (that is the mode for running it by hand outside an image build).
+ * `--payload` is the CARRIER directory (holding `primary-runtime/` and
+ * `office-skills/`). `--repo` may be omitted; the declaration and wiring checks are
+ * then skipped with a warning (that is the mode for running it by hand outside an
+ * image build), and `--entrypoint` is only read when `--repo` is given.
  */
 
 import { execFileSync } from 'node:child_process'
@@ -207,9 +210,10 @@ print("wrote", ${JSON.stringify(document)})
   return kit
 }
 
-/** The extra skill this image ships for PDFs, discovered through DSH_BUNDLED_SKILL_DIR. */
-function checkExtraSkills(payload) {
-  const skill = join(payload, 'office-skills', 'pdf-documents', 'SKILL.md')
+/** The extra skills this image ships (PDFs), discovered through DSH_BUNDLED_SKILL_DIR. */
+function checkExtraSkills(carrier) {
+  const root = join(carrier, 'office-skills')
+  const skill = join(root, 'pdf-documents', 'SKILL.md')
   if (!existsSync(skill)) return bad(`no pdf-documents skill at ${skill} — DSH_BUNDLED_SKILL_DIR would point at nothing`)
   const text = readFileSync(skill, 'utf8')
   const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/u.exec(text)
@@ -217,7 +221,37 @@ function checkExtraSkills(payload) {
   const block = frontmatter[1]
   if (!/^name:\s*pdf-documents\s*$/mu.test(block)) bad('the pdf-documents skill frontmatter has no matching name')
   if (!/^description:\s*\S/mu.test(block)) bad('the pdf-documents skill frontmatter has no description (the model would never see it)')
-  if (problems.length === 0) ok('the pdf-documents skill is present with valid frontmatter')
+  if (problems.length === 0) ok(`the pdf-documents skill is present at ${root} with valid frontmatter`)
+}
+
+/**
+ * The path contract, which is the one failure a file-existence check cannot see.
+ *
+ * A payload at the wrong depth is a HEALTHY image whose Office rows disable themselves
+ * at boot: the bundle patch's `source:` and its fail-open gate both name a directory,
+ * and if `runtime.json` is not in that exact directory the feature quietly disappears.
+ * So this reads the two literals out of the files that will run and demands the paths
+ * they name actually hold what they expect.
+ */
+function checkWiring(carrier, repo, entrypoint) {
+  const patchPath = join(repo, 'dsh-office.cordis.patch.yml')
+  const patch = readFileSync(patchPath, 'utf8')
+  const sources = [...patch.matchAll(/process\.env\.DSH_OFFICE_RUNTIME \|\| '([^']+)'/gu)].map((match) => match[1])
+  if (sources.length === 0) return bad("the bundle patch no longer names a payload default (no 'process.env.DSH_OFFICE_RUNTIME || <path>' literal)")
+  // `source:` and the fail-open gate must agree, or the rows mount against a path the
+  // gate does not check (or vice versa).
+  const unique = [...new Set(sources)]
+  if (unique.length !== 1) bad(`the bundle patch names ${unique.length} different payload defaults: ${unique.join(', ')}`)
+  const declared = unique[0]
+  if (existsSync(join(declared, 'runtime.json'))) ok(`the bundle patch's payload path resolves: ${declared}/runtime.json`)
+  else bad(`the bundle patch points at ${declared}, which holds no runtime.json — the Office rows would disable themselves at boot while the image still looks healthy (the payload is at ${carrier}/primary-runtime)`)
+
+  if (entrypoint === undefined) return
+  const text = readFileSync(entrypoint, 'utf8')
+  const skillsRoot = /DSH_BUNDLED_SKILL_DIR="\$\{DSH_BUNDLED_SKILL_DIR:-([^}]+)\}"/u.exec(text)?.[1]
+  if (skillsRoot === undefined) bad('the entrypoint no longer exports DSH_BUNDLED_SKILL_DIR with a default — the pdf-documents skill would never be discovered')
+  else if (!existsSync(join(skillsRoot, 'pdf-documents', 'SKILL.md'))) bad(`the entrypoint points DSH_BUNDLED_SKILL_DIR at ${skillsRoot}, which holds no pdf-documents skill`)
+  else ok(`the entrypoint's bundled skill root resolves: ${skillsRoot}`)
 }
 
 /** The four declarations that have to agree for the card to exist and work. */
@@ -259,21 +293,26 @@ async function main() {
     options: {
       payload: { type: 'string' },
       repo: { type: 'string' },
+      entrypoint: { type: 'string' },
       install: { type: 'string', multiple: true },
     },
     allowPositionals: true,
   })
-  const payload = resolve(values.payload ?? '/opt/dsh-office')
+  // `--payload` is the CARRIER: the directory holding `primary-runtime/` (the payload
+  // the tool is given) and `office-skills/` (the extra skills).
+  const carrier = resolve(values.payload ?? '/opt/dsh-office')
+  const payload = join(carrier, 'primary-runtime')
   // `--install` may be repeated, and bare paths are accepted too: the image build
   // passes both roots either way, and this keeps a hand-run from silently checking
   // one root and reporting a missing package.
   const installs = [...(values.install ?? []), ...positionals].map((root) => resolve(root))
   const repo = values.repo === undefined ? undefined : resolve(values.repo)
+  const entrypoint = values.entrypoint === undefined ? undefined : resolve(values.entrypoint)
   if (installs.length === 0) {
     console.error('check-office: --install <node_modules-root> [...] is required')
     process.exit(2)
   }
-  console.log(`check-office: payload ${payload}`)
+  console.log(`check-office: carrier ${carrier}`)
   console.log(`check-office: installations ${installs.join(', ')}`)
 
   const work = join('/tmp', 'office-gate')
@@ -286,10 +325,13 @@ async function main() {
   console.log('checker and engine')
   if (python !== undefined) checkCheckerAndRoundTrip(python, installs, work)
   console.log('extra skills')
-  checkExtraSkills(payload)
+  checkExtraSkills(carrier)
   console.log('declarations')
   if (repo === undefined) note('--repo not given: the four declaration checks were skipped (expected when running this by hand)')
-  else checkDeclarations(repo, installs)
+  else {
+    checkDeclarations(repo, installs)
+    checkWiring(carrier, repo, entrypoint)
+  }
 
   rmSync(work, { recursive: true, force: true })
 
