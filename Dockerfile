@@ -91,8 +91,12 @@ ENV NPM_CONFIG_CACHE=/tmp/.npm-cache \
 #                           python3 build-essential bash-completion + pnpm + uv
 #   runzhliu extras       : less ripgrep rsync (build-essential/git/curl/...
 #                           already ship inside node:24-trixie buildpack-deps)
-#   this build            : docker-ce-cli + docker-compose-plugin (socket/TCP
-#                           engine access), tini (init, orphan reaping),
+#   this build            : docker-ce-cli + docker-compose-plugin +
+#                           docker-buildx-plugin (socket/TCP engine access;
+#                           without buildx `docker build` silently falls back
+#                           to the DEPRECATED legacy builder and every
+#                           `docker buildx` call is "unknown command"),
+#                           tini (init, orphan reaping),
 #                           bubblewrap (DSH Linux bwrap sandbox backend)
 #   browser desktop       : the virtual display + VNC stack the visible browser
 #                           runs on (Xvfb -> openbox -> x11vnc -> websockify +
@@ -110,7 +114,7 @@ RUN set -eux; \
       nano jq unzip vim zip htop tmux tree openssl python3 bash-completion \
       less ripgrep rsync procps ca-certificates \
       tini bubblewrap \
-      docker-ce-cli docker-compose-plugin \
+      docker-ce-cli docker-compose-plugin docker-buildx-plugin \
       xvfb x11vnc x11-utils openbox websockify novnc \
       fonts-liberation fonts-noto-cjk; \
     rm -rf /var/lib/apt/lists/*
