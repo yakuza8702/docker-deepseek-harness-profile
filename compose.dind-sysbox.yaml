@@ -1,0 +1,29 @@
+# =====================================================================
+# OPTIONAL override ON TOP of compose.dind.yaml — run the isolated engine
+# under Sysbox, with NO privileges at all.
+#
+#   docker compose -f compose.yaml -f compose.dind.yaml -f compose.dind-sysbox.yaml up -d
+#
+# Requires Sysbox CE on the host (Docker runtime `sysbox-runc` registered and
+# sysbox / sysbox-mgr / sysbox-fs services active) — see README "Option C".
+#
+# What changes is exactly two fields: the engine runs in a user namespace with
+# a full uid/gid mapping (container root → an unprivileged host uid, e.g.
+# 165536), so `privileged` is not needed and no capability is added. An escape
+# from inside has to beat the kernel rather than walk out through CAP_SYS_ADMIN.
+#
+# Everything else is identical: same private network, same never-published
+# 2375, same /export hand-off, same fleet-of-images-survive-the-purge logic.
+# Only note: the data root is uid-shifted, so on the host it ends up owned by
+# the container's mapped uid — the purge `rm` still needs root.
+#
+# Pre-flight on the host before switching:
+#   docker info --format '{{json .Runtimes}}' | tr ',' '\n' | grep sysbox
+#   docker run --rm --runtime=sysbox-runc alpine:3.20 echo sysbox-ok
+# =====================================================================
+
+services:
+  dind:
+    runtime: sysbox-runc
+    # Sysbox supplies the isolation — the container needs no privilege.
+    privileged: false
