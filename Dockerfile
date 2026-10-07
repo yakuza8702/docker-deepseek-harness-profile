@@ -435,18 +435,20 @@ COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.o
 COPY --chmod=0644 docker/workspace-browser.overlay.yml /opt/seek-harness/workspace-browser.overlay.yml
 COPY --chmod=0644 docker/plugins-page.overlay.yml /opt/seek-harness/plugins-page.overlay.yml
 
-# Gate the profile-create CHOOSER ("Start New" vs "Inherit plugins").
+# Gate the profile controls: the create CHOOSER and "Reset to Default".
 #
 # The pill's "+ New Profile" asks how a profile should start, which makes the
 # answer a contract: `mode: "new"` has to produce a STOCK profile (two bundles, no
 # dependencies, no node_modules, none of the source's patch layer) while a caller
 # that sends no mode — the recovery page, an older client bundle — must keep
-# getting the copy. The gate EXECUTES the plugin's own HTTP route against a
-# throwaway $DSH_HOME for both, MOUNTS the browser half on a stub React runtime and
-# clicks the chooser through, and, when the image carries `dsh-app-boot`, proves
-# the local fallback skeleton is byte-identical to `initProfile`'s output so a
-# fresh profile cannot differ between the npm and source channels. See
-# tools/check-profile-switcher.mjs.
+# getting the copy. The row's `Reset to Default` is the same skeleton written into
+# an EXISTING profile, so it must wipe it and leave nothing of the old plugin set
+# behind. The gate EXECUTES the plugin's own HTTP route against a throwaway
+# $DSH_HOME for all of it, MOUNTS the browser half on a stub React runtime and
+# clicks the chooser and the row controls through, and, when the image carries
+# `dsh-app-boot`, proves the local fallback skeleton is byte-identical to
+# `initProfile`'s output so a fresh profile cannot differ between the npm and
+# source channels. See tools/check-profile-switcher.mjs.
 COPY --chmod=0644 tools/check-profile-switcher.mjs /tmp/check-profile-switcher.mjs
 RUN node /tmp/check-profile-switcher.mjs /opt/dsh /opt/dsh-src \
  && rm -f /tmp/check-profile-switcher.mjs

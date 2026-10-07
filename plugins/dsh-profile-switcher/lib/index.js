@@ -9,6 +9,9 @@
  *                                                                   "inherit" (default) copies
  *                                                                   `from`, "new" starts from
  *                                                                   the stock skeleton
+ *   POST /api/dsh-profile-switcher/reset     { name }             -> wipes EVERYTHING inside the
+ *                                                                   profile and writes the stock
+ *                                                                   skeleton back in its place
  *   POST /api/dsh-profile-switcher/delete    { name }             -> deletes a profile
  *   POST /api/dsh-profile-switcher/rename    { name, label }      -> display label only
  *   POST /api/dsh-profile-switcher/move      { name, direction }  -> reorder the list
@@ -297,10 +300,14 @@ function stockManifest(dir) {
     && Object.keys(dependencies).length === 0
 }
 
-/** Materialise a stock profile directory; returns which writer was used. */
-async function createStock(name) {
-  const dir = join(profilesRoot(), name)
-  mkdirSync(dir, { recursive: true })
+/**
+ * Write the stock skeleton into an EMPTY directory; returns which writer was used.
+ *
+ * The two callers are "a new profile" and "a profile that was just wiped back to
+ * its default", so they must produce the same directory — a file that differs
+ * between them is a profile that only looks clean.
+ */
+async function materialiseStock(dir, name) {
   const initialiser = await loadInitialiser()
   if (initialiser !== null) {
     try {
@@ -312,6 +319,48 @@ async function createStock(name) {
   if (stockManifest(dir)) return initialiser === null ? 'template' : 'app-boot'
   writeStockSkeleton(dir, name)
   return 'template'
+}
+
+/** Materialise a stock profile DIRECTORY; returns which writer was used. */
+async function createStock(name) {
+  const dir = join(profilesRoot(), name)
+  mkdirSync(dir, { recursive: true })
+  return materialiseStock(dir, name)
+}
+
+/**
+ * Reset a profile to the shipped default: EVERYTHING inside
+ * `$DSH_HOME/profiles/<name>` is deleted — its plugins, pins, `node_modules`, market
+ * state and its own patch layer — and the stock skeleton is written back in its
+ * place, so the directory keeps its name and ends up exactly what "Start New" would
+ * have created. This is the way out of a profile whose plugin set is broken, and
+ * for the shipped `web` profile it is the only way out at all (it cannot be
+ * deleted: the launcher falls back to it).
+ *
+ * NOTHING OUTSIDE THE PROFILE IS TOUCHED. Sessions, settings and credentials live at
+ * the home level; the display label and the list order are sidecars beside the
+ * profile. A reset undoes a plugin set, not a rename — and it must not be able to
+ * take the profile control down with the profile it is repairing.
+ *
+ * When the reset profile is the ACTIVE one, the running harness keeps serving the
+ * plugin set it loaded into memory at boot, so the caller is told a restart is
+ * required; the panel restarts into the clean tree exactly like a profile switch.
+ *
+ * @param name - profile (folder) name to wipe.
+ * @returns what was reset, and whether a restart is needed for it to take effect.
+ */
+async function reset(name) {
+  if (!validName(name)) throw new Error(`invalid profile name: ${JSON.stringify(name)}`)
+  const dir = join(profilesRoot(), name)
+  if (!existsSync(dir)) throw new Error(`profile "${name}" does not exist`)
+  // Remove each entry rather than the directory itself: the profile must keep its
+  // name, and `rmSync` on a symlinked entry removes the LINK, never its target.
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    rmSync(join(dir, entry.name), { recursive: true, force: true })
+  }
+  const skeleton = await materialiseStock(dir, name)
+  log(`reset profile ${name} to the shipped default (${skeleton} skeleton)`)
+  return { name, reset: true, skeleton, restartRequired: name === activeName() }
 }
 
 /**
@@ -498,6 +547,10 @@ export function apply(ctx) {
               body.mode === undefined ? undefined : String(body.mode),
             )
             return send(res, 200, { ok: true, ...created, profiles: listProfiles() })
+          }
+          case 'reset': {
+            const wiped = await reset(String(body.name ?? ''))
+            return send(res, 200, { ok: true, ...wiped, profiles: listProfiles() })
           }
           case 'rename':
             return send(res, 200, { ok: true, ...rename(String(body.name ?? ''), body.label), profiles: listProfiles() })

@@ -31,6 +31,19 @@ sidebar.footer.action  (root scope, list cardinality — additive)
         └───────────────────────────────────────┘
 ```
 
+Every row is the same strip of controls, left to right:
+
+```
+[ Switch ]  ✎ rename  ▲ up  ▼ down  ⟲ Reset to Default  🗑 Delete
+ │          │         │     │       │                   └ 🔒 on `web` — the
+ │          │         │     │       │                      default profile cannot
+ │          │         │     │       └ the words appear    be deleted, so reset is
+ │          │         │     │         on hover/focus only  its only way back
+ │          │         └─────┴─ reorder the list (sidecar, folders never move)
+ │          └─ cosmetic label; the folder keeps its name
+ └─ absent on the profile this harness is running from ("Current Profile" instead)
+```
+
 ## Two ways a profile can start
 
 A new profile used to be one thing: a **copy** of the source profile, so a profile
@@ -54,6 +67,36 @@ Both answers produce a **web-capable** profile (`dsh-base` + `dsh-web-app`), whi
 is the condition the switcher selects on — a new profile can therefore always be
 switched to and deleted again.
 
+## Reset to Default — the way back, on every row
+
+`⟲ Reset to Default` deletes **everything inside `profiles/<name>`** — plugins,
+pins, `node_modules`, market state and the profile's own patch layer — and writes
+the shipped skeleton back in its place. The directory keeps its name, so the
+profile ends up exactly what *Start New* would have created.
+
+It is on **every** row, including the two that otherwise have no destructive action
+at all:
+
+* **`web`** — the launcher's fallback profile, which can never be deleted, so
+  resetting it is the only way to get rid of a plugin set that broke it;
+* **the profile this harness is running from** — resetting the running profile is
+  the point: it is how a session that boots into a broken plugin set gets fixed
+  without leaving the UI.
+
+What it does **not** touch is as important as what it does: profile **labels**, the
+list **order**, and everything at the home level — sessions, settings, credentials —
+live outside the profile directory, and a reset undoes a plugin set, not a rename.
+The control itself is a row icon whose word appears on hover/focus (the same
+treatment the trash gets), because a row that always reads "Reset to Default"
+beside "Delete" is a row that invites the wrong click.
+
+**A reset of the ACTIVE profile restarts the harness.** The running process still
+serves the plugin set it loaded at boot, so the clean tree only exists after a
+reboot; the host half answers `restartRequired: true`, and the panel restarts and
+waits exactly like a profile switch (including the recovery hand-off if the boot
+fails). Resetting any other profile is an in-place operation — switch to it when
+you are ready.
+
 ## Why a restart is part of the feature
 
 A DSH profile is a **boot-time launcher input** (`dsh --profile <name>` →
@@ -74,6 +117,7 @@ The UI confirms first, then polls until the harness answers and reloads the page
 | `GET /api/dsh-profile-switcher/list` | — | active profile + every profile with its bundle count and web-capability |
 | `POST /api/dsh-profile-switcher/select` | `{ name }` | validates, writes the selection (atomic) |
 | `POST /api/dsh-profile-switcher/create` | `{ name, mode?, from? }` | `mode: "inherit"` (default, and the behaviour of every older caller) copies `from`; `mode: "new"` writes the stock skeleton and copies nothing. Answers `{ name, mode, from, skeleton }` |
+| `POST /api/dsh-profile-switcher/reset` | `{ name }` | deletes everything inside `profiles/<name>` and writes the stock skeleton back; the folder, its label and its list position stay. Answers `{ name, reset, skeleton, restartRequired }` |
 | `POST /api/dsh-profile-switcher/safe` | — | ensures `shell-safe` (stock bundles only), selects it, restarts |
 | `POST /api/dsh-profile-switcher/restart` | — | exits the process; the container policy reboots it |
 

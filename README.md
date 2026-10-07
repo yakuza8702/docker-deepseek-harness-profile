@@ -469,7 +469,7 @@ sidebar footer:   ◍ Profile: research ▸      Settings
 ```
 
 * host routes: `GET /api/dsh-profile-switcher/list`, `POST …/select`,
-  `POST …/create`, `POST …/safe`, `POST …/restart`;
+  `POST …/create`, `POST …/reset`, `POST …/safe`, `POST …/restart`;
 * **creating a profile asks HOW it should start** — one click used to copy the
   source profile, so a profile made to isolate something arrived carrying every
   plugin of the profile it came from. *Start New* writes the **stock skeleton**
@@ -477,6 +477,13 @@ sidebar footer:   ◍ Profile: research ▸      Settings
   `node_modules`) using DSH's own `initProfile`; *Inherit plugins* copies the
   current profile — the branch case. `create` takes `mode: "new" | "inherit"`,
   and a caller that sends no mode keeps getting the copy;
+* **every row can be reset to the shipped default** (`⟲`, whose words appear on
+  hover/focus like the trash's). It deletes everything INSIDE `profiles/<name>` —
+  plugins, pins, `node_modules`, patch layer — and writes the skeleton back, keeping
+  the folder name, its label and its list position. It is the only destructive
+  action the locked `web` profile has (it can never be deleted), and resetting the
+  profile the harness is RUNNING from restarts it, so a session stuck on a broken
+  plugin set is fixable from the panel;
 * a switch writes `active-profile.json` and asks the harness to exit — the
   container's `restart: unless-stopped` brings it back **on the selected
   profile** (the UI confirms first, then waits for the harness and reloads);

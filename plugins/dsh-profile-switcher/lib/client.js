@@ -153,6 +153,11 @@ body.dsh-ps--beside-settings .dsh-ps__trigger:not(.dsh-ps__inline){display:none}
    (or focused), which is what keeps the row quiet the rest of the time. */
 .dsh-ps__delLabel{max-width:0;overflow:hidden;white-space:nowrap;opacity:0;transition:max-width 140ms ease,opacity 140ms ease}
 .dsh-ps__icon:hover .dsh-ps__delLabel,.dsh-ps__icon:focus-visible .dsh-ps__delLabel{max-width:60px;opacity:1}
+/* Same reveal for the reset glyph, whose words are longer — "Reset to Default"
+   needs 120px, and the class must repeat the base declarations to win on order
+   (identical specificity to the rule above). */
+.dsh-ps__wideLabel{max-width:0;overflow:hidden;white-space:nowrap;opacity:0;transition:max-width 140ms ease,opacity 140ms ease}
+.dsh-ps__icon:hover .dsh-ps__wideLabel,.dsh-ps__icon:focus-visible .dsh-ps__wideLabel{max-width:120px;opacity:1}
 .dsh-ps__dangerIcon:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-error-primary,inherit)}
 .dsh-ps__renameInput{box-sizing:border-box;width:100%;margin-top:6px;padding:6px 8px;border-radius:8px;font:inherit;font-size:13px;
   border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.45));background:var(--dsw-alias-bg-layer-2,transparent);color:inherit}
@@ -195,25 +200,35 @@ const Icons = {
   pencil: () => Icon(['M11.1 2.6a1.3 1.3 0 0 1 1.9 0l.4.4a1.3 1.3 0 0 1 0 1.9L5.9 12.4l-2.5.6.6-2.5 7.1-7.9Z', 'M10.2 3.6l2.2 2.2']),
   up: () => Icon(['M8 12.5V3.8', 'M4.4 7.4 8 3.8l3.6 3.6'], 14),
   down: () => Icon(['M8 3.5v8.7', 'M4.4 8.6 8 12.2l3.6-3.6'], 14),
+  // counter-clockwise arrow (lucide `rotate-ccw`, redrawn on the 16px grid the
+  // other row icons use): "put this back the way it shipped".
+  reset: () => Icon(['M2 8a6 6 0 1 0 6-6 6.5 6.5 0 0 0-4.5 1.83L2 5.33', 'M2 2v3.33h3.33']),
 }
 
 /**
- * Trash button whose word appears beside the icon only on hover/focus.
+ * Row icon button whose WORD appears beside the icon only on hover/focus.
  *
- * It takes the SAME action style as its neighbours (the row's other icon
- * buttons), which is what keeps it 44px on a phone: without it the trash was the
- * only 30px control in a row of 44px ones — visibly undersized and harder to hit.
+ * Both destructive row actions use it — the trash ("Delete") and the reset glyph
+ * ("Reset to Default") — because that is what keeps a row quiet: at rest it is a
+ * strip of icons, and the word only arrives under the pointer that is about to do
+ * something irreversible. The label class decides how much room the word may take
+ * (`.dsh-ps__delLabel` 60px, `.dsh-ps__wideLabel` 120px), since the words differ in
+ * length and a clipped "Reset to Def…" would be worse than no word at all.
+ *
+ * It takes the SAME action style as its neighbours (the row's other icon buttons),
+ * which is what keeps it 44px on a phone: without it the trash was the only 30px
+ * control in a row of 44px ones — visibly undersized and harder to hit.
  */
-function DeleteButton({ disabled, onDelete, name, style }) {
+function RowIconButton({ disabled, onAct, name, label, labelClass, icon, title, danger, style }) {
   return React.createElement('button', {
     type: 'button',
-    className: 'dsh-ps__icon dsh-ps__dangerIcon',
+    className: `dsh-ps__icon${danger === true ? ' dsh-ps__dangerIcon' : ''}`,
     style,
     disabled,
-    title: `delete profiles/${name}`,
-    'aria-label': `Delete ${name}`,
-    onClick: onDelete,
-  }, Icons.trash(), React.createElement('span', { className: 'dsh-ps__delLabel' }, 'Delete'))
+    title,
+    'aria-label': `${label} ${name}`,
+    onClick: onAct,
+  }, icon(), React.createElement('span', { className: labelClass }, label))
 }
 
     const styles = (mobile) => ({
@@ -573,6 +588,80 @@ function DeleteButton({ disabled, onDelete, name, style }) {
           clearClone()
         }
       }, [])
+      /**
+       * Wait for the harness to go DOWN and then answer again, then reload the page.
+       *
+       * Shared by a profile switch and by resetting the ACTIVE profile — both end
+       * in the same restart, and a second copy of this loop is a second place for
+       * the recovery hand-off to rot. `started` is when the operation began (the
+       * elapsed counter the user sees resumes from it).
+       */
+      const waitForRestart = async (label, started, ticker) => {
+        let down = false
+        for (let attempt = 0; attempt < 180; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+          try {
+            await call('list')
+            if (down) {
+              clearInterval(ticker)
+              window.location.reload()
+              return
+            }
+          } catch {
+            if (!down) {
+              down = true
+              setNote(`harness restarting into “${label}”…`)
+            }
+          }
+          if (!down && attempt >= 30) {
+            setNote('the harness did not restart — the container needs `restart: unless-stopped` (or any supervisor) for a profile switch to take effect')
+            break
+          }
+          /**
+           * A profile that CANNOT boot never brings this page back: the user is
+           * left staring at a dead UI with no idea that a reload would hand them
+           * the diagnostics — while a switch to a WORKING profile reloads by
+           * itself. Both directions have to behave the same way.
+           *
+           * The reverse proxy is the one thing still answering (it serves the
+           * recovery surface), so ask IT whether the boot this switch started
+           * has already failed, and navigate there when it has. This check is
+           * deliberately independent of `down` above: the hand-off must not
+           * depend on how the client happened to learn the harness went away.
+           *
+           * The floor is what keeps a NORMAL switch — which reports `starting`
+           * for its whole restart — from being mistaken for a broken one.
+           */
+          const waited = Date.now() - started
+          if (waited > 10000) {
+            const state = await recoveryState()
+            const broken = state !== null && state.ready !== true
+              && (state.boot?.state === 'failed' || state.boot?.state === 'client-failed')
+            if (broken) {
+              clearInterval(ticker)
+              setNote(`“${label}” did not boot — opening the recovery page…`)
+              window.location.replace('/__recovery/page?from=switch')
+              return
+            }
+            /**
+             * Last resort, for a stack whose boot state never resolves (an older
+             * image, or a container policy that does not reboot at all): nothing
+             * has answered for 45s, so reload. A navigation taken WHILE the
+             * harness is down is what serves the recovery page, and that page
+             * reloads itself into the app as soon as the harness answers — so
+             * the user is never left on a frozen tab.
+             */
+            if (down && waited > 45000) {
+              clearInterval(ticker)
+              setNote('the harness has not come back — reloading to the recovery page…')
+              window.location.reload()
+              return
+            }
+          }
+        }
+        clearInterval(ticker)
+      }
+
       /** Confirm, apply, restart, then wait for the harness to come back. */
       const applyAndWait = async (action, body, label, confirmMessage) => {
         if (!window.confirm(confirmMessage ?? `Switch to “${label}” and restart the harness?\n\nThe interface disconnects for about 20 seconds. Sessions, settings and credentials are kept — only the plugin set changes.`)) return
@@ -586,73 +675,56 @@ function DeleteButton({ disabled, onDelete, name, style }) {
           // 'restart' IS the action when exiting Safe Mode — calling it twice
           // races the harness exit and can abort the reload wait.
           if (action !== 'restart') await call('restart', {})
-          let down = false
-          for (let attempt = 0; attempt < 180; attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 1000))
-            try {
-              await call('list')
-              if (down) {
-                clearInterval(ticker)
-                window.location.reload()
-                return
-              }
-            } catch {
-              if (!down) {
-                down = true
-                setNote(`harness restarting into “${label}”…`)
-              }
-            }
-            if (!down && attempt >= 30) {
-              setNote('the harness did not restart — the container needs `restart: unless-stopped` (or any supervisor) for a profile switch to take effect')
-              break
-            }
-            /**
-             * A profile that CANNOT boot never brings this page back: the user is
-             * left staring at a dead UI with no idea that a reload would hand them
-             * the diagnostics — while a switch to a WORKING profile reloads by
-             * itself. Both directions have to behave the same way.
-             *
-             * The reverse proxy is the one thing still answering (it serves the
-             * recovery surface), so ask IT whether the boot this switch started
-             * has already failed, and navigate there when it has. This check is
-             * deliberately independent of `down` above: the hand-off must not
-             * depend on how the client happened to learn the harness went away.
-             *
-             * The floor is what keeps a NORMAL switch — which reports `starting`
-             * for its whole restart — from being mistaken for a broken one.
-             */
-            const waited = Date.now() - started
-            if (waited > 10000) {
-              const state = await recoveryState()
-              const broken = state !== null && state.ready !== true
-                && (state.boot?.state === 'failed' || state.boot?.state === 'client-failed')
-              if (broken) {
-                clearInterval(ticker)
-                setNote(`“${label}” did not boot — opening the recovery page…`)
-                window.location.replace('/__recovery/page?from=switch')
-                return
-              }
-              /**
-               * Last resort, for a stack whose boot state never resolves (an older
-               * image, or a container policy that does not reboot at all): nothing
-               * has answered for 45s, so reload. A navigation taken WHILE the
-               * harness is down is what serves the recovery page, and that page
-               * reloads itself into the app as soon as the harness answers — so
-               * the user is never left on a frozen tab.
-               */
-              if (down && waited > 45000) {
-                clearInterval(ticker)
-                setNote('the harness has not come back — reloading to the recovery page…')
-                window.location.reload()
-                return
-              }
-            }
-          }
-          clearInterval(ticker)
+          await waitForRestart(label, started, ticker)
         } catch (error) {
           clearInterval(ticker)
           setNote(error.message)
         } finally {
+          setBusy(false)
+          setElapsed(null)
+        }
+      }
+
+      /**
+       * "Reset to Default" — wipe ONE profile back to the shipped skeleton.
+       *
+       * The profile directory keeps its name and its place in the list; everything
+       * inside it (plugins, pins, `node_modules`, market state, its own patch layer)
+       * is deleted. For the locked `web` profile this is the only way to get rid of
+       * a plugin set — it cannot be deleted — and for a profile that can no longer
+       * boot it is the repair.
+       *
+       * Resetting the ACTIVE profile has to restart: this harness is running the
+       * plugin set it loaded at boot, so the clean tree only exists after a reboot.
+       * Any other profile is reset in place, and the note says so.
+       */
+      const resetProfile = async (profile) => {
+        const label = profile.label ?? profile.name
+        const shared = `EVERYTHING inside profiles/${profile.name} is deleted — every plugin, every pin, its patch layer and its installed modules. The profile itself stays, back on DSH's shipped bundles (\`dsh-base\` + \`dsh-web-app\`). Profile labels, the list order, sessions, settings and credentials are not touched.`
+        const question = profile.active
+          ? `Reset “${label}” to the shipped default?\n\n${shared}\n\nIt IS the profile this harness is running from, so the harness restarts and comes back clean.`
+          : `Reset “${label}” to the shipped default?\n\n${shared}\n\nSwitch to it when you are ready.`
+        if (!window.confirm(question)) return
+        setBusy(true)
+        setElapsed(null)
+        const started = Date.now()
+        let ticker = null
+        try {
+          const result = await call('reset', { name: profile.name })
+          if (result.restartRequired === true) {
+            setNote(`“${label}” is back to the shipped default — restarting the harness…`)
+            setElapsed(0)
+            ticker = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 1000)
+            await call('restart', {})
+            await waitForRestart(label, started, ticker)
+          } else {
+            await refresh()
+            setNote(`reset “${label}” to the shipped default — every plugin it carried is gone; switch to it when you are ready`)
+          }
+        } catch (error) {
+          setNote(error.message)
+        } finally {
+          if (ticker !== null) clearInterval(ticker)
           setBusy(false)
           setElapsed(null)
         }
@@ -805,12 +877,28 @@ function DeleteButton({ disabled, onDelete, name, style }) {
             disabled: busy || index === profiles.length - 1, title: 'move down', 'aria-label': `Move ${profile.name} down`,
             onClick: () => void moveProfile(profile, 'down'),
           }, Icons.down()),
+          /**
+           * Reset sits directly after the arrows, before the delete/lock slot: it is
+           * the last thing you reach for AFTER moving a profile around, and for the
+           * locked `web` profile it is the only destructive action available at all.
+           * Every row has it — including a locked one, a broken one and the one this
+           * harness is running from — because "put it back the way it shipped" is
+           * exactly what you want when a profile's plugins are the problem.
+           */
+          React.createElement(RowIconButton, {
+            disabled: busy, name: profile.name, style: S.action,
+            label: 'Reset to Default', labelClass: 'dsh-ps__wideLabel',
+            title: `delete everything inside profiles/${profile.name} and restore the shipped bundles`,
+            icon: Icons.reset, onAct: () => void resetProfile(profile),
+          }),
           profile.locked
             ? React.createElement('span', { style: S.lock, title: 'default profile — the launcher falls back to it, so it cannot be deleted' }, '🔒')
             : (profile.deletable && !profile.active
-                ? React.createElement(DeleteButton, {
-                    disabled: busy, name: profile.name, style: S.action,
-                    onDelete: () => void deleteProfile(profile),
+                ? React.createElement(RowIconButton, {
+                    disabled: busy, name: profile.name, style: S.action, danger: true,
+                    label: 'Delete', labelClass: 'dsh-ps__delLabel',
+                    title: `delete profiles/${profile.name}`,
+                    icon: Icons.trash, onAct: () => void deleteProfile(profile),
                   })
                 : null))))
 

@@ -7,9 +7,11 @@
  * "+ New Profile" in the pill used to copy the whole source profile on one click,
  * so a profile made to try something in isolation arrived carrying every plugin of
  * the profile it was created from — invisible until it booted. The click now asks:
- * **Start New** (the stock skeleton) or **Inherit plugins** (the copy).
+ * **Start New** (the stock skeleton) or **Inherit plugins** (the copy). Every row
+ * also carries **Reset to Default**, which puts ONE profile back to that same
+ * skeleton — the way out of a plugin set that broke the profile.
  *
- * That is a contract across five places a refactor can silently desync:
+ * That is a contract across six places a refactor can silently desync:
  *
  *   1. the HOST half — `mode: "new"` must really produce a stock profile (two Web
  *      bundles, no dependencies, no `node_modules`, no copied patch layer), or the
@@ -25,7 +27,12 @@
  *   5. the CLIENT half's plumbing — the chooser is portaled OUTSIDE the panel, so
  *      the panel's own outside-click guard and its Escape handler must both know
  *      about it (otherwise clicking an answer closes the panel, and the create
- *      with it, before the request is sent).
+ *      with it, before the request is sent);
+ *   6. the RESET control — `POST …/reset` must leave the profile as the stock
+ *      skeleton and NOTHING else (the same three files "Start New" writes), report
+ *      `restartRequired` for the profile the harness is running from, leave every
+ *      other profile alone, and sit in the same slot of every row — including the
+ *      locked `web`, whose only destructive action it is.
  *
  * The host half is therefore EXECUTED here — its real HTTP route, driven with a
  * fake carrier over a throwaway `$DSH_HOME` — and the browser half is MOUNTED on a
@@ -144,15 +151,29 @@ function mountPill(clientPath) {
   let loaded = null
   let component = null
   let tree = null
-  const profiles = [{
-    name: 'web', label: null, bundleCount: 2, webCapable: true, active: true, locked: true, deletable: false,
-    bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
-  }]
+  let reloads = 0
+  let restartTicks = 0
+  const profiles = [
+    {
+      name: 'web', label: null, bundleCount: 2, webCapable: true, active: true, locked: true, deletable: false,
+      bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
+    },
+    {
+      name: 'branch', label: null, bundleCount: 3, webCapable: true, active: false, locked: false, deletable: true,
+      bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'community-plugin'],
+    },
+  ]
 
   const reply = (payload) => ({ ok: true, status: 200, json: async () => payload })
   const fetchStub = async (url, options = {}) => {
     const target = String(url)
     if (target.endsWith('/list')) {
+      // A restart makes the harness unreachable for a moment, then it answers
+      // again — that down→up edge is what the panel reloads the page on.
+      if (restartTicks > 0) {
+        restartTicks -= 1
+        throw new Error('fetch failed: the harness is restarting')
+      }
       return reply({ ok: true, home: '/tmp/home', active: 'web', profiles, safeModeActive: false, boot: null })
     }
     if (target.endsWith('/create')) {
@@ -160,6 +181,17 @@ function mountPill(clientPath) {
       posts.push({ url: target, body })
       profiles.push({ name: body.name, label: null, bundleCount: 0, webCapable: true, active: false, locked: false, deletable: true, bundles: null })
       return reply({ ok: true, name: body.name, mode: body.mode, from: body.mode === 'new' ? null : 'web', skeleton: 'app-boot', profiles })
+    }
+    if (target.endsWith('/reset')) {
+      const body = JSON.parse(options.body)
+      posts.push({ url: target, body })
+      const isActive = profiles.find((profile) => profile.name === body.name)?.active === true
+      return reply({ ok: true, name: body.name, reset: true, skeleton: 'template', restartRequired: isActive, profiles })
+    }
+    if (target.endsWith('/restart')) {
+      posts.push({ url: target, body: null })
+      restartTicks = 2
+      return reply({ ok: true, restarting: true })
     }
     return reply({ ok: false, error: `unexpected request ${target}` })
   }
@@ -181,7 +213,7 @@ function mountPill(clientPath) {
     addEventListener() {}, removeEventListener() {},
     innerWidth: 1200, innerHeight: 800,
     setInterval: () => ({}), clearInterval() {},
-    location: { reload() {}, replace() {}, assign() {} },
+    location: { reload() { reloads += 1 }, replace() {}, assign() {} },
     confirm: () => true,
   }
 
@@ -194,6 +226,26 @@ function mountPill(clientPath) {
   let pendingEffects = []
   let rendering = false
   let dirty = false
+  /**
+   * Nested function components — the row's icon buttons — are EXPANDED here, once
+   * the body has run: without that they are element nodes whose type is a function,
+   * and every assertion about a row control (its aria-label, its order in the row)
+   * would silently see nothing. They must be hook-free: this runtime has one hook
+   * slot table and the component under test is its only hook user, so `cursor` is
+   * saved and restored around the call instead of giving them a table of their own.
+   */
+  const expand = (node) => {
+    if (node === null || node === undefined || typeof node !== 'object') return node
+    if (Array.isArray(node)) return node.map(expand)
+    if (node.props === undefined) return node
+    if (typeof node.type === 'function') {
+      const saved = cursor
+      const rendered = expand(node.type(node.props))
+      cursor = saved
+      return rendered
+    }
+    return { type: node.type, props: { ...node.props, children: expand(node.props.children) } }
+  }
   const render = () => {
     if (rendering) { dirty = true; return }
     rendering = true
@@ -204,7 +256,7 @@ function mountPill(clientPath) {
         cursor = 0
         const queued = []
         pendingEffects = queued
-        tree = component({ wide: true })
+        tree = expand(component({ wide: true }))
         pendingEffects = []
         for (const effect of queued) effect()
         guard += 1
@@ -326,10 +378,21 @@ function mountPill(clientPath) {
   }
   /** Same lookup, but a missing control is an answer ("not there"), not a crash. */
   const tryClick = (label) => { try { click(label); return true } catch { return false } }
-  const settle = () => new Promise((resolve) => realSetTimeout(resolve, 30))
+  const settle = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms ?? 30))
   /** Optional trace (`PS_GATE_TRACE=1`) — a failing wiring check is easier to read
    * with the rendered text than with a stack. */
   const trace = (label) => { if (process.env.PS_GATE_TRACE === '1') console.log(`[trace] ${label}: ${flatten(tree).replace(/\s+/gu, ' ').slice(0, 400)}`) }
+  const clickAria = (label) => {
+    const target = findAll((node) => node.type === 'button' && node.props['aria-label'] === label)[0]
+    if (target === undefined) throw new Error(`no button is labelled ${JSON.stringify(label)}`)
+    target.props.onClick()
+  }
+  /** The row's own controls, in the order the browser lays them out. */
+  const rowActions = (name) => findAll((node) => node.type === 'button'
+    && typeof node.props['aria-label'] === 'string'
+    && ['Rename', 'Move', 'Reset to Default', 'Delete']
+      .some((verb) => node.props['aria-label'].startsWith(`${verb} ${name}`)))
+    .map((node) => node.props['aria-label'])
 
   return {
     posts,
@@ -339,6 +402,15 @@ function mountPill(clientPath) {
     trace,
     click: (label) => { click(label); trace(`after click ${label}`) },
     tryClick,
+    rowActions,
+    reloads: () => reloads,
+    /** Press a row control by its accessible name; `false` when it is not there. */
+    pressAria: async (label, wait) => {
+      const clicked = (() => { try { clickAria(label); return true } catch { return false } })()
+      await settle(wait)
+      trace(`after ${label} (clicked: ${clicked})`)
+      return clicked
+    },
     /** Answer the chooser when the answer is there; report it when it is not, so a
      * missing control fails a check WITH the rendered text instead of throwing. */
     answer: async (label) => {
@@ -440,6 +512,29 @@ try {
   const duplicate = await request(handler, 'create', { name: 'fresh', mode: 'new' })
   check('an existing name is refused with 400', duplicate.status === 400, `${duplicate.status}`)
 
+  // ---- reset: wipe ONE profile back to the shipped skeleton --------------
+  const resetCopy = await request(handler, 'reset', { name: 'legacy' })
+  check('reset leaves only the stock skeleton inside the profile',
+    resetCopy.status === 200 && resetCopy.body?.reset === true
+      && JSON.stringify(readdirSync(join(home, 'profiles', 'legacy')).sort()) === JSON.stringify(STOCK_FILES),
+    `${resetCopy.status} ${JSON.stringify(readdirSync(join(home, 'profiles', 'legacy')))}`)
+  check('a reset profile is still web-capable afterwards',
+    (await request(handler, 'list')).body?.profiles
+      ?.some((profile) => profile.name === 'legacy' && profile.webCapable === true && profile.deletable === true) === true)
+  check('reset of a profile that is not active needs no restart',
+    resetCopy.body?.restartRequired === false, JSON.stringify(resetCopy.body?.restartRequired))
+  check('reset touches ONLY the named profile',
+    manifestOf(home, 'branch').dsh.profile.bundles.includes('community-plugin')
+      && existsSync(join(home, 'profiles', 'branch', 'node_modules', 'community-plugin', 'index.js')))
+  const resetActive = await request(handler, 'reset', { name: 'web' })
+  check('resetting the ACTIVE profile reports that a restart is required',
+    resetActive.status === 200 && resetActive.body?.restartRequired === true
+      && JSON.stringify(readdirSync(join(home, 'profiles', 'web')).sort()) === JSON.stringify(STOCK_FILES),
+    `${resetActive.status} ${JSON.stringify(resetActive.body?.restartRequired)}`)
+  const resetMissing = await request(handler, 'reset', { name: 'nope' })
+  check('resetting a profile that does not exist is refused with 400',
+    resetMissing.status === 400, `${resetMissing.status}`)
+
   // ---- the same ask with NO installation to borrow the initialiser from ---
   const fallbackHandler = await loadHost('fallback')
   check('the installation roots are overridable (the fallback path is reachable at all)',
@@ -492,6 +587,12 @@ try {
     ['Escape answers the chooser before it closes the panel', /if \(choice !== null\) \{ setChoice\(null\); return \}/.test(clientSource)],
     ['closing the panel also drops the chooser',
       /const hide = React\.useCallback\(\(\) => \{[\s\S]{0,400}?setChoice\(null\)[\s\S]{0,120}?setEntered\(false\)/.test(clientSource)],
+    ['both destructive row actions share the hover-expanding label',
+      /labelClass: 'dsh-ps__wideLabel'/.test(clientSource) && /labelClass: 'dsh-ps__delLabel'/.test(clientSource)],
+    ['the reset label gets more room than the delete one (it is longer)',
+      /\.dsh-ps__wideLabel\{max-width:0/.test(clientSource) && /\.dsh-ps__icon:hover \.dsh-ps__wideLabel,\.dsh-ps__icon:focus-visible \.dsh-ps__wideLabel\{max-width:120px/.test(clientSource)],
+    ['a reset of the active profile restarts before it reports success',
+      /result\.restartRequired === true/.test(clientSource) && /await call\('restart', \{\}\)/.test(clientSource)],
   ]
   for (const [name, ok] of clientChecks) check(name, ok)
 
@@ -530,11 +631,11 @@ try {
   check('the chooser closes and the panel reports what was created',
     !pill.hasChooser() && pill.text().includes('as a new profile'))
 
-  pill.type('branch')
+  pill.type('inherit-test')
   pill.tryClick('+ New Profile')
   const inheritedAgain = await pill.answer('Inherit plugins')
   check('"Inherit plugins" creates the profile with mode=inherit',
-    inheritedAgain && pill.posts.length === 2 && pill.posts[1].body.mode === 'inherit' && pill.posts[1].body.name === 'branch',
+    inheritedAgain && pill.posts.length === 2 && pill.posts[1].body.mode === 'inherit' && pill.posts[1].body.name === 'inherit-test',
     JSON.stringify(pill.posts.map((post) => post.body)))
 
   pill.type('web')
@@ -555,6 +656,44 @@ try {
   await pill.settle()
   check('a second Escape closes the panel itself', pill.text().includes('Available Profiles') === false,
     pill.text().slice(0, 120))
+
+  // ---- "Reset to Default" in the rendered row ----------------------------
+  // The row is a STRIP of controls and their order is the feature: reset sits
+  // directly after the move arrows (so it is reachable right where a profile was
+  // just reordered) and BEFORE the delete/lock slot, which is what keeps the one
+  // action a locked profile still has — reset — in the same place on every row.
+  // The two Escapes above closed the panel, so open it again first.
+  pill.tryClick('dsh-ps__trigger')
+  await pill.settle()
+  check('the panel reopens with its profile rows after the chooser work',
+    pill.text().includes('Available Profiles') && pill.rowActions('web').length > 0,
+    JSON.stringify(pill.rowActions('web')))
+  check('the row of a NEW profile is: rename, up, down, reset, then delete',
+    JSON.stringify(pill.rowActions('inherit-test'))
+      === JSON.stringify(['Rename inherit-test', 'Move inherit-test up', 'Move inherit-test down', 'Reset to Default inherit-test', 'Delete inherit-test']),
+    JSON.stringify(pill.rowActions('inherit-test')))
+  check('the row of the LOCKED default profile ends with reset, then the lock',
+    JSON.stringify(pill.rowActions('web'))
+      === JSON.stringify(['Rename web', 'Move web up', 'Move web down', 'Reset to Default web']),
+    JSON.stringify(pill.rowActions('web')))
+
+  const beforeOther = pill.posts.length
+  const resetOther = await pill.pressAria('Reset to Default branch', 60)
+  const otherPosts = pill.posts.slice(beforeOther)
+  check('resetting a profile that is not running sends the reset and nothing else',
+    resetOther && otherPosts.length === 1 && otherPosts[0].url.endsWith('/reset') && otherPosts[0].body.name === 'branch',
+    JSON.stringify(otherPosts))
+  check('the panel says the reset profile is ready to switch to',
+    pill.text().includes('reset “branch” to the shipped default') && pill.reloads() === 0)
+
+  const beforeActive = pill.posts.length
+  const resetRunning = await pill.pressAria('Reset to Default web', 300)
+  const activePosts = pill.posts.slice(beforeActive)
+  check('resetting the ACTIVE profile sends the reset, then restarts the harness',
+    resetRunning && activePosts.length === 2 && activePosts[0].url.endsWith('/reset')
+      && activePosts[0].body.name === 'web' && activePosts[1].url.endsWith('/restart'),
+    JSON.stringify(activePosts))
+  check('and the page reloads itself once the harness answers again', pill.reloads() === 1, `${pill.reloads()}`)
 } finally {
   delete process.env.DSH_INSTALL_ROOTS
   rmSync(scratch, { recursive: true, force: true })
