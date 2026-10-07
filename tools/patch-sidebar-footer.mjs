@@ -39,12 +39,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const TARGET = path.join(
-  "@deepseek-ai",
-  "dsh-client-ui-sidebar",
-  "lib",
-  "client.js",
-);
+const PACKAGE = "@deepseek-ai/dsh-client-ui-sidebar";
+const TARGET_SUBPATH = path.join("lib", "client.js");
+/** Kept for the log messages: the path as it looks in a flat (npm) install. */
+const TARGET = path.join(PACKAGE, TARGET_SUBPATH);
 
 const MARKER = "sidebar.footer.trailing";
 
@@ -118,6 +116,68 @@ function stylesheet(names) {
   ].join("");
 }
 
+/**
+ * Locate PACKAGE's directory under one installation root.
+ *
+ * A build produces exactly ONE of three layouts, so a root-only lookup is a
+ * silent no-op on the other two — which is how this patch went missing from every
+ * source-channel image:
+ *   npm    <root>/@deepseek-ai/<name>
+ *   pnpm   <root>/.pnpm/@deepseek-ai+<name>@<version>/node_modules/@deepseek-ai/<name>
+ *   source <tree>/packages/<tier>/<name>, <tree>/apps/<name>, <tree>/native/<name>
+ *          — pnpm links workspace packages by SYMLINK, so the workspace copy IS
+ *            the file the runtime serves and the one that must be patched.
+ */
+function resolvePackageDir(root) {
+  const flat = path.join(root, PACKAGE);
+  if (isDir(flat)) return flat;
+
+  const store = path.join(root, ".pnpm");
+  if (isDir(store)) {
+    const mangled = PACKAGE.replace("/", "+");
+    const hit = fs.readdirSync(store).find((entry) => entry === mangled || entry.startsWith(`${mangled}@`));
+    if (hit !== undefined) {
+      const dir = path.join(store, hit, "node_modules", PACKAGE);
+      if (isDir(dir)) return dir;
+    }
+  }
+
+  const tree = path.dirname(root);
+  for (const group of ["packages", "apps", "vendor", "native"]) {
+    const groupDir = path.join(tree, group);
+    if (!isDir(groupDir)) continue;
+    for (const entry of fs.readdirSync(groupDir)) {
+      const entryDir = path.join(groupDir, entry);
+      if (!isDir(entryDir)) continue;
+      // packages/<tier>/<pkg>; the other groups are one level deep.
+      const candidates =
+        group === "packages" ? fs.readdirSync(entryDir).map((child) => path.join(entryDir, child)) : [entryDir];
+      for (const dir of candidates) {
+        if (packageName(dir) === PACKAGE) return dir;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** A directory's package.json name, or undefined when it has none. */
+function packageName(dir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).name;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Directory test that tolerates a dangling symlink. */
+function isDir(candidate) {
+  try {
+    return fs.statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 const roots = process.argv.slice(2);
 if (roots.length === 0) {
   console.error("usage: node tools/patch-sidebar-footer.mjs <node_modules-root> [...]");
@@ -128,9 +188,10 @@ let patched = 0;
 let skipped = 0;
 
 for (const root of roots) {
-  const file = path.join(root, TARGET);
-  if (!fs.existsSync(file)) {
-    console.log(`[sidebar-footer] skipped ${file} (absent)`);
+  const packageDir = resolvePackageDir(root);
+  const file = packageDir === undefined ? undefined : path.join(packageDir, TARGET_SUBPATH);
+  if (file === undefined || !fs.existsSync(file)) {
+    console.log(`[sidebar-footer] skipped ${path.join(root, TARGET)} (absent in this layout)`);
     continue;
   }
   const before = fs.readFileSync(file, "utf8");
