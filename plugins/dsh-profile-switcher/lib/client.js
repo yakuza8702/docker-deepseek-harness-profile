@@ -6,6 +6,13 @@
  * offers: switch, New Profile…, Delete (never for `web` — the launcher's
  * fallback), and Safe Mode. No menu bar.
  *
+ * New Profile ASKS before it creates: the name plus one click used to copy the
+ * whole source profile, so a new profile silently arrived carrying a plugin set
+ * nobody chose. The click now opens a CENTRED chooser with the two shapes a
+ * profile can be born with — **Start New** (the stock bundles and nothing else)
+ * or **Inherit plugins** (a copy of the current profile, the branch case) — and
+ * only the answer creates anything.
+ *
  * Layout follows `dsh-mobile`:
  *   * the slot's own `wide` prop decides the trigger shape — the labelled pill in
  *     the expanded sidebar, a 36×36 round icon button when the sidebar is the
@@ -149,6 +156,18 @@ body.dsh-ps--beside-settings .dsh-ps__trigger:not(.dsh-ps__inline){display:none}
 .dsh-ps__dangerIcon:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-error-primary,inherit)}
 .dsh-ps__renameInput{box-sizing:border-box;width:100%;margin-top:6px;padding:6px 8px;border-radius:8px;font:inherit;font-size:13px;
   border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.45));background:var(--dsw-alias-bg-layer-2,transparent);color:inherit}
+/* The two answers in the create chooser. Each is a card, not a button: a title and
+   an explanation, because "start clean" and "copy everything" are two different
+   profiles, not two styles of the same button. Full width so the two read as a
+   choice, and 44px+ tall on a phone so a thumb can hit either one. */
+.dsh-ps__choice{box-sizing:border-box;display:flex;flex-direction:column;gap:3px;width:100%;margin:0 0 8px;
+  padding:12px 14px;text-align:left;font:inherit;color:inherit;cursor:pointer;
+  border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.45));border-radius:12px;background:none;
+  transition:background-color 120ms ease,border-color 120ms ease}
+.dsh-ps__choice:hover{background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-state-business-primary,rgba(120,140,220,.6))}
+.dsh-ps__choice:active{background:var(--dsw-alias-interactive-bg-active)}
+.dsh-ps__choice:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,currentColor);outline-offset:2px}
+.dsh-ps__choice:disabled{cursor:not-allowed;opacity:.6}
 `
 
     /** Install the stylesheet once, beside the tag dsh-mobile manages. */
@@ -284,6 +303,33 @@ function DeleteButton({ disabled, onDelete, name, style }) {
       },
       note: { marginTop: 10, fontSize: mobile ? 13 : 12, lineHeight: 1.45 },
       sheetGrabber: { width: 42, height: 4, borderRadius: 999, background: 'rgba(127,127,127,.45)', margin: '0 auto 12px' },
+      /**
+       * The create chooser: its own CENTRED dialog above the panel.
+       *
+       * It is centred rather than attached to the trigger because it is a question
+       * about the click just made, and on a phone the panel is a bottom sheet —
+       * a second block inside it would sit half off the screen. Both z-indexes are
+       * above the panel's 2147483000, so the panel (and the name being created)
+       * stays visible behind the dimmed backdrop.
+       */
+      chooserBackdrop: { position: 'fixed', inset: 0, zIndex: 2147483100, background: 'rgba(0,0,0,.5)' },
+      chooser: {
+        position: 'fixed', left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
+        boxSizing: 'border-box', width: mobile ? 'calc(100vw - 28px)' : 420, maxWidth: 'calc(100vw - 28px)',
+        maxHeight: '86dvh', overflowY: 'auto', padding: mobile ? 18 : 16, borderRadius: 16, zIndex: 2147483101,
+        border: '1px solid rgba(127,127,127,.35)', fontSize: mobile ? 15 : 13,
+        background: 'var(--dsw-alias-bg-layer-1, rgba(28,28,36,.99))',
+        color: 'var(--dsw-alias-label-primary, inherit)',
+        boxShadow: '0 24px 60px rgba(0,0,0,.6)', WebkitOverflowScrolling: 'touch',
+      },
+      chooserTitle: { fontWeight: 650, fontSize: mobile ? 17 : 14.5, marginBottom: 4, overflowWrap: 'anywhere' },
+      chooserLead: { opacity: .65, fontSize: mobile ? 13 : 12, marginBottom: 12, lineHeight: 1.4 },
+      choiceTitle: { fontWeight: 600, fontSize: mobile ? 15 : 13 },
+      choiceText: { opacity: .65, fontSize: mobile ? 12.5 : 11.5, lineHeight: 1.45, whiteSpace: 'normal' },
+      chooserFoot: {
+        display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8,
+        marginTop: 2, paddingTop: mobile ? 4 : 2,
+      },
     })
 
     const describe = (profile) => {
@@ -307,6 +353,8 @@ function DeleteButton({ disabled, onDelete, name, style }) {
       const [note, setNote] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
       const [draft, setDraft] = React.useState('')
+      /** The create chooser: `{ name }` while it is asking, `null` otherwise. */
+      const [choice, setChoice] = React.useState(null)
       const [boot, setBoot] = React.useState(null)
       const [safeModeActive, setSafeModeActive] = React.useState(false)
       const [renaming, setRenaming] = React.useState(null)
@@ -315,6 +363,7 @@ function DeleteButton({ disabled, onDelete, name, style }) {
       const [anchor, setAnchor] = React.useState(null)
       const buttonRef = React.useRef(null)
       const panelRef = React.useRef(null)
+      const chooserRef = React.useRef(null)
       const wrapRef = React.useRef(null)
       const closeTimer = React.useRef(null)
 
@@ -363,6 +412,9 @@ function DeleteButton({ disabled, onDelete, name, style }) {
       }, [refresh])
 
       const hide = React.useCallback(() => {
+        // The chooser is part of this panel's flow: closing the panel must never
+        // leave the question floating over a page with no list behind it.
+        setChoice(null)
         setEntered(false)
         closeTimer.current = setTimeout(() => { setMounted(false); closeTimer.current = null }, duration)
       }, [duration])
@@ -375,6 +427,10 @@ function DeleteButton({ disabled, onDelete, name, style }) {
         const onPointerDown = (event) => {
           const target = event.target
           if (panelRef.current?.contains(target) === true) return
+          // The chooser is rendered OUTSIDE the panel (its own portal), so a click
+          // on one of its two answers would otherwise read as an outside click and
+          // close the panel — and the create with it.
+          if (chooserRef.current?.contains(target) === true) return
           if (buttonRef.current?.contains(target) === true) return
           // The beside-Settings clone is a plain copy of the trigger, so it counts
           // as the trigger: without this every click on it would be an "outside"
@@ -382,7 +438,13 @@ function DeleteButton({ disabled, onDelete, name, style }) {
           if (document.getElementById(INLINE_ID)?.contains(target) === true) return
           hide()
         }
-        const onKeyDown = (event) => { if (event.key === 'Escape') hide() }
+        const onKeyDown = (event) => {
+          if (event.key !== 'Escape') return
+          // Escape answers the chooser first — it is the question on top, and
+          // cancelling it must not also close the panel behind it.
+          if (choice !== null) { setChoice(null); return }
+          hide()
+        }
         const onResize = () => { if (!mobile) place() }
         document.addEventListener('pointerdown', onPointerDown, true)
         document.addEventListener('keydown', onKeyDown)
@@ -393,7 +455,7 @@ function DeleteButton({ disabled, onDelete, name, style }) {
           document.removeEventListener('keydown', onKeyDown)
           window.removeEventListener('resize', onResize)
         }
-      }, [mounted, mobile, place, hide])
+      }, [mounted, mobile, place, hide, choice !== null])
 
       /**
        * Sit BESIDE Settings while the sidebar is expanded — WITHOUT touching a
@@ -596,15 +658,44 @@ function DeleteButton({ disabled, onDelete, name, style }) {
         }
       }
 
-      const createProfile = async () => {
+      /**
+       * "+ New Profile" ASKS first.
+       *
+       * One click used to copy the whole source profile, so a profile created to
+       * try something in isolation arrived with every plugin of the profile it was
+       * made from — invisible until it booted. Neither answer is the right default,
+       * so the name is validated here (a name that cannot work or already exists
+       * must fail BEFORE a question is asked) and the chooser takes over.
+       */
+      const openChooser = () => {
         const name = draft.trim()
         if (name === '') return
+        if (!/^[a-z0-9][a-z0-9_-]{0,63}$/iu.test(name)) {
+          setNote(`“${name}” cannot be a profile name — start with a letter or digit and use letters, digits, “-” or “_” (max 64)`)
+          return
+        }
+        if (profiles.some((profile) => profile.name === name)) {
+          setNote(`“${name}” already exists — pick another name`)
+          return
+        }
+        setNote(null)
+        setChoice({ name })
+      }
+
+      /** Create the pending profile the way the chooser was answered. */
+      const createProfile = async (mode) => {
+        const name = (choice === null ? draft : choice.name).trim()
+        if (name === '') return
+        const source = active ?? 'web'
         setBusy(true)
         try {
-          await call('create', { name, from: active ?? 'web' })
+          const created = await call('create', { name, from: source, mode })
           setDraft('')
+          setChoice(null)
           await refresh()
-          setNote(`created “${name}” from “${active ?? 'web'}” — switch to it when you are ready`)
+          setNote(created.mode === 'new'
+            ? `created “${name}” as a new profile — the stock bundles only, nothing copied from “${source}”. Add plugins in the Plugins page, then switch to it when you are ready`
+            : `created “${name}” from “${created.from ?? source}” — switch to it when you are ready`)
         } catch (error) {
           setNote(error.message)
         } finally {
@@ -837,19 +928,62 @@ function DeleteButton({ disabled, onDelete, name, style }) {
             React.createElement('input', {
               style: S.input, placeholder: 'new profile name', value: draft, disabled: busy,
               onChange: (event) => setDraft(event.target.value),
-              onKeyDown: (event) => { if (event.key === 'Enter') void createProfile() },
+              onKeyDown: (event) => { if (event.key === 'Enter') openChooser() },
             }),
             React.createElement('button', {
               type: 'button', className: 'dsh-ps__action', style: { ...S.action, opacity: draft.trim() === '' || busy ? .5 : 1 },
-              disabled: draft.trim() === '' || busy, onClick: () => void createProfile(),
+              disabled: draft.trim() === '' || busy, onClick: openChooser,
+              title: 'choose how the new profile starts — clean, or a copy of this one',
             }, '+ New Profile')),
           note !== null && React.createElement('div', {
             style: { ...S.note, color: 'var(--dsw-alias-label-secondary, inherit)' },
           }, elapsed === null ? note : `${note} (${elapsed}s)`)))
 
+      /**
+       * The create chooser — a CENTRED dialog, portaled to <body> like the panel
+       * (and for the same reason: the sidebar's transform would otherwise be its
+       * containing block). Both answers create the profile with the name already
+       * typed in the panel; `busy` disables them while the request is in flight, so
+       * a double click cannot try to create the same profile twice.
+       */
+      const chooser = choice === null ? null : React.createElement(React.Fragment, null,
+        React.createElement('div', {
+          style: S.chooserBackdrop, onClick: () => { if (!busy) setChoice(null) }, 'aria-hidden': true,
+        }),
+        React.createElement('div', {
+          ref: chooserRef,
+          role: 'dialog',
+          'aria-modal': true,
+          'aria-labelledby': 'dsh-ps-chooser-title',
+          style: S.chooser,
+        },
+          React.createElement('div', { id: 'dsh-ps-chooser-title', style: S.chooserTitle },
+            `Create profile “${choice.name}”`),
+          React.createElement('div', { style: S.chooserLead }, 'How should it start?'),
+          React.createElement('button', {
+            type: 'button', className: 'dsh-ps__choice', autoFocus: true, disabled: busy,
+            onClick: () => void createProfile('new'),
+          },
+            React.createElement('span', { style: S.choiceTitle }, 'Start New'),
+            React.createElement('span', { style: S.choiceText },
+              'A clean profile: the stock bundles only (dsh-base + dsh-web-app). Nothing from the current profile is copied — add the plugins you want from the Plugins page.')),
+          React.createElement('button', {
+            type: 'button', className: 'dsh-ps__choice', disabled: busy,
+            onClick: () => void createProfile('inherit'),
+          },
+            React.createElement('span', { style: S.choiceTitle }, 'Inherit plugins'),
+            React.createElement('span', { style: S.choiceText },
+              `A copy of “${active ?? 'web'}”: its whole plugin set, its pins and its patch layer come along, so the new profile is a branch you can diverge from.`)),
+          React.createElement('div', { style: S.chooserFoot },
+            React.createElement('button', {
+              type: 'button', className: 'dsh-ps__action', style: { ...S.action, opacity: busy ? .5 : 1 },
+              disabled: busy, onClick: () => setChoice(null),
+            }, 'Cancel'))))
+
       return React.createElement(React.Fragment, null,
         trigger,
-        mounted && (createPortal === null ? overlay : createPortal(overlay, document.body)))
+        mounted && (createPortal === null ? overlay : createPortal(overlay, document.body)),
+        chooser !== null && (createPortal === null ? chooser : createPortal(chooser, document.body)))
     }
 
     function apply(ctx) {

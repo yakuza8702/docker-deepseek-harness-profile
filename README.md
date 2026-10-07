@@ -453,10 +453,30 @@ sidebar footer:   ◍ Profile: research ▸      Settings
                   │ [ new profile name ]        [ + New Profile ]
                   │ [ Safe Mode — boot stock bundles only ]     │
                   └────────────────────────────────────────────┘
+                  ↓  "+ New Profile" asks before it creates
+                  ┌──────────────────────────────────────┐     ← centred dialog
+                  │ Create profile “test”                │
+                  │ How should it start?                 │
+                  │ ┌──────────────────────────────────┐ │
+                  │ │ Start New                        │ │
+                  │ │ stock bundles only, nothing copied│ │
+                  │ ├──────────────────────────────────┤ │
+                  │ │ Inherit plugins                  │ │
+                  │ │ a copy of “web” — the branch case│ │
+                  │ └──────────────────────────────────┘ │
+                  │                           [ Cancel ] │
+                  └──────────────────────────────────────┘
 ```
 
 * host routes: `GET /api/dsh-profile-switcher/list`, `POST …/select`,
   `POST …/create`, `POST …/safe`, `POST …/restart`;
+* **creating a profile asks HOW it should start** — one click used to copy the
+  source profile, so a profile made to isolate something arrived carrying every
+  plugin of the profile it came from. *Start New* writes the **stock skeleton**
+  (the two shipped bundles, an empty dependency list and patch layer, no
+  `node_modules`) using DSH's own `initProfile`; *Inherit plugins* copies the
+  current profile — the branch case. `create` takes `mode: "new" | "inherit"`,
+  and a caller that sends no mode keeps getting the copy;
 * a switch writes `active-profile.json` and asks the harness to exit — the
   container's `restart: unless-stopped` brings it back **on the selected
   profile** (the UI confirms first, then waits for the harness and reloads);

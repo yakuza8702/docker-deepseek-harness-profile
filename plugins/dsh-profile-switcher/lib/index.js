@@ -5,7 +5,10 @@
  *
  *   GET  /api/dsh-profile-switcher/list      -> { ok, active, profiles[], locked[] }
  *   POST /api/dsh-profile-switcher/select    { name }             -> writes the selection
- *   POST /api/dsh-profile-switcher/create    { name, from? }      -> copies a profile
+ *   POST /api/dsh-profile-switcher/create    { name, mode?, from? } -> creates a profile:
+ *                                                                   "inherit" (default) copies
+ *                                                                   `from`, "new" starts from
+ *                                                                   the stock skeleton
  *   POST /api/dsh-profile-switcher/delete    { name }             -> deletes a profile
  *   POST /api/dsh-profile-switcher/rename    { name, label }      -> display label only
  *   POST /api/dsh-profile-switcher/move      { name, direction }  -> reorder the list
@@ -40,9 +43,12 @@
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const ROUTE = '/api/dsh-profile-switcher'
 const WEB_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
+/** The two ways a new profile can start — see `create`. */
+const CREATE_MODES = ['inherit', 'new']
 /** Profiles that must always exist: `web` is the entrypoint's fallback. */
 const LOCKED = new Set(['web'])
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/iu
@@ -200,16 +206,153 @@ function select(name) {
   return { active: name }
 }
 
-function create(name, from) {
+/** Where an installation may live. `DSH_INSTALL_ROOTS` (colon-separated) REPLACES
+ * the default list — the build gate uses that to prove the no-installation path. */
+function installRoots() {
+  const override = process.env.DSH_INSTALL_ROOTS
+  if (typeof override === 'string' && override.trim() !== '') {
+    return override.split(':').map((entry) => entry.trim()).filter((entry) => entry !== '')
+  }
+  return ['/opt/dsh', '/opt/dsh-src']
+}
+
+/**
+ * DSH's own profile initialiser (`initProfile`), when this image carries one.
+ *
+ * Preferred over writing the skeleton here for the same reason the image's
+ * entrypoint prefers it: no template knowledge is duplicated, so the stock
+ * profile cannot drift from what the launcher itself creates. Both layouts this
+ * image can have are searched — the npm channel hoists it into the installation
+ * `node_modules`, the source channel keeps it in the workspace tree — and a
+ * module that loads but has no `initProfile` is treated as absent rather than
+ * trusted. Memoised: one lookup per process, `null` included.
+ */
+let initialiserPromise = null
+function loadInitialiser() {
+  if (initialiserPromise === null) {
+    initialiserPromise = (async () => {
+      for (const root of installRoots()) {
+        for (const file of [
+          join(root, 'node_modules', '@deepseek-ai', 'dsh-app-boot', 'lib', 'index.js'),
+          join(root, 'packages', 'boot', 'app-boot', 'lib', 'index.js'),
+        ]) {
+          if (!existsSync(file)) continue
+          try {
+            const module = await import(pathToFileURL(file).href)
+            if (typeof module.initProfile === 'function') return module
+            log(`the initialiser at ${file} exports no initProfile — ignoring it`)
+          } catch (error) {
+            log(`could not load the initialiser at ${file}: ${error.message}`)
+          }
+        }
+      }
+      return null
+    })()
+  }
+  return initialiserPromise
+}
+
+/**
+ * The stock skeleton, byte-for-byte what `@deepseek-ai/dsh-app-boot`'s
+ * `initProfile` writes (its `PROFILE_PATCH_TEMPLATE` + `PROFILE_PNPM_WORKSPACE`).
+ * It is only ever written when no initialiser could be loaded, and
+ * `tools/check-profile-switcher.mjs` fails the build if the two ever disagree.
+ */
+const STOCK_PATCH = `# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; \`!!js\` expressions allowed).
+[]
+`
+const STOCK_WORKSPACE = `packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+`
+
+/** Write the stock manifest + the two files an initialised profile carries. */
+function writeStockSkeleton(dir, name) {
+  writeFileSync(join(dir, 'package.json'), `${JSON.stringify({
+    name: `dsh-profile-${name}`,
+    private: true,
+    dependencies: {},
+    dsh: { profile: { bundles: [...WEB_BUNDLES] } },
+  }, null, 2)}\n`)
+  const patch = join(dir, 'cordis.patch.yml')
+  if (!existsSync(patch)) writeFileSync(patch, STOCK_PATCH)
+  const workspace = join(dir, 'pnpm-workspace.yaml')
+  if (!existsSync(workspace)) writeFileSync(workspace, STOCK_WORKSPACE)
+}
+
+/** True when a directory already holds a stock manifest: the two Web bundles and
+ * nothing else, no dependencies. Read back rather than assumed — a partial or
+ * unexpected write must not be reported as a profile that can boot. */
+function stockManifest(dir) {
+  const manifest = readJson(join(dir, 'package.json'))
+  const bundles = manifest?.dsh?.profile?.bundles
+  const dependencies = manifest?.dependencies
+  return Array.isArray(bundles) && bundles.length === WEB_BUNDLES.length
+    && WEB_BUNDLES.every((bundle) => bundles.includes(bundle))
+    && dependencies !== null && typeof dependencies === 'object' && !Array.isArray(dependencies)
+    && Object.keys(dependencies).length === 0
+}
+
+/** Materialise a stock profile directory; returns which writer was used. */
+async function createStock(name) {
+  const dir = join(profilesRoot(), name)
+  mkdirSync(dir, { recursive: true })
+  const initialiser = await loadInitialiser()
+  if (initialiser !== null) {
+    try {
+      initialiser.initProfile(dir, [...WEB_BUNDLES])
+    } catch (error) {
+      log(`the initialiser refused ${name} (${error.message}) — writing the skeleton instead`)
+    }
+  }
+  if (stockManifest(dir)) return initialiser === null ? 'template' : 'app-boot'
+  writeStockSkeleton(dir, name)
+  return 'template'
+}
+
+/**
+ * Create a profile — and the difference between the two modes is the whole point
+ * of the chooser the panel asks with:
+ *
+ *   inherit — COPY `from` (the active profile unless another is named). Its
+ *             plugin set, pins, patch layer and installed `node_modules` all come
+ *             along, so the new profile is a branch of it. This was the only mode
+ *             until now, which is why "+ New Profile" silently cloned a plugin set.
+ *   new     — a STOCK profile: `dsh-base` + `dsh-web-app`, no dependencies, no
+ *             `node_modules`, no plugins of any kind. Nothing follows the source.
+ *             Bootable and web-capable by construction, so the switcher can select
+ *             it, and the integrated bundles stay available on the Plugins page.
+ *
+ * @param name - the new profile's name (folder name, validated).
+ * @param from - source profile for `inherit`.
+ * @param mode - `inherit` (default, so older callers keep working) or `new`.
+ * @returns what was created and how.
+ */
+async function create(name, from, mode) {
   if (!validName(name)) throw new Error(`invalid profile name: ${JSON.stringify(name)}`)
+  const how = mode === undefined || mode === null || mode === '' ? 'inherit' : String(mode)
+  if (!CREATE_MODES.includes(how)) {
+    throw new Error(`mode must be one of ${CREATE_MODES.map((entry) => JSON.stringify(entry)).join(', ')}, got ${JSON.stringify(mode)}`)
+  }
+  const target = join(profilesRoot(), name)
+  if (existsSync(target)) throw new Error(`profile "${name}" already exists`)
+
+  if (how === 'new') {
+    const skeleton = await createStock(name)
+    log(`created profile ${name} as a new profile (${skeleton} skeleton)`)
+    return { name, mode: how, from: null, skeleton }
+  }
+
   const source = validName(from) ? from : (activeName() ?? 'web')
   const sourceDir = join(profilesRoot(), source)
   if (!existsSync(join(sourceDir, 'package.json'))) throw new Error(`source profile "${source}" does not exist`)
-  const target = join(profilesRoot(), name)
-  if (existsSync(target)) throw new Error(`profile "${name}" already exists`)
   cpSync(sourceDir, target, { recursive: true, errorOnExist: true, force: false })
-  log(`created profile ${name} from ${source}`)
-  return { name, from: source }
+  log(`created profile ${name} as a copy of ${source}`)
+  return { name, mode: how, from: source, skeleton: null }
 }
 
 function remove(name) {
@@ -349,7 +492,11 @@ export function apply(ctx) {
           case 'select':
             return send(res, 200, { ok: true, ...select(String(body.name ?? '')), restartRequired: true })
           case 'create': {
-            const created = create(String(body.name ?? ''), body.from === undefined ? undefined : String(body.from))
+            const created = await create(
+              String(body.name ?? ''),
+              body.from === undefined ? undefined : String(body.from),
+              body.mode === undefined ? undefined : String(body.mode),
+            )
             return send(res, 200, { ok: true, ...created, profiles: listProfiles() })
           }
           case 'rename':
