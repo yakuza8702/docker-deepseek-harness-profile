@@ -38,8 +38,8 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 
 const problems = []
@@ -62,6 +62,68 @@ function note(message) {
 /** Run a command and return its stdout, or throw with the captured stderr. */
 function run(file, args, options = {}) {
   return execFileSync(file, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...options })
+}
+
+/**
+ * Locate a package directory among the installation roots, in every layout a
+ * build can produce.
+ *
+ * A root-only lookup is a silent no-op on the source channel, where the
+ * `@deepseek-ai/*` packages are pnpm WORKSPACE members: pnpm links them by
+ * symlink from their workspace directory, so `<root>/@deepseek-ai/<name>` does
+ * not exist and the gate reported a missing skill package / engine that were in
+ * fact installed (same class as the client-bundle patchers).
+ *
+ *   npm    <root>/<name>
+ *   pnpm   <root>/.pnpm/<scope>+<pkg>@<v>/node_modules/<name>
+ *   source <tree>/packages/<tier>/<pkg>, <tree>/apps/<name>, <tree>/native/<name>
+ */
+function findPackageDir(installs, name) {
+  const isDir = (candidate) => {
+    try {
+      return statSync(candidate).isDirectory()
+    } catch {
+      return false
+    }
+  }
+  const packageName = (dir) => {
+    try {
+      return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).name
+    } catch {
+      return undefined
+    }
+  }
+
+  for (const root of installs) {
+    const flat = join(root, name)
+    if (existsSync(flat)) return flat
+
+    const store = join(root, '.pnpm')
+    if (isDir(store)) {
+      const mangled = name.replace('/', '+')
+      const hit = readdirSync(store).find((entry) => entry === mangled || entry.startsWith(`${mangled}@`))
+      if (hit !== undefined) {
+        const dir = join(store, hit, 'node_modules', name)
+        if (existsSync(dir)) return dir
+      }
+    }
+
+    const tree = dirname(root)
+    for (const group of ['packages', 'apps', 'vendor', 'native']) {
+      const groupDir = join(tree, group)
+      if (!isDir(groupDir)) continue
+      for (const entry of readdirSync(groupDir)) {
+        const entryDir = join(groupDir, entry)
+        if (!isDir(entryDir)) continue
+        // packages/<tier>/<pkg>; the other groups are one level deep.
+        const candidates = group === 'packages' ? readdirSync(entryDir).map((child) => join(entryDir, child)) : [entryDir]
+        for (const dir of candidates) {
+          if (packageName(dir) === name) return dir
+        }
+      }
+    }
+  }
+  return undefined
 }
 
 /** The manifest rules `parsePrimaryRuntime` enforces, applied here so a payload that
@@ -151,7 +213,7 @@ print("wrote", ${JSON.stringify(document)})
     return bad(`could not write a document with the payload: ${String(error.stderr ?? error.message).trim().split('\n').slice(-1)[0]}`)
   }
 
-  const skillOffice = installs.map((root) => join(root, '@deepseek-ai', 'dsh-skill-office')).find((dir) => existsSync(dir))
+  const skillOffice = findPackageDir(installs, '@deepseek-ai/dsh-skill-office')
   const checker = skillOffice === undefined ? undefined : join(skillOffice, 'assets', 'scripts', 'check_office.py')
   if (checker === undefined || !existsSync(checker)) {
     bad('the installed skill-office package has no assets/scripts/check_office.py')
@@ -171,7 +233,8 @@ print("wrote", ${JSON.stringify(document)})
     else bad(`missing skill assets: ${missingSkills.join(', ')}`)
   }
 
-  const kit = installs.map((root) => join(root, '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')).find((file) => existsSync(file))
+  const kitDir = findPackageDir(installs, '@deepseek-ai/libreoffice-kit')
+  const kit = kitDir === undefined ? undefined : join(kitDir, 'lib', 'cli.js')
   if (kit === undefined) return bad('no libreoffice-kit CLI in the installation — nothing can render or convert')
   let capabilities
   try {
@@ -279,7 +342,7 @@ function checkDeclarations(repo, installs) {
   if (/INTEGRATED_BUNDLES = \[[^\]]*"dsh-office"/su.test(patcher)) ok('the duplicate-card suppression list includes dsh-office, so the card appears once')
   else bad('INTEGRATED_BUNDLES does not include "dsh-office" — the same feature would appear twice')
 
-  const bundleDir = installs.map((root) => join(root, 'dsh-office')).find((dir) => existsSync(dir))
+  const bundleDir = findPackageDir(installs, 'dsh-office')
   if (bundleDir === undefined) return bad('the dsh-office bundle is not installed in any node_modules root — no profile could mount it')
   const manifest = JSON.parse(readFileSync(join(bundleDir, 'package.json'), 'utf8'))
   const declared = manifest.dsh?.bundle?.patch

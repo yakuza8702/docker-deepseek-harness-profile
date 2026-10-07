@@ -34,6 +34,54 @@ if (!wrapperPath || !expectedVersion || roots.length === 0) {
   process.exit(2);
 }
 
+/**
+ * Locate the plugin-manager client bundle in one installation root.
+ *
+ * A root-only lookup silently SKIPPED this whole section on the source channel:
+ * the page is a pnpm WORKSPACE member there, so `<root>/@deepseek-ai/<name>`
+ * never exists and the gate asserted nothing while still reporting success.
+ *   npm    <root>/@deepseek-ai/<name>/lib/client.js
+ *   pnpm   <root>/.pnpm/@deepseek-ai+<name>@<v>/node_modules/@deepseek-ai/<name>/lib/client.js
+ *   source <tree>/packages/<tier>/<pkg>/lib/client.js (pnpm links it by symlink,
+ *          so the workspace copy is the file the runtime serves)
+ */
+function resolvePageFile(root) {
+  const name = "@deepseek-ai/dsh-client-ui-plugin-manager";
+  const flat = path.join(root, name, "lib", "client.js");
+  if (fs.existsSync(flat)) return flat;
+
+  const store = path.join(root, ".pnpm");
+  if (fs.existsSync(store)) {
+    const hit = fs.readdirSync(store).find((entry) => entry.startsWith("@deepseek-ai+dsh-client-ui-plugin-manager@"));
+    if (hit !== undefined) {
+      const candidate = path.join(store, hit, "node_modules", name, "lib", "client.js");
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+
+  const tree = path.dirname(root);
+  for (const group of ["packages", "apps", "vendor", "native"]) {
+    const groupDir = path.join(tree, group);
+    if (!fs.existsSync(groupDir)) continue;
+    for (const entry of fs.readdirSync(groupDir)) {
+      const entryDir = path.join(groupDir, entry);
+      if (!fs.existsSync(entryDir)) continue;
+      const candidates =
+        group === "packages" ? fs.readdirSync(entryDir).map((child) => path.join(entryDir, child)) : [entryDir];
+      for (const dir of candidates) {
+        const candidate = path.join(dir, "lib", "client.js");
+        if (!fs.existsSync(candidate)) continue;
+        try {
+          if (JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).name === name) return candidate;
+        } catch {
+          /* not a package directory */
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
 let checks = 0;
 let failed = 0;
 
@@ -241,12 +289,13 @@ if (extras !== undefined) {
 /* ------------------------------------------------- 4. no duplicate card, ever */
 console.log("[check-brave-mcp] 4/4 the bundle stays out of the page's own list");
 
-for (const root of roots) {
-  const page = path.join(root, "@deepseek-ai", "dsh-client-ui-plugin-manager", "lib", "client.js");
-  if (!fs.existsSync(page)) {
-    console.log(`  --   ${page} absent in this tree`);
-    continue;
-  }
+const pageFiles = [...new Set(roots.map((root) => resolvePageFile(root)).filter((file) => file !== undefined))];
+expect(
+  pageFiles.length > 0,
+  "the plugin-manager client bundle was found in some installation tree (the section cannot be verified without it)",
+  roots.join(", ")
+);
+for (const page of pageFiles) {
   const source = fs.readFileSync(page, "utf8");
   const set = /const BUILTIN_PROFILE_BUNDLES = new Set\(\[([\s\S]*?)\]\)/u.exec(source);
   expect(set !== null, `the exclusion set is still where the patch expects it (${path.dirname(page)})`);
