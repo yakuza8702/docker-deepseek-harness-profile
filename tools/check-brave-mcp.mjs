@@ -47,12 +47,30 @@ if (!wrapperPath || !expectedVersion || roots.length === 0) {
  */
 function resolvePageFile(root) {
   const name = "@deepseek-ai/dsh-client-ui-plugin-manager";
+  // Upstream trees carry stray FILES where directories are expected (README.md
+  // inside packages/, the tier directories, …), so every readdir goes through
+  // these guards: an ENOTDIR here would crash the gate instead of failing it.
+  const isDir = (candidate) => {
+    try {
+      return fs.statSync(candidate).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+  const listDir = (dir) => {
+    try {
+      return fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+  };
+
   const flat = path.join(root, name, "lib", "client.js");
   if (fs.existsSync(flat)) return flat;
 
   const store = path.join(root, ".pnpm");
-  if (fs.existsSync(store)) {
-    const hit = fs.readdirSync(store).find((entry) => entry.startsWith("@deepseek-ai+dsh-client-ui-plugin-manager@"));
+  if (isDir(store)) {
+    const hit = listDir(store).find((entry) => entry.startsWith("@deepseek-ai+dsh-client-ui-plugin-manager@"));
     if (hit !== undefined) {
       const candidate = path.join(store, hit, "node_modules", name, "lib", "client.js");
       if (fs.existsSync(candidate)) return candidate;
@@ -62,13 +80,14 @@ function resolvePageFile(root) {
   const tree = path.dirname(root);
   for (const group of ["packages", "apps", "vendor", "native"]) {
     const groupDir = path.join(tree, group);
-    if (!fs.existsSync(groupDir)) continue;
-    for (const entry of fs.readdirSync(groupDir)) {
+    if (!isDir(groupDir)) continue;
+    for (const entry of listDir(groupDir)) {
       const entryDir = path.join(groupDir, entry);
-      if (!fs.existsSync(entryDir)) continue;
+      if (!isDir(entryDir)) continue;
       const candidates =
-        group === "packages" ? fs.readdirSync(entryDir).map((child) => path.join(entryDir, child)) : [entryDir];
+        group === "packages" ? listDir(entryDir).map((child) => path.join(entryDir, child)) : [entryDir];
       for (const dir of candidates) {
+        if (!isDir(dir)) continue;
         const candidate = path.join(dir, "lib", "client.js");
         if (!fs.existsSync(candidate)) continue;
         try {
