@@ -256,11 +256,16 @@ RUN set -eux; \
 # it in EITHER channel, then proves it with the real functional probe
 # (`landlock-run --probe` builds and enforces a maximal ruleset, so a kernel that
 # has the syscalls but refuses enforcement reads as unusable) and FAILS THE BUILD
-# otherwise. The path is never spelled out here — it is derived from
-# `launcherPath()` — so an upstream layout change cannot silently skip this step
-# (the old step computed `native/landlock-run/packages/linux-${TARGETARCH}`,
-# which stopped matching upstream, and Docker's `TARGETARCH` (amd64/arm64) never
-# matched the package names (x64/arm64) either).
+# otherwise. The tool resolves the launcher through the installed package's own
+# `launcherPath()` first and falls back to the platform-package locations every
+# channel actually produces — the root's node_modules (npm), the API package's
+# own fallback directory, the pnpm store sibling and the source workspace's
+# in-tree `native/system/packages/<platform>/bin/` — so an upstream layout change
+# cannot silently skip this step (an earlier version read only the npm layout and
+# broke every source-channel build; the step before that computed
+# `native/landlock-run/packages/linux-${TARGETARCH}`, which stopped matching
+# upstream, and Docker's `TARGETARCH` (amd64/arm64) never matched the package
+# names (x64/arm64) either).
 #
 # CONSEQUENCE FOR DEPLOYMENTS: nothing to download and nothing to mount. The
 # compose file no longer asks for a Landlock bind-mount; images built before this
