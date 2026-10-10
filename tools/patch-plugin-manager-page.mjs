@@ -14,7 +14,9 @@
  *
  *   1. the page DECLARES a child slot `plugins.page.top` in its own slot contract
  *      (declaring is what authorises rendering the key), and
- *   2. the page RENDERS it immediately before the "Official" group.
+ *   2. the page RENDERS it immediately before the first group of its main list —
+ *      `basic` since 0.2.1-alpha.2, `official` before that (both shapes are
+ *      anchored; see ANCHOR_RENDER_VARIANTS).
  *
  * `dsh-plugins-page-extras` then registers the component that fills it.
  *
@@ -49,9 +51,19 @@ const MARKER = "plugins.page.top";
 //    file's own indentation) instead of hardcoding a layout.
 const ANCHOR_DECL = /([ \t]*)"plugins\.item": \{\s*\n\s*kind: "list",\s*\n\s*scope: "root"\s*\n\s*\},/u;
 
-// 2. The render site: immediately before the "Official" group (a single line).
-const ANCHOR_RENDER = 'renderGroup("official", t("officialTitle"), officialCards)';
-const REPLACE_RENDER = `renderSlot("${MARKER}", {}), ${ANCHOR_RENDER}`;
+// 2. The render site: immediately before the FIRST group of the page's main list —
+//    the group the shipped bundles live in. Upstream renamed it in 0.2.1-alpha.2:
+//    `renderGroup("official", t("officialTitle"), officialCards)` became
+//    `renderGroup("basic", t("basicTitle"), basicCards)`, and the page now renders
+//    three groups (basic / extensions / bundles) instead of one official list.
+//    Both shapes are listed, newest first: the image may be built against either
+//    channel, the first variant that appears EXACTLY ONCE wins, and a third shape
+//    fails the build with every variant's count printed — so the next re-anchor is
+//    a one-line change instead of a bisect through a 200 KB bundle.
+const ANCHOR_RENDER_VARIANTS = [
+  { since: "0.2.1-alpha.2+", anchor: 'renderGroup("basic", t("basicTitle"), basicCards)' },
+  { since: "<= 0.2.1-alpha.1", anchor: 'renderGroup("official", t("officialTitle"), officialCards)' },
+];
 
 // 3. The page's own exclusion list: names that stay out of it even when the
 //    profile declares them as dependencies.
@@ -165,10 +177,13 @@ for (const root of roots) {
 
   if (!slotsDone) {
     const declCount = countRe(after, ANCHOR_DECL);
-    const renderCount = count(after, ANCHOR_RENDER);
-    if (declCount !== 1 || renderCount !== 1) {
+    const variant = ANCHOR_RENDER_VARIANTS.find((candidate) => count(after, candidate.anchor) === 1);
+    if (declCount !== 1 || variant === undefined) {
+      const seen = ANCHOR_RENDER_VARIANTS
+        .map((candidate) => `${candidate.since} ${count(after, candidate.anchor)}x`)
+        .join(", ");
       console.error(
-        `[plugins-page] ERROR: anchors moved in ${file} (slot declaration seen ${declCount}x, render site seen ${renderCount}x, expected 1 each).\n` +
+        `[plugins-page] ERROR: anchors moved in ${file} (slot declaration seen ${declCount}x, render site: ${seen}; expected 1 each).\n` +
           `  The Plugins page cannot be extended above its groups without them, so the image refuses to build. Re-anchor this script against the new upstream code.`,
       );
       process.exit(1);
@@ -177,7 +192,8 @@ for (const root of roots) {
     const clone = declaration.replace('"plugins.item"', `"${MARKER}"`);
     after = after
       .replace(declaration, `${clone}\n${declaration}`)
-      .replace(ANCHOR_RENDER, REPLACE_RENDER);
+      .replace(variant.anchor, `renderSlot("${MARKER}", {}), ${variant.anchor}`);
+    console.log(`[plugins-page] render site: ${variant.since} shape`);
   }
 
   if (!builtinDone) {

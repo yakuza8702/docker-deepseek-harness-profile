@@ -26,7 +26,7 @@ Official 8
 ## The `plugins.page.top` slot does not exist upstream
 
 The stock Plugins page can be contributed INTO (`plugins.item` puts a card inside
-"Official"), but it offers **no extension point above its groups**. DSH Desktop
+a group), but it offers **no extension point above its groups**. DSH Desktop
 solves this by patching the same package; this image does the same, at build time:
 
 `tools/patch-plugin-manager-page.mjs` — content-anchored, idempotent, and it
@@ -34,7 +34,11 @@ solves this by patching the same package; this image does the same, at build tim
 
 1. the page **declares** the child slot `plugins.page.top` in its slot contract
    (declaring is what authorises rendering the key), and
-2. the page **renders** it immediately before the `renderGroup("official", …)` call.
+2. the page **renders** it immediately before the first group of its main list —
+   `renderGroup("basic", …)` since 0.2.1-alpha.2, `renderGroup("official", …)`
+   before that. Both shapes are anchored (newest first, the one that appears
+   exactly once wins); a third shape fails the build with every variant's count
+   printed, so re-anchoring is a one-line change instead of a bisect.
 
 ## What is actually installable
 
