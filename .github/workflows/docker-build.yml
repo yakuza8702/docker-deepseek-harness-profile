@@ -31,14 +31,14 @@
 name: docker-build
 
 on:
-  # A push to main builds the image immediately (this fork carries the
-  # profile-aware launcher, so its image must exist as soon as the code lands).
-  # Feature branches listed here also build, so a feature can be tested as a real
-  # image before it is merged — and the branch stays revertable on its own.
+  # A push to main builds the image immediately. `main` is now the ONLY branch:
+  # every feature branch (browser stack, Office, APK toolchain, isolated Docker,
+  # profile management, the profile chooser + reset, the alpha.2 re-anchor) has
+  # been merged into it, so this single trigger is the whole build surface — and
+  # `:latest` now carries the browser stack that a stack pulling it expects.
   push:
     branches:
       - main
-      - feature/profile-management
   workflow_dispatch:
     inputs:
       dsh_version:
