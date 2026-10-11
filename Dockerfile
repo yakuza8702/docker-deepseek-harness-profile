@@ -683,6 +683,76 @@ COPY --chmod=0644 docker/apk-tools.md /opt/apk-tools/README.md
 COPY --chmod=0644 tools/check-apk-toolchain.mjs /opt/apk-tools/check.mjs
 RUN node /opt/apk-tools/check.mjs
 
+# ---------------------------------------------------------------------
+# OCR for image-only PDFs — the other half of "read this PDF".
+#
+# WHY IT IS IN THE IMAGE
+# The PDF skill could say, truthfully, that a page with no text layer was a
+# scan — and nothing else. That is an honest answer and a useless one: a deck
+# exported as pictures, a photographed form, a contract whose signature pages
+# are scans all arrive as pages whose words exist only as pixels, and the
+# deliverable the user wants is the searchable one they did not have to run a
+# second tool for.
+#
+# THE ENGINE IS TESSERACT 5, and deliberately nothing else. It is the fast,
+# folder-clean one: one process per page, no model session to warm up, no
+# Python wheels to load, no runtime download, and output every other OCR tool is
+# calibrated against. The alternatives (RapidOCR/PP-OCRv4 ONNX, EasyOCR,
+# PaddleOCR) each pull a few hundred MB of runtime and burn CPU on every run for
+# a second opinion this image does not need — so they are not installed, and the
+# driver has no flag that pretends otherwise.
+#
+# WHAT IT DOES NOT DO: improve the picture. The driver adds an INVISIBLE text
+# layer (render mode 3) on top of the page's own content and never re-encodes,
+# re-samples or redraws an image — tesseract's own PDF writer re-renders its
+# copies of the page images, which is how "OCR this PDF" usually becomes
+# "quietly replace this PDF's images". See tools/ocr-pdf.py.
+#
+# The traineddata is shape-checked before it is installed (a 404 that landed as
+# an HTML error page carries no version header), and the build then EXECUTES the
+# surface — tools/check-ocr-toolchain.mjs renders a page whose text it knows,
+# OCRs it through the real driver, requires the words back out of the RESULT and
+# requires the layer to be invisible — so a broken engine cannot ship as a
+# working one.
+#
+# SIZE: roughly 40 MB (the Debian packages plus tessdata_best).
+# ---------------------------------------------------------------------
+ARG OCR_TESSDATA_TIER=best
+
+COPY --chmod=0755 docker/ocr-toolchain.sh /tmp/ocr-toolchain.sh
+COPY --chmod=0755 docker/ocr-tools.sh /usr/local/bin/ocr-tools
+COPY --chmod=0644 tools/ocr-pdf.py /opt/ocr-tools/ocr-pdf.py
+RUN set -eux; \
+    OCR_TESSDATA_TIER="${OCR_TESSDATA_TIER}" \
+      /tmp/ocr-toolchain.sh; \
+    rm -f /tmp/ocr-toolchain.sh
+
+# The driver runs on the payload interpreter (pypdf + PyMuPDF live there), and
+# the wrapper has to be able to find it from anywhere — including a shell whose
+# PATH has been rewritten — so the resolving wrapper is written here rather than
+# guessed at call time.
+COPY --chmod=0644 docker/ocr-pdf.md /opt/ocr-tools/README.md
+COPY --chmod=0644 tools/check-ocr-toolchain.mjs /opt/ocr-tools/check.mjs
+ENV OCR_TESSDATA_DIR=/usr/share/tesseract-ocr/5/tessdata
+RUN set -eux; \
+    python="$(command -v python3)"; \
+    payload=/opt/dsh-office/primary-runtime/dependencies/python/bin/python3; \
+    [ -x "$payload" ] && python="$payload"; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# ocr-pdf — the driver, always on the interpreter that owns pypdf/PyMuPDF.' \
+      '# See /opt/ocr-tools/README.md; the wrapper `ocr-tools` prints the inventory.' \
+      'payload=/opt/dsh-office/primary-runtime/dependencies/python/bin/python3' \
+      'if [ -x "$payload" ]; then exec "$payload" /opt/ocr-tools/ocr-pdf.py "$@"; fi' \
+      'exec python3 /opt/ocr-tools/ocr-pdf.py "$@"' \
+      > /usr/local/bin/ocr-pdf; \
+    chmod 0755 /usr/local/bin/ocr-pdf; \
+    echo "ocr-pdf -> $python"; \
+    /usr/local/bin/ocr-pdf --probe
+
+# The build-time proof (also runnable in a live container: `ocr-tools --check`).
+RUN node /opt/ocr-tools/check.mjs
+
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \
     HOME=/workspace \

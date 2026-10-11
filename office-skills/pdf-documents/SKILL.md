@@ -1,6 +1,6 @@
 ---
 name: pdf-documents
-description: 'Read, create, assemble and check PDF files (.pdf). Use when a PDF is an input or a requested deliverable — extract text or embedded images, render pages as images so a vision model can look at the layout, split, merge, rotate, stamp or fill what is fillable, and produce a PDF from a Word, PowerPoint or Excel source. Load this before running any PDF command.'
+description: 'Read, create, assemble and check PDF files (.pdf). Use when a PDF is an input or a requested deliverable — extract text or embedded images, OCR a scanned or image-only page into a real searchable text layer, render pages as images so a vision model can look at the layout, split, merge, rotate, stamp or fill what is fillable, and produce a PDF from a Word, PowerPoint or Excel source. Load this before running any PDF command.'
 ---
 
 # PDF documents
@@ -42,8 +42,43 @@ for index, page in enumerate(reader.pages, 1):
 ```
 
 Text that extracts as garbage usually means a scanned page (an image of text, no text
-layer). **There is no OCR in this image** — report that plainly and offer the page
-renders instead; do not silently return empty text as if the page were blank.
+layer). **Do not report that as a dead end — OCR it** (see below), or render the page
+and read it with a vision model. Never return empty text as if the page were blank.
+
+**Image-only pages — OCR them, and hand back a searchable PDF.**
+
+```sh
+ocr-pdf --input paper.pdf --output paper-searchable.pdf            # every page
+ocr-pdf --input paper.pdf --output paper-searchable.pdf --pages 3-5 --verify
+ocr-pdf --input paper.pdf --output part.pdf --pages 1-40 --text-dump part.md
+```
+
+`ocr-pdf` runs tesseract 5 over the page's pixels and writes the result back as an
+**invisible text layer** (render mode 3), so the output is the same document — the
+images are never re-encoded or redrawn — but Ctrl-F, copy/paste and `extract_text`
+now find words that only existed as pictures. `--output` must differ from `--input`.
+
+| You want | Flag |
+|---|---|
+| A page range (a contract whose signature pages are scans) | `--pages 3-5,12` |
+| More precision on small type | `--dpi 300` (default) up to 400 |
+| Fewer wrong invisible words in a document that will be searched | `--min-conf 0.60` |
+| A sideways scan | `--rotate-pages` |
+| The OCR text without opening the PDF | `--text-dump notes.md` |
+| Proof the layer sits on the right pixels | `--verify --json report.json` |
+
+Read `--verify`'s output rather than assuming: `sample.matched == sample.checked` is
+the bar for delivering, and the mismatches are printed verbatim. A stylised brand
+wordmark read back differently is the *source image* being decorative — the layer is
+still correctly placed; a real word read back as an unrelated one means the layer is
+on the wrong pixels, and the fix is `--dpi` up, `--min-conf` up, or `--mode reflow`.
+
+`ocr-tools` prints what is installed; `ocr-tools --check` re-proves it. Full guide:
+`/opt/ocr-tools/README.md`.
+
+**OCR is not a substitute for looking.** For a page whose *layout* is the question — a
+diagram, a chart, a form's geometry — render the page and read the image. Use both
+when both matter: OCR for "find the word", a render for "what does the page look like".
 
 **Layout, figures and scans — for a vision model.** Render pages to PNG and read them:
 
@@ -128,7 +163,10 @@ file in place. Workspace paths are fine too when `present` is unavailable.
 ## Limits, state them rather than fight them
 
 * No reflow, no editing text inside an existing page, no re-pagination.
-* No OCR (no scanned-image text recovery).
+* OCR adds a *text layer*, it does not improve the picture: a scan unreadable to a
+  human produces confident nonsense, and `--verify` is how you find that out rather
+  than promise a search that works.
+* OCR does not do handwriting reliably. Say so instead of returning guesses.
 * AES-encrypted PDFs may not open (no `cryptography` package in the payload).
 * Page rendering: compare against the source before claiming a "missing" element — a
   font the payload does not carry renders as a substitute, and the manifest names it.

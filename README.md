@@ -292,12 +292,62 @@ What the model can do, and what proves it works:
 | Read a PDF's text, images and pages | `pypdf` + `PyMuPDF` + the engine's PDFium render path |
 | Check before delivering | `check_office.py` — OOXML packages, relationships, structure |
 
+And for the PDF that has **no text to read at all** — a scan, a photographed form, a
+deck exported as pictures — the image carries a real OCR layer (`ocr-pdf`, tesseract 5):
+it writes the recognised words back as an *invisible* text layer, so Ctrl-F and
+`extract_text` work on the result while the pages stay pixel-for-pixel what they were.
+`--verify` re-reads the output and measures that the layer sits on the glyphs, instead
+of asserting it. See [OCR for image-only PDFs](#ocr-for-image-only-pdfs--when-the-text-is-only-pixels).
+
 **What it is not:** the engine is LibreOffice, so pagination can differ from Word —
 previews are layout QA, not proof of print. A render is bounded to 100 pages and 16.7M
 pixels, and the engine is not resident (each operation starts it for ~2-3 s). PDF has no
 reflow: read, split, merge, rotate, stamp, render, or regenerate from the Office source.
 Missing fonts are reported (`missingFonts`), never silently substituted. Full detail and
 provenance: `plugins/dsh-office/README.md`.
+
+## OCR for image-only PDFs — when the text is only pixels
+
+The Office card above reads a PDF's text layer. This is what handles the PDF that has
+none: a scan, a phone photo of a form, a deck whose words were exported as pictures.
+
+```sh
+ocr-pdf --input scan.pdf --output scan-searchable.pdf
+ocr-pdf --input deck.pdf --output deck-searchable.pdf --verify --json report.json
+ocr-pdf --input book.pdf --output part.pdf --pages 1-40 --dpi 300 --text-dump part.md
+ocr-tools --check          # re-prove the stack in a running container (exit 1 = broken)
+```
+
+| | |
+|---|---|
+| Engine | tesseract 5 (LSTM) with the `tessdata_best` weights, plus `tesseract-ocr-osd` for `--rotate-pages` |
+| Driver | `tools/ocr-pdf.py` → `/usr/local/bin/ocr-pdf`, on the Office payload interpreter |
+| What it writes | an *invisible* text layer (PDF text render mode 3) over the page's own content |
+| What it never does | re-encode, re-sample or redraw the page image — the pixels are byte-identical afterwards |
+| Guide | `/opt/ocr-tools/README.md` (also `docker/ocr-pdf.md`) |
+| Gate | `tools/check-ocr-toolchain.mjs` — renders a page whose text it knows, OCRs it through the real driver, and requires the words back out of the RESULT |
+
+**One engine, on purpose.** tesseract is the fast, folder-clean option: one process per
+page, no model session, no runtime download, no Python wheels. The heavier alternatives
+(RapidOCR/PP-OCRv4 ONNX, EasyOCR, PaddleOCR) each add hundreds of MB of runtime and burn
+CPU on every run for a second opinion this image does not need, so they are not
+installed and the driver has no flag that pretends otherwise.
+
+`--verify` is the part that makes the output trustworthy. Writing a text layer is easy;
+writing it *in the right place* is the whole problem, and a layer off by a few percent
+is invisible until someone selects a line and gets the line below it. So the driver
+re-opens the result, crops the **output page** at each sampled word's own declared
+rectangle, and OCRs that crop alone: the crop contains one word's pixels only if the
+layer really is where it says it is. The report carries `matched`/`checked` per page and
+prints the mismatches verbatim, so a systematic offset reads as a pattern rather than as
+noise. The gate applies the same discipline at build time and also asserts the page's
+rendered pixels are **unchanged** by the pass.
+
+**What it is not:** OCR does not improve the picture. A scan unreadable to a human
+produces confident nonsense, and `--verify` is how that is discovered rather than
+promised over. It does not do handwriting reliably, and it does not make a scan reflow —
+PDF has no reflow. For layout questions, render the page and look at it; use OCR for
+"find the word" and a render for "what does the page look like".
 
 ## Workspace file manager — the "Files" entry in the sidebar footer
 
