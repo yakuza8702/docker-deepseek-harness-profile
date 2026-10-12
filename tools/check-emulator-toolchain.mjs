@@ -66,6 +66,24 @@ function run(cmd, args, opts = {}) {
   });
 }
 
+/**
+ * The image is BUILT as root and RUNS as uid 1000, so a probe that only root can
+ * pass proves nothing. This actually happened: the emulator launcher shipped as
+ * 0744 root:root, every root-run probe here passed, and in a live session
+ * `emulator-tools` reported "NOT INSTALLED" — because "others" had no execute
+ * bit. Sdkmanager preserves the archive's mode, so it is not a hypothetical.
+ *
+ * When we are root, every emulator probe is therefore re-run as uid 1000 with
+ * setpriv, i.e. as the user who will actually use it.
+ */
+function asRuntimeUser(cmd, args) {
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) return [cmd, args];
+  const found = spawnSync("sh", ["-c", "command -v setpriv"], { encoding: "utf8" });
+  const setpriv = found.stdout?.trim();
+  if (!setpriv) return [cmd, args];
+  return [setpriv, ["--reuid=1000", "--regid=1000", "--clear-groups", cmd, ...args]];
+}
+
 console.log("check-emulator-toolchain: verifying the emulator toolchain\n");
 
 // ---------------------------------------------------------------------------
@@ -85,7 +103,7 @@ if (!["x64"].includes(arch) || (process.env.DPKG_ARCH && process.env.DPKG_ARCH !
 if (!fs.existsSync(EMU)) {
   fail("emulator binary", `${EMU} missing`);
 } else {
-  const version = run(EMU, ["-version"], { timeout: 30_000 });
+  const version = run(...asRuntimeUser(EMU, ["-version"]), { timeout: 30_000 });
   const out = `${version.stdout}${version.stderr}`;
   if (version.error) {
     fail("emulator -version", version.error.message);
@@ -159,7 +177,10 @@ if (fs.existsSync(EMU) && fs.existsSync(propsPath)) {
     TMPDIR: avdHome,
   };
 
-  const list = run(EMU, ["-list-avds"], { timeout: 30_000, env: probeEnv });
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    spawnSync("chown", ["-R", "1000:1000", avdHome], { encoding: "utf8" });
+  }
+  const list = run(...asRuntimeUser(EMU, ["-list-avds"]), { timeout: 30_000, env: probeEnv });
   if (`${list.stdout}`.split("\n").map((s) => s.trim()).includes(name)) {
     ok("AVD", `written by hand and discovered (${name})`);
   } else {
@@ -169,8 +190,9 @@ if (fs.existsSync(EMU) && fs.existsSync(propsPath)) {
   // (b) starting it must resolve the system image. We stop after a few seconds:
   // booting needs /dev/kvm, but "Found systemPath …" is printed before that.
   const probe = run(
-    EMU,
-    ["-avd", name, "-no-window", "-no-audio", "-no-snapshot", "-accel", "off", "-verbose"],
+    ...asRuntimeUser(EMU, [
+      "-avd", name, "-no-window", "-no-audio", "-no-snapshot", "-accel", "off", "-verbose",
+    ]),
     { timeout: 25_000, env: probeEnv },
   );
   const probeOut = `${probe.stdout}${probe.stderr}`;
@@ -187,6 +209,34 @@ if (fs.existsSync(EMU) && fs.existsSync(propsPath)) {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. The runtime user's view of the files, asserted in the mode bits — the one
+// thing a root-run probe above cannot see.
+// ---------------------------------------------------------------------------
+function othersCanUse(p, needExecute) {
+  try {
+    const mode = fs.statSync(p).mode & 0o777;
+    const read = (mode & 0o004) !== 0;
+    const exec = (mode & 0o001) !== 0;
+    return { ok: read && (!needExecute || exec), mode };
+  } catch {
+    return { ok: false, mode: null };
+  }
+}
+
+if (fs.existsSync(EMU)) {
+  const bin = othersCanUse(EMU, true);
+  const dir = othersCanUse("/opt/emulator-tools", true);
+  if (bin.ok) ok("emulator is usable by uid 1000", `mode ${bin.mode.toString(8)}`);
+  else fail("emulator is NOT usable by uid 1000", `mode ${bin.mode?.toString(8) ?? "?"} — needs o+rX (see the installer's permissions step)`);
+  if (dir.ok) ok("/opt/emulator-tools is reachable by uid 1000");
+  else fail("/opt/emulator-tools is NOT reachable by uid 1000", `mode ${dir.mode?.toString(8) ?? "?"} — a directory without o+x cannot be listed`);
+  const imageRoot = path.join(SDK, "system-images");
+  const img = othersCanUse(path.join(IMAGE_DIR, "source.properties"), false);
+  if (!img.ok) fail("system image is NOT readable by uid 1000", `mode ${img.mode?.toString(8) ?? "?"}`);
+  if (!othersCanUse(imageRoot, true).ok) fail("system-images dir is NOT reachable by uid 1000");
+}
+
+// ---------------------------------------------------------------------------
 // 4. Hardware acceleration: a runtime device, not a build artefact.
 // ---------------------------------------------------------------------------
 if (fs.existsSync("/dev/kvm") && fs.accessSync) {
@@ -194,7 +244,13 @@ if (fs.existsSync("/dev/kvm") && fs.accessSync) {
     fs.accessSync("/dev/kvm", fs.constants.R_OK | fs.constants.W_OK);
     ok("/dev/kvm", "present and accessible — the emulator will run accelerated");
   } catch {
-    warn("/dev/kvm", "present but not accessible — add `group_add: [kvm]` to the run");
+    warn(
+      "/dev/kvm",
+      "present but not accessible — this process lacks the gid that owns the device on the " +
+        "HOST. Run `getent group kvm` there and add that NUMBER: group_add: [\"<gid>\"] " +
+        "(a group NAME resolves against this image's /etc/group, so it only works when the " +
+        "two gids happen to match)",
+    );
   }
 } else {
   warn(

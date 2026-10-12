@@ -824,9 +824,10 @@ ENV ANDROID_AVD_HOME=/workspace/.android/avd \
     GRADLE_USER_HOME=/workspace/.gradle
 
 # The build-time proof (also runnable in a live container: `emulator-tools --check`).
-COPY --chmod=0644 docker/emulator.md /opt/emulator-tools/README.md
-COPY --chmod=0644 tools/check-emulator-toolchain.mjs /opt/emulator-tools/check.mjs
+COPY --chown=node:node --chmod=0644 docker/emulator.md /opt/emulator-tools/README.md
+COPY --chown=node:node --chmod=0644 tools/check-emulator-toolchain.mjs /opt/emulator-tools/check.mjs
 RUN set -eux; \
+    chmod 0755 /opt/emulator-tools; \
     if [ "${WITH_EMULATOR}" = "1" ]; then node /opt/emulator-tools/check.mjs; \
     else echo "emulator check: skipped (WITH_EMULATOR=0)"; fi
 

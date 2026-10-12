@@ -113,6 +113,31 @@ if [ ! -f "$image_dir/source.properties" ]; then
 fi
 echo "system image: $image_dir"
 
+# ---------------------------------------------------------------------
+# 3b. HAND IT TO THE RUNTIME USER.
+#
+# The image is built as root but RUNS as uid 1000, and this section comes
+# AFTER apk-toolchain.sh's own `chown -R node:node …` — so nothing installed
+# here is reachable unless it is said so explicitly. sdkmanager preserves the
+# archive's mode for the launcher, which arrives as 0744 root:root: root can
+# execute it, "others" — the runtime user — cannot. Every symptom of that is
+# the same and misleading: `emulator-tools` reports NOT INSTALLED, and a
+# `ls` of /opt looks completely fine. Measured in CI, where the build passed.
+#
+# `a+rX` adds read for all and execute only where it already exists (dirs and
+# programs), and the find mirrors root's execute bit onto every program.
+# ---------------------------------------------------------------------
+step "runtime-user permissions (uid 1000)"
+chown -R node:node "$SDK/emulator" "$SDK/system-images"
+chmod -R a+rX "$SDK/emulator" "$SDK/system-images"
+find "$SDK/emulator" -type f -perm -0100 -exec chmod a+x {} +
+chmod 0755 "$SDK/emulator/emulator"
+# Created here with the right mode: a later `COPY --chmod=0644 … /opt/emulator-tools/x`
+# would otherwise create the DIRECTORY as 0644 — a directory without the search bit,
+# which nobody but root can even list.
+mkdir -p /opt/emulator-tools
+chmod 0755 /opt/emulator-tools
+
 # A convenience symlink: every other SDK tool is on PATH, this one should be too.
 ln -sfn "$SDK/emulator/emulator" /usr/local/bin/emulator
 
