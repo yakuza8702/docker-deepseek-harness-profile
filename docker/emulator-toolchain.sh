@@ -92,9 +92,18 @@ groupadd -f kvm
 #    already created. Licenses are accepted non-interactively (the modern
 #    CLI no longer needs this, older ones do — hence the fallback).
 # ---------------------------------------------------------------------
-step "Android SDK: emulator + system-images;${EMU_API};${EMU_TAG};${EMU_ABI}"
+step "Android SDK: platform-tools + emulator + system-images;${EMU_API};${EMU_TAG};${EMU_ABI}"
+# platform-tools is NOT for adb — the image keeps Debian's adb on purpose (see
+# apk-toolchain.sh: Google's platform-tools has no aarch64 build). It is here
+# because the EMULATOR validates its SDK root by looking for that directory:
+# without it the launcher prints
+#     WARN: Cannot find valid sdk root from environment variable ANDROID_HOME …
+# and then cannot resolve the system image at all, so no AVD will ever boot.
+# Measured: with the directory, "Found systemPath …"; without it, the warning and
+# nothing else. This whole section is x86_64-only anyway, where the package exists.
 yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null 2>&1 || true
 "$SDKMANAGER" --sdk_root="$SDK" --install \
+  "platform-tools" \
   "emulator" \
   "system-images;${EMU_API};${EMU_TAG};${EMU_ABI}"
 

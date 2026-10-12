@@ -202,10 +202,32 @@ if (fs.existsSync(EMU) && fs.existsSync(propsPath)) {
   } else if (/cannot find android emulator system path|Cannot find AVD system path|unknown AVD/i.test(probeOut)) {
     fail("AVD → system image", "emulator could not resolve the image from the AVD");
   } else {
-    warn("AVD → system image", "no confirmation line in the first 25 s (see -verbose output if booting fails)");
+    // The binary is executable and the image is on disk, so the launcher should
+    // always get this far. A missing line means the SDK root could not be
+    // validated (or another precondition failed) — a boot that never happens.
+    const hint = /valid sdk root/i.test(probeOut)
+      ? "the launcher could not validate its SDK root (is platform-tools installed?)"
+      : `no confirmation line in the first 25 s — first output: ${probeOut.split("\n").find((l) => l.trim()) ?? "(none)"}`;
+    fail("AVD → system image", hint);
   }
 
   fs.rmSync(avdHome, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 3a. The emulator refuses to resolve a system image unless it can validate its
+// SDK root, and it validates that root by finding `platform-tools` inside it.
+// Without the directory the launcher only warns — so this is asserted, because
+// the symptom is otherwise an AVD that simply never boots.
+// ---------------------------------------------------------------------------
+const platformTools = path.join(SDK, "platform-tools");
+if (fs.existsSync(platformTools)) {
+  ok("SDK root is valid (platform-tools present)");
+} else {
+  fail(
+    "SDK root is NOT valid for the emulator",
+    `${platformTools} missing — the launcher will print "Cannot find valid sdk root" and cannot resolve any system image (sdkmanager --install platform-tools)`,
+  );
 }
 
 // ---------------------------------------------------------------------------
