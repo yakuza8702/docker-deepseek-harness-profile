@@ -798,6 +798,10 @@ RUN node /opt/ocr-tools/check.mjs
 ARG EMU_API=android-36
 ARG EMU_TAG=google_apis
 ARG EMU_ABI=x86_64
+# The gid that owns /dev/kvm on the host this image is built for (Debian/OMV:
+# kvm:x:104:). It goes into the image so the runtime user can open the device
+# without a compose `group_add` line — see docker/emulator-toolchain.sh.
+ARG KVM_GID=104
 # Escape hatch for lean builds: `--build-arg WITH_EMULATOR=0` skips the ~2.4 GB
 # and leaves `emulator-tools` reporting the capability as not installed. Useful
 # when the CI disk or the buildx gha cache (10 GB per repo) is the constraint —
@@ -808,7 +812,7 @@ COPY --chmod=0755 docker/emulator-toolchain.sh /tmp/emulator-toolchain.sh
 COPY --chmod=0755 docker/emulator-tools.sh /usr/local/bin/emulator-tools
 RUN set -eux; \
     if [ "${WITH_EMULATOR}" = "1" ]; then \
-      EMU_API="${EMU_API}" EMU_TAG="${EMU_TAG}" EMU_ABI="${EMU_ABI}" \
+      EMU_API="${EMU_API}" EMU_TAG="${EMU_TAG}" EMU_ABI="${EMU_ABI}" KVM_GID="${KVM_GID}" \
         /tmp/emulator-toolchain.sh; \
     else \
       echo "emulator: skipped (WITH_EMULATOR=0)"; \
@@ -862,7 +866,11 @@ RUN rm -rf /tmp/.npm-cache /tmp/node-compile-cache \
  && chown -R node:node /home/node/.dsh /workspace /opt/seek-harness
 
 # Non-root (runzhliu hardening): uid/gid 1000 = image "node" user
-USER node:node
+# `USER node` — NOT `node:node`. The explicit user:group form makes Docker drop
+# the image's supplementary groups, which is exactly what carries kvm access
+# (measured: `USER node` → groups=1000(node),104(kvm); `--user node:node` →
+# groups=1000(node) only). Same uid and same primary gid either way.
+USER node
 
 # entrypoint handles: `web` (default), `-`-prefixed dsh args, or arbitrary exec
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint.sh"]

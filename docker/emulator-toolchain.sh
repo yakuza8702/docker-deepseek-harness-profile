@@ -82,10 +82,43 @@ apt-get update
 apt-get install -y --no-install-recommends libpulse0 libxdamage1
 rm -rf /var/lib/apt/lists/*
 
-# The `kvm` group must EXIST in the image for a compose `group_add: [kvm]` to
-# resolve; the gid does not matter because the device node keeps its own.
-step "kvm group"
-groupadd -f kvm
+# ---------------------------------------------------------------------
+# 1b. The container user must be able to open /dev/kvm.
+#
+# The device node carries the gid that owns /dev/kvm ON THE HOST (104 on the
+# reference host: `kvm:x:104:`), so the image needs a group with that same
+# NUMBER and the runtime user in it. Nothing on the compose side is then
+# required — no `group_add`, no udev rule, and the device stays 0660.
+#
+# This only works because the runtime user's supplementary groups are applied
+# at all: Docker DROPS them when a container is started with an explicit
+# `user:`/`USER name:group` spec, even when it names the same user and group.
+# Measured:
+#     USER node          → groups=1000(node),104(kvm)
+#     --user node:node   → groups=1000(node)          ← no 104, no device access
+# The Dockerfile therefore ends with `USER node`, not `USER node:node`.
+#
+# If a compose file sets `user: node:node` anyway, the membership is dropped
+# again and `group_add: ["<gid>"]` is the only way back — that is a property of
+# how Docker composes the spec, not something this image can work around.
+# ---------------------------------------------------------------------
+KVM_GID="${KVM_GID:-104}"
+step "kvm group at the host's gid (${KVM_GID}) + membership for the runtime user"
+KVM_GROUP_NAME="kvm"
+_existing="$(getent group "$KVM_GID" | cut -d: -f1 || true)"
+if [ -n "$_existing" ] && [ "$_existing" != "kvm" ]; then
+  # The gid is already taken by another group name: use it as-is rather than
+  # renaming a package's group out from under its files.
+  KVM_GROUP_NAME="$_existing"
+  echo "gid ${KVM_GID} belongs to the existing group '${KVM_GROUP_NAME}'"
+elif getent group kvm >/dev/null; then
+  groupmod -g "$KVM_GID" kvm
+else
+  groupadd -g "$KVM_GID" kvm
+fi
+usermod -aG "$KVM_GROUP_NAME" node
+echo "node supplementary groups: $(id -nG node 2>/dev/null)"
+getent group "$KVM_GROUP_NAME"
 
 # ---------------------------------------------------------------------
 # 2. The emulator and one system image, into the SDK the APK toolchain

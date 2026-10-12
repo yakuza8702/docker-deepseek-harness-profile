@@ -283,6 +283,42 @@ if (fs.existsSync("/dev/kvm") && fs.accessSync) {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. KVM access by GROUP MEMBERSHIP, which is what removes the compose
+// `group_add` line entirely: the image must carry a group with the gid that owns
+// /dev/kvm on the host (KVM_GID, 104 by default) and the runtime user must be in
+// it. Note the trap this only survives because of: a container started with an
+// explicit `user:`/`USER name:group` spec has its supplementary groups DROPPED,
+// so `USER node:node` silently defeats the membership.
+// ---------------------------------------------------------------------------
+function groupEntry(name) {
+  try {
+    return (
+      fs.readFileSync("/etc/group", "utf8")
+        .split("\n")
+        .find((line) => line.startsWith(`${name}:`)) ?? null
+    );
+  } catch {
+    return null;
+  }
+}
+
+const kvmGroup = groupEntry("kvm");
+if (!kvmGroup) {
+  warn("no kvm group in the image", "the runtime user cannot open /dev/kvm without group_add");
+} else {
+  const parts = kvmGroup.split(":");
+  const gid = parts[2];
+  const members = (parts[3] ?? "").split(",").map((m) => m.trim());
+  if (members.includes("node")) {
+    ok("runtime user is in the kvm group", `gid ${gid} — no compose group_add needed`);
+  } else {
+    warn(
+      `runtime user is NOT in the kvm group (gid ${gid})`,
+      "containers will need group_add: [\"<host gid>\"] unless the membership is added",
+    );
+  }
+}
+// ---------------------------------------------------------------------------
 // 5. The agent-facing command must exist, or the capability is theoretical.
 // ---------------------------------------------------------------------------
 if (fs.existsSync(TOOLS)) ok("emulator-tools", "on PATH");
