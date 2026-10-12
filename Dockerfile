@@ -753,6 +753,72 @@ RUN set -eux; \
 # The build-time proof (also runnable in a live container: `ocr-tools --check`).
 RUN node /opt/ocr-tools/check.mjs
 
+# ---------------------------------------------------------------------
+# Android EMULATOR — the "what does this app DO" half of APK analysis.
+#
+# WHY IT IS IN THE IMAGE
+# The APK toolchain above answers "what is in this app" from a file. It cannot
+# answer "what does this app DO when it runs": permission prompts, camera
+# capture, WebView rendering, insets on a device with a camera cutout. Those
+# need a booted Android system, and without this layer the only honest answer
+# is "install an emulator first" — a ~2.4 GB download and a long detour in the
+# middle of a task the user asked for now.
+#
+# WHAT EACH PIECE BUYS
+#   emulator          the QEMU-based Android emulator (Linux x86_64 only)
+#   system image      a bootable Android (API) google_apis x86_64, no Play
+#                     account needed and nothing licensed to accept
+#   libpulse0         the emulator binary links libpulse.so.0 DIRECTLY — without
+#                     it the process dies before printing its version
+#   libxdamage1       X11 damage extension, used by the emulator's Qt window
+#   kvm group         so a compose `group_add: [kvm]` resolves by name
+#
+# HARDWARE ACCELERATION IS A RUNTIME DEVICE, NOT A PACKAGE: /dev/kvm is passed
+# to the container by compose.emulator.yaml (or `--device /dev/kvm --group-add
+# kvm`). Without it the emulator REFUSES to start; with `-accel off` it boots
+# but Android's watchdog kills system_server within minutes (measured), so API
+# 34+ is effectively untestable. That is also why the build-time check treats a
+# missing /dev/kvm as a warning: the build has no device, the container does.
+#
+# ARCHITECTURE: Google publishes the Linux emulator for x86_64 ONLY (linux_x64,
+# darwin_x64, darwin_aarch64, windows_x64 — there is no linux_aarch64). On
+# arm64 docker/emulator-toolchain.sh installs nothing and says so, the same way
+# the APK toolchain takes adb from Debian because platform-tools has no aarch64
+# build either. The check is skipped rather than failed there.
+#
+# The AVD is NOT created here: the rootfs is read-only at run time, so
+# docker/entrypoint.sh writes it into $ANDROID_AVD_HOME on the workspace volume
+# (see provision_emulator_avd) and `emulator-tools` owns it from then on.
+#
+# SIZE WARNING: this section adds roughly 2.4 GB (emulator ~1.0 GB, system image
+# ~1.3 GB). It is the price of being able to RUN an APK offline instead of only
+# reading it. Set DSH_EMULATOR=0 at boot to skip AVD provisioning; the packages
+# stay in the image either way.
+# ---------------------------------------------------------------------
+ARG EMU_API=android-36
+ARG EMU_TAG=google_apis
+ARG EMU_ABI=x86_64
+
+COPY --chmod=0755 docker/emulator-toolchain.sh /tmp/emulator-toolchain.sh
+COPY --chmod=0755 docker/emulator-tools.sh /usr/local/bin/emulator-tools
+RUN set -eux; \
+    EMU_API="${EMU_API}" EMU_TAG="${EMU_TAG}" EMU_ABI="${EMU_ABI}" \
+      /tmp/emulator-toolchain.sh; \
+    rm -f /tmp/emulator-toolchain.sh
+
+# The AVD and the Gradle cache must live on the writable workspace: the rootfs is
+# read-only at run time, and a JVM tool resolving user.home = /home/node (which
+# is read-only here) fails with "Read-only file system" rather than a clear error.
+ENV ANDROID_AVD_HOME=/workspace/.android/avd \
+    ANDROID_USER_HOME=/workspace/.android \
+    ANDROID_PREFS_ROOT=/workspace/.android \
+    GRADLE_USER_HOME=/workspace/.gradle
+
+# The build-time proof (also runnable in a live container: `emulator-tools --check`).
+COPY --chmod=0644 docker/emulator.md /opt/emulator-tools/README.md
+COPY --chmod=0644 tools/check-emulator-toolchain.mjs /opt/emulator-tools/check.mjs
+RUN node /opt/emulator-tools/check.mjs
+
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \
     HOME=/workspace \

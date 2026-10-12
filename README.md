@@ -798,6 +798,61 @@ a container that boots is a container whose toolchain works. The in-image guide
 (`/opt/apk-tools/README.md`, also in the repo as [`docker/apk-tools.md`](docker/apk-tools.md))
 carries the full workflow: Hermes bundles, repack/sign, native libs, and the limits.
 
+## Android emulator — running the app, not just reading it
+
+The APK toolchain above is *static*: it tells you what is inside an APK. It cannot tell
+you what the app **does** — the permission prompts, the camera flow, whether the layout
+survives a device with a camera cutout. That needs a booted Android system, and the image
+ships one (Android API 36, `google_apis`, x86_64) rather than making the agent fetch a
+1.3 GB image in the middle of a task:
+
+```bash
+emulator-tools              # inventory: what is installed, what is missing, what to run
+emulator-tools --up         # write the AVD, boot Android, wait for boot_completed
+emulator-tools --apk app-debug.apk --pkg com.example.app
+emulator-tools --down
+```
+
+**KVM is a host device, not a package.** It is deliberately *not* in the base compose
+(which keeps `cap_drop ALL` + a read-only rootfs), because Docker refuses to start a
+container whose `devices:` entry does not exist on the host. It ships as an opt-in
+override, exactly like the docker-access one:
+
+```bash
+docker compose -f compose.yaml -f compose.emulator.yaml up -d
+#   …or: docker run --device /dev/kvm --group-add kvm ...
+```
+
+Without `/dev/kvm` the emulator refuses to start; with `-accel off` it boots but Android's
+watchdog kills `system_server` within minutes (measured on this image, at load ~20), so
+API 34+ is effectively untestable without hardware acceleration. `emulator-tools` reports
+the KVM state plainly and refuses to start unless you insist.
+
+**The APK must carry x86_64 native code.** The emulator image has no ARM translation, so
+an `arm64-v8a`-only APK cannot run there. For a Gradle project:
+`./gradlew assembleDebug -PforEmulator`. Check with `unzip -l app-debug.apk | grep lib/x86_64`.
+
+Traps the tooling already handles (all measured): `avdmanager create avd` is broken in the
+current cmdline-tools and its replacement downloads images — so the AVD is **written by
+hand** against the image that ships; the AVD lives in `$ANDROID_AVD_HOME` on the workspace
+volume because the rootfs is read-only; `adb install` of a large APK fails *silently* on a
+slow guest, so the tool pushes to `/data/local/tmp` and verifies with `pm path`;
+`sys.boot_completed` flips before the launcher is usable, so boot waiting adds a settle
+delay; and `libpulse0` is a hard dependency of the emulator binary (installed here).
+
+What it is **not** good for: real inference latency, camera image quality (the back camera
+is a virtual scene), Play Services or a Google account, and anything user-facing that
+depends on real hardware behaviour. Emulated numbers are not device numbers.
+
+`emulator-tools --check` re-runs the build-time proof (the binary executes, the image
+metadata is complete, a hand-written AVD is discovered *and* resolved to its system image,
+KVM state reported). Full guide: [`docker/emulator.md`](docker/emulator.md) — also in the
+image at `/opt/emulator-tools/README.md`.
+
+Cost, stated plainly: roughly **2.4 GB** (emulator ~1.0 GB, system image ~1.3 GB), on top
+of the APK toolchain's 0.7 GB. `DSH_EMULATOR=0` at boot skips AVD provisioning; the
+packages stay in the image.
+
 ## Auto-update workflow
 
 `.github/workflows/docker-build.yml` keeps `:latest` in sync with the official project:

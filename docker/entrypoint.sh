@@ -125,6 +125,31 @@ ensure_home_alias() {
 }
 
 # ---------------------------------------------------------------------
+# Android emulator: make the AVD EXIST before the first session.
+#
+# `emulator-tools --up` is all an agent should need, so the AVD is written here
+# instead (cheap, and offline: the system image ships inside the image, so
+# nothing is downloaded). The rootfs is read-only, hence $ANDROID_AVD_HOME on
+# the workspace volume — see docker/emulator.md.
+#
+# Skipped silently when the emulator is not installed (arm64 builds install
+# none, because Google publishes no linux_aarch64 emulator). Booting still
+# needs /dev/kvm, which compose.emulator.yaml passes in; this step only removes
+# the "create an AVD first" friction.
+# ---------------------------------------------------------------------
+provision_emulator_avd() {
+  [[ "${DSH_EMULATOR:-1}" == "0" ]] && { log "emulator: skipped (DSH_EMULATOR=0)"; return 0; }
+  local sdk="${ANDROID_SDK_ROOT:-/opt/android-sdk}"
+  [[ -x "$sdk/emulator/emulator" ]] || return 0
+  if emulator-tools --avd >/dev/null 2>&1; then
+    log "emulator: AVD ready (${ANDROID_AVD_HOME:-/workspace/.android/avd}) — 'emulator-tools --up' boots it, needs /dev/kvm"
+  else
+    log "WARN: emulator: could not write the AVD — run 'emulator-tools --avd' to see why"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------
 # Fresh start: materialize the profile selection.
 #
 # A DSH profile is a BOOT-TIME launcher input read from
@@ -730,6 +755,9 @@ fi
 # a shell the user opens, an agent tool that runs `dsh plugin …` — must resolve
 # `~/.dsh` and `$DSH_HOME` to the same directory.
 ensure_home_alias || true
+
+# The emulator's AVD, so a session can boot Android without preparing anything.
+provision_emulator_avd || true
 
 # Make the boot-time selection explicit on a fresh volume (see
 # seed_profile_selection). Safe Mode runs on a throwaway home and must never

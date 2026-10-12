@@ -1,0 +1,36 @@
+# =====================================================================
+# Emulator override — gives the container the ONE thing it cannot carry in an
+# image: access to the host's KVM device.
+#
+#   docker compose -f compose.yaml -f compose.emulator.yaml up -d
+#
+# WHY THIS IS AN OVERRIDE AND NOT PART OF THE BASE FILE
+# Docker refuses to start a container whose `devices:` entry does not exist on
+# the host, so putting /dev/kvm in compose.yaml would break the harness on every
+# machine without it. The base compose stays fully locked down (cap_drop ALL,
+# read-only rootfs); this file is the explicit opt-in.
+#
+# REQUIREMENTS
+#   * /dev/kvm on the HOST. On a host that is itself a VM, enable nested
+#     virtualisation, otherwise /dev/kvm appears but guests refuse to start.
+#   * `group_add: [kvm]` so the non-root user inside the container may open the
+#     device. The image creates the `kvm` group (docker/emulator-toolchain.sh);
+#     Docker adds the HOST's gid for that name, which is what the device node
+#     actually carries. If the name does not resolve on your host, use the
+#     numeric gid instead:
+#         group_add: ["$(getent group kvm | cut -d: -f3)"]   # e.g. "109"
+#
+# VERIFY INSIDE THE CONTAINER
+#   emulator-tools                       # "hardware accel: /dev/kvm present and accessible"
+#   emulator-tools --up                  # boot Android
+#
+# NO EXTRA CAPABILITIES ARE NEEDED: the emulator is an ordinary userspace QEMU
+# process. If it ever refuses with a seccomp error, prefer
+# `security_opt: [seccomp=unconfined]` over `privileged: true`.
+# =====================================================================
+services:
+  seek-harness:
+    devices:
+      - /dev/kvm
+    group_add:
+      - kvm
