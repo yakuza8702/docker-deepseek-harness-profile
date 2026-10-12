@@ -306,6 +306,28 @@ reflow: read, split, merge, rotate, stamp, render, or regenerate from the Office
 Missing fonts are reported (`missingFonts`), never silently substituted. Full detail and
 provenance: `plugins/dsh-office/README.md`.
 
+### Native LibreOffice beside the card — the compatibility exit
+
+The card's engine is LibreOffice-for-WASM: bounded (100 pages, 16.7M pixels, not
+resident). The image ALSO carries the real `soffice --headless` — Writer, Calc, Impress
+and Draw with the full import/export filters (`--no-install-recommends`, so no Java and
+no desktop menus) — plus `python-docx` and `openpyxl` bound to the system `python3`, so
+document code works in ANY shell even before the payload is found:
+
+```
+office-convert pdf report.odt           # whole-document compatibility swap, output beside the input
+office-convert docx report/*.doc        # swap legacy binary formats to OOXML
+office-swap-pages scan.pdf out.pdf 1,4,3,2   # rebuild a PDF with pages swapped/reordered (pixels byte-identical)
+office-swap-pages deck.pdf full.pdf 1-5,6:180 # ...and rotated, the same pypdf path ocr-pdf trusts
+python3 -c "import docx, openpyxl"      # the system interpreter is ready too
+```
+
+PowerPoint authoring has no Debian package, so it stays on the SHA-256-pinned payload
+interpreter (`/opt/dsh-office/primary-runtime`, full set: python-pptx, XlsxWriter,
+Pillow, pypdf, PyMuPDF…). This native layer ships WITHOUT a build-time gate on
+purpose: the apt resolution is the proof, and the wrappers are plain `sh` over
+`soffice --convert-to`.
+
 ## OCR for image-only PDFs — when the text is only pixels
 
 The Office card above reads a PDF's text layer. This is what handles the PDF that has

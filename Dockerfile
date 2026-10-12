@@ -604,6 +604,92 @@ RUN node /tmp/check-office.mjs \
  && rm -rf /tmp/check-office.mjs /tmp/office-repo
 
 # ---------------------------------------------------------------------
+# Native LibreOffice layout — soffice --headless + system-python docx/xlsx.
+#
+# WHY IT IS IN THE IMAGE
+# The `dsh-office` card above runs LibreOffice compiled to WebAssembly through
+# @deepseek-ai/libreoffice-kit: a good PREVIEW engine, but bounded (100 pages,
+# 16.7M pixels, not resident) and missing the add-on import/export filters of
+# the real build. When an agent needs the REAL engine — a .doc (binary format)
+# swapped to .docx, legacy .ods/.ppt round-tripping, batch-converting a folder,
+# or a page swap that must not pass a bounded renderer — `soffice --headless`
+# is the better-compatibility tool, so it ships here NEXT TO the card, not
+# instead of it.
+#
+# WHAT EACH PIECE BUYS
+#   libreoffice-writer/calc/impress/draw
+#                       the real Word/Excel/PowerPoint/ODF engines, pulled in
+#                       together with libreoffice-core and their full
+#                       import/export filter sets (--no-install-recommends
+#                       keeps out Java, the KDE/GNOME menu integration and the
+#                       wiki/mediawiki filters the conversion path never
+#                       touches; core itself provides the soffice launcher and
+#                       binary). Layout-faithful fonts are ALREADY in the
+#                       image (fonts-liberation + fonts-noto-cjk, installed
+#                       above) and are the same files the WASM engine gets.
+#   python3-docx        python-docx bound to the SYSTEM python3, so
+#                       `python3 -c "import docx"` works in ANY shell the
+#                       agent gets — even one that never reads the payload.
+#                       The office payload interpreter keeps the full pinned
+#                       set (python-pptx, XlsxWriter, Pillow, numpy, pandas…);
+#                       this is the plain-default convenience layer, not a
+#                       second source of truth.
+#   python3-openpyxl    same, for .xlsx/.xlsm read-write on plain python3.
+#                       Debian has no python3-pptx package, so PowerPoint work
+#                       goes through the payload interpreter, where the wheel
+#                       is SHA-256-pinned by the office lock.
+#
+# THE WRAPPERS the agent reaches for instead of memorising flags:
+#   office-convert <to> <file>...
+#                       soffice --headless --convert-to; output lands beside
+#                       each input. `office-convert pdf report.odt` and
+#                       `office-convert docx report/*.doc` both work.
+#   office-swap-pages <in.pdf> <out.pdf> <order>
+#                       rebuild a PDF with pages reordered / swapped
+#                       (1,4,3,2) or rotated (6:180), on pypdf, WITHOUT
+#                       re-encoding — copied pages stay byte-identical, the
+#                       same rule ocr-pdf's invisible layer keeps to. Runs on
+#                       the office payload interpreter (it owns pypdf).
+#
+# NO BUILD-TIME GATE is attached to this block, deliberately (unlike the WASM
+# card above): the apt resolution is itself the proof — a package that is not
+# in trixie fails the build loudly at install time, and the wrappers' behaviour
+# is exercised by whoever first runs them against a real file.
+# ---------------------------------------------------------------------
+COPY --chmod=0644 tools/office-swap-pages.py /opt/office-native/office-swap-pages.py
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
+      python3-docx python3-openpyxl; \
+    rm -rf /var/lib/apt/lists/*; \
+    soffice --version; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# office-convert — the native LibreOffice format converter (soffice, headless).' \
+      '# Whole-document compatibility swaps: doc->docx, odt->pdf, ppt->docx, xlsx->csv…' \
+      '# Usage: office-convert <target-ext> <file>...   e.g. office-convert pdf a.docx b.odt' \
+      '# Output files land beside the FIRST input file. For previews and page renders' \
+      '# the dsh-office card is the correct path; this wrapper is the unbounded one.' \
+      '[ "$#" -ge 2 ] || { echo "usage: office-convert <to> <file>... (e.g. office-convert pdf deck.odt)" >&2; exit 64; }' \
+      'for f in "$@"; do [ -f "$f" ] || { echo "office-convert: not a file: $f" >&2; exit 66; }; done' \
+      'to="$1"; shift' \
+      'exec /usr/bin/soffice --headless --norestore --convert-to "$to" --outdir "$(dirname "$1")" -- "$@"' \
+      > /usr/local/bin/office-convert; \
+    chmod 0755 /usr/local/bin/office-convert; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# office-swap-pages — rebuild a PDF with pages reordered / swapped / rotated.' \
+      '# Usage: office-swap-pages <in.pdf> <out.pdf> <order>   e.g. ... 3,1-2  or  1-5,6:180' \
+      '# Runs on the office payload interpreter when present (it owns the pinned' \
+      '# pypdf); any other shell falls back to the system python3.' \
+      'payload=/opt/dsh-office/primary-runtime/dependencies/python/bin/python3' \
+      'if [ -x "$payload" ]; then exec "$payload" /opt/office-native/office-swap-pages.py "$@"; fi' \
+      'exec python3 /opt/office-native/office-swap-pages.py "$@"' \
+      > /usr/local/bin/office-swap-pages; \
+    chmod 0755 /usr/local/bin/office-swap-pages
+
+# ---------------------------------------------------------------------
 # APK / Android reverse-engineering toolchain.
 #
 # WHY IT IS IN THE IMAGE
