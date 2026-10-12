@@ -74,8 +74,13 @@ fi
 #    emulator has (libGL, libX11/xcb, libnss3, libasound) was already there.
 # ---------------------------------------------------------------------
 step "apt: libpulse0 libxdamage1 (emulator runtime libraries)"
+# The image prunes /var/lib/apt/lists at the end of every earlier apt block, so
+# an install without an index refresh fails with "Unable to locate package" —
+# measured in CI, where this exact omission failed three consecutive builds.
 export DEBIAN_FRONTEND=noninteractive
+apt-get update
 apt-get install -y --no-install-recommends libpulse0 libxdamage1
+rm -rf /var/lib/apt/lists/*
 
 # The `kvm` group must EXIST in the image for a compose `group_add: [kvm]` to
 # resolve; the gid does not matter because the device node keeps its own.
