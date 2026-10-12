@@ -13,12 +13,22 @@
 # REQUIREMENTS
 #   * /dev/kvm on the HOST. On a host that is itself a VM, enable nested
 #     virtualisation, otherwise /dev/kvm appears but guests refuse to start.
-#   * `group_add: [kvm]` so the non-root user inside the container may open the
-#     device. The image creates the `kvm` group (docker/emulator-toolchain.sh);
-#     Docker adds the HOST's gid for that name, which is what the device node
-#     actually carries. If the name does not resolve on your host, use the
-#     numeric gid instead:
-#         group_add: ["$(getent group kvm | cut -d: -f3)"]   # e.g. "109"
+#   * access to the device for the non-root user. MEASURED: Docker resolves a
+#     group NAME against the IMAGE's /etc/group, not the host's — so
+#     `group_add: [kvm]` adds whatever gid this image assigned (the image
+#     creates one, docker/emulator-toolchain.sh) and that is only correct when it
+#     happens to equal the gid that owns /dev/kvm on the host. Two reliable ways:
+#
+#       (a) no gid guessing — make the device accessible on the host:
+#             # /etc/udev/rules.d/99-kvm.rules
+#             KERNEL=="kvm", GROUP="kvm", MODE="0666"
+#
+#       (b) pin the host's gid explicitly (compose cannot run `getent`, so put it
+#           in .env):   echo "KVM_GID=$(getent group kvm | cut -d: -f3)" >> .env
+#           and use:     group_add: ["${KVM_GID}"]
+#
+#     Check what the container actually sees before trusting either:
+#       docker run --rm --device /dev/kvm alpine:3 sh -c 'ls -l /dev/kvm; id'
 #
 # VERIFY INSIDE THE CONTAINER
 #   emulator-tools                       # "hardware accel: /dev/kvm present and accessible"

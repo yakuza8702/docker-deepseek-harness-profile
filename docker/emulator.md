@@ -29,7 +29,7 @@ docker compose -f compose.yaml -f compose.emulator.yaml up -d
 or, without compose:
 
 ```bash
-docker run --device /dev/kvm --group-add kvm ...
+docker run --device /dev/kvm ...
 ```
 
 Check it inside the container:
@@ -37,6 +37,28 @@ Check it inside the container:
 ```bash
 ls -l /dev/kvm            # must be readable AND writable
 emulator-tools            # prints "hardware accel: /dev/kvm present and accessible"
+```
+
+**About `group_add` — measured, and easy to get wrong.** Docker resolves a group NAME
+against the **image's** `/etc/group`, not the host's (verified with `docker run --group-add
+kvm alpine id`: it used alpine's own `kvm` gid, and Debian — this image's base family —
+ships no `kvm` group at all, which is why the installer creates one). The device node,
+however, keeps the gid that owns `/dev/kvm` **on the host**. So the name only works if the
+two gids happen to match. Reliable options:
+
+```bash
+# (a) no gid guessing: make the device accessible on the host
+#     /etc/udev/rules.d/99-kvm.rules
+KERNEL=="kvm", GROUP="kvm", MODE="0666"
+
+# (b) pin the host's gid (compose cannot run getent, so put it in .env)
+echo "KVM_GID=$(getent group kvm | cut -d: -f3)" >> .env     # then group_add: ["${KVM_GID}"]
+```
+
+See what the container actually gets before trusting either:
+
+```bash
+docker run --rm --device /dev/kvm alpine:3 sh -c 'ls -l /dev/kvm; id'
 ```
 
 **Without KVM the emulator refuses to start** (`x86_64 emulation currently
