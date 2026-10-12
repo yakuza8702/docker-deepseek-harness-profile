@@ -136,7 +136,19 @@ adb logcat -d | grep -iE 'AndroidRuntime|FATAL'        # crash triage
 * The Linux emulator exists for **x86_64 only**. On an arm64 host this toolchain
   installs nothing and `emulator-tools` says so; static APK analysis still works.
 
-## 8. Inventory and proof
+## 8. Building the image without it
+
+The capability costs ~2.4 GB, and CI pays for it twice (the image layer and the
+buildx cache). A lean build can skip it and still keep the tooling wired:
+
+```bash
+docker build --build-arg WITH_EMULATOR=0 ...
+```
+
+`emulator-tools` then reports "NOT INSTALLED" and everything else in the image is
+unchanged. At runtime `DSH_EMULATOR=0` skips only the boot-time AVD provisioning.
+
+## 9. Inventory and proof
 
 ```bash
 emulator-tools --check     # re-runs the build-time proof:

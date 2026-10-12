@@ -850,8 +850,10 @@ KVM state reported). Full guide: [`docker/emulator.md`](docker/emulator.md) — 
 image at `/opt/emulator-tools/README.md`.
 
 Cost, stated plainly: roughly **2.4 GB** (emulator ~1.0 GB, system image ~1.3 GB), on top
-of the APK toolchain's 0.7 GB. `DSH_EMULATOR=0` at boot skips AVD provisioning; the
-packages stay in the image.
+of the APK toolchain's 0.7 GB — and CI pays it twice, because `cache-to: type=gha,mode=max`
+stores the layers too. `--build-arg WITH_EMULATOR=0` builds the image without it (the
+tooling stays wired and reports itself as not installed); `DSH_EMULATOR=0` at boot skips
+only AVD provisioning.
 
 ## Auto-update workflow
 

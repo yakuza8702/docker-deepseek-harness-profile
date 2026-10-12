@@ -149,7 +149,17 @@ if (fs.existsSync(EMU) && fs.existsSync(propsPath)) {
   );
 
   // (a) the AVD must be discoverable
-  const list = run(EMU, ["-list-avds"], { timeout: 30_000, env: { ANDROID_AVD_HOME: avdHome } });
+  // The probe owns its environment: at build time HOME may be root-owned or
+  // absent, and the emulator writes there before it does anything useful.
+  const probeEnv = {
+    ANDROID_AVD_HOME: avdHome,
+    ANDROID_USER_HOME: avdHome,
+    ANDROID_PREFS_ROOT: avdHome,
+    HOME: avdHome,
+    TMPDIR: avdHome,
+  };
+
+  const list = run(EMU, ["-list-avds"], { timeout: 30_000, env: probeEnv });
   if (`${list.stdout}`.split("\n").map((s) => s.trim()).includes(name)) {
     ok("AVD", `written by hand and discovered (${name})`);
   } else {
@@ -161,7 +171,7 @@ if (fs.existsSync(EMU) && fs.existsSync(propsPath)) {
   const probe = run(
     EMU,
     ["-avd", name, "-no-window", "-no-audio", "-no-snapshot", "-accel", "off", "-verbose"],
-    { timeout: 25_000, env: { ANDROID_AVD_HOME: avdHome } },
+    { timeout: 25_000, env: probeEnv },
   );
   const probeOut = `${probe.stdout}${probe.stderr}`;
   if (/Found systemPath/i.test(probeOut)) {

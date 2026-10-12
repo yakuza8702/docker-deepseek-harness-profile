@@ -798,12 +798,21 @@ RUN node /opt/ocr-tools/check.mjs
 ARG EMU_API=android-36
 ARG EMU_TAG=google_apis
 ARG EMU_ABI=x86_64
+# Escape hatch for lean builds: `--build-arg WITH_EMULATOR=0` skips the ~2.4 GB
+# and leaves `emulator-tools` reporting the capability as not installed. Useful
+# when the CI disk or the buildx gha cache (10 GB per repo) is the constraint —
+# the capability is then built on demand instead of on every push.
+ARG WITH_EMULATOR=1
 
 COPY --chmod=0755 docker/emulator-toolchain.sh /tmp/emulator-toolchain.sh
 COPY --chmod=0755 docker/emulator-tools.sh /usr/local/bin/emulator-tools
 RUN set -eux; \
-    EMU_API="${EMU_API}" EMU_TAG="${EMU_TAG}" EMU_ABI="${EMU_ABI}" \
-      /tmp/emulator-toolchain.sh; \
+    if [ "${WITH_EMULATOR}" = "1" ]; then \
+      EMU_API="${EMU_API}" EMU_TAG="${EMU_TAG}" EMU_ABI="${EMU_ABI}" \
+        /tmp/emulator-toolchain.sh; \
+    else \
+      echo "emulator: skipped (WITH_EMULATOR=0)"; \
+    fi; \
     rm -f /tmp/emulator-toolchain.sh
 
 # The AVD and the Gradle cache must live on the writable workspace: the rootfs is
@@ -817,7 +826,9 @@ ENV ANDROID_AVD_HOME=/workspace/.android/avd \
 # The build-time proof (also runnable in a live container: `emulator-tools --check`).
 COPY --chmod=0644 docker/emulator.md /opt/emulator-tools/README.md
 COPY --chmod=0644 tools/check-emulator-toolchain.mjs /opt/emulator-tools/check.mjs
-RUN node /opt/emulator-tools/check.mjs
+RUN set -eux; \
+    if [ "${WITH_EMULATOR}" = "1" ]; then node /opt/emulator-tools/check.mjs; \
+    else echo "emulator check: skipped (WITH_EMULATOR=0)"; fi
 
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \
