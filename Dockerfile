@@ -908,9 +908,15 @@ RUN set -eux; \
 # The AVD and the Gradle cache must live on the writable workspace: the rootfs is
 # read-only at run time, and a JVM tool resolving user.home = /home/node (which
 # is read-only here) fails with "Read-only file system" rather than a clear error.
+# ANDROID_PREFS_ROOT is deliberately NOT set. It is the legacy alias of
+# ANDROID_USER_HOME, and AGP refuses to configure a project when both are present
+# ("Several environment variables and/or system properties contain different paths to
+# the Android Preferences folder") — measured, and it is not about the values being
+# different: setting both to the SAME path still fails. Anyone overriding one of them
+# — the natural thing to do when giving the AVD its own volume — would otherwise turn
+# every Gradle build into that error. One variable, one meaning.
 ENV ANDROID_AVD_HOME=/workspace/.android/avd \
     ANDROID_USER_HOME=/workspace/.android \
-    ANDROID_PREFS_ROOT=/workspace/.android \
     GRADLE_USER_HOME=/workspace/.gradle
 
 # The build-time proof (also runnable in a live container: `emulator-tools --check`).

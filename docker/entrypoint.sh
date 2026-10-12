@@ -756,6 +756,16 @@ fi
 # `~/.dsh` and `$DSH_HOME` to the same directory.
 ensure_home_alias || true
 
+# The image no longer sets ANDROID_PREFS_ROOT at all: it is the legacy alias of
+# ANDROID_USER_HOME, and AGP fails to configure a project when BOTH are present, even when they
+# hold the same path (measured — see the note in the Dockerfile). A user or an older compose file
+# may still export it, so it is dropped whenever the modern name is in play rather than leaving a
+# build to die with "different paths to the Android Preferences folder".
+if [ -n "${ANDROID_USER_HOME:-}" ] && [ -n "${ANDROID_PREFS_ROOT:-}" ]; then
+  echo "entrypoint: ignoring ANDROID_PREFS_ROOT (legacy alias of ANDROID_USER_HOME; both together break AGP)"
+  unset ANDROID_PREFS_ROOT
+fi
+
 # The emulator's AVD, so a session can boot Android without preparing anything.
 provision_emulator_avd || true
 
