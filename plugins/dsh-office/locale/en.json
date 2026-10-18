@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Office documents",
+    "description": "Word, PowerPoint, Excel and PDF work for the model: create, read and edit .docx/.pptx/.xlsx with the harness's own Office skills on a pinned Python payload, render any page or worksheet to an image so a vision model can actually look at it, convert to PDF, and check the file's structure before it is delivered. Switch it off to release the office skills and their tool from every request."
+  }
+}

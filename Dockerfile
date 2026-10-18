@@ -1,0 +1,973 @@
+# syntax=docker/dockerfile:1
+# =====================================================================
+# seek-harness — hardened DeepSeek Harness container
+#
+# Provenance:
+#   * Official upstream : @deepseek-ai/dsh npm package (deepseek-ai/deepseek-harness)
+#   * smanx             : complete devtools package set + the "0.0.0.0 fix"
+#                         (built-in Node reverse proxy 0.0.0.0 -> 127.0.0.1 with
+#                         HTTP+WS forwarding, optional Basic Auth, and a
+#                         crypto.randomUUID polyfill for non-secure LAN pages)
+#   * runzhliu          : security hardening (non-root UID 1000, tini, fixed
+#                         pnpm, build-time version pin+verify, HOME=/workspace
+#                         dir-selector fix, --expose-internals only for the DSH
+#                         main process). Its Chromium/Xvfb/noVNC desktop stack is
+#                         adopted here (see "browser desktop" below), with Brave
+#                         instead of Chromium and a SINGLE public port.
+#   * This repo         : Docker access — pass a mounted docker.sock (with
+#                         group_add) OR a Docker proxy over TCP via
+#                         DOCKER_HOST env var. docker CLI + compose plugin
+#                         included.
+#
+# Base: node:24-trixie (Debian 13, glibc 2.41, non-slim buildpack-deps) —
+# chosen by runzhliu so newer prebuilt agent binaries keep working.
+# =====================================================================
+
+ARG NODE_IMAGE=node:24-trixie
+
+# ---------------------------------------------------------------------
+# Stage 1 — obtain the OFFICIAL DeepSeek Harness release, pin and verify
+# the exact version at build time (runzhliu pattern).
+#
+# Two channels (see README "Release channels"):
+#   DSH_SOURCE_REF=""           -> npm channel: install @deepseek-ai/dsh
+#                                  <DSH_VERSION> from the npm registry
+#                                  (DEFAULT — what runzhliu & smanx do)
+#   DSH_SOURCE_REF=<github tag> -> source channel: clone the official repo
+#                                  at that tag (e.g. dsh-v0.1.2-alpha.1)
+#                                  and build the monorepo. For GitHub
+#                                  pre-releases/alphas that are not (yet)
+#                                  published to npm. Slower, larger image.
+# ---------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS dsh-fetch
+ARG DSH_VERSION=latest
+ARG DSH_SOURCE_REF
+WORKDIR /opt/dsh
+RUN mkdir -p /opt/dsh /src
+
+# npm channel
+RUN if [ -z "${DSH_SOURCE_REF}" ]; then \
+      npm init -y >/dev/null 2>&1 \
+   && npm install --omit=dev --no-audit --no-fund "@deepseek-ai/dsh@${DSH_VERSION}" \
+   && node -p "require('/opt/dsh/node_modules/@deepseek-ai/dsh/package.json').version" > /opt/dsh/.dsh-version \
+   && echo "fetched @deepseek-ai/dsh $(cat /opt/dsh/.dsh-version) (npm)" \
+   && /opt/dsh/node_modules/.bin/dsh --version; \
+    fi
+
+# source channel (github tag, incl. pre-releases/alphas missing from npm)
+RUN if [ -n "${DSH_SOURCE_REF}" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends git python3 \
+   && rm -rf /var/lib/apt/lists/* \
+   && git clone --depth 1 --branch "${DSH_SOURCE_REF}" https://github.com/deepseek-ai/deepseek-harness.git /src \
+   && npm install -g --no-audit --no-fund pnpm@10 \
+   && cd /src \
+   && (pnpm install --frozen-lockfile || pnpm install) \
+   && pnpm run build \
+   && node -p "require('/src/package.json').version" > /src/.dsh-version \
+   && echo "built @deepseek-ai/dsh $(cat /src/.dsh-version) (source ${DSH_SOURCE_REF})" \
+   && node /src/apps/cli/lib/bin.js --version; \
+    fi
+
+# ---------------------------------------------------------------------
+# Stage 2 — runtime
+# ---------------------------------------------------------------------
+FROM ${NODE_IMAGE}
+ARG DSH_VERSION=latest
+ARG DSH_SOURCE_REF
+ARG PNPM_VERSION=10
+ARG TARGETARCH=amd64
+LABEL org.opencontainers.image.title="seek-harness" \
+      org.opencontainers.image.description="Hardened DeepSeek Harness container — smanx devtools + 0.0.0.0 reverse-proxy fix + runzhliu hardening + docker.sock/TCP support + official Browser Use with a visible Brave desktop on the SAME port (path-routed, human takeover)" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/yakuza8702/docker-deepseek-harness" \
+      org.opencontainers.image.version="${DSH_VERSION}"
+
+ENV NPM_CONFIG_CACHE=/tmp/.npm-cache \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
+
+# smanx devtools-latest package set (merged with runzhliu extras):
+#   smanx devtools-latest : git curl wget nano jq procps ca-certificates unzip
+#                           vim openssh-client zip htop tmux tree openssl
+#                           python3 build-essential bash-completion + pnpm + uv
+#   runzhliu extras       : less ripgrep rsync (build-essential/git/curl/...
+#                           already ship inside node:24-trixie buildpack-deps)
+#   this build            : docker-ce-cli + docker-compose-plugin +
+#                           docker-buildx-plugin (socket/TCP engine access;
+#                           without buildx `docker build` silently falls back
+#                           to the DEPRECATED legacy builder and every
+#                           `docker buildx` call is "unknown command"),
+#                           tini (init, orphan reaping),
+#                           bubblewrap (DSH Linux bwrap sandbox backend)
+#   browser desktop       : the virtual display + VNC stack the visible browser
+#                           runs on (Xvfb -> openbox -> x11vnc -> websockify +
+#                           noVNC). Same set runzhliu ships: x11-utils provides
+#                           xdpyinfo (the entrypoint waits for the display with
+#                           it) and the fonts keep real web pages readable,
+#                           including CJK.
+RUN set -eux; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" \
+      > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      nano jq unzip vim zip htop tmux tree openssl python3 bash-completion \
+      less ripgrep rsync procps ca-certificates \
+      tini bubblewrap \
+      docker-ce-cli docker-compose-plugin docker-buildx-plugin \
+      xvfb x11vnc x11-utils openbox websockify novnc \
+      fonts-liberation fonts-noto-cjk; \
+    rm -rf /var/lib/apt/lists/*
+
+# Brave — the browser the desktop runs (user's choice; it is also the browser
+# they use locally). Installed from Brave's official APT repository, added here
+# explicitly with its keyring rather than via a curl|bash installer.
+#   * Shields do ad blocking natively, so no ad-block extension is needed
+#   * Chrome Web Store extensions still install normally
+#   * ANY Debian Chromium fork would work; swap this block for
+#     `apt-get install chromium` to drop the third-party repo.
+ARG BRAVE_APT_URL=https://brave-browser-apt-release.s3.brave.com
+RUN set -eux; \
+    install -m 0755 -d /usr/share/keyrings; \
+    curl -fsSL --retry 3 -o /usr/share/keyrings/brave-browser-archive-keyring.gpg \
+      "${BRAVE_APT_URL}/brave-browser-archive-keyring.gpg"; \
+    chmod 0644 /usr/share/keyrings/brave-browser-archive-keyring.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] ${BRAVE_APT_URL}/ stable main" \
+      > /etc/apt/sources.list.d/brave-browser-release.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends brave-browser; \
+    rm -rf /var/lib/apt/lists/*; \
+    brave-browser --version
+
+# uv (static binary) — many community DSH MCP servers launch via "uvx"
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh \
+ && uv --version
+
+# pnpm pinned at build (required by `dsh plugin ...` and plugin marketplaces)
+RUN npm install -g --no-audit --no-fund "pnpm@${PNPM_VERSION}" \
+ && pnpm --version
+
+# Official DSH release from stage 1 + CLI on PATH (version re-verified here).
+#   npm channel    -> /opt/dsh/node_modules/.bin/dsh
+#   source channel -> /opt/dsh-src (cloned + built monorepo incl. node_modules)
+COPY --from=dsh-fetch /opt/dsh /opt/dsh
+COPY --from=dsh-fetch /src /opt/dsh-src
+RUN if [ -f /opt/dsh/node_modules/.bin/dsh ]; then \
+      ln -sfn /opt/dsh/node_modules/.bin/dsh /usr/local/bin/dsh \
+   && echo "installed @deepseek-ai/dsh $(cat /opt/dsh/.dsh-version) (npm)"; \
+    else \
+      ln -sfn /opt/dsh-src/apps/cli/lib/bin.js /usr/local/bin/dsh \
+   && echo "installed @deepseek-ai/dsh $(cat /opt/dsh-src/.dsh-version) (source)"; \
+    fi \
+ && dsh --version
+
+# ---------------------------------------------------------------------
+# Official Browser Use — the model-facing half of the browser stack.
+#
+# The browser-use packages are published SEPARATELY from the core and carry
+# their own dist-tags, so they are installed at the CORE's resolved version:
+# their `latest` tag lags the core (0.1.6-alpha.1 while the core is 0.2.0-rc.2),
+# and installing a mismatched pair fails at load time. If a future core release
+# has no matching browser-use release yet, the build falls back to the package's
+# `next` tag and says so loudly instead of failing — which is what keeps the
+# unpinned, auto-following build in the workflow working.
+#
+# PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 is load-bearing: @playwright/mcp depends on
+# the full `playwright` package, whose install script downloads Chromium,
+# Firefox and WebKit (~500 MB) that this image never uses — the provider runs in
+# ATTACH mode against the desktop browser over CDP.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# The packages are installed into a SCRATCH prefix and then merged in, rather
+# than `npm install --prefix /opt/dsh ...`: a plain install re-resolves the
+# installation's whole dependency tree, which would silently upgrade the very
+# core version stage 1 pinned and verified. Packages the core already provides
+# are kept at the core's version (the peers are satisfied by it by construction);
+# only genuinely new packages are copied in.
+RUN set -eux; \
+    if [ -f /opt/dsh/.dsh-version ]; then T=/opt/dsh; else T=/opt/dsh-src; fi; \
+    V="$(cat "$T/.dsh-version")"; \
+    BU="$V"; \
+    if ! npm view "@deepseek-ai/dsh-browser-use@${BU}" version >/dev/null 2>&1; then \
+      BU="$(npm view '@deepseek-ai/dsh-browser-use' dist-tags.next 2>/dev/null || true)"; \
+      echo "WARNING: @deepseek-ai/dsh-browser-use@${V} is not published; falling back to the 'next' tag (${BU}) — the browser integration may not match the core runtime"; \
+    fi; \
+    [ -n "$BU" ] || { echo "ERROR: could not resolve any browser-use version"; exit 1; }; \
+    echo "browser-use ${BU} (core ${V}) -> ${T}/node_modules"; \
+    SB=/tmp/browser-use-install; rm -rf "$SB"; mkdir -p "$SB"; \
+    cd "$SB"; \
+    npm init -y >/dev/null 2>&1; \
+    npm install --omit=dev --no-audit --no-fund \
+      "@deepseek-ai/dsh-browser-use@${BU}" \
+      "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp@${BU}"; \
+    for p in "$SB"/node_modules/* "$SB"/node_modules/@*/*; do \
+      [ -e "$p" ] || continue; \
+      rel="${p#"$SB"/node_modules/}"; \
+      if [ -e "$T/node_modules/$rel" ]; then \
+        echo "kept the core copy of $rel"; \
+      else \
+        mkdir -p "$(dirname "$T/node_modules/$rel")"; \
+        cp -a "$p" "$T/node_modules/$rel"; \
+        echo "added $rel"; \
+      fi; \
+    done; \
+    rm -rf "$SB"; \
+    node -e 'const p=process.argv[1];for(const n of ["@deepseek-ai/dsh-browser-use","@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]){console.log("installed",n,require(p+"/node_modules/"+n+"/package.json").version)}' "$T"
+
+# ---------------------------------------------------------------------
+# Make the attached browser usable from EVERY Session instead of exactly one.
+#
+# Upstream passes `exclusive: config.mode === "attach"`, which reserves the
+# browser for a single live Session; every other Session is skipped silently and
+# permanently ("A busy attachment skips startup permanently for that live
+# activation" — runtime README, Known Limitations). In a container that boots with
+# sessions already open, the winner of that race is whichever activation happens
+# first, often not the session you are looking at, so browser tools appear to be
+# missing at random and closing the "owner" does not bring them back.
+#
+# The patch makes the provider non-exclusive: each live Session gets its own MCP
+# client attached to the SAME visible browser, so the tools are always present and
+# human takeover still works. The honest trade-off: it is one browser, so cookies,
+# logins and tabs are shared between Sessions, and two Sessions driving it at once
+# compete for the active tab. DSH_BROWSER_USE_EXCLUSIVE=1 restores upstream.
+#
+# Content-anchored and idempotent, and it FAILS THE BUILD if upstream changes that
+# expression — an upstream refactor must never silently restore the behaviour this
+# fork removed. Same philosophy as tools/apply-profile-patch.mjs.
+# ---------------------------------------------------------------------
+COPY tools/patch-browser-use-exclusivity.mjs /tmp/patch-browser-use-exclusivity.mjs
+RUN set -eux; \
+    node /tmp/patch-browser-use-exclusivity.mjs /opt/dsh/node_modules /opt/dsh-src/node_modules; \
+    rm -f /tmp/patch-browser-use-exclusivity.mjs
+
+# ---------------------------------------------------------------------
+# Landlock launcher — the confinement backend DSH's sandbox modes need.
+#
+# DSH's Linux runner chain is `bwrap` then `landlock` (probed in order). bwrap
+# needs unprivileged user namespaces, which this container refuses BY DESIGN
+# (`cap_drop: ALL` + `no-new-privileges` + the daemon's seccomp profile), so the
+# chain always falls through to the Landlock launcher — and without that binary
+# every confined permission mode fails closed ("no backend usable").
+#
+# The binary ships in the per-platform npm package
+# `@deepseek-ai/node-addon-system-<platform>-<arch>` and is resolved by
+# `launcherPath()`. It is an OPTIONAL dependency of the install, so a build that
+# skipped optional deps, or a source-channel monorepo build that only linked the
+# workspace copy, can be missing it. tools/ensure-landlock-launcher.mjs provides
+# it in EITHER channel, then proves it with the real functional probe
+# (`landlock-run --probe` builds and enforces a maximal ruleset, so a kernel that
+# has the syscalls but refuses enforcement reads as unusable) and FAILS THE BUILD
+# otherwise. The tool resolves the launcher through the installed package's own
+# `launcherPath()` first and falls back to the platform-package locations every
+# channel actually produces — the root's node_modules (npm), the API package's
+# own fallback directory, the pnpm store sibling and the source workspace's
+# in-tree `native/system/packages/<platform>/bin/` — so an upstream layout change
+# cannot silently skip this step (an earlier version read only the npm layout and
+# broke every source-channel build; the step before that computed
+# `native/landlock-run/packages/linux-${TARGETARCH}`, which stopped matching
+# upstream, and Docker's `TARGETARCH` (amd64/arm64) never matched the package
+# names (x64/arm64) either).
+#
+# CONSEQUENCE FOR DEPLOYMENTS: nothing to download and nothing to mount. The
+# compose file no longer asks for a Landlock bind-mount; images built before this
+# change can keep their mount (it is simply redundant now).
+# ---------------------------------------------------------------------
+COPY tools/ensure-landlock-launcher.mjs /tmp/ensure-landlock-launcher.mjs
+RUN set -eux; \
+    node /tmp/ensure-landlock-launcher.mjs /opt/dsh /opt/dsh-src; \
+    rm -f /tmp/ensure-landlock-launcher.mjs
+
+# ---------------------------------------------------------------------
+# The harness home must be unambiguous in EVERY shell.
+#
+# DSH resolves its user data as `--dsh-home` > `$DSH_HOME` > `~/.dsh`
+# (@deepseek-ai/dsh-home-paths) while this image sets HOME=/workspace (the Web
+# UI's directory picker treats the mounted workspace as home) and the harness
+# home is /home/node/.dsh. A shell that starts WITHOUT the image environment
+# (su -, ssh, a console with a scrubbed env) therefore resolves `~/.dsh` to a
+# phantom home, and a `dsh plugin … add` run there installs into a directory the
+# launcher never reads. The entrypoint also symlinks ~/.dsh to the real home;
+# these two files make the env itself consistent for interactive and login
+# shells, so the documented path works even before the alias is in place.
+# ---------------------------------------------------------------------
+RUN printf '%s\n' \
+      '# DeepSeek Harness home — see the image docs. `~/.dsh` is symlinked to this' \
+      '# directory by the entrypoint, so both spellings are the same place.' \
+      ': "${DSH_HOME:=/home/node/.dsh}"' \
+      'export DSH_HOME' \
+      > /etc/profile.d/10-dsh-home.sh \
+ && chmod 0644 /etc/profile.d/10-dsh-home.sh \
+ && printf '%s\n' \
+      '' \
+      '# DeepSeek Harness home (see /etc/profile.d/10-dsh-home.sh).' \
+      ': "${DSH_HOME:=/home/node/.dsh}"' \
+      'export DSH_HOME' \
+      >> /etc/bash.bashrc
+
+# Reverse proxy ("0.0.0.0 fix", smanx pattern) + entrypoint + recovery surface.
+# recovery.mjs is imported by the proxy: it renders the boot-failure screen and
+# serves its API while the harness itself is down.
+# lockfile-integrity.mjs runs from the entrypoint BEFORE dsh starts (see the
+# guard block there): pnpm refuses a lockfile tarball resolution without an
+# integrity unless the URL is git-hosted, so one Market install of a curated
+# release-archive plugin bricks every install in that profile.
+COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs docker/lockfile-integrity.mjs /opt/seek-harness/
+RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
+ && ln -sfn /opt/seek-harness/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# The lockfile guard must recognise exactly the shapes pnpm accepts without an
+# integrity (and refuse everything else). A wrong predicate either misses the
+# bricked profile or rewrites an entry pnpm was happy with, so its decision table
+# is a build gate: well-formed fixtures in, expected classifications out, plus
+# the exact rewritten line pnpm itself writes. Offline — no network in the gate.
+RUN node /opt/seek-harness/lockfile-integrity.mjs --self-test
+
+# Gate the recovery page's inline JavaScript BEFORE it can ship.
+#
+# The page is emitted from a template literal, so one mistake in it (an escape
+# that is not double-escaped, or a stray backtick) is not cosmetic: the served
+# page carries a SyntaxError in its single inline script, no listener is attached,
+# and EVERY button on the surface a user needs when the harness is down stops
+# working. That regression shipped on 2026-10-02 and this build step makes the
+# class unshippable: it renders the page in every boot state, parses what the
+# browser would receive, and fails the build on a syntax error or a control that
+# lost its wiring.
+COPY tools/check-recovery-page.mjs /tmp/check-recovery-page.mjs
+RUN node /tmp/check-recovery-page.mjs /opt/seek-harness/recovery.mjs \
+ && rm -f /tmp/check-recovery-page.mjs
+
+# Give the Plugins page a slot ABOVE its groups, so this image can put its
+# integrated feature and the market selector there the way DSH Desktop does (see
+# plugins/dsh-plugins-page-extras/README.md). Desktop patches the same package for
+# the same reason; here it is content-anchored, idempotent and FAILS THE BUILD if
+# upstream moves either anchor.
+COPY tools/patch-plugin-manager-page.mjs /tmp/patch-plugin-manager-page.mjs
+RUN node /tmp/patch-plugin-manager-page.mjs /opt/dsh/node_modules /opt/dsh-src/node_modules \
+ && rm -f /tmp/patch-plugin-manager-page.mjs
+
+# Give the sidebar's Settings row a trailing LIST slot, so the file browser and
+# browser-desktop controls can sit BESIDE Settings at the far right instead of in
+# the footer action area — which belongs to whatever panel registers there (the
+# provider-usage panel), and where they used to overlap it and each other in the
+# collapsed rail. The shipped `sidebar.settings` slot is `kind: "single"`, so
+# there is no second seat to use. The step also appends the glyph and rail layout
+# rules to the package's own stylesheet, resolved from that file's own class map,
+# and FAILS THE BUILD if upstream moves an anchor. See
+# tools/patch-sidebar-footer.mjs and plugins/dsh-browser-desktop/README.md.
+COPY tools/patch-sidebar-footer.mjs /tmp/patch-sidebar-footer.mjs
+RUN node /tmp/patch-sidebar-footer.mjs /opt/dsh/node_modules /opt/dsh-src/node_modules \
+ && rm -f /tmp/patch-sidebar-footer.mjs
+
+# Browser launcher. The container drops every capability and sets
+# no-new-privileges, so Brave's setuid/user-namespace sandbox cannot initialise
+# and the browser would refuse to start. Keep the exception scoped to the
+# already-isolated browser process instead of weakening the container.
+RUN printf '%s\n' \
+      '#!/bin/sh' \
+      '# Brave inside this container: the container IS the sandbox boundary' \
+      '# (cap_drop ALL + no-new-privileges), so the in-process sandbox cannot be' \
+      '# used. Call this wrapper, never brave-browser directly.' \
+      'exec /usr/bin/brave-browser --no-sandbox "$@"' \
+      > /usr/local/bin/brave-desktop \
+ && chmod 0755 /usr/local/bin/brave-desktop \
+ && brave-desktop --version
+
+# In-app profile control (dsh-profile-switcher), the visible browser desktop
+# (dsh-browser-desktop) and the workspace file manager (dsh-workspace-browser).
+# The last two are vendored from runzhliu — neither is published to npm; see each
+# plugin's README for its provenance and port notes.
+# All three packages are placed in the DSH installation's node_modules so the
+# launcher can mount them by name from ANY profile; the overlay patches that mount
+# them sit beside the entrypoint that applies them (`--patch`, AFTER the profile
+# layer) — no profile directory in $DSH_HOME is ever edited. Uninstall = remove the
+# overlay (or set DSH_PROFILE_OVERLAY= / DSH_BROWSER_USE_OVERLAY= /
+# DSH_WORKSPACE_BROWSER_OVERLAY=).
+COPY plugins/dsh-profile-switcher /opt/dsh-profile-switcher
+COPY plugins/dsh-browser-desktop /opt/dsh-browser-desktop
+COPY plugins/dsh-workspace-browser /opt/dsh-workspace-browser
+COPY plugins/dsh-browser-mcp /opt/dsh-browser-mcp
+COPY plugins/dsh-brave-devtools-mcp /opt/dsh-brave-devtools-mcp
+COPY plugins/dsh-plugins-page-extras /opt/dsh-plugins-page-extras
+COPY plugins/dsh-office /opt/dsh-office-bundle
+RUN set -eux; \
+    installed=0; \
+    for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
+      if [ -d "$target" ]; then \
+        cp -a /opt/dsh-profile-switcher "$target/dsh-profile-switcher"; \
+        cp -a /opt/dsh-browser-desktop "$target/dsh-browser-desktop"; \
+        cp -a /opt/dsh-workspace-browser "$target/dsh-workspace-browser"; \
+        cp -a /opt/dsh-browser-mcp "$target/dsh-browser-mcp"; \
+        cp -a /opt/dsh-brave-devtools-mcp "$target/dsh-brave-devtools-mcp"; \
+        cp -a /opt/dsh-plugins-page-extras "$target/dsh-plugins-page-extras"; \
+        cp -a /opt/dsh-office-bundle "$target/dsh-office"; \
+        installed=1; \
+      fi; \
+    done; \
+    [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras /opt/dsh-office-bundle; \
+    chmod -R a+rX \
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras /opt/dsh/node_modules/dsh-office \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras /opt/dsh-src/node_modules/dsh-office 2>/dev/null || true
+# The workspace plugin's own suite, kept in the image so the ported host logic can
+# be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
+
+
+# Declare the plugins in the DSH installation's own manifest. This is what makes
+# their bare row names resolvable at boot: the launcher builds a module-resolution
+# table by walking the installation package's dependency closure (a package that
+# merely sits in node_modules is invisible to the loader — it fails with
+# "failed to import"), and `client-modules` scans loader entries for packages
+# declaring `dsh.client`, which needs the specifier to be a package name.
+#
+# It is ALSO what puts a bundle on the Plugins page: the plugin manager builds that
+# list from `dsh.profile.bundles` ∪ the profile's dependencies ∪ the INSTALLATION's
+# dependencies, and gives every entry with a `dsh.bundle.patch` a switch that
+# selects/deselects it. `dsh-browser-mcp` relies on exactly that — declare it here
+# or it is invisible in the UI no matter what else is done.
+RUN set -eux; \
+    for spec in "/opt/dsh/node_modules/@deepseek-ai/dsh/package.json:/opt/dsh/node_modules" "/opt/dsh-src/apps/cli/package.json:/opt/dsh-src/node_modules"; do \
+      anchor="${spec%%:*}"; root="${spec##*:}"; \
+      [ -f "$anchor" ] || continue; \
+      [ -d "$root/dsh-browser-desktop" ] || continue; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "dsh-office", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
+    done
+COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
+COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
+COPY --chmod=0644 docker/workspace-browser.overlay.yml /opt/seek-harness/workspace-browser.overlay.yml
+COPY --chmod=0644 docker/plugins-page.overlay.yml /opt/seek-harness/plugins-page.overlay.yml
+
+# Gate the profile controls: the create CHOOSER and "Reset to Default".
+#
+# The pill's "+ New Profile" asks how a profile should start, which makes the
+# answer a contract: `mode: "new"` has to produce a STOCK profile (two bundles, no
+# dependencies, no node_modules, none of the source's patch layer) while a caller
+# that sends no mode — the recovery page, an older client bundle — must keep
+# getting the copy. The row's `Reset to Default` is the same skeleton written into
+# an EXISTING profile, so it must wipe it and leave nothing of the old plugin set
+# behind. The gate EXECUTES the plugin's own HTTP route against a throwaway
+# $DSH_HOME for all of it, MOUNTS the browser half on a stub React runtime and
+# clicks the chooser and the row controls through, and, when the image carries
+# `dsh-app-boot`, proves the local fallback skeleton is byte-identical to
+# `initProfile`'s output so a fresh profile cannot differ between the npm and
+# source channels. See tools/check-profile-switcher.mjs.
+COPY --chmod=0644 tools/check-profile-switcher.mjs /tmp/check-profile-switcher.mjs
+RUN node /tmp/check-profile-switcher.mjs /opt/dsh /opt/dsh-src \
+ && rm -f /tmp/check-profile-switcher.mjs
+
+# The browser tooling as ONE switchable MCP row. The fragment is what the
+# entrypoint splices into a profile's own patch layer (the layer the Plugin
+# list's switch writes to — an overlay row could never be switched off, see
+# plugins/dsh-browser-mcp/README.md), and the wrapper is what that row spawns.
+#
+# @playwright/mcp is the server behind those tools. It arrives as a dependency of
+# the browser-use provider, which is still installed (the provider remains an
+# opt-in alternative), and this step FAILS THE BUILD if it is ever missing: the
+# row would otherwise be seeded into profiles and then fail to start, which looks
+# exactly like a broken plugin.
+COPY --chmod=0644 plugins/dsh-browser-mcp/cordis.patch.yml /opt/seek-harness/browser-mcp.patch.yml
+RUN set -eux; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# The browser MCP server this image offers as the switchable row `browser-mcp`:' \
+      '# the pinned @playwright/mcp that ships inside the image, started in attach' \
+      '# mode against the visible Brave desktop over CDP. A stable path, so the row' \
+      '# never has to know whether DSH came from the npm channel (/opt/dsh) or the' \
+      '# source channel (/opt/dsh-src).' \
+      'for root in /opt/dsh /opt/dsh-src; do' \
+      '  cli="$root/node_modules/@playwright/mcp/cli.js"' \
+      '  if [ -f "$cli" ]; then exec node "$cli" "$@"; fi' \
+      'done' \
+      'echo "dsh-playwright-mcp: @playwright/mcp is not installed in this image" >&2' \
+      'exit 127' \
+      > /usr/local/bin/dsh-playwright-mcp; \
+    chmod 0755 /usr/local/bin/dsh-playwright-mcp; \
+    found=""; \
+    for root in /opt/dsh /opt/dsh-src; do \
+      if [ -f "$root/node_modules/@playwright/mcp/cli.js" ]; then found="$root"; fi; \
+    done; \
+    [ -n "$found" ] || { echo "ERROR: @playwright/mcp is missing — the switchable browser MCP row would fail to start"; exit 1; }; \
+    echo "browser MCP: @playwright/mcp present in $found"
+
+# The browser TROUBLESHOOTING row (`brave-devtools-mcp`, "Browser tools brave").
+#
+# `brave-mcp` (github.com/triuzzi/brave-devtools-mcp — a Brave-native fork of
+# Chrome DevTools MCP) is what turns "the page looks wrong" into evidence: the
+# console with source-mapped stacks, every network request and its status, the CSS
+# cascade, performance traces with insight sets, Lighthouse audits, heap
+# snapshots. It ATTACHES to the same visible Brave desktop over loopback CDP
+# (127.0.0.1:$DSH_CDP_PORT, which start_desktop already passes to Brave as
+# --remote-debugging-address/-port), so the model and the human share one browser
+# and nothing here ever launches or downloads a second one.
+#
+# WHY IT IS PINNED AND INSTALLED, RATHER THAN `npx -y brave-mcp@latest`
+#   * a boot would then depend on the npm registry being reachable: an offline or
+#     rate-limited container would lose 30 tools at random, which is
+#     indistinguishable from a broken plugin;
+#   * `@latest` moves under the user without a rebuild — the tool surface (and so
+#     its context cost) would change on a restart, and a bad upstream release
+#     would land on the next restart instead of the next build.
+# Bump BRAVE_MCP_VERSION and rebuild to move it; the gate below re-runs a real
+# handshake, so a broken bump cannot ship.
+#
+# It lives in its OWN prefix rather than in the DSH installation's node_modules:
+# upstream's rollup bundle makes `npm install brave-mcp` add exactly one package
+# with no transitive tree, and only BUNDLES have to be resolvable by the loader —
+# this one is a child process the row spawns.
+ARG BRAVE_MCP_VERSION=1.9.0
+RUN set -eux; \
+    npm install --prefix /opt/brave-mcp --omit=dev --no-audit --no-fund "brave-mcp@${BRAVE_MCP_VERSION}"; \
+    installed="$(node -p 'require("/opt/brave-mcp/node_modules/brave-mcp/package.json").version')"; \
+    [ "$installed" = "${BRAVE_MCP_VERSION}" ] || { echo "ERROR: installed brave-mcp ${installed}, expected ${BRAVE_MCP_VERSION}"; exit 1; }; \
+    [ -f /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js ] \
+      || { echo "ERROR: the brave-mcp package carries no build/src/bin/brave-devtools-mcp.js"; exit 1; }; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# The DevTools MCP server this image offers as the switchable row' \
+      '# `brave-devtools-mcp` ("Browser tools brave"): the pinned brave-mcp that' \
+      '# ships inside the image, started in attach mode against the visible Brave' \
+      '# desktop over loopback CDP. A stable path, so the row never has to know' \
+      '# where the package lives — and never runs npx.' \
+      'exec node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
+      > /usr/local/bin/dsh-brave-devtools-mcp; \
+    chmod 0755 /usr/local/bin/dsh-brave-devtools-mcp; \
+    echo "browser DevTools: brave-mcp ${installed} behind /usr/local/bin/dsh-brave-devtools-mcp"
+
+# The row works only while FOUR pieces agree — the server above, the bundle patch
+# that mounts the row, the Plugins-page switch (host table + client row) and the
+# page's duplicate-card suppression. One of them missing still produces a healthy
+# image and a dead switch, so this gate EXECUTES the server through the wrapper
+# (a real MCP handshake — brave-mcp connects to the browser lazily, so no browser
+# is needed at build time) and reads the other three out of the installed files.
+# See tools/check-brave-mcp.mjs.
+COPY --chmod=0644 tools/check-brave-mcp.mjs /tmp/check-brave-mcp.mjs
+RUN node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
+ && rm -f /tmp/check-brave-mcp.mjs
+
+# ---------------------------------------------------------------------
+# Office documents — Word, PowerPoint, Excel and PDF work for the model.
+#
+# WHY IT IS IN THE IMAGE
+# The harness ships the whole feature and mounts none of it in a plain container:
+# `@deepseek-ai/dsh-skill-office` carries the three skills (office-docx,
+# office-pptx, office-xlsx) plus the standard-library check_office.py structural
+# checker, and `@deepseek-ai/libreoffice-kit` carries the rendering engine
+# (LibreOffice compiled to WebAssembly — a prebuilt dependency, nothing to
+# apt-install and nothing to run as a service). What is missing is the interpreter
+# the skills are told to use: they call `load_workspace_dependencies` and run the
+# Python it returns, so a payload has to exist. That payload is what this step
+# assembles, from a lock file pinned by SHA-256.
+#
+# The packages are already in the installation's node_modules (they are ordinary
+# dependencies of the DSH release). What this image adds is:
+#   1. /opt/dsh-office/primary-runtime — the pinned Python 3.12.14 payload with
+#      python-docx, python-pptx, openpyxl, XlsxWriter, Pillow, lxml, numpy, pandas,
+#      and this image's two additions: pypdf and PyMuPDF, which are what make
+#      reading a PDF's text and embedded images possible.
+#   2. /opt/dsh-office/office-skills/pdf-documents — this repository's fourth skill,
+#      for PDFs, discovered through DSH_BUNDLED_SKILL_DIR (set in the entrypoint).
+#   3. the bundle that mounts both rows, so the Plugins page has one switch for it.
+#
+# BOTH ARCHITECTURES ARE COVERED: the lock carries linux-x64 and linux-arm64, and
+# the target is derived from the platform actually being built.
+#
+# The gate EXECUTES the payload and the engine — the interpreter imports every
+# library, the checker passes on a document the payload itself wrote, the engine
+# converts that document to a real PDF and renders a page to a real PNG, and the
+# four declarations that have to agree (bundle patch row, Plugins-page row host
+# table, duplicate-card suppression, entrypoint switch) are read out of the files.
+# See tools/check-office.mjs.
+COPY --chmod=0644 docker/office-runtime.lock.json tools/build-office-payload.mjs /tmp/office/
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      arm64) office_target=linux-arm64 ;; \
+      *) office_target=linux-x64 ;; \
+    esac; \
+    dsh_version="$(node -p "require('/opt/dsh/node_modules/@deepseek-ai/dsh/package.json').version" 2>/dev/null || echo unknown)"; \
+    node /tmp/office/build-office-payload.mjs \
+      --lock /tmp/office/office-runtime.lock.json \
+      --target "$office_target" \
+      --output /opt/dsh-office \
+      --cache /tmp/office-cache \
+      --version "dsh-$dsh_version"; \
+    rm -rf /tmp/office /tmp/office-cache
+COPY --chmod=0644 office-skills /opt/dsh-office/office-skills
+# The gate needs the four declarations, not the whole repository.
+COPY --chmod=0644 plugins/dsh-office/cordis.patch.yml /tmp/office-repo/dsh-office.cordis.patch.yml
+COPY --chmod=0644 plugins/dsh-plugins-page-extras/index.js /tmp/office-repo/plugins-page-extras.index.js
+COPY --chmod=0644 tools/patch-plugin-manager-page.mjs /tmp/office-repo/patch-plugin-manager-page.mjs
+COPY --chmod=0644 docker/entrypoint.sh /tmp/office-repo/entrypoint.sh
+COPY --chmod=0644 tools/check-office.mjs /tmp/check-office.mjs
+RUN node /tmp/check-office.mjs \
+      --payload /opt/dsh-office \
+      --repo /tmp/office-repo \
+      --entrypoint /tmp/office-repo/entrypoint.sh \
+      --install /opt/dsh/node_modules --install /opt/dsh-src/node_modules \
+ && rm -rf /tmp/check-office.mjs /tmp/office-repo
+
+# ---------------------------------------------------------------------
+# Native LibreOffice layout — soffice --headless + system-python docx/xlsx.
+#
+# WHY IT IS IN THE IMAGE
+# The `dsh-office` card above runs LibreOffice compiled to WebAssembly through
+# @deepseek-ai/libreoffice-kit: a good PREVIEW engine, but bounded (100 pages,
+# 16.7M pixels, not resident) and missing the add-on import/export filters of
+# the real build. When an agent needs the REAL engine — a .doc (binary format)
+# swapped to .docx, legacy .ods/.ppt round-tripping, batch-converting a folder,
+# or a page swap that must not pass a bounded renderer — `soffice --headless`
+# is the better-compatibility tool, so it ships here NEXT TO the card, not
+# instead of it.
+#
+# WHAT EACH PIECE BUYS
+#   libreoffice-writer/calc/impress/draw
+#                       the real Word/Excel/PowerPoint/ODF engines, pulled in
+#                       together with libreoffice-core and their full
+#                       import/export filter sets (--no-install-recommends
+#                       keeps out Java, the KDE/GNOME menu integration and the
+#                       wiki/mediawiki filters the conversion path never
+#                       touches; core itself provides the soffice launcher and
+#                       binary). Layout-faithful fonts are ALREADY in the
+#                       image (fonts-liberation + fonts-noto-cjk, installed
+#                       above) and are the same files the WASM engine gets.
+#   python3-docx        python-docx bound to the SYSTEM python3, so
+#                       `python3 -c "import docx"` works in ANY shell the
+#                       agent gets — even one that never reads the payload.
+#                       The office payload interpreter keeps the full pinned
+#                       set (python-pptx, XlsxWriter, Pillow, numpy, pandas…);
+#                       this is the plain-default convenience layer, not a
+#                       second source of truth.
+#   python3-openpyxl    same, for .xlsx/.xlsm read-write on plain python3.
+#                       Debian has no python3-pptx package, so PowerPoint work
+#                       goes through the payload interpreter, where the wheel
+#                       is SHA-256-pinned by the office lock.
+#
+# THE WRAPPERS the agent reaches for instead of memorising flags:
+#   office-convert <to> <file>...
+#                       soffice --headless --convert-to; output lands beside
+#                       each input. `office-convert pdf report.odt` and
+#                       `office-convert docx report/*.doc` both work.
+#   office-swap-pages <in.pdf> <out.pdf> <order>
+#                       rebuild a PDF with pages reordered / swapped
+#                       (1,4,3,2) or rotated (6:180), on pypdf, WITHOUT
+#                       re-encoding — copied pages stay byte-identical, the
+#                       same rule ocr-pdf's invisible layer keeps to. Runs on
+#                       the office payload interpreter (it owns pypdf).
+#
+# NO BUILD-TIME GATE is attached to this block, deliberately (unlike the WASM
+# card above): the apt resolution is itself the proof — a package that is not
+# in trixie fails the build loudly at install time, and the wrappers' behaviour
+# is exercised by whoever first runs them against a real file.
+# ---------------------------------------------------------------------
+COPY --chmod=0644 tools/office-swap-pages.py /opt/office-native/office-swap-pages.py
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
+      python3-docx python3-openpyxl; \
+    rm -rf /var/lib/apt/lists/*; \
+    soffice --version; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# office-convert — the native LibreOffice format converter (soffice, headless).' \
+      '# Whole-document compatibility swaps: doc->docx, odt->pdf, ppt->docx, xlsx->csv…' \
+      '# Usage: office-convert <target-ext> <file>...   e.g. office-convert pdf a.docx b.odt' \
+      '# Output files land beside the FIRST input file. For previews and page renders' \
+      '# the dsh-office card is the correct path; this wrapper is the unbounded one.' \
+      '[ "$#" -ge 2 ] || { echo "usage: office-convert <to> <file>... (e.g. office-convert pdf deck.odt)" >&2; exit 64; }' \
+      'for f in "$@"; do [ -f "$f" ] || { echo "office-convert: not a file: $f" >&2; exit 66; }; done' \
+      'to="$1"; shift' \
+      'exec /usr/bin/soffice --headless --norestore --convert-to "$to" --outdir "$(dirname "$1")" -- "$@"' \
+      > /usr/local/bin/office-convert; \
+    chmod 0755 /usr/local/bin/office-convert; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# office-swap-pages — rebuild a PDF with pages reordered / swapped / rotated.' \
+      '# Usage: office-swap-pages <in.pdf> <out.pdf> <order>   e.g. ... 3,1-2  or  1-5,6:180' \
+      '# Runs on the office payload interpreter when present (it owns the pinned' \
+      '# pypdf); any other shell falls back to the system python3.' \
+      'payload=/opt/dsh-office/primary-runtime/dependencies/python/bin/python3' \
+      'if [ -x "$payload" ]; then exec "$payload" /opt/office-native/office-swap-pages.py "$@"; fi' \
+      'exec python3 /opt/office-native/office-swap-pages.py "$@"' \
+      > /usr/local/bin/office-swap-pages; \
+    chmod 0755 /usr/local/bin/office-swap-pages
+
+# ---------------------------------------------------------------------
+# APK / Android reverse-engineering toolchain.
+#
+# WHY IT IS IN THE IMAGE
+# The harness gets pointed at an .apk ("what does this app actually do, and
+# where does my data go?") and the honest answer without this layer is
+# `unzip` + `strings`: enough for the DEX string table, useless for the real
+# logic — which for a React-Native app is not in the DEX at all, it is a
+# Hermes BYTECODE bundle that neither jadx nor strings can read.
+#
+# WHAT EACH PIECE BUYS
+#   JDK                 jadx, apktool, apksigner, sdkmanager and
+#                       apkanalyzer are all JVM programs
+#   jadx                DEX -> Java source: the readable half of an APK
+#   apktool             binary AndroidManifest + resources.arsc -> real XML,
+#                       plus smali decode/rebuild — the only sane repack path
+#                       (a decompiler cannot produce an APK; this can)
+#   hbctool, hermes-dec Hermes HBC bytecode -> disassembly/decompilation,
+#                       covering different HBC revisions so both ship
+#   frida-tools,        dynamic instrumentation on a target device, dexdump
+#   frida-dexdump,      from memory, and objection's wrapper on top
+#   objection
+#   androguard, apkid   scriptable APK/DEX/AXML analysis WITHOUT a JVM, and
+#                       packer/obfuscator detection
+#   Android SDK         apksigner + zipalign + aapt2 + apkanalyzer: sign,
+#                       align and inspect a rebuilt APK
+#   adb                 talks to a device/emulator when there is one. Taken
+#                       from Debian on purpose: Google's platform-tools zip
+#                       has no aarch64 build, and this image builds for arm64
+#                       too.
+#
+# Nothing here runs at container start and nothing needs a phone, an account
+# or a network call at runtime — it is static-analysis capability for the
+# agent's shell. `apk-tools` prints the inventory from inside a running
+# container; `apk-unpack` is the one-shot entry point.
+#
+# Versions are pinned in docker/apk-toolchain.sh (and every download is
+# checksum-verified against the vendor's own digest), because a silent
+# upstream change would make yesterday's analysis unreproducible. The build
+# then EXECUTES all of it — tools/check-apk-toolchain.mjs fails the build if
+# a tool cannot run, so a broken toolchain cannot ship as a working one.
+#
+# SIZE WARNING: this section adds roughly 0.7 GB to the image (mostly the
+# JDK and the Android SDK). It is the price of being able to answer the
+# question offline instead of downloading a toolchain per session.
+# ---------------------------------------------------------------------
+ARG JADX_VERSION=1.5.6
+ARG APKTOOL_VERSION=3.0.3
+ARG ANDROID_CMDLINE_TOOLS_BUILD=16111833
+ARG ANDROID_BUILD_TOOLS=36.1.0
+ARG ANDROID_PLATFORM=android-36
+
+COPY --chmod=0755 docker/apk-toolchain.sh /tmp/apk-toolchain.sh
+COPY --chmod=0755 docker/apk-tools.sh /usr/local/bin/apk-tools
+COPY --chmod=0755 docker/apk-unpack.sh /usr/local/bin/apk-unpack
+RUN set -eux; \
+    APK_JADX_VERSION="${JADX_VERSION}" \
+    APK_APKTOOL_VERSION="${APKTOOL_VERSION}" \
+    APK_CMDLINE_TOOLS_BUILD="${ANDROID_CMDLINE_TOOLS_BUILD}" \
+    APK_BUILD_TOOLS="${ANDROID_BUILD_TOOLS}" \
+    APK_PLATFORM="${ANDROID_PLATFORM}" \
+      /tmp/apk-toolchain.sh; \
+    rm -f /tmp/apk-toolchain.sh
+
+# JAVA_HOME is /opt/java because the real JDK path carries the architecture
+# (java-21-openjdk-amd64 / -arm64) and tools like Gradle and sdkmanager
+# refuse to guess; the installer points that symlink at whatever apt
+# installed. The tool venv comes FIRST on PATH so `python3` and `pip` stay
+# the same interpreter — `pip install X` then `python3 -c "import X"` must
+# not disagree with itself.
+ENV JAVA_HOME=/opt/java \
+    ANDROID_HOME=/opt/android-sdk \
+    ANDROID_SDK_ROOT=/opt/android-sdk \
+    PATH=/opt/apk-tools/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The build-time proof (also runnable in a live container: `apk-tools --check`).
+COPY --chmod=0644 docker/apk-tools.md /opt/apk-tools/README.md
+COPY --chmod=0644 tools/check-apk-toolchain.mjs /opt/apk-tools/check.mjs
+RUN node /opt/apk-tools/check.mjs
+
+# ---------------------------------------------------------------------
+# OCR for image-only PDFs — the other half of "read this PDF".
+#
+# WHY IT IS IN THE IMAGE
+# The PDF skill could say, truthfully, that a page with no text layer was a
+# scan — and nothing else. That is an honest answer and a useless one: a deck
+# exported as pictures, a photographed form, a contract whose signature pages
+# are scans all arrive as pages whose words exist only as pixels, and the
+# deliverable the user wants is the searchable one they did not have to run a
+# second tool for.
+#
+# THE ENGINE IS TESSERACT 5, and deliberately nothing else. It is the fast,
+# folder-clean one: one process per page, no model session to warm up, no
+# Python wheels to load, no runtime download, and output every other OCR tool is
+# calibrated against. The alternatives (RapidOCR/PP-OCRv4 ONNX, EasyOCR,
+# PaddleOCR) each pull a few hundred MB of runtime and burn CPU on every run for
+# a second opinion this image does not need — so they are not installed, and the
+# driver has no flag that pretends otherwise.
+#
+# WHAT IT DOES NOT DO: improve the picture. The driver adds an INVISIBLE text
+# layer (render mode 3) on top of the page's own content and never re-encodes,
+# re-samples or redraws an image — tesseract's own PDF writer re-renders its
+# copies of the page images, which is how "OCR this PDF" usually becomes
+# "quietly replace this PDF's images". See tools/ocr-pdf.py.
+#
+# The traineddata is shape-checked before it is installed (a 404 that landed as
+# an HTML error page carries no version header), and the build then EXECUTES the
+# surface — tools/check-ocr-toolchain.mjs renders a page whose text it knows,
+# OCRs it through the real driver, requires the words back out of the RESULT and
+# requires the layer to be invisible — so a broken engine cannot ship as a
+# working one.
+#
+# SIZE: roughly 40 MB (the Debian packages plus tessdata_best).
+# ---------------------------------------------------------------------
+ARG OCR_TESSDATA_TIER=best
+
+COPY --chmod=0755 docker/ocr-toolchain.sh /tmp/ocr-toolchain.sh
+COPY --chmod=0755 docker/ocr-tools.sh /usr/local/bin/ocr-tools
+COPY --chmod=0644 tools/ocr-pdf.py /opt/ocr-tools/ocr-pdf.py
+RUN set -eux; \
+    OCR_TESSDATA_TIER="${OCR_TESSDATA_TIER}" \
+      /tmp/ocr-toolchain.sh; \
+    rm -f /tmp/ocr-toolchain.sh
+
+# The driver runs on the payload interpreter (pypdf + PyMuPDF live there), and
+# the wrapper has to be able to find it from anywhere — including a shell whose
+# PATH has been rewritten — so the resolving wrapper is written here rather than
+# guessed at call time.
+COPY --chmod=0644 docker/ocr-pdf.md /opt/ocr-tools/README.md
+COPY --chmod=0644 tools/check-ocr-toolchain.mjs /opt/ocr-tools/check.mjs
+ENV OCR_TESSDATA_DIR=/usr/share/tesseract-ocr/5/tessdata
+RUN set -eux; \
+    python="$(command -v python3)"; \
+    payload=/opt/dsh-office/primary-runtime/dependencies/python/bin/python3; \
+    [ -x "$payload" ] && python="$payload"; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# ocr-pdf — the driver, always on the interpreter that owns pypdf/PyMuPDF.' \
+      '# See /opt/ocr-tools/README.md; the wrapper `ocr-tools` prints the inventory.' \
+      'payload=/opt/dsh-office/primary-runtime/dependencies/python/bin/python3' \
+      'if [ -x "$payload" ]; then exec "$payload" /opt/ocr-tools/ocr-pdf.py "$@"; fi' \
+      'exec python3 /opt/ocr-tools/ocr-pdf.py "$@"' \
+      > /usr/local/bin/ocr-pdf; \
+    chmod 0755 /usr/local/bin/ocr-pdf; \
+    echo "ocr-pdf -> $python"; \
+    /usr/local/bin/ocr-pdf --probe
+
+# The build-time proof (also runnable in a live container: `ocr-tools --check`).
+RUN node /opt/ocr-tools/check.mjs
+
+# ---------------------------------------------------------------------
+# Android EMULATOR — the "what does this app DO" half of APK analysis.
+#
+# WHY IT IS IN THE IMAGE
+# The APK toolchain above answers "what is in this app" from a file. It cannot
+# answer "what does this app DO when it runs": permission prompts, camera
+# capture, WebView rendering, insets on a device with a camera cutout. Those
+# need a booted Android system, and without this layer the only honest answer
+# is "install an emulator first" — a ~2.4 GB download and a long detour in the
+# middle of a task the user asked for now.
+#
+# WHAT EACH PIECE BUYS
+#   emulator          the QEMU-based Android emulator (Linux x86_64 only)
+#   system image      a bootable Android (API) google_apis x86_64, no Play
+#                     account needed and nothing licensed to accept
+#   libpulse0         the emulator binary links libpulse.so.0 DIRECTLY — without
+#                     it the process dies before printing its version
+#   libxdamage1       X11 damage extension, used by the emulator's Qt window
+#   kvm group         so a compose `group_add: [kvm]` resolves by name
+#
+# HARDWARE ACCELERATION IS A RUNTIME DEVICE, NOT A PACKAGE: /dev/kvm is passed
+# to the container by compose.emulator.yaml (or `--device /dev/kvm --group-add
+# kvm`). Without it the emulator REFUSES to start; with `-accel off` it boots
+# but Android's watchdog kills system_server within minutes (measured), so API
+# 34+ is effectively untestable. That is also why the build-time check treats a
+# missing /dev/kvm as a warning: the build has no device, the container does.
+#
+# ARCHITECTURE: Google publishes the Linux emulator for x86_64 ONLY (linux_x64,
+# darwin_x64, darwin_aarch64, windows_x64 — there is no linux_aarch64). On
+# arm64 docker/emulator-toolchain.sh installs nothing and says so, the same way
+# the APK toolchain takes adb from Debian because platform-tools has no aarch64
+# build either. The check is skipped rather than failed there.
+#
+# The AVD is NOT created here: the rootfs is read-only at run time, so
+# docker/entrypoint.sh writes it into $ANDROID_AVD_HOME on the workspace volume
+# (see provision_emulator_avd) and `emulator-tools` owns it from then on.
+#
+# SIZE WARNING: this section adds roughly 2.4 GB (emulator ~1.0 GB, system image
+# ~1.3 GB). It is the price of being able to RUN an APK offline instead of only
+# reading it. Set DSH_EMULATOR=0 at boot to skip AVD provisioning; the packages
+# stay in the image either way.
+# ---------------------------------------------------------------------
+ARG EMU_API=android-36
+ARG EMU_TAG=google_apis
+ARG EMU_ABI=x86_64
+# The gid that owns /dev/kvm on the host this image is built for (Debian/OMV:
+# kvm:x:104:). It goes into the image so the runtime user can open the device
+# without a compose `group_add` line — see docker/emulator-toolchain.sh.
+ARG KVM_GID=104
+# Escape hatch for lean builds: `--build-arg WITH_EMULATOR=0` skips the ~2.4 GB
+# and leaves `emulator-tools` reporting the capability as not installed. Useful
+# when the CI disk or the buildx gha cache (10 GB per repo) is the constraint —
+# the capability is then built on demand instead of on every push.
+ARG WITH_EMULATOR=1
+
+COPY --chmod=0755 docker/emulator-toolchain.sh /tmp/emulator-toolchain.sh
+COPY --chmod=0755 docker/emulator-tools.sh /usr/local/bin/emulator-tools
+RUN set -eux; \
+    if [ "${WITH_EMULATOR}" = "1" ]; then \
+      EMU_API="${EMU_API}" EMU_TAG="${EMU_TAG}" EMU_ABI="${EMU_ABI}" KVM_GID="${KVM_GID}" \
+        /tmp/emulator-toolchain.sh; \
+    else \
+      echo "emulator: skipped (WITH_EMULATOR=0)"; \
+    fi; \
+    rm -f /tmp/emulator-toolchain.sh
+
+# The AVD and the Gradle cache must live on the writable workspace: the rootfs is
+# read-only at run time, and a JVM tool resolving user.home = /home/node (which
+# is read-only here) fails with "Read-only file system" rather than a clear error.
+# ANDROID_PREFS_ROOT is deliberately NOT set. It is the legacy alias of
+# ANDROID_USER_HOME, and AGP refuses to configure a project when both are present
+# ("Several environment variables and/or system properties contain different paths to
+# the Android Preferences folder") — measured, and it is not about the values being
+# different: setting both to the SAME path still fails. Anyone overriding one of them
+# — the natural thing to do when giving the AVD its own volume — would otherwise turn
+# every Gradle build into that error. One variable, one meaning.
+ENV ANDROID_AVD_HOME=/workspace/.android/avd \
+    ANDROID_USER_HOME=/workspace/.android \
+    GRADLE_USER_HOME=/workspace/.gradle
+
+# The build-time proof (also runnable in a live container: `emulator-tools --check`).
+COPY --chown=node:node --chmod=0644 docker/emulator.md /opt/emulator-tools/README.md
+COPY --chown=node:node --chmod=0644 tools/check-emulator-toolchain.mjs /opt/emulator-tools/check.mjs
+RUN set -eux; \
+    chmod 0755 /opt/emulator-tools; \
+    if [ "${WITH_EMULATOR}" = "1" ]; then node /opt/emulator-tools/check.mjs; \
+    else echo "emulator check: skipped (WITH_EMULATOR=0)"; fi
+
+ENV NODE_ENV=production \
+    DSH_HOME=/home/node/.dsh \
+    HOME=/workspace \
+    DSH_PORT=3079 \
+    PROXY_PORT=3080 \
+    PROXY_HOST=0.0.0.0 \
+    DSH_TELEMETRY_DISABLED=1 \
+    DSH_DESKTOP_ENABLED=1 \
+    DSH_BROWSER_USE_ENABLED=1 \
+    DSH_BROWSER_USE_EXCLUSIVE=0 \
+    DSH_DESKTOP_PREFIX=desktop \
+    DSH_NOVNC_PORT=6080 \
+    DSH_CDP_PORT=9222 \
+    DSH_DESKTOP_WIDTH=1440 \
+    DSH_DESKTOP_HEIGHT=900 \
+    DISPLAY=:99
+
+WORKDIR /workspace
+# Build residue in /tmp must not ship root-owned. The npm cache and Node's
+# compile cache were created by the BUILD (running as root) and stay inside the
+# image layer; with the compose tmpfs on /tmp that is invisible, but under a plain
+# `docker run` (documented below) or any mount that exposes the image's /tmp,
+# every npm/npx call for uid 1000 dies with EACCES — "Your cache folder contains
+# root-owned files" — which breaks `dsh plugin add`, npx-launched MCP servers and
+# `npm pack` at runtime. npm recreates both caches as the running user when it
+# needs them, so removing them is free.
+RUN rm -rf /tmp/.npm-cache /tmp/node-compile-cache \
+ && mkdir -p /workspace /home/node/.dsh \
+ && chown -R node:node /home/node/.dsh /workspace /opt/seek-harness
+
+# Non-root (runzhliu hardening): uid/gid 1000 = image "node" user
+# `USER node` — NOT `node:node`. The explicit user:group form makes Docker drop
+# the image's supplementary groups, which is exactly what carries kvm access
+# (measured: `USER node` → groups=1000(node),104(kvm); `--user node:node` →
+# groups=1000(node) only). Same uid and same primary gid either way.
+USER node
+
+# entrypoint handles: `web` (default), `-`-prefixed dsh args, or arbitrary exec
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint.sh"]
+CMD ["web"]
+
+# Healthcheck probes the public proxy port; 502 while DSH is still booting.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=5 \
+  CMD curl -s -o /dev/null "http://127.0.0.1:${PROXY_PORT}/" || exit 1

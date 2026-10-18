@@ -1,0 +1,61 @@
+# dsh-office — the Office document feature as ONE switchable bundle.
+#
+# WHAT THIS IS
+# ------------
+# Two rows, and both of them are the harness's OWN packages, already inside the
+# image:
+#
+#   skill-office           @deepseek-ai/dsh-skill-office — the bundled Word,
+#                          PowerPoint and Excel skills (office-docx, office-pptx,
+#                          office-xlsx) plus the standard-library check_office.py
+#                          structural checker they run before delivery.
+#   workspace-dependencies @deepseek-ai/dsh-tool-workspace-dependencies — the
+#                          `load_workspace_dependencies` tool. The skills do NOT
+#                          ship an interpreter: they call this tool for the Python
+#                          that owns python-docx / python-pptx / openpyxl /
+#                          XlsxWriter / Pillow / pypdf / PyMuPDF. `source` is the
+#                          pinned payload this image bakes in at build time
+#                          (tools/build-office-payload.mjs).
+#
+# Nothing here is a third-party plugin, nothing is installed at runtime, and no
+# Marketplace entry is involved: the packages ship inside the image and this file is
+# what mounts them.
+#
+# WHY A BUNDLE
+# ------------
+# A bundle is the unit the Plugins page lists and toggles, so the feature appears
+# there as a card with a switch, beside the browser rows. `dsh-plugins-page-extras`
+# draws that row (its ROWS entry names the row id below), and
+# tools/patch-plugin-manager-page.mjs keeps this package out of the page's own list
+# by name so it appears exactly once.
+#
+# The switch flips THIS bundle's `skill-office` row — the one that carries the
+# skills, which is the part that costs context in every request. The dependency tool
+# stays mounted: it is one tool definition, it answers a path question and does
+# nothing else, and with the skills released there is nothing left to call it.
+#
+# THE FAIL-OPEN GATE
+# ------------------
+# Both rows are ALSO disabled when the payload is absent. That is deliberate: the
+# plugin tree aborts on the first failing entry, and a skill whose interpreter is
+# missing is worse than a skill that is simply not offered. With this gate a build
+# that lost the payload boots with the feature hidden instead of not booting at all.
+#
+# NO assetRoot / node / cli config, on purpose: both defaults resolve inside the
+# installation — skill-office finds @deepseek-ai/libreoffice-kit and its own three
+# skill folders beside itself (verified against the shipped image), so naming them
+# here would only be a second place to keep right.
+#
+# SWITCHES
+# --------
+#   DSH_OFFICE=0                       mount neither row
+#   DSH_OFFICE_RUNTIME=<absolute dir>  use a different primary-runtime payload
+- insert:
+    - id: workspace-dependencies
+      name: '@deepseek-ai/dsh-tool-workspace-dependencies'
+      disabled: !!js "Number(process.env.DSH_OFFICE ?? 1) === 0 || !process.getBuiltinModule('node:fs').existsSync((process.env.DSH_OFFICE_RUNTIME || '/opt/dsh-office/primary-runtime') + '/runtime.json')"
+      config:
+        source: !!js "(process.env.DSH_OFFICE_RUNTIME || '/opt/dsh-office/primary-runtime')"
+    - id: skill-office
+      name: '@deepseek-ai/dsh-skill-office'
+      disabled: !!js "Number(process.env.DSH_OFFICE ?? 1) === 0 || !process.getBuiltinModule('node:fs').existsSync((process.env.DSH_OFFICE_RUNTIME || '/opt/dsh-office/primary-runtime') + '/runtime.json')"
