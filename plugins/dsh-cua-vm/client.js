@@ -188,6 +188,10 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      // Refresh the VM gate cookie before the first viewer opens. The page may
+      // have been loaded before a restart, in which case its cookie was minted
+      // with the previous per-boot secret and every /vm/view call would 403.
+      useEffect(() => { void fetch('/vm/gate', { credentials: 'same-origin' }).catch(() => {}) }, [])
       useEffect(() => { void load() }, [load])
 
       // While a machine is starting, poll so its row and its button catch up

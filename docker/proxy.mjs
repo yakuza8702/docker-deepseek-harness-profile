@@ -193,8 +193,8 @@ function vmGateAllows(req) {
   return query !== null && safeEqual(query, VM_GATE_SECRET);
 }
 
-function issueVmGate(req, res) {
-  if (vmGateCookie(req) !== null) return;
+function issueVmGate(req, res, force = false) {
+  if (!force && vmGateCookie(req) !== null) return;
   const secure = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
   res.setHeader("set-cookie", [
     `${VM_GATE_COOKIE}=${encodeURIComponent(VM_GATE_SECRET)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${secure ? "; Secure" : ""}`
@@ -877,6 +877,16 @@ function forwardToUpstream(req, res, autoAuthTried) {
 
 const server = http.createServer((req, res) => {
   if (!checkAuth(req, false)) return deny(res, false);
+  // A page loaded before a restart holds a cookie minted with the previous
+  // per-boot secret, and a SPA does not refetch its document — so the page asks
+  // for a fresh cookie explicitly instead of failing on the first Show VM.
+  if (String(req.url || "").split("?")[0] === "/vm/gate") {
+    const secure = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
+    const cookie = `${VM_GATE_COOKIE}=${encodeURIComponent(VM_GATE_SECRET)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${secure ? "; Secure" : ""}`;
+    res.writeHead(204, { "set-cookie": cookie, "cache-control": "no-store" });
+    res.end();
+    return;
+  }
   if (isVmSurface(req) && !vmGateAllows(req)) return denyVmGate(res, false);
   // Any page served here means the visitor already passed the app's own guard,
   // so this is where the VM gate cookie is handed out.
