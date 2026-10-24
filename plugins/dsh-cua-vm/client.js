@@ -68,6 +68,7 @@ window.__ModuleLoader__.load({
       const [png, setPng] = useState(null)
       const [text, setText] = useState('')
       const [frameAt, setFrameAt] = useState(0)
+      const [pos, setPos] = useState(null)
 
       const send = async (payload) => {
         try {
@@ -90,6 +91,20 @@ window.__ModuleLoader__.load({
         const timer = setInterval(() => { void tick() }, 1200)
         return () => { alive = false; clearInterval(timer) }
       }, [frames, name, frameAt])
+      // X11 renders the cursor as an overlay the capture does not include, so
+      // the real pointer moves invisibly. Poll it and draw our own.
+      useEffect(() => {
+        let alive = true
+        const tick = async () => {
+          try {
+            const p = await api('pointer', { name })
+            if (alive) setPos(p)
+          } catch { /* the VM may be busy; the next tick retries */ }
+        }
+        void tick()
+        const timer = setInterval(() => { void tick() }, 500)
+        return () => { alive = false; clearInterval(timer) }
+      }, [name])
       return h('div', {
         role: 'dialog', 'aria-modal': 'true', 'aria-label': `VM desktop ${name}`,
         style: {
@@ -107,6 +122,7 @@ window.__ModuleLoader__.load({
         },
           h('div', { style: { fontWeight: 600 } }, `${name} — shared desktop`),
           h('div', { style: { ...S.muted, marginLeft: 'auto' } }, 'You and the model share this screen. Input from either side lands in the same session.'),
+          pos !== null && h('div', { style: { ...S.muted, fontVariantNumeric: 'tabular-nums' } }, `pointer ${pos.x},${pos.y}`),
           h('button', {
             type: 'button',
             style: { ...S.button, background: frames ? T.hover : 'transparent', color: T.text },
@@ -139,22 +155,32 @@ window.__ModuleLoader__.load({
               h('div', { style: { display: 'grid', placeItems: 'center', background: '#000', borderRadius: T.radiusLg, overflow: 'hidden', minHeight: 0 } },
                 png === null
                   ? h('div', { style: { color: '#ddd', fontSize: 13 } }, 'Capturing the first frame…')
-                  : h('img', {
-                      src: `data:image/png;base64,${png}`,
-                      alt: `${name} screen`,
-                      title: 'Click to click in the computer',
-                      style: { maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', cursor: 'crosshair' },
-                      onClick: (event) => {
-                        const img = event.currentTarget
-                        const rect = img.getBoundingClientRect()
-                        const scale = img.naturalWidth / rect.width
-                        void send({
-                          kind: 'click',
-                          x: Math.round((event.clientX - rect.left) * scale),
-                          y: Math.round((event.clientY - rect.top) * scale)
-                        })
-                      }
-                    })
+                  : h('div', { style: { position: 'relative', display: 'inline-block', maxWidth: '100%', maxHeight: '100%' } },
+                      h('img', {
+                        src: `data:image/png;base64,${png}`,
+                        alt: `${name} screen`,
+                        title: 'Click to click in the computer',
+                        style: { display: 'block', maxWidth: '100%', maxHeight: '100%', width: 'auto', height: 'auto', cursor: 'crosshair' },
+                        onClick: (event) => {
+                          const img = event.currentTarget
+                          const rect = img.getBoundingClientRect()
+                          const scale = img.naturalWidth / rect.width
+                          void send({
+                            kind: 'click',
+                            x: Math.round((event.clientX - rect.left) * scale),
+                            y: Math.round((event.clientY - rect.top) * scale)
+                          })
+                        }
+                      }),
+                      pos !== null && pos.width > 0 && h('div', {
+                        'aria-hidden': true,
+                        style: {
+                          position: 'absolute', pointerEvents: 'none', left: `${(pos.x / pos.width) * 100}%`,
+                          top: `${(pos.y / pos.height) * 100}%`, transform: 'translate(-2px,-2px)', width: 16, height: 16
+                        }
+                      }, h('svg', { width: 16, height: 16, viewBox: '0 0 16 16' },
+                        h('path', { d: 'M2 1 L2 13 L5.5 9.8 L8 15 L10.2 14 L7.8 8.9 L12.5 8.4 Z', fill: '#fff', stroke: '#111', strokeWidth: 1 })))
+                    )
               ),
               h('div', { style: S.muted }, 'Frames refresh every 1.2 s. Click the screen to click in the computer, type above to type.')
             )

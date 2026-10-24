@@ -129,6 +129,7 @@ export function apply(ctx, config = {}) {
           case 'screenshot': return send(200, { ok: true, ...(await call({ op: 'screenshot', ...(await body()) })) })
           case 'input': return send(200, { ok: true, ...(await call({ op: 'input', ...(await body()) })) })
           case 'gui': return send(200, { ok: true, ...(await call({ op: 'gui', ...(await body()) })) })
+          case 'pointer': return send(200, { ok: true, ...(await call({ op: 'pointer', ...(await body()) })) })
           default: return send(404, { ok: false, error: `unknown action: ${action}` })
         }
       } catch (error) {

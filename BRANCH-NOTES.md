@@ -243,3 +243,16 @@ the proxy compares hashes — a header that merely looks like a ticket is refuse
 leaving the surface open. With Pangolin in front, the only rule needed is
 `Bypass Auth` on `/vm/view/media`; the socket is then still gated by this cookie
 *and* by the signed `?ticket=` from the authenticated `/cua/view` call.
+
+## Why the agent's pointer was invisible
+
+X11 paints the cursor as an overlay that the capture path does not composite:
+`xdotool getmouselocation` reports the agent's position, but neither
+`cua sb screenshot` nor the spacesd stream contains the cursor. That is the same
+reason Cua Driver draws a cursor of its own ("the agent gets its own cursor
+overlay").
+
+`/cua/pointer` returns the live position, the panel polls it twice a second and
+draws a cursor over the frames view, and the viewer header shows `pointer x,y` —
+which is also the quickest way to tell whether the model actually moved the
+mouse or just ran a shell command.

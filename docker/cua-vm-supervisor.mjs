@@ -737,6 +737,25 @@ const handlers = {
     return ok({ name, action, output })
   },
 
+  /**
+   * Where the guest's pointer is. X11 draws the cursor as an overlay the
+   * capture path does not composite, so screenshots and the stream show no
+   * cursor even though the agent is moving it — the panel draws one instead.
+   */
+  async pointer({ name }) {
+    const read = await runCua(['sb', 'exec', '--local', name, '--timeout', '15',
+      'DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell; DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry'], { timeoutMs: 60000 })
+    if (read.code !== 0) return fail((read.stderr || read.stdout).trim().slice(-300))
+    const x = Number((/X=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
+    const y = Number((/Y=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
+    const geometry = /^(\d+)\s+(\d+)$/mu.exec(read.stdout)
+    return ok({
+      name, x, y,
+      width: geometry === null ? 0 : Number(geometry[1]),
+      height: geometry === null ? 0 : Number(geometry[2])
+    })
+  },
+
   async stop({ name }) {
     return handlers.suspend({ name })
   },
