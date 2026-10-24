@@ -128,6 +128,7 @@ export function apply(ctx, config = {}) {
           case 'view': return send(200, { ok: true, ...(await call({ op: 'view', ...(await body()) })) })
           case 'screenshot': return send(200, { ok: true, ...(await call({ op: 'screenshot', ...(await body()) })) })
           case 'input': return send(200, { ok: true, ...(await call({ op: 'input', ...(await body()) })) })
+          case 'gui': return send(200, { ok: true, ...(await call({ op: 'gui', ...(await body()) })) })
           default: return send(404, { ok: false, error: `unknown action: ${action}` })
         }
       } catch (error) {
@@ -144,6 +145,7 @@ export function apply(ctx, config = {}) {
       'Build, run and test inside it; keep the workspace clean. Copy only finished artifacts back with `cua_vm_get`.',
       'The VM persists across turns and is stopped only when the user asks. If a tool reports that no VM exists, call `cua_vm_ensure` once, then `cua_vm_exec`.',
       'The VM is a different machine: paths inside it are not workspace paths, and it cannot see /workspace until you copy a file in.',
+      'You can also drive its desktop with `cua_vm_gui`: screenshot, click, type, hotkeys, drag. Find an element with `a11y` (or list windows) before clicking its bounds, and prefer the shell when a command can do the job.',
       'Before you create a computer for the user, ask with `ask_user_question` for its name, vCPU/RAM and image unless they already said so; never invent a spec silently. Debian and Arch need a built Cua disk, so say that instead of substituting an image.'
     ].join(' ')
   })
@@ -196,6 +198,44 @@ export function apply(ctx, config = {}) {
         waitDesktop: args.waitForDesktop === true
       })
       return { text: `${result.created ? 'Created' : 'Resumed'} ${result.name} (tier=${result.tier}, state=${result.state}). Use this name with cua_vm_exec.` }
+    }
+  })
+
+  ctx.tools.register({
+    name: 'cua_vm_gui',
+    description: 'Drive the desktop of the personal VM the way a person would: screenshot, click, double-click, move, drag, type text, press keys or hotkeys, scroll, list windows, read the accessibility tree, read the clipboard, launch an app or open a file. Coordinates are pixels in the last screenshot, origin top-left. Use `a11y` first when you need to know where an element is, then click its bounds, then screenshot to confirm. Pointer moves are animated (eased path, slight jitter) so a human watching the shared desktop sees a hand, not a teleport; set smooth=false only when you need an instant jump.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['action', 'name'],
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['screenshot', 'click', 'dclick', 'move', 'drag', 'type', 'key', 'hotkey', 'scroll', 'windows', 'a11y', 'clipboard', 'launch', 'open'],
+          description: 'What to do on the VM desktop.'
+        },
+        name: { type: 'string', description: 'Computer name from cua_vm_status / cua_vm_ensure.' },
+        x: { type: 'number', description: 'X pixel for click/dclick/move/drag start.' },
+        y: { type: 'number', description: 'Y pixel for click/dclick/move/drag start.' },
+        x2: { type: 'number', description: 'X pixel for the drag end.' },
+        y2: { type: 'number', description: 'Y pixel for the drag end.' },
+        text: { type: 'string', description: 'Text to type.' },
+        key: { type: 'string', description: 'Key name (enter, escape, tab, f5) or hotkey combination (ctrl+c, ctrl+shift+s).' },
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Scroll direction.' },
+        amount: { type: 'number', description: 'Scroll steps (default 3).' },
+        app: { type: 'string', description: 'Application name for launch.' },
+        path: { type: 'string', description: 'File or URL for open.' },
+        save: { type: 'string', description: 'Where to save the screenshot, inside the VM (default /cua-vm/shots/<name>-<timestamp>.png).' },
+        smooth: { type: 'boolean', description: 'Animate the pointer along an eased path instead of teleporting. Default true.' },
+        steps: { type: 'number', description: 'Pointer path steps (2-120, default 24).' },
+        durationMs: { type: 'number', description: 'Pointer travel time in milliseconds (default 380).' }
+      }
+    },
+    output: textOutput('What the action did, or the screenshot path.'),
+    async execute(input) {
+      const target = input.name
+      const answer = await call({ op: 'gui', ...input, name: target })
+      return { text: answer.output || `${input.action} done` }
     }
   })
 

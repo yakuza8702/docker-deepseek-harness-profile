@@ -94,7 +94,7 @@ window.__ModuleLoader__.load({
         row: 'cua-vm',
         glyph: 'desktop',
         title: 'Personal VM (CUA)',
-        body: 'A Linux VM per workspace, on KVM, owned by a supervisor outside the agent sandbox. The model builds, tests and troubleshoots inside it and copies only the finished product back; VM disks live outside the workspace and survive until you delete them. Turn it off to release the eight cua_vm_* tools and their prompt section \u2014 suspending a VM is separate, and nothing is destroyed.'
+        body: 'A Linux VM per workspace, on KVM, owned by a supervisor outside the agent sandbox. The model builds, tests and troubleshoots inside it and copies only the finished product back; VM disks live outside the workspace and survive until you delete them. Turn it off to release the cua_vm_* tools and their prompt section \u2014 suspending a VM is separate, and nothing is destroyed.'
       },
       {
         row: 'skill-office',

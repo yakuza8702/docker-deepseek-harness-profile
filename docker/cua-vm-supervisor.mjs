@@ -649,6 +649,94 @@ const handlers = {
     return ok({ name, kind })
   },
 
+  /**
+   * GUI control. Pointer actions are animated: a single `mousemove` teleports
+   * the cursor, which reads as a machine; a short eased path with sub-pixel
+   * jitter reads as a hand, and it is what makes the streamed desktop look like
+   * the upstream demo. Everything else goes through `cua do`.
+   */
+  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, path: target, save, smooth = true, steps = 24, durationMs = 380 }) {
+    const num = (value) => {
+      const parsed = Math.round(Number(value))
+      if (!Number.isFinite(parsed) || parsed < 0) throw new Error('coordinates must be positive numbers')
+      return parsed
+    }
+    const pointer = ['click', 'dclick', 'move', 'drag'].includes(action)
+    await runCua(['sb', 'resume', '--local', name], { timeoutMs: 120000 })
+
+    if (pointer) {
+      const read = await runCua(['sb', 'exec', '--local', name, '--timeout', '20', 'DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell'], { timeoutMs: 60000 })
+      const matchX = /X=(-?\d+)/u.exec(read.stdout)
+      const matchY = /Y=(-?\d+)/u.exec(read.stdout)
+      const fromX = matchX === null ? 0 : Number(matchX[1])
+      const fromY = matchY === null ? 0 : Number(matchY[1])
+      const toX = num(x)
+      const toY = num(y)
+      const total = Math.max(2, Math.min(120, Math.round(Number(steps) || 24)))
+      const perStep = Math.max(0.004, Math.min(0.05, (Number(durationMs) || 380) / 1000 / total))
+      const parts = []
+      const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2)
+      if (action === 'drag') parts.push('mousedown 1')
+      for (let index = 1; index <= total; index += 1) {
+        const t = ease(index / total)
+        const jitter = smooth && index < total ? (Math.random() * 2 - 1) : 0
+        const px = Math.round(fromX + (toX - fromX) * t + jitter)
+        const py = Math.round(fromY + (toY - fromY) * t + jitter)
+        parts.push(`mousemove ${Math.max(0, px)} ${Math.max(0, py)}`, `sleep ${perStep.toFixed(3)}`)
+      }
+      if (action === 'click') parts.push('click 1')
+      if (action === 'dclick') parts.push('click --repeat 2 --delay 80 1')
+      if (action === 'drag') parts.push('mouseup 1')
+      const script = `DISPLAY=\${DISPLAY:-:1} xdotool ${parts.join(' ')}`
+      const moved = await runCua(['sb', 'exec', '--local', name, '--timeout', '60', script], { timeoutMs: 120000 })
+      if (moved.code !== 0) return fail((moved.stderr || moved.stdout).trim().slice(-400))
+      return ok({ name, action, output: `${action} at ${toX},${toY} (${total} steps over ${Math.round(perStep * total * 1000)} ms)` })
+    }
+
+    const argv = (() => {
+      switch (action) {
+        case 'type': return ['type', String(text ?? '')]
+        case 'key': {
+          if (!/^[A-Za-z0-9_+\-]+$/.test(String(key ?? ''))) throw new Error('unsupported key name')
+          return ['key', String(key)]
+        }
+        case 'hotkey': {
+          if (!/^[A-Za-z0-9_+\-]+$/.test(String(key ?? ''))) throw new Error('unsupported key combination')
+          return ['hotkey', String(key)]
+        }
+        case 'scroll': {
+          const dir = String(direction ?? 'down')
+          if (!['up', 'down', 'left', 'right'].includes(dir)) throw new Error('direction must be up, down, left or right')
+          return ['scroll', dir, String(Math.max(1, Math.min(50, Math.round(Number(amount) || 3))))]
+        }
+        case 'screenshot': {
+          mkdirSync('/cua-vm/shots', { recursive: true })
+          return ['screenshot', '-s', String(save || `/cua-vm/shots/${name}-${Date.now()}.png`), '--json']
+        }
+        case 'windows': return ['window', 'list']
+        case 'a11y': return ['a11y', 'tree', '--json']
+        case 'clipboard': return ['clipboard']
+        case 'launch': return ['launch', String(app ?? '')]
+        case 'open': return ['open', String(target ?? '')]
+        default: throw new Error(`unknown gui action: ${action}`)
+      }
+    })()
+
+    const switched = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
+    if (switched.code !== 0) return fail((switched.stderr || switched.stdout).trim().slice(-400))
+    let acted = await runCua(['do', ...argv], { timeoutMs: 120000 })
+    let output = `${acted.stdout}${acted.stderr}`.trim()
+    // A freshly resumed VM takes a moment to answer on spacesd; retry once
+    // instead of reporting a failure the caller cannot act on.
+    if (acted.code !== 0 && /spacesd is not available|not answering/i.test(output)) {
+      await new Promise((resolve) => setTimeout(resolve, 5000))
+      acted = await runCua(['do', ...argv], { timeoutMs: 120000 })
+      output = `${acted.stdout}${acted.stderr}`.trim()
+    }
+    if (acted.code !== 0) return fail(output.slice(-600))
+    return ok({ name, action, output })
+  },
+
   async stop({ name }) {
     return handlers.suspend({ name })
   },
