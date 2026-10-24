@@ -256,3 +256,20 @@ overlay").
 draws a cursor over the frames view, and the viewer header shows `pointer x,y` —
 which is also the quickest way to tell whether the model actually moved the
 mouse or just ran a shell command.
+
+## Surviving a container recreate: VM checkpoints
+
+cua cannot cold-boot a QEMU VM whose process died, and the old recovery deleted
+the sandbox — so every `docker compose down && up` produced a blank computer and
+lost whatever the model had installed.
+
+Before deleting a dead sandbox the supervisor now flattens its writable overlay
+with `qemu-img convert -O qcow2` into `/cua-vm/checkpoints/<name>.qcow2` and
+recreates the computer from that disk (`cua sb create <path>`). A plain copy is
+not enough: it keeps the backing chain, and a disk created from the previous
+restore turns the chain into a cycle ("Too many open files"). Verified: a marker
+file written before a container restart is readable afterwards.
+
+The checkpoint is taken from whatever the disk held at recovery time, so it
+survives `down/up`, image updates and host reboots as long as the `/cua-vm`
+volume does. It is not a backup: deleting the volume still deletes the computer.

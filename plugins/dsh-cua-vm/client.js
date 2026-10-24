@@ -98,7 +98,9 @@ window.__ModuleLoader__.load({
         const tick = async () => {
           try {
             const p = await api('pointer', { name })
-            if (alive) setPos(p)
+            // Keep the last good position: a busy or briefly unavailable guest
+            // answers with width 0, which used to make the drawn cursor vanish.
+            if (alive && p !== null && p.width > 0 && p.height > 0) setPos(p)
           } catch { /* the VM may be busy; the next tick retries */ }
         }
         void tick()

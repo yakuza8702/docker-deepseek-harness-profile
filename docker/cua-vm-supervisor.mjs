@@ -45,10 +45,10 @@
  */
 
 import { createServer, connect as netConnect } from 'node:net'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync
+  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync
 } from 'node:fs'
 import path from 'node:path'
 
@@ -340,16 +340,41 @@ function findListed(parsed, name) {
 
 /** The create argv, shared by a fresh create and a recovery recreate. */
 function createArgs(name, tier, cpu, memory, waitDesktop, image = 'linux') {
-  return [
-    'sb', 'create', image,
-    '--on', 'local', '--kind', 'vm',
-    '--name', name,
-    '--tier', String(tier),
-    '--cpu', String(cpu),
-    '--memory', `${memory}GB`,
-    '--json',
-    '--wait', waitDesktop ? 'desktop' : 'tcp:3211'
-  ]
+  const args = ['sb', 'create', image, '--on', 'local', '--kind', 'vm', '--name', name]
+  // A local disk path carries its own variant; --tier only applies to catalog refs.
+  if (String(image).startsWith('/') === false) args.push('--tier', String(tier))
+  args.push('--cpu', String(cpu), '--memory', `${memory}GB`, '--json', '--wait', waitDesktop ? 'desktop' : 'tcp:3211')
+  return args
+}
+
+/**
+ * A QEMU VM that outlives its process is gone as a *sandbox*, but its writable
+ * disk is still in the store. Copy it out before anything deletes it, so the
+ * recreated computer boots the filesystem the model had (installed packages,
+ * cloned repos) instead of a blank image.
+ */
+const CHECKPOINT_DIR = path.join(STORE, 'checkpoints')
+
+function checkpointSandbox(name) {
+  const disk = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name, 'disk.qcow2')
+  if (!existsSync(disk)) return null
+  const target = path.join(CHECKPOINT_DIR, `${name}.qcow2`)
+  try {
+    mkdirSync(CHECKPOINT_DIR, { recursive: true })
+    // FLATTEN. A plain copy keeps the backing chain, and a disk that was itself
+    // created from the previous restore file turns that chain into a cycle
+    // ("Could not open backing file … Too many open files"). `convert` follows
+    // the chain once and writes a self-contained disk, which is what a restore
+    // needs.
+    execFileSync(path.join(CUA_HOME, '.cua', 'bin', 'qemu-img'), ['convert', '-O', 'qcow2', disk, `${target}.tmp`], { timeout: 180000 })
+    renameSync(`${target}.tmp`, target)
+    log(`checkpoint ${name}: ${(statSync(target).size / 1024 ** 2).toFixed(1)} MB (flattened)`)
+    return target
+  } catch (error) {
+    log(`checkpoint ${name} failed: ${error && error.message}`)
+    try { unlinkSync(`${target}.tmp`) } catch {}
+    return null
+  }
 }
 
 const handlers = {
@@ -392,9 +417,16 @@ const handlers = {
               // explicitly. Rebuild it from the base image so the workspace keeps
               // a computer, and say that the previous disk did not survive.
               log(`recovering ${name}: ${(restarted.stderr || restarted.stdout).trim().slice(-200)}`)
+              const snapshot = checkpointSandbox(name)
               await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
               await ensureRuntime()
-              const recreated = await runCua(createArgs(name, known?.tier || tier, known?.cpu || cpu, known?.memory || memory, waitDesktop), { timeoutMs: 1500000 })
+              const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : 'linux'
+              if (snapshot !== null) copyFileSync(snapshot, bootImage)
+              let recreated = await runCua(createArgs(name, known?.tier || tier, known?.cpu || cpu, known?.memory || memory, waitDesktop, bootImage), { timeoutMs: 1500000 })
+              if (recreated.code !== 0 && snapshot !== null) {
+                log(`restore from checkpoint failed for ${name}; falling back to the base image`)
+                recreated = await runCua(createArgs(name, known?.tier || tier, known?.cpu || cpu, known?.memory || memory, waitDesktop, 'linux'), { timeoutMs: 1500000 })
+              }
               if (recreated.code !== 0) {
                 return fail(`the VM could not be resumed or recreated: ${(recreated.stderr || recreated.stdout).trim().slice(-1200)}`)
               }
@@ -579,9 +611,16 @@ const handlers = {
       // Same reality as ensure: a QEMU VM whose process is gone cannot start.
       // Rebuild it from its recorded spec so the Start button is never a dead end.
       log(`start: recreating ${name} after "${(result.stderr || result.stdout).trim().slice(-160)}"`)
+      const snapshot = checkpointSandbox(name)
       await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
       await ensureRuntime()
-      result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, meta.image), { timeoutMs: 1500000 })
+      const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : meta.image
+      if (snapshot !== null) copyFileSync(snapshot, bootImage)
+      result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, bootImage), { timeoutMs: 1500000 })
+      if (result.code !== 0 && snapshot !== null) {
+        log(`restore from checkpoint failed for ${name}; falling back to ${meta.image}`)
+        result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, meta.image), { timeoutMs: 1500000 })
+      }
       if (result.code !== 0) return fail((result.stderr || result.stdout).trim().slice(-800))
     }
     meta.state = 'ready'
