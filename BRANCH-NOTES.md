@@ -233,6 +233,13 @@ and WebSocket alike.
 
 `VM_GATE_SECRET` pins the value (otherwise it is minted per boot and a reload
 re-issues it). Scripts may present `x-dsh-vm-gate: <secret>` or `?gate=<secret>`
-instead of the cookie. With Pangolin in front, the only rule needed is
+instead of the cookie.
+
+The viewer's own gRPC client does not send cookies, so the gate also accepts the
+minted ticket (`x-cua-env-authorization: Bearer …`, or `?ticket=` on the media
+socket). The supervisor stores the ticket's SHA-256 when it mints the link, and
+the proxy compares hashes — a header that merely looks like a ticket is refused
+(403). That is what keeps the SSO bypass to `/vm/view/media` usable without
+leaving the surface open. With Pangolin in front, the only rule needed is
 `Bypass Auth` on `/vm/view/media`; the socket is then still gated by this cookie
 *and* by the signed `?ticket=` from the authenticated `/cua/view` call.

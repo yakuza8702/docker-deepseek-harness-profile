@@ -750,10 +750,14 @@ const handlers = {
     try { info = JSON.parse(result.stdout) } catch { return fail('the viewer did not return a URL') }
     const url = new URL(info.url)
     const views = readViews()
+    const ticket = new URLSearchParams(String(url.hash || '').replace(/^#/u, '')).get('ticket') || ''
     views[name] = {
       port: Number(url.port) || 0,
       path: url.pathname || '/viewer/',
       hash: url.hash || '',
+      // The proxy accepts this hash instead of the gate cookie, because the
+      // viewer's gRPC client sends the ticket but not cookies.
+      ticketHash: ticket === '' ? '' : createHash('sha256').update(ticket).digest('hex'),
       expiresAt: Number(info.expires_at_unix ?? 0) * 1000,
       openedAt: new Date().toISOString()
     }

@@ -23,7 +23,7 @@
 import http from "node:http";
 import net from "node:net";
 import fs from "node:fs";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 // Recovery surface: when the harness cannot boot, no plugin inside it can render
 // anything — this proxy is the process that survives, so it serves the failure,
 // the profile list and the two fixes (switch profile / Safe Mode).
@@ -157,8 +157,33 @@ function isVmSurface(req) {
   return vmViewReferer(req.headers.referer) !== null;
 }
 
-/** The three ways in: cookie (browsers), header or ?gate= (scripts). */
+/**
+ * The viewer's gRPC client does NOT send cookies (connect-es omits credentials
+ * for these calls), so it authenticates with the ticket instead. That ticket
+ * was minted by /cua/view, which sits behind the app's own auth, and the
+ * supervisor recorded its hash when the link was issued — comparing the hash is
+ * what makes this proof, not merely a header that looks right.
+ */
+function vmGateTicketProof(req) {
+  const auth = String(req.headers["x-cua-env-authorization"] || "");
+  const bearer = /^Bearer\s+(.+)$/iu.exec(auth.trim());
+  const url = String(req.url || "/");
+  const query = url.includes("?") ? new URLSearchParams(url.slice(url.indexOf("?") + 1)).get("ticket") : null;
+  const ticket = (bearer === null ? null : bearer[1]) || query;
+  if (ticket === null || ticket === "") return false;
+  const hash = createHash("sha256").update(ticket).digest("hex");
+  try {
+    const table = JSON.parse(fs.readFileSync(VM_VIEWS_FILE, "utf8"));
+    return Object.values(table).some((entry) => entry && entry.ticketHash === hash
+      && (Number(entry.expiresAt) === 0 || Number(entry.expiresAt) > Date.now()));
+  } catch {
+    return false;
+  }
+}
+
+/** The ways in: cookie (pages), gate header/query (scripts), or a viewer ticket. */
 function vmGateAllows(req) {
+  if (vmGateTicketProof(req)) return true;
   const cookie = vmGateCookie(req);
   if (cookie !== null && safeEqual(cookie, VM_GATE_SECRET)) return true;
   const header = String(req.headers["x-dsh-vm-gate"] || "");
