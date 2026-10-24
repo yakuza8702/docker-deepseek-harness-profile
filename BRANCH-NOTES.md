@@ -107,10 +107,13 @@ never sees it. The page frames it same-origin with a header that says what it
 is: *"You and the model share this screen. Input from either side lands in the
 same session."* A human can type a password the model never reads.
 
-Two proxy details matter: the viewer ships `frame-ancestors 'none'` (rewritten
-to `'self'`), and spacesd routes its gRPC services at **root** paths that the
-viewer resolves against `/vm/view/` — dotted service segments are forwarded to
-the newest viewer instead of being read as a VM name.
+Three proxy details matter: the viewer ships `frame-ancestors 'none'`
+(rewritten to `'self'`); spacesd routes its gRPC services at **root** paths that
+the viewer resolves against `/vm/view/`, so dotted service segments are
+forwarded to the newest viewer instead of being read as a VM name; and the
+media socket is `/vm/view/media?ticket=…`, a bare segment with no dot — it is
+matched explicitly, because a 502 there is what makes the viewer loop on
+"Reconnecting…" forever.
 
 **Plain HTTP / LAN.** The video path needs a secure context, which
 `http://192.168.x.x` is not. The viewer therefore offers **Frames (http)**: the

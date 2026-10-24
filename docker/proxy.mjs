@@ -388,6 +388,23 @@ function newestViewEntry() {
   }
 }
 
+/**
+ * Segments the viewer asks for at the top level of its own origin. spacesd
+ * serves `/media` (the media socket) and friends next to `/viewer/`, while the
+ * browser resolves them against `/vm/view/`, so they arrive as
+ * `/vm/view/media?ticket=…` — a path that must NOT be mistaken for a VM name.
+ */
+const VM_VIEW_SERVICE_SEGMENTS = new Set(["media", "ws", "api", "session"]);
+
+function isViewerService(segment) {
+  return segment.includes(".") || VM_VIEW_SERVICE_SEGMENTS.has(segment);
+}
+
+/** `/vm/view/<service>/<rest>` -> `/<service>/<rest>` on the viewer upstream. */
+function vmServiceUpstream(segment, suffix, query) {
+  return suffix === "" ? `/${segment}${query}` : `/${segment}/${suffix}${query}`;
+}
+
 function vmViewUpstream(entry, suffix, query) {
   const base = entry.path.endsWith("/") ? entry.path : `${entry.path}/`;
   return suffix === "" ? `${base}${query}` : `${base}${suffix}${query}`;
@@ -789,14 +806,13 @@ const server = http.createServer((req, res) => {
   if (view !== null) {
     let entry = vmViewTarget(view.name);
     let upstreamPath = entry === null ? null : vmViewUpstream(entry, view.suffix, view.query);
-    if (entry === null && view.name.includes(".")) {
-      // spacesd routes its gRPC services at ROOT paths, but the viewer resolves
-      // them against `/vm/view/`, so they arrive here as
-      // `/vm/view/cua.env.v1.SystemService/<Method>`. A dotted segment is a
-      // service, not a VM name: send it to the newest viewer with its path
-      // intact.
+    if (entry === null && isViewerService(view.name)) {
+      // The viewer resolves spacesd's ROOT services against `/vm/view/`, so
+      // they arrive as `/vm/view/cua.env.v1.SystemService/<Method>` or
+      // `/vm/view/media?ticket=…`. A service segment is not a VM name: send it
+      // to the newest viewer with its own path intact.
       entry = newestViewEntry();
-      if (entry !== null) upstreamPath = `/${view.name}/${view.suffix}${view.query}`;
+      if (entry !== null) upstreamPath = vmServiceUpstream(view.name, view.suffix, view.query);
     }
     if (entry === null || upstreamPath === null) return vmViewUnavailable(res, false, view.name);
     return forwardToVmView(req, res, entry, upstreamPath, view.name);
@@ -847,9 +863,9 @@ server.on("upgrade", (req, socket, head) => {
   if (viewUpgrade !== null) {
     let entry = vmViewTarget(viewUpgrade.name);
     let upstreamPath = entry === null ? null : vmViewUpstream(entry, viewUpgrade.suffix, viewUpgrade.query);
-    if (entry === null && viewUpgrade.name.includes(".")) {
+    if (entry === null && isViewerService(viewUpgrade.name)) {
       entry = newestViewEntry();
-      if (entry !== null) upstreamPath = `/${viewUpgrade.name}/${viewUpgrade.suffix}${viewUpgrade.query}`;
+      if (entry !== null) upstreamPath = vmServiceUpstream(viewUpgrade.name, viewUpgrade.suffix, viewUpgrade.query);
     }
     if (entry === null || upstreamPath === null) return vmViewUnavailable(socket, true, viewUpgrade.name);
     return tunnelToVmView(req, socket, head, entry, upstreamPath, viewUpgrade.name);
