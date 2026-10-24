@@ -23,7 +23,7 @@
 import http from "node:http";
 import net from "node:net";
 import fs from "node:fs";
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 // Recovery surface: when the harness cannot boot, no plugin inside it can render
 // anything — this proxy is the process that survives, so it serves the failure,
 // the profile list and the two fixes (switch profile / Safe Mode).
@@ -64,6 +64,17 @@ const VM_PORTS_FILE = process.env.CUA_PORTS_FILE || `${process.env.CUA_VM_STORE 
 // bytes. Same auth as the harness because it is the same origin.
 const VM_VIEW_PREFIX = "/vm/view";
 const VM_VIEWS_FILE = process.env.CUA_VIEWS_FILE || `${process.env.CUA_VM_STORE || "/cua-vm"}/views.json`;
+// ---------------------------------------------------------------------
+// VM gate: the shared desktop and the port previews get their own layer even
+// when the resource itself is protected by an SSO proxy that cannot carry an
+// auth redirect through a WebSocket upgrade. The proxy sets this cookie on any
+// page it serves (so the visitor has already passed whatever guards the app),
+// and refuses the VM surfaces without it. Set VM_GATE_SECRET to keep it stable
+// across restarts; otherwise it is minted per boot and a reload re-issues it.
+// ---------------------------------------------------------------------
+const VM_GATE_SECRET = process.env.VM_GATE_SECRET || randomBytes(24).toString("hex");
+const VM_GATE_COOKIE = "dsh_vm_gate";
+
 const AUTH_USER = process.env.PROXY_USERNAME || "";
 const AUTH_PASS = process.env.PROXY_PASSWORD || "";
 const AUTH_ENABLED = AUTH_USER !== "" && AUTH_PASS !== "";
@@ -131,6 +142,58 @@ function checkAuth(req) {
     safeEqual(decoded.slice(0, idx), AUTH_USER) &&
     safeEqual(decoded.slice(idx + 1), AUTH_PASS)
   );
+}
+
+function vmGateCookie(req) {
+  const raw = String(req.headers.cookie || "");
+  const match = /(?:^|;\s*)dsh_vm_gate=([^;]+)/u.exec(raw);
+  return match === null ? null : decodeURIComponent(match[1]);
+}
+
+/** True when a request is part of the VM desktop or a port preview. */
+function isVmSurface(req) {
+  const url = String(req.url || "/");
+  if (url.startsWith("/vm/view/") || url.startsWith("/vm/port/")) return true;
+  return vmViewReferer(req.headers.referer) !== null;
+}
+
+/** The three ways in: cookie (browsers), header or ?gate= (scripts). */
+function vmGateAllows(req) {
+  const cookie = vmGateCookie(req);
+  if (cookie !== null && safeEqual(cookie, VM_GATE_SECRET)) return true;
+  const header = String(req.headers["x-dsh-vm-gate"] || "");
+  if (header !== "" && safeEqual(header, VM_GATE_SECRET)) return true;
+  const url = String(req.url || "/");
+  const query = url.includes("?") ? new URLSearchParams(url.slice(url.indexOf("?") + 1)).get("gate") : null;
+  return query !== null && safeEqual(query, VM_GATE_SECRET);
+}
+
+function issueVmGate(req, res) {
+  if (vmGateCookie(req) !== null) return;
+  const secure = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
+  res.setHeader("set-cookie", [
+    `${VM_GATE_COOKIE}=${encodeURIComponent(VM_GATE_SECRET)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${secure ? "; Secure" : ""}`
+  ]);
+}
+
+function denyVmGate(res, upgrade) {
+  const body = [
+    "403 — the personal VM needs the harness session first.",
+    "",
+    "Open the harness page in this browser, then press Show VM again. If you are",
+    "a script, send `x-dsh-vm-gate: <VM_GATE_SECRET>` or append `?gate=<secret>`.",
+  ].join("\n");
+  if (upgrade) {
+    res.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    res.destroy();
+    return;
+  }
+  res.writeHead(403, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
 }
 
 function deny(res, upgrade) {
@@ -789,6 +852,10 @@ function forwardToUpstream(req, res, autoAuthTried) {
 
 const server = http.createServer((req, res) => {
   if (!checkAuth(req, false)) return deny(res, false);
+  if (isVmSurface(req) && !vmGateAllows(req)) return denyVmGate(res, false);
+  // Any page served here means the visitor already passed the app's own guard,
+  // so this is where the VM gate cookie is handed out.
+  issueVmGate(req, res);
   // The browser desktop is a separate loopback service. It is routed before
   // everything else because it must NOT be touched by the DSH-specific HTML/JS
   // rewriting below (noVNC is a static client and the harness recovery surface
@@ -852,6 +919,7 @@ const server = http.createServer((req, res) => {
 // incl. the Authorization header already validated above).
 server.on("upgrade", (req, socket, head) => {
   if (!checkAuth(req, true)) return deny(socket, true);
+  if (isVmSurface(req) && !vmGateAllows(req)) return denyVmGate(socket, true);
   // Same discriminator for the viewer's websocket traffic.
   const viewerUpgradeRef = vmViewReferer(req.headers.referer);
   if (viewerUpgradeRef !== null) {

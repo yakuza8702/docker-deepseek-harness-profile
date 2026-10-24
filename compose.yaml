@@ -117,6 +117,13 @@ services:
       CUA_VM_STORE: "${CUA_VM_STORE:-/cua-vm}"
       CUA_WORKSPACE_ROOT: "/workspace"
       CUA_VM_TIER: "${CUA_VM_TIER:-slim}"
+      # Shared-desktop gate. The proxy hands this cookie to any browser that can
+      # load the harness page, and refuses /vm/view/* and /vm/port/* without it —
+      # so an SSO/passkey in front of the app also protects the VM surfaces that
+      # cannot survive an auth redirect on their WebSocket upgrade.
+      # Leave empty for a per-boot secret (a reload re-issues the cookie), or pin
+      # it here to keep viewers valid across restarts.
+      VM_GATE_SECRET: "${VM_GATE_SECRET:-}"
     env_file:
       - path: .env
         required: false

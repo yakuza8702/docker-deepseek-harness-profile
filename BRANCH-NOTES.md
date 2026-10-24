@@ -221,3 +221,18 @@ BoxCompute means either sharing `/workspace` into the guest (virtiofs needs
 `/dev/fuse`, absent here; 9p needs custom QEMU args) or routing the shell and
 file tools to `cua_vm_exec` / `cua_vm_put` / `cua_vm_get`. That is a mode, not a
 setting, so it is written down rather than half-done.
+
+## The VM gate: protecting the desktop behind an SSO/passkey
+
+`/vm/view/*` and `/vm/port/*` are the only surfaces that must be reachable when
+an upstream proxy handles auth, because a WebSocket upgrade cannot follow an
+auth redirect. They are not left open: the harness proxy sets an HttpOnly
+`dsh_vm_gate` cookie on any page it serves (so the visitor has already passed
+whatever guards the app) and answers 403 on the VM surfaces without it — HTTP
+and WebSocket alike.
+
+`VM_GATE_SECRET` pins the value (otherwise it is minted per boot and a reload
+re-issues it). Scripts may present `x-dsh-vm-gate: <secret>` or `?gate=<secret>`
+instead of the cookie. With Pangolin in front, the only rule needed is
+`Bypass Auth` on `/vm/view/media`; the socket is then still gated by this cookie
+*and* by the signed `?ticket=` from the authenticated `/cua/view` call.
