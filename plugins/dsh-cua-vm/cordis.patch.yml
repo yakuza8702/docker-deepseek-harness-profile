@@ -1,0 +1,26 @@
+# dsh-cua-vm — the personal VM as ONE switchable bundle.
+#
+# The row mounts the plugin whose tools speak to `cua-vm-supervisor`, the
+# process docker/entrypoint.sh starts before any Session exists. The split is
+# deliberate:
+#
+#   * the harness runs in `workspace-write`, where the Landlock grant is
+#     /dev/null + /tmp + the workspace root, so a shell tool can never open
+#     /dev/kvm O_RDWR — and must not, because the VM store is outside the
+#     workspace by design;
+#   * the supervisor owns /dev/kvm, QEMU, the cua daemon and /cua-vm;
+#   * the tools only write JSON to a unix socket under /tmp.
+#
+# SWITCHES
+#   DSH_CUA_VM=0                  do not mount the row (no VM tools at all)
+#   CUA_SUPERVISOR_SOCK           socket path (default /tmp/cua-vm/supervisor.sock)
+#   CUA_WORKSPACE_ROOT            the only host tree the tools may touch (/workspace)
+#   CUA_VM_TIER                   slim | full (default slim)
+- insert:
+    - id: cua-vm
+      name: 'dsh-cua-vm'
+      disabled: !!js "process.env.DSH_CUA_VM === '0'"
+      config:
+        socketPath: !!js "process.env.CUA_SUPERVISOR_SOCK || '/tmp/cua-vm/supervisor.sock'"
+        workspaceRoot: !!js "process.env.CUA_WORKSPACE_ROOT || '/workspace'"
+        defaultTier: !!js "process.env.CUA_VM_TIER || 'slim'"

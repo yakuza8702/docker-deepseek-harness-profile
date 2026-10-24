@@ -1,0 +1,81 @@
+# dsh-brave-devtools-mcp — the browser TROUBLESHOOTING tool surface as ONE
+# switchable MCP row.
+#
+# This is the row the bundle owns. It is not seeded into the profile's patch
+# layer by hand (an earlier attempt at that, for the sibling row, did not show up
+# on the Plugins page — see plugins/dsh-browser-mcp/README.md): it exists exactly
+# while the bundle is selected, and the Plugins page's switch is what selects or
+# deselects it.
+#
+# WHAT IT IS
+# ----------
+# `brave-mcp` (github.com/triuzzi/brave-devtools-mcp, npm `brave-mcp`) is a
+# Brave-native fork of Chrome DevTools MCP: full DevTools MCP parity, telemetry
+# OFF by default. Where the Playwright row (`browser-mcp`) DRIVES a page, this one
+# DIAGNOSES it — console messages with source-mapped stacks, every network request
+# with its status and headers, performance traces with insight sets, Lighthouse
+# audits, CSS cascade inspection, heap snapshots, emulation. That is the
+# "why is this site broken" surface the model otherwise has to approximate from a
+# screenshot and a page dump.
+#
+# HOW IT REACHES THE BROWSER
+# --------------------------
+# ATTACH ONLY, over the loopback CDP endpoint the visible desktop already exposes
+# (`--browserUrl=http://127.0.0.1:$DSH_CDP_PORT`, see `start_desktop` in
+# docker/entrypoint.sh, which passes `--remote-debugging-address=127.0.0.1
+# --remote-debugging-port=$DSH_CDP_PORT` to Brave). So:
+#
+#   * it drives the SAME browser the human sees in the noVNC panel — same tabs,
+#     same cookies, same logins, same console;
+#   * it never launches a second browser and never downloads one;
+#   * the endpoint is loopback-only, so the MCP can only reach a browser running
+#     INSIDE this container: nothing on the LAN can attach to it, and it cannot
+#     wander off to a browser on another host.
+#
+# Sharing one browser with the Playwright row is supported (Chrome accepts
+# several CDP clients), and the two rows stay independent: each switch releases
+# only its own tool definitions. If a page ever fights over the active tab, turn
+# one of the two off — that is the whole point of having them separate.
+#
+# SWITCHES
+# --------
+#   DSH_BRAVE_DEVTOOLS_MCP=0     do not select the bundle at all
+#   DSH_DESKTOP_ENABLED=0        no desktop stack => the row is disabled too
+#   DSH_CDP_PORT=9222            the browser's DevTools port inside the container
+#   DSH_BRAVE_MCP_TIMEOUT=120000 per-tool-call timeout in ms (Lighthouse and
+#                                performance traces legitimately run long, so the
+#                                default is double the Playwright row's)
+#
+# Toggling: Plugin list -> "Browser tools brave" -> off/on. The plugin manager
+# writes an id-targeted `disabled:` override into the profile patch and the loader
+# recomposes live — no restart.
+- insert:
+    - id: brave-devtools-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      disabled: !!js "process.env.DSH_BRAVE_DEVTOOLS_MCP === '0' || process.env.DSH_DESKTOP_ENABLED === '0'"
+      config:
+        # The tool namespace. Tools surface as `mcp__brave-devtools__<name>`.
+        serverName: brave-devtools
+        transport: stdio
+        # A stable path, so the row never has to know whether DSH came from the
+        # npm channel (/opt/dsh) or the source channel (/opt/dsh-src), and never
+        # has to run npx (which would fetch from npm at every boot).
+        command: /usr/local/bin/dsh-brave-devtools-mcp
+        args:
+          # Attach to the desktop browser over loopback CDP. The address is
+          # 127.0.0.1 on purpose: the same expression the desktop is launched
+          # with, so the two can never disagree.
+          - !!js "'--browserUrl=http://127.0.0.1:' + (process.env.DSH_CDP_PORT || '9222')"
+          # A performance trace can carry its trace URL to Google's CrUX API for
+          # real-user field data. This image keeps egress explicit: the hosted
+          # lookup is off, the lab trace — which is the part that finds YOUR bug —
+          # is unaffected. Drop this line from the row to opt back in.
+          - --no-performance-crux
+        env:
+          # The server ships from a PINNED version inside this image; a registry
+          # update check would be pure noise in a container.
+          BRAVE_DEVTOOLS_MCP_NO_UPDATE_CHECKS: '1'
+          # Belt and braces with the flag above: upstream also honours this to
+          # refuse usage statistics outright.
+          BRAVE_DEVTOOLS_MCP_NO_USAGE_STATISTICS: '1'
+        toolCallTimeoutMs: !!js "Number(process.env.DSH_BRAVE_MCP_TIMEOUT || 120000)"

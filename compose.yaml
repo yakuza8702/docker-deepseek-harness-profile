@@ -1,0 +1,187 @@
+# =====================================================================
+# seek-harness — hardened deployment (runzhliu-style hardening)
+#
+#   cp .env.example .env   (then edit)
+#   docker compose pull
+#   DSH_WORKSPACE=/abs/path/to/project docker compose up -d
+#
+# Security model (base compose keeps everything locked down):
+#   * DSH listens on 127.0.0.1 INSIDE the container (upstream refuses
+#     0.0.0.0 by design); the built-in reverse proxy is the only public
+#     surface (the "0.0.0.0 fix").
+#   * Publishes to 127.0.0.1 by default. For LAN access set DSH_BIND=0.0.0.0 —
+#     the proxy auto-mints browser sessions from dsh web's boot token
+#     (zero-auth LAN). Set PROXY_USERNAME+PROXY_PASSWORD to require Basic
+#     Auth if other LAN devices should stay out.
+#   * cap_drop ALL / no-new-privileges / read-only rootfs / tmpfs /tmp.
+#   * The browser desktop (official Browser Use + noVNC human takeover) shares
+#     the SAME published port: the proxy path-routes /desktop/ to a loopback
+#     noVNC, so there is no second port to forward and the panel inherits the
+#     proxy's auth. The browser profile (cookies, logins, extensions) persists
+#     in the dsh-home volume.
+#   * Only the workspace bind is writable. Never mount ~, .ssh, cloud
+#     credentials, or docker.sock into the BASE compose file — use the
+#     compose.docker.yaml override for docker access.
+# =====================================================================
+
+services:
+  seek-harness:
+    depends_on:
+      cua-init:
+        condition: service_completed_successfully
+    image: ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest
+    container_name: seek-harness
+    restart: unless-stopped
+    ports:
+      # DSH_BIND=127.0.0.1 (default, local only) or 0.0.0.0 (LAN, needs auth)
+      - "${DSH_BIND:-127.0.0.1}:${PROXY_PORT:-3080}:${PROXY_PORT:-3080}"
+    environment:
+      # 0.0.0.0 fix: DSH loopback port + public proxy port (must differ)
+      DSH_PORT: "${DSH_PORT:-3079}"
+      PROXY_PORT: "${PROXY_PORT:-3080}"
+      PROXY_HOST: "0.0.0.0"
+      # Optional Basic Auth on HTTP + WebSocket (enabled only when BOTH set)
+      PROXY_USERNAME: "${PROXY_USERNAME:-}"
+      PROXY_PASSWORD: "${PROXY_PASSWORD:-}"
+      # Extra authorities for DSH's /api browser-trust fence (comma list).
+      # OPTIONAL/legacy — the proxy now translates same-origin markers itself;
+      # only useful if you expose DSH's port without its proxy.
+      DSH_TRUSTED_HOSTS: "${DSH_TRUSTED_HOSTS:-}"
+      # Docker engine access — either TCP proxy…
+      DOCKER_HOST: "${DOCKER_HOST:-}"
+      # …or mount /var/run/docker.sock via the compose.docker.yaml override
+      # FIX 2026-09-01: proxy "unlock remote settings" JS rewrite regex only
+      # matched the LAST dotted segment; on newer upstream code it corrupted
+      # the served bundle (ctx.remote.$host.isLoopback ? ... -> ctx.remote."host"
+      # = SyntaxError). Patched proxy + settings shim are bind-mounted below.
+      # PROXY_UNLOCK_REMOTE_SETTINGS=1 keeps the (now-safe) rewrite feature on;
+      # set to 0 to disable the feature entirely (stock behaviour).
+      PROXY_UNLOCK_REMOTE_SETTINGS: "${PROXY_UNLOCK_REMOTE_SETTINGS:-1}"
+      # upstream runtime knobs (safe defaults; see README)
+      DSH_TELEMETRY_DISABLED: "${DSH_TELEMETRY_DISABLED:-1}"
+      DSH_PERMISSION_MODE: "${DSH_PERMISSION_MODE:-}"
+      DSH_TOOLS_MODE: "${DSH_TOOLS_MODE:-}"
+      # --- browser desktop (Browser Use + human takeover) ---
+      # There is deliberately NO desktop port here: Xvfb/x11vnc/websockify and
+      # the browser all bind 127.0.0.1 inside the container and the reverse
+      # proxy path-routes /${DSH_DESKTOP_PREFIX:-desktop}/ to noVNC on the SAME
+      # published port. That is what lets an https reverse proxy (Pangolin /
+      # nginx) embed the panel — a separately published http://host:6080 would
+      # be blocked as mixed content on an https UI, and would bypass the proxy's
+      # Basic Auth.
+      DSH_DESKTOP_ENABLED: "${DSH_DESKTOP_ENABLED:-1}"
+      DSH_BROWSER_USE_ENABLED: "${DSH_BROWSER_USE_ENABLED:-1}"
+      # 0 (default) = every Session drives the SAME visible browser, so browser
+      # tools are always present; cookies/logins/tabs are shared between
+      # Sessions. 1 = upstream's single-owner attachment, where one Session
+      # reserves the browser and the rest silently never get the tools.
+      DSH_BROWSER_USE_EXCLUSIVE: "${DSH_BROWSER_USE_EXCLUSIVE:-0}"
+      DSH_DESKTOP_PREFIX: "${DSH_DESKTOP_PREFIX:-desktop}"
+      DSH_NOVNC_PORT: "${DSH_NOVNC_PORT:-6080}"
+      DSH_CDP_PORT: "${DSH_CDP_PORT:-9222}"
+      DSH_DESKTOP_WIDTH: "${DSH_DESKTOP_WIDTH:-1440}"
+      DSH_DESKTOP_HEIGHT: "${DSH_DESKTOP_HEIGHT:-900}"
+      # --- workspace file manager (dsh-workspace-browser) ---
+      # A "Files" entry in the sidebar footer with directory navigation, text
+      # preview and editing, and create / rename / delete inside the root below.
+      # It WRITES, including recursive delete, so the UI's own auth is the
+      # boundary: keep the Harness behind Pangolin/Badger or Basic Auth and mount
+      # only the workspace you are willing to expose. Set to 0 to remove it.
+      DSH_WORKSPACE_BROWSER_ENABLED: "${DSH_WORKSPACE_BROWSER_ENABLED:-1}"
+      DSH_WORKSPACE_ROOT: "${DSH_WORKSPACE_ROOT:-/workspace}"
+      DSH_WORKSPACE_MAX_ENTRIES: "${DSH_WORKSPACE_MAX_ENTRIES:-2000}"
+      DSH_WORKSPACE_MAX_PREVIEW_BYTES: "${DSH_WORKSPACE_MAX_PREVIEW_BYTES:-524288}"
+      DSH_WORKSPACE_MAX_WRITE_BYTES: "${DSH_WORKSPACE_MAX_WRITE_BYTES:-1048576}"
+      # --- Office documents (dsh-office) ---
+      # Word, PowerPoint, Excel and PDF work for the model: the harness's own
+      # office-docx/office-pptx/office-xlsx skills plus this image's PDF skill,
+      # running on the pinned Python payload baked into the image, with the bundled
+      # LibreOffice kit rendering pages to images (so a vision model can look at a
+      # document) and converting to PDF. It is a SWITCHABLE CARD in the Plugins
+      # page; this flag only decides whether a FRESH home selects it. 1 = select it
+      # once (recommended), 0 = keep the card but never select it.
+      DSH_OFFICE: "${DSH_OFFICE:-1}"
+      # Point the dependency tool at a different payload directory (one holding
+      # runtime.json + dependencies/). Empty = the image's own
+      # /opt/dsh-office/primary-runtime. The rows refuse to mount when the payload
+      # is missing, so a wrong path hides the feature instead of breaking the boot.
+      DSH_OFFICE_RUNTIME: "${DSH_OFFICE_RUNTIME:-}"
+      # --- personal VM (cua) -------------------------------------------------
+      # The model's own Linux computer. The supervisor that owns it starts from
+      # the entrypoint, outside the agent's sandbox, because `workspace-write`
+      # cannot open /dev/kvm and the disks must stay out of the workspace.
+      # Needs /dev/kvm: apply compose.emulator.yaml (or your own override) —
+      # without it the tools start and report the device error instead of
+      # failing the boot.
+      DSH_CUA_VM: "${DSH_CUA_VM:-1}"
+      CUA_VM_STORE: "${CUA_VM_STORE:-/cua-vm}"
+      CUA_WORKSPACE_ROOT: "/workspace"
+      CUA_VM_TIER: "${CUA_VM_TIER:-slim}"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # DSH state: profiles / settings / credentials / sessions / storage
+      # The browser profile lives here too ($DSH_HOME/brave-profile), which is
+      # what makes logins, cookies and installed extensions survive a restart.
+      - dsh-home:/home/node/.dsh
+      # Agent workspace (the Web UI dir-selector treats /workspace as HOME)
+      - ${DSH_WORKSPACE:-./workspace}:/workspace
+      # VM store: base image, per-workspace deltas, QEMU and logs. Outside the
+      # workspace on purpose — a 1.3 GB base disk is not project data. Delete
+      # the volume to reclaim everything; the next vm_ensure re-provisions.
+      - cua-vm:/cua-vm
+      # NOTE 2026-10-01: the ./overrides/proxy.mjs bind-mount was REMOVED. It
+      # carried the 2026-09-01 dotted-chain regex fix as a runtime patch over the
+      # image copy — but the image's docker/proxy.mjs has owned that fix (plus
+      # the recovery surface, the client-boot watchdog and the /desktop route)
+      # since the diagnostic-screen work, so the stale 415-line copy silently
+      # shadowed every later proxy change. The image copy is now authoritative.
+      #
+      # FIX 2026-09-01: re-export settingsNamespace (made internal upstream in
+      # 0.1.2-alpha.3) so ecosystem plugins that still import it keep loading.
+      # Remove once the plugins ship alpha3-compatible releases.
+      - ./overrides/settings-index.js:/opt/dsh-src/packages/settings/settings/lib/index.js:ro
+      # NOTE (2026-10-02): the Landlock launcher bind-mount was REMOVED. The
+      # image now bundles the launcher (the platform package
+      # @deepseek-ai/node-addon-system-<platform>-<arch>) and the build PROVES it
+      # with the real `--probe`, so confined permission modes work on a fresh
+      # deployment with nothing downloaded or mounted. The old mount pointed at
+      # a source-channel path (/opt/dsh-src/native/landlock-run/...) that does
+      # not exist in an npm-channel image, so it shadowed nothing and only made
+      # a fresh start look like it needed a manual setup step. Remove any
+      # `./overrides/landlock-run/...` line from an existing compose file; the
+      # mount is harmless but redundant.
+    # Chromium-derived browsers use /dev/shm for renderer shared memory; the
+    # 64 MB default makes heavy pages crash the renderer. The entrypoint detects
+    # a small /dev/shm and falls back to --disable-dev-shm-usage, so this is the
+    # fast path rather than a requirement.
+    shm_size: "1g"
+    # Writable temp space, required because of `read_only: true` below: Node,
+    # npm/pnpm caches, python, uv/uvx temp venvs (MCP servers), gcc — and the
+    # browser's XDG config/cache/runtime plus its display logs. `exec` lets them
+    # execute files placed there. size=2g caps RAM usage (1g was tight once the
+    # browser shares this tmpfs).
+    tmpfs:
+      - /tmp:exec,size=2g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    init: false # tini runs INSIDE the image (PID 1, orphan reaping)
+
+  # The VM store is a named volume, so it arrives root-owned and the image runs
+  # as node. This one-shot service hands it to uid 1000 before the harness boots.
+  # (A bind mount with the right ownership makes it unnecessary.)
+  cua-init:
+    image: alpine:3.20
+    container_name: ${CUA_INIT_CONTAINER_NAME:-seek-harness-cua-init}
+    command: ["sh", "-c", "chown -R 1000:1000 /cua-vm"]
+    volumes:
+      - cua-vm:/cua-vm
+    restart: "no"
+
+volumes:
+  dsh-home:
+  cua-vm:

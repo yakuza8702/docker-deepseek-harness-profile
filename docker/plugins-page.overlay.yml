@@ -1,0 +1,9 @@
+# Plugin market + integrated features, mounted into EVERY profile as a launcher
+# overlay (`--patch`), the same mechanism as the other overlays. The plugin's row
+# is what makes its CLIENT half part of the served bundle; the two sections it
+# renders appear at the top of the Plugins page through the `plugins.page.top`
+# slot, which tools/patch-plugin-manager-page.mjs adds to the upstream page at
+# image-build time.
+- insert:
+    - id: plugins-page-extras
+      name: dsh-plugins-page-extras

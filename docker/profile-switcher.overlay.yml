@@ -1,0 +1,7 @@
+# In-app profile control: mounts dsh-profile-switcher into every profile as a
+# launcher overlay (`--patch`), applied AFTER the profile layer — no profile
+# directory in $DSH_HOME is edited, and removing this file (or setting
+# DSH_PROFILE_OVERLAY=) removes the control again.
+- insert:
+    - id: dsh-profile-switcher
+      name: dsh-profile-switcher

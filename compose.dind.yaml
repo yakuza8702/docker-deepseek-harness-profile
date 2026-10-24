@@ -1,0 +1,135 @@
+# =====================================================================
+# OPTIONAL override — a FULL, ISOLATED Docker engine for the harness.
+#
+#   docker compose -f compose.yaml -f compose.dind.yaml up -d
+#
+# Option A (DOCKER_HOST=socket-proxy) and Option B (compose.docker.yaml,
+# host docker.sock) both LEND the agent the host daemon. This override
+# does not: it gives the agent an engine of its own, in a sidecar.
+#
+#   * the harness keeps every bit of its hardening — cap_drop ALL,
+#     read_only rootfs, no-new-privileges — because *using* docker needs
+#     no capability, only a TCP connection to the sidecar;
+#   * the engine's root API (2375) is reachable ONLY on the private
+#     `harness-docker` network. It is never published, so no other stack
+#     on the host can drive it and nothing the agent does touches the
+#     host daemon;
+#   * everything the agent builds, runs and tests lives under DIND_DATA,
+#     one directory that can be deleted to purge the whole engine.
+#
+# Image hand-off (agent-built image → host), no host-daemon changes:
+#   DIND_EXPORT is mounted at /export in the harness, so a finished image
+#   leaves the isolated engine as a plain archive:
+#       docker save myapp:1.0 | gzip > /export/myapp-1.0.tgz
+#   and the host's own daemon picks it up:
+#       docker load < <DIND_EXPORT>/myapp-1.0.tgz
+#
+# Purge (keep the finished images, throw the engine away):
+#   docker compose -f compose.yaml -f compose.dind.yaml rm -sf dind
+#   sudo rm -rf "$DIND_DATA"   # build cache, test containers, scratch layers
+#   DIND_EXPORT (archives) and DIND_REGISTRY_DATA (pushed images) live
+#   OUTSIDE the engine's data root, so they survive by construction.
+#   NOTE: dockerd creates DIND_DATA root-owned (0710), so the rm needs root —
+#   a plain user rm fails with EACCES and looks like "purge didn't work".
+#
+# SECURITY: the sidecar is `privileged` — that is what a real nested
+# dockerd needs (it mounts overlayfs and manages iptables/cgroups). It is
+# not the host: it has its own PID/mount/net namespaces and sees exactly
+# one host path (DIND_DATA). Do not mount anything else into it. The
+# privilege-free alternatives are a rootless engine (docker:dind-rootless,
+# needs /dev/fuse + unprivileged user namespaces) or a Sysbox runtime on
+# the host; both are host-level installs, this file is not.
+# =====================================================================
+
+services:
+  # ── the isolated engine ─────────────────────────────────────────────
+  dind:
+    image: docker:${DIND_IMAGE_TAG:-29-dind}
+    container_name: ${DIND_CONTAINER_NAME:-seek-harness-dind}
+    restart: unless-stopped
+    privileged: true
+    # dockerd has to stop the containers running INSIDE it first
+    stop_grace_period: 60s
+    environment:
+      # the API is private to `harness-docker`; TLS would only add a
+      # certificate-distribution problem inside a single compose project
+      DOCKER_TLS_CERTDIR: ""
+    command:
+      - --host=tcp://0.0.0.0:2375
+      - --host=unix:///var/run/docker.sock
+      - --storage-driver=overlay2
+      - --data-root=/var/lib/docker
+      # the registry sibling speaks plain HTTP on the private network
+      - --insecure-registry=registry:5000
+    volumes:
+      # The engine's ENTIRE state. Must be a real filesystem (ext4/xfs/
+      # btrfs): overlay2 refuses to sit on top of FUSE, so a mergerfs
+      # path fails at engine start. Keep it on the same physical disk as
+      # the host's own docker root.
+      - ${DIND_DATA:-./dind-data}:/var/lib/docker
+    networks:
+      - harness-docker
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    # Reaching a stack the agent deployed INSIDE the engine (the port
+    # ladder): the inner compose publishes on the ENGINE's network
+    # namespace, so publish the same port here to reach it from the LAN —
+    #   inner:  ports: ["8080:80"]
+    #   here:   ports: ["192.168.0.6:18080:8080"]
+    # The harness reaches it directly at dind:<inner-published-port>.
+    #
+    # Deliberately NO published port for 2375, the engine's root API. To
+    # stream images host-ward with no archive at all, publish it on the
+    # host loopback only and pipe straight into the host daemon:
+    #   ports: ["127.0.0.1:${DIND_PORT:-2375}:2375"]
+    #   HOST: docker -H tcp://127.0.0.1:2375 save myapp:1.0 | docker load
+    # (that loopback port is root-equivalent for the isolated engine, so
+    # keep it on 127.0.0.1 — never on a LAN address.)
+
+  # ── durable image store (optional, recommended) ─────────────────────
+  # The engine's data root is scratch. This is where finished images go
+  # when they should outlive a purge. From inside the engine:
+  #   docker tag  myapp:1.0  registry:5000/myapp:1.0
+  #   docker push registry:5000/myapp:1.0
+  # …and any stack the agent deploys inside the engine can pull it back.
+  registry:
+    image: registry:${REGISTRY_IMAGE_TAG:-2}
+    container_name: ${REGISTRY_CONTAINER_NAME:-seek-harness-registry}
+    restart: unless-stopped
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - ${DIND_REGISTRY_DATA:-./dind-registry}:/var/lib/registry
+    networks:
+      - harness-docker
+    # Publish this to let the HOST pull finished images directly. A loopback
+    # address needs NO daemon.json change at all: Docker treats 127.0.0.0/8
+    # registries as insecure by default, so `docker pull 127.0.0.1:<port>/…`
+    # just works (verified end to end). Pick a port that is actually free —
+    # 5000 is very commonly taken by other stacks.
+    #   ports: ["${DIND_REGISTRY_BIND:-127.0.0.1}:${DIND_REGISTRY_PORT:-5001}:5000"]
+
+  # ── the harness: hardening unchanged, one new connection ────────────
+  seek-harness:
+    depends_on:
+      dind:
+        condition: service_healthy
+    environment:
+      # overrides Option A/B on purpose: this file MEANS "use the
+      # isolated engine", whatever .env says
+      DOCKER_HOST: "tcp://${DIND_HOST:-dind}:2375"
+    volumes:
+      # where finished images leave the isolated engine (host-visible)
+      - ${DIND_EXPORT:-./image-export}:/export
+    networks:
+      - default
+      - harness-docker
+
+networks:
+  default:
+  harness-docker:
+    name: ${DIND_NETWORK:-harness-docker}

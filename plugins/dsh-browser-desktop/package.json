@@ -1,0 +1,70 @@
+{
+  "name": "dsh-browser-desktop",
+  "version": "0.1.4",
+  "description": "Visible browser desktop (Brave/Chromium) and human takeover layer for DeepSeek Harness Browser Use — vendored from runzhliu/deepseek-harness-docker and patched for single-port, same-origin deployments behind a reverse proxy.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "files": [
+    "client.js",
+    "cordis.patch.yml",
+    "index.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-modules",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/runzhliu/deepseek-harness-docker.git",
+    "directory": "plugins/dsh-browser-desktop"
+  },
+  "homepage": "https://github.com/runzhliu/deepseek-harness-docker/tree/main/plugins/dsh-browser-desktop#readme",
+  "bugs": {
+    "url": "https://github.com/runzhliu/deepseek-harness-docker/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "browser-agent",
+    "browser-use",
+    "human-in-the-loop",
+    "human-takeover",
+    "chromium",
+    "novnc",
+    "vnc",
+    "webui"
+  ],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-client-modules": "^0.1.2-alpha.3 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-layout": "^0.1.2-alpha.3 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-sidebar": "^0.1.2-alpha.3 || ^0.2.0-rc.1",
+    "react": "^18.2.0"
+  }
+}
