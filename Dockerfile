@@ -563,13 +563,18 @@ RUN set -eux; \
 
 # The row works only while FOUR pieces agree — the server above, the bundle patch
 # that mounts the row, the Plugins-page switch (host table + client row) and the
-# page's duplicate-card suppression. One of them missing still produces a healthy
+# page's duplicate-card suppression.
+#
+# The gate below runs with DSH_MCP_SLIM=0: it asks whether the WRAPPER reaches a
+# working server, i.e. the upstream surface. What the model actually sees is the
+# trimmed catalogue, and that is checked separately (tools/check-tool-trim.mjs
+# for the policy, and the measured 30 -> 12 tools / -66% in the commit). One of them missing still produces a healthy
 # image and a dead switch, so this gate EXECUTES the server through the wrapper
 # (a real MCP handshake — brave-mcp connects to the browser lazily, so no browser
 # is needed at build time) and reads the other three out of the installed files.
 # See tools/check-brave-mcp.mjs.
 COPY --chmod=0644 tools/check-brave-mcp.mjs /tmp/check-brave-mcp.mjs
-RUN node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
+RUN DSH_MCP_SLIM=0 node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
  && rm -f /tmp/check-brave-mcp.mjs
 
 # ---------------------------------------------------------------------

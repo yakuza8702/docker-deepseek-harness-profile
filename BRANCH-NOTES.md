@@ -404,3 +404,50 @@ version was a base64 blob inside the supervisor: unreadable, untestable, and
 impossible to debug when the guest rejected a line. The script is versioned
 (`/var/lib/cua-provision`) and re-runs when the version changes, so an existing
 computer gets the fixes on its next Start.
+
+---
+
+## Trimming the static tool catalogue
+
+Every tool schema rides in the static context of every request, so a verbose
+description is paid on each turn of every session. Five plugins on the Plugins
+page put that catalogue around **19.6k tokens**; most of it was prose.
+
+The model-facing surface is unchanged in capability — the trimming removes
+*words*, and only removes *tools* where a sibling server already offers the same
+verb better.
+
+### What changed
+
+| Where | Change | Measured |
+|---|---|---|
+| `docker/mcp-slim.mjs` | stdio MCP proxy in front of both browser servers; rewrites only the `tools/list` reply | — |
+| Playwright row (`browser-mcp`) | all 24 tools kept; descriptions to one sentence, boolean param docs dropped | 4,626 → 3,672 tok (−21%) |
+| Brave DevTools row (`brave-devtools-mcp`) | keeps what Playwright cannot do: Lighthouse, perf traces + insights, CPU/network emulation, console with source-mapped stacks, CSS cascade, heap snapshots, network detail. Drops the driving verbs Playwright already has | 6,776 → 2,135 tok (−68%), 30 → 11 tools |
+| `plugins/dsh-cua-vm` | 12 tool descriptions rewritten from prose to one line | 1,426 → 661 tok (−54%) |
+
+Total: **12,828 → 6,468 tokens** of tool schema, i.e. ~6.4k off a 19.6k
+catalogue. The office bundle and the opt-in Browser-Use provider are untouched
+(third-party tool definitions, and Browser-Use is not enabled by default here).
+
+### How the proxy works
+
+It spawns the real server, pipes stdin/stdout/stderr through untouched, and
+rewrites only the `tools/list` **reply**: drop names in the policy, apply a
+hand-written override when the policy has one, otherwise keep the first sentence
+(stripping "This tool is used to…"), cap it, and delete a boolean parameter's
+description because the name and type already say it. A parse or rewrite error
+forwards the original bytes, so it can never break a handshake.
+
+* `DSH_MCP_SLIM=0` — bypass the proxy entirely (full upstream surface).
+* `DSH_MCP_SLIM_VERBOSE=1` — one line per server: tools before/after, chars,
+  estimated tokens.
+
+### The gate
+
+`tools/check-tool-trim.mjs` runs both policies against a synthetic 27-tool
+catalogue (no browser, no network) and fails when a dropped tool survives, a
+description exceeds its cap, or the JSON-RPC stream is disturbed. The Dockerfile
+runs it at build time. The Brave plugin's own gate runs with `DSH_MCP_SLIM=0`,
+because it asks whether the *wrapper* reaches a working server — what the model
+sees is the trimmed catalogue, and that is what this gate measures.
