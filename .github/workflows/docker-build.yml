@@ -11,6 +11,8 @@
 #                  GITHUB_TOKEN, no secrets required.
 # * tags pushed  : latest, dsh-<version>, build-<version>-<sha8>
 # * platforms    : linux/amd64 (default) — arm64 opt-in via workflow input
+# * virgl        : opt-in build of the personal-VM QEMU with virtio-gpu-gl-pci
+#                  (workflow input `virgl`, or repo variable DSH_WITH_VIRGL_QEMU=1)
 #                  or repo variable vars.DSH_PLATFORMS (source builds for
 #                  arm64 run under slow QEMU emulation, avoid on free runners)
 #
@@ -61,6 +63,10 @@ on:
         description: "Target platforms (comma-separated). Default linux/amd64. arm64 needs QEMU and makes source builds 5-15x slower"
         required: false
         default: "linux/amd64"
+      virgl:
+        description: "Build with the virgl-capable QEMU (GPU acceleration for the personal VM; +~200 MB, needs /dev/dri on the host)"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 */6 * * *"
 
@@ -189,6 +195,10 @@ jobs:
           build-args: |
             DSH_VERSION=${{ needs.check.outputs.dsh_version }}
             DSH_SOURCE_REF=${{ needs.check.outputs.source_ref }}
+            # Opt-in GPU support: the distro QEMU plus qemu-system-modules-opengl
+            # (the package that carries virtio-gpu-gl-pci) and virgl/Mesa.
+            # DSH_CUA_VM_GPU=virgl at runtime then switches cua onto it.
+            WITH_VIRGL_QEMU=${{ (github.event.inputs.virgl == 'true' || vars.DSH_WITH_VIRGL_QEMU == '1') && '1' || '0' }}
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:dsh-${{ needs.check.outputs.dsh_version }}
@@ -209,4 +219,5 @@ jobs:
             echo "| Version tag | \`:dsh-${{ needs.check.outputs.dsh_version }}\` |"
             echo "| Build tag | \`${{ needs.check.outputs.build_key }}\` |"
             echo "| Platforms | \`${{ github.event.inputs.platforms || vars.DSH_PLATFORMS || 'linux/amd64' }}\` |"
+            echo "| virgl QEMU | \`${{ (github.event.inputs.virgl == 'true' || vars.DSH_WITH_VIRGL_QEMU == '1') && 'on' || 'off' }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
