@@ -69,12 +69,19 @@ window.__ModuleLoader__.load({
       const [text, setText] = useState('')
       const [frameAt, setFrameAt] = useState(0)
       const [pos, setPos] = useState(null)
-      const [cursor, setCursor] = useState(null)
       const frameRef = React.useRef(null)
 
       const send = async (payload) => {
         try {
-          await api('input', { name, ...payload })
+          // Pointer actions ride the same cua path the model uses, so a click
+          // here cannot drift if the capture size ever differs from the
+          // display. Typing and keys are position independent and stay on the
+          // cheaper xdotool route.
+          if (payload.kind === 'click') {
+            await api('gui', { name, action: 'click', x: payload.x, y: payload.y, smooth: false })
+          } else {
+            await api('input', { name, ...payload })
+          }
           setFrameAt(Date.now())
         } catch (error) {
           setPng(null)
@@ -96,6 +103,7 @@ window.__ModuleLoader__.load({
       // X11 renders the cursor as an overlay the capture does not include, so
       // the real pointer moves invisibly. Poll it and draw our own.
       useEffect(() => {
+        if (!frames) { setPos(null); return undefined }
         let alive = true
         const tick = async () => {
           try {
@@ -108,34 +116,8 @@ window.__ModuleLoader__.load({
         void tick()
         const timer = setInterval(() => { void tick() }, 400)
         return () => { alive = false; clearInterval(timer) }
-      }, [name])
+      }, [name, frames])
 
-      // Map the guest pointer onto the viewer's canvas so the shared video view
-      // shows the agent's cursor too. The stream itself never contains it (X11
-      // draws the cursor outside the capture).
-      useEffect(() => {
-        if (pos === null || frames) { setCursor(null); return }
-        const frame = frameRef.current
-        if (frame === null) { setCursor(null); return }
-        try {
-          const doc = frame.contentDocument
-          if (doc === null) { setCursor(null); return }
-          const elements = [...doc.querySelectorAll('canvas, video')]
-            .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))
-          const target = elements[0]
-          if (target === undefined) { setCursor(null); return }
-          const outer = frame.getBoundingClientRect()
-          const inner = target.getBoundingClientRect()
-          if (inner.width === 0 || inner.height === 0) { setCursor(null); return }
-          const scale = Math.min(inner.width / pos.width, inner.height / pos.height)
-          setCursor({
-            left: outer.left + inner.left + (inner.width - pos.width * scale) / 2 + pos.x * scale,
-            top: outer.top + inner.top + (inner.height - pos.height * scale) / 2 + pos.y * scale
-          })
-        } catch {
-          setCursor(null)
-        }
-      }, [pos, frames])
       return h('div', {
         role: 'dialog', 'aria-modal': 'true', 'aria-label': `VM desktop ${name}`,
         style: {
@@ -153,7 +135,9 @@ window.__ModuleLoader__.load({
         },
           h('div', { style: { fontWeight: 600 } }, `${name} — shared desktop`),
           h('div', { style: { ...S.muted, marginLeft: 'auto' } }, 'You and the model share this screen. Input from either side lands in the same session.'),
-          pos !== null && h('div', { style: { ...S.muted, fontVariantNumeric: 'tabular-nums' } }, `pointer ${pos.x},${pos.y}`),
+          // The numeric pointer is only meaningful next to a static frame: in
+          // the video view the viewer renders the guest cursor itself.
+          frames && pos !== null && h('div', { style: { ...S.muted, fontVariantNumeric: 'tabular-nums' } }, `pointer ${pos.x},${pos.y}`),
           h('button', {
             type: 'button',
             style: { ...S.button, background: frames ? T.hover : 'transparent', color: T.text },
@@ -222,14 +206,6 @@ window.__ModuleLoader__.load({
               style: { width: '100%', height: '100%', border: 'none', borderRadius: T.radiusLg, background: '#000' },
               allow: 'clipboard-read; clipboard-write; fullscreen'
             }),
-        cursor !== null && h('div', {
-          'aria-hidden': true,
-          style: {
-            position: 'fixed', pointerEvents: 'none', zIndex: 71,
-            left: cursor.left, top: cursor.top, transform: 'translate(-2px,-2px)', width: 16, height: 16
-          }
-        }, h('svg', { width: 16, height: 16, viewBox: '0 0 16 16' },
-          h('path', { d: 'M2 1 L2 13 L5.5 9.8 L8 15 L10.2 14 L7.8 8.9 L12.5 8.4 Z', fill: '#fff', stroke: '#111', strokeWidth: 1 })))
       )
     }
 
@@ -380,7 +356,7 @@ window.__ModuleLoader__.load({
               placeholder: 'name (a-z, 0-9, dashes)', value: draft.name, style: S.input,
               onChange: (event) => setDraft({ ...draft, name: event.target.value })
             }),
-            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 2fr 1fr auto auto', gap: 8, alignItems: 'end' } },
+            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 2fr 1fr auto', gap: 8, alignItems: 'end' } },
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'vCPU'),
                 h('input', { type: 'number', min: 1, max: 8, value: draft.cpu, style: S.input, onChange: (event) => setDraft({ ...draft, cpu: Number(event.target.value) }) })),
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'RAM (GB)'),
@@ -392,22 +368,24 @@ window.__ModuleLoader__.load({
                 )),
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'Disk (GB)'),
                 h('input', { type: 'number', min: 20, max: 200, step: 10, value: draft.diskGb, style: S.input, onChange: (event) => setDraft({ ...draft, diskGb: Number(event.target.value) }) })),
-              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, paddingBottom: 6 } },
-                h('input', {
-                  type: 'checkbox', checked: draft.gpu === true,
-                  onChange: (event) => setDraft({ ...draft, gpu: event.target.checked })
-                }),
-                'Enable GPU'
-              ),
-              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, paddingBottom: 6 } },
-                h('input', {
-                  type: 'checkbox', checked: draft.android === true,
-                  onChange: (event) => setDraft({ ...draft, android: event.target.checked })
-                }),
-                'Android SDK'
+              h('div', { style: { display: 'grid', gap: 4, paddingBottom: 2 } },
+                h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 } },
+                  h('input', {
+                    type: 'checkbox', checked: draft.gpu === true,
+                    onChange: (event) => setDraft({ ...draft, gpu: event.target.checked })
+                  }),
+                  'Enable GPU'
+                ),
+                h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 } },
+                  h('input', {
+                    type: 'checkbox', checked: draft.android === true,
+                    onChange: (event) => setDraft({ ...draft, gpu: event.target.checked || draft.android })
+                  }),
+                  'Install Android'
+                )
               )
             ),
-            h('div', { style: S.muted }, 'Everything the guest needs is provisioned automatically on the first start when Enable GPU is on: Xorg on virgl, OpenGL 4.3, render/KVM access, a 1200x750 desktop and the workspace share. Android SDK adds ~7 GB inside the VM and takes a few minutes; grow Disk (GB) to 40 for it. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field.'),
+            h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field.'),
             h('div', { style: S.row },
               h('button', { type: 'button', style: S.primary, disabled: pending !== null || draft.name.trim() === '', onClick: () => void create() }, pending?.action === 'create' ? 'Creating…' : 'Create computer')
             )
@@ -427,6 +405,8 @@ window.__ModuleLoader__.load({
                   h('span', { style: { fontWeight: 600, fontSize: 13 } }, name),
                   h('span', { style: S.badge(ready) }, vm.state ?? 'unknown'),
                   vm.gpu === true && h('span', { style: { ...S.badge(false), color: T.info } }, 'GPU'),
+                  vm.android === true && h('span', { style: { ...S.badge(false), color: T.accent, border: `1px solid ${T.line}`, background: T.accent } }, 'Android'),
+                  vm.diskGb > 0 && h('span', { style: { ...S.badge(false), color: T.caption } }, `${vm.diskGb} GB`),
                   h('span', { style: { ...S.muted, marginLeft: 'auto' } }, `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · ${vm.image ?? 'linux'}`)
                 ),
                 h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },

@@ -981,6 +981,10 @@ const handlers = {
         image: String(image),
         tier: String(tier),
         gpu: gpu === true,
+        // Kept so the panel can show a GPU / Android indicator per computer
+        // long after creation, without asking the guest.
+        android: android === true,
+        diskGb: Number(diskGb) > 0 ? Number(diskGb) : 20,
         cpu: Number(cpu) || 2,
         memory: Number(memory) || 4,
         createdAt: new Date().toISOString(),
@@ -1391,7 +1395,11 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
     if (!registry.vms[name]) return fail(`no computer named "${name}"`)
     try {
       const result = await growGuestDisk(name, Number(sizeGb))
-      if (result.changed) log(`disk: ${name} grew to ${result.sizeGb} GB`)
+      if (result.changed) {
+        log(`disk: ${name} grew to ${result.sizeGb} GB`)
+        registry.vms[name].diskGb = result.sizeGb
+        writeRegistry(registry)
+      }
       return ok({ name, ...result })
     } catch (error) {
       return fail(`${error && error.message}`)
