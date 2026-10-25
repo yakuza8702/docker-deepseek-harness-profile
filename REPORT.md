@@ -1,7 +1,7 @@
 # Report — CUA personal computers for the DeepSeek Harness
 
 Branch: `feat/cua-web` · head `da91f4b` · base `@deepseek-ai/dsh` 0.2.1-rc.2
-Image: `dsh-harness:trim-cua-v2` (6.43 GB, round 2, built with `WITH_VIRGL_QEMU=1`) · GPU adds virgl QEMU
+Image: built from this branch with `WITH_VIRGL_QEMU=1` (6.43 GB) · GPU adds virgl QEMU
 `main` keeps the old emulator/APK build; this branch deliberately drops it.
 
 This file is a handoff: what exists, what was discovered the hard way, what is
@@ -76,8 +76,10 @@ NVIDIA 610.57) with a computer created at 4 vCPU / 8 GB / 40 GB / GPU:
 | a11y | still absent for Blender; falls back to display + window list with bounds from `cua do window ls` |
 | Panel | themed (dark/light), left-nav entry, self-updating list |
 
-Not re-verified: Chromium WebGL on the Xorg desktop, and the video viewer over
-HTTPS (both unchanged from round 1).
+| **Chromium WebGL** | works on the accelerated desktop — the page renders WebGL on the Xorg/virgl session, so the round-1 llvmpipe failure does not come back |
+
+Still un-re-verified: the video viewer over HTTPS (the frames fallback is what
+plain HTTP gets).
 
 ---
 
@@ -165,6 +167,9 @@ HTTPS (both unchanged from round 1).
 | round 2 | **GPU provisioning rewritten as `docker/cua-guest-provision.sh`** (real file, not a base64 blob): apt repair, packages, render/kvm udev + groups, Xorg, GL override for the desktop *and* spacesd, 9p mount, marker with renderer/kvm |
 | round 2 | **`MESA_GL_VERSION_OVERRIDE=4.3FC`**: Blender 4.x on virgl instead of llvmpipe |
 | round 2 | **`cua_vm_disk`** (QMP `block_resize` + `growpart`/`resize2fs`, online) and `diskGb` on create |
+| round 2 | **tool catalogue trimmed**: `docker/mcp-slim.mjs` drops the Brave verbs Playwright already offers and compresses both browser catalogues (12.8k → 6.5k tok measured in the image); CUA descriptions rewritten (1.4k → 0.7k) |
+| round 2 | **MCP-manager rows filtered in the proxy** (`/dsh-mcp-manager/api`), so a plugin install can no longer reveal `browser-mcp` / `brave-devtools-mcp` |
+| round 2 | panel: Install Android switch + per-VM GPU/Android/disk badges, Android in light green, and **no cursor of our own in the video view** (the viewer draws the pointer; Frames keeps its marker and the readout) |
 | round 2 | **`cua_vm_android`** (`docker/cua-guest-android.sh`): SDK, platform-tools, emulator, system image, AVD, `cua-emulator` launcher |
 | round 2 | provisioning runs on every start (version-checked) and has an explicit `provision` op |
 | `da91f4b` | fractional clicks (`relative`), server-side `region` crops with printed mapping, screenshot size in the result, `sb exec` retries while spacesd restarts |
@@ -227,27 +232,26 @@ cat /var/lib/cua-provision            # version=6 … kvm=yes
 
 ## 7. Open issues
 
-1. **Chromium WebGL on the accelerated desktop is still unverified.** Try the
-   default ANGLE path first; this Chromium build rejects `--use-gl=egl`
-   (`--use-gl=angle --use-angle=gl` is the allowed spelling).
-2. **The GL override is a report, not a capability.** virgl exposes the 4.3
+1. **The GL override is a report, not a capability.** virgl exposes the 4.3
    extension set but reports 4.2; the session lifts the string. If an app uses a
    function that is genuinely missing, it will fail on the GPU instead of
    falling back. That is still better than the old behaviour (refuse to start,
    or run at llvmpipe speed), and `LIBGL_ALWAYS_SOFTWARE=1` remains the escape
    hatch.
-3. **The scratch mode is copy-then-build.** 9p is fine for source and results,
+2. **The scratch mode is copy-then-build.** 9p is fine for source and results,
    not for object files; the prompt tells the model to build in the VM's own
    `/tmp/build` when a build writes thousands of files.
-4. **Video needs HTTPS.** On plain HTTP the viewer falls back to frames. Behind
+3. **Video needs HTTPS.** On plain HTTP the viewer falls back to frames. Behind
    Pangolin, `Bypass Auth` is required on `/vm/view/media`.
-5. **A container restart kills QEMU**; the supervisor recreates from the
+4. **A container restart kills QEMU**; the supervisor recreates from the
    flattened checkpoint, so files survive but running processes do not.
-6. **Debian/Arch are not Cua disks.**
-7. **The MCP-manager filter is content-anchored** against a third-party bundle.
-8. **Android needs the disk grown first.** The bootstrap refuses with a clear
+5. **Debian/Arch are not Cua disks.**
+6. **The MCP manager needs no patch any more.** The rows are filtered from
+   `/dsh-mcp-manager/api` in the proxy, so installing or updating the plugin
+   cannot bring `browser-mcp` / `brave-devtools-mcp` back.
+7. **Android needs the disk grown first.** The bootstrap refuses with a clear
    message under 12 GB free; `diskGb: 40` on create is the intended path.
-9. **`cua_vm_android` downloads ~3.5 GB.** It is one-off per computer and the
+8. **`cua_vm_android` downloads ~3.5 GB.** It is one-off per computer and the
    script is idempotent, but a slow link makes the first run long.
 
 ---
