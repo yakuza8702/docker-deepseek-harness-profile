@@ -273,3 +273,23 @@ file written before a container restart is readable afterwards.
 The checkpoint is taken from whatever the disk held at recovery time, so it
 survives `down/up`, image updates and host reboots as long as the `/cua-vm`
 volume does. It is not a backup: deleting the volume still deletes the computer.
+
+## GPU in the VM: virgl, not passthrough
+
+`cua sb create --gpu virgl` is the paravirtual path: the host GPU is shared, the
+VM gets a virtio-gpu-gl device, and it is OpenGL/GLES, not CUDA. Two things were
+missing and are now solved:
+
+* cua's own QEMU has no `virtio-gpu-gl-pci` (verified). The distro build does —
+  but only with `qemu-system-modules-opengl`, which ships
+  `hw-display-virtio-gpu-pci-gl.so`. The image installs both behind
+  `--build-arg WITH_VIRGL_QEMU=1`.
+* `DSH_CUA_VM_GPU=virgl` makes the supervisor overwrite cua's QEMU wrapper with
+  the system binary (it re-applies after every `runtime setup`) and add
+  `--gpu virgl` to creates.
+
+`compose.gpu.yaml` carries the host side: `/dev/dri`, the render/video GIDs, the
+NVIDIA toolkit reservation with the `graphics` capability, and
+`NVIDIA_DRIVER_CAPABILITIES=all`. Without a render node the create fails with
+"No GPU render node (/dev/dri/renderD*)" — a clear refusal, not a silent
+software fallback. CUDA inside the VM still requires VFIO and a dedicated GPU.

@@ -119,6 +119,22 @@ RUN set -eux; \
       fonts-liberation fonts-noto-cjk; \
     rm -rf /var/lib/apt/lists/*
 
+# Optional: a virgl-capable QEMU. cua provisions its own QEMU, but that build
+# has no virtio-gpu-gl-pci (verified: "This QEMU was built without
+# virglrenderer"), so the personal VM is limited to software GL. Installing the
+# distro build lets `cua sb create --gpu virgl` hand the guest a virgl context;
+# the supervisor points cua's wrapper at this binary when DSH_CUA_VM_GPU=virgl.
+# Off by default: it costs ~200 MB and needs /dev/dri (or the NVIDIA toolkit)
+# on the host to be worth anything.
+ARG WITH_VIRGL_QEMU=0
+RUN set -eux; \
+    if [ "$WITH_VIRGL_QEMU" = "1" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends \
+        qemu-system-x86 qemu-system-modules-opengl libvirglrenderer1 libegl1 libgl1-mesa-dri; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Brave — the browser the desktop runs (user's choice; it is also the browser
 # they use locally). Installed from Brave's official APT repository, added here
 # explicitly with its keyring rather than via a curl|bash installer.

@@ -310,6 +310,9 @@ async function ensureRuntime() {
     if (setup.code !== 0) throw new Error(`cua runtime setup qemu failed: ${(setup.stderr || setup.stdout).trim().slice(-800)}`)
   }
   repairQemuData()
+  // Runs every time: a re-provision would otherwise put cua's non-virgl binary
+  // back and silently drop the GPU.
+  preferSystemQemu()
   return existsSync(wrapper)
 }
 
@@ -343,6 +346,7 @@ function createArgs(name, tier, cpu, memory, waitDesktop, image = 'linux') {
   const args = ['sb', 'create', image, '--on', 'local', '--kind', 'vm', '--name', name]
   // A local disk path carries its own variant; --tier only applies to catalog refs.
   if (String(image).startsWith('/') === false) args.push('--tier', String(tier))
+  if (GPU_MODE === 'virgl') args.push('--gpu', 'virgl')
   args.push('--cpu', String(cpu), '--memory', `${memory}GB`, '--json', '--wait', waitDesktop ? 'desktop' : 'tcp:3211')
   return args
 }
@@ -354,6 +358,30 @@ function createArgs(name, tier, cpu, memory, waitDesktop, image = 'linux') {
  * cloned repos) instead of a blank image.
  */
 const CHECKPOINT_DIR = path.join(STORE, 'checkpoints')
+
+/**
+ * DSH_CUA_VM_GPU=virgl makes the supervisor point cua's QEMU wrapper at the
+ * distro build (the one with virtio-gpu-gl-pci) and pass `--gpu virgl` on
+ * create. Without it everything stays exactly as before.
+ */
+const GPU_MODE = String(process.env.DSH_CUA_VM_GPU || '').trim().toLowerCase()
+const SYSTEM_QEMU = '/usr/bin/qemu-system-x86_64'
+
+function preferSystemQemu() {
+  if (GPU_MODE !== 'virgl') return
+  if (!existsSync(SYSTEM_QEMU)) {
+    log('DSH_CUA_VM_GPU=virgl but the image has no system QEMU (build with WITH_VIRGL_QEMU=1)')
+    return
+  }
+  const wrapper = path.join(CUA_HOME, '.cua', 'bin', 'qemu-system-x86_64')
+  try {
+    writeFileSync(wrapper, `#!/bin/sh\nexec ${SYSTEM_QEMU} "$@"\n`)
+    chmodSync(wrapper, 0o755)
+    log(`qemu: using ${SYSTEM_QEMU} (virgl enabled)`)
+  } catch (error) {
+    log(`qemu: could not switch to the system build: ${error && error.message}`)
+  }
+}
 
 function checkpointSandbox(name) {
   const disk = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name, 'disk.qcow2')
