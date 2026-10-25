@@ -1,7 +1,7 @@
 # Report — CUA personal computers for the DeepSeek Harness
 
 Branch: `feat/cua-web` · head `da91f4b` · base `@deepseek-ai/dsh` 0.2.1-rc.2
-Image: `dsh-harness:trim-cua-20261024` (6.29 GB) · GPU image adds virgl QEMU
+Image: `dsh-harness:trim-cua-v2` (6.43 GB, round 2, built with `WITH_VIRGL_QEMU=1`) · GPU adds virgl QEMU
 `main` keeps the old emulator/APK build; this branch deliberately drops it.
 
 This file is a handoff: what exists, what was discovered the hard way, what is
