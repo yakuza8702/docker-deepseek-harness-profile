@@ -311,8 +311,8 @@ async function ensureRuntime() {
   }
   repairQemuData()
   // Runs every time: a re-provision would otherwise put cua's non-virgl binary
-  // back and silently drop the GPU.
-  preferSystemQemu()
+  // back and silently drop the GPU. Swapped only when something asks for it.
+  if (GPU_MODE === 'virgl' || Object.values(readRegistry().vms).some((vm) => vm && vm.gpu === true)) preferSystemQemu()
   return existsSync(wrapper)
 }
 
@@ -342,11 +342,11 @@ function findListed(parsed, name) {
 }
 
 /** The create argv, shared by a fresh create and a recovery recreate. */
-function createArgs(name, tier, cpu, memory, waitDesktop, image = 'linux') {
+function createArgs(name, tier, cpu, memory, waitDesktop, image = 'linux', gpu = false) {
   const args = ['sb', 'create', image, '--on', 'local', '--kind', 'vm', '--name', name]
   // A local disk path carries its own variant; --tier only applies to catalog refs.
   if (String(image).startsWith('/') === false) args.push('--tier', String(tier))
-  if (GPU_MODE === 'virgl') args.push('--gpu', 'virgl')
+  if (gpu === true) args.push('--gpu', 'virgl')
   args.push('--cpu', String(cpu), '--memory', `${memory}GB`, '--json', '--wait', waitDesktop ? 'desktop' : 'tcp:3211')
   return args
 }
@@ -367,10 +367,26 @@ const CHECKPOINT_DIR = path.join(STORE, 'checkpoints')
 const GPU_MODE = String(process.env.DSH_CUA_VM_GPU || '').trim().toLowerCase()
 const SYSTEM_QEMU = '/usr/bin/qemu-system-x86_64'
 
+let systemQemuChecked = false
+let systemQemuHasVirgl = false
+
+/** Does the distro QEMU in this image carry virtio-gpu-gl-pci? */
+function systemQemuSupportsVirgl() {
+  if (systemQemuChecked) return systemQemuHasVirgl
+  systemQemuChecked = true
+  if (!existsSync(SYSTEM_QEMU)) return (systemQemuHasVirgl = false)
+  try {
+    const help = execFileSync(SYSTEM_QEMU, ['-device', 'help'], { encoding: 'utf8', timeout: 30000 })
+    systemQemuHasVirgl = help.includes('virtio-gpu-gl-pci')
+  } catch {
+    systemQemuHasVirgl = false
+  }
+  return systemQemuHasVirgl
+}
+
 function preferSystemQemu() {
-  if (GPU_MODE !== 'virgl') return
-  if (!existsSync(SYSTEM_QEMU)) {
-    log('DSH_CUA_VM_GPU=virgl but the image has no system QEMU (build with WITH_VIRGL_QEMU=1)')
+  if (!systemQemuSupportsVirgl()) {
+    if (GPU_MODE === 'virgl') log('DSH_CUA_VM_GPU=virgl but this image has no virgl QEMU (build with WITH_VIRGL_QEMU=1)')
     return
   }
   const wrapper = path.join(CUA_HOME, '.cua', 'bin', 'qemu-system-x86_64')
@@ -450,10 +466,11 @@ const handlers = {
               await ensureRuntime()
               const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : 'linux'
               if (snapshot !== null) copyFileSync(snapshot, bootImage)
-              let recreated = await runCua(createArgs(name, known?.tier || tier, known?.cpu || cpu, known?.memory || memory, waitDesktop, bootImage), { timeoutMs: 1500000 })
+              if (known?.gpu === true) preferSystemQemu()
+              let recreated = await runCua(createArgs(name, known?.tier || tier, known?.cpu || cpu, known?.memory || memory, waitDesktop, bootImage, known?.gpu === true), { timeoutMs: 1500000 })
               if (recreated.code !== 0 && snapshot !== null) {
                 log(`restore from checkpoint failed for ${name}; falling back to the base image`)
-                recreated = await runCua(createArgs(name, known?.tier || tier, known?.cpu || cpu, known?.memory || memory, waitDesktop, 'linux'), { timeoutMs: 1500000 })
+                recreated = await runCua(createArgs(name, known?.tier || tier, known?.cpu || cpu, known?.memory || memory, waitDesktop, 'linux', known?.gpu === true), { timeoutMs: 1500000 })
               }
               if (recreated.code !== 0) {
                 return fail(`the VM could not be resumed or recreated: ${(recreated.stderr || recreated.stdout).trim().slice(-1200)}`)
@@ -595,7 +612,7 @@ const handlers = {
    * substitution. Debian/Arch are not Cua disk images: they need
    * `cua images build` and a pinned reference, so the UI offers aliases only.
    */
-  async vmCreate({ name, cpu = 2, memory = 4, image = 'linux', tier = 'slim', workspace = WORKSPACE_ROOT, waitDesktop = false }) {
+  async vmCreate({ name, cpu = 2, memory = 4, image = 'linux', tier = 'slim', workspace = WORKSPACE_ROOT, waitDesktop = false, gpu = false }) {
     if (!/^[a-z0-9][a-z0-9-]{1,30}$/.test(String(name || ''))) {
       throw new Error('name must be 2-31 chars: lowercase letters, digits and dashes')
     }
@@ -612,12 +629,14 @@ const handlers = {
         return fail(`VM store quota reached (${(used / 1024 ** 3).toFixed(1)} GB of ${config.diskQuotaGb} GB). Delete a computer or raise the quota above.`)
       }
       await ensureRuntime()
-      const created = await runCua(createArgs(name, tier, Number(cpu) || 2, Number(memory) || 4, waitDesktop, String(image || 'linux')), { timeoutMs: 1500000 })
+      if (gpu === true) preferSystemQemu()
+      const created = await runCua(createArgs(name, tier, Number(cpu) || 2, Number(memory) || 4, waitDesktop, String(image || 'linux'), gpu === true), { timeoutMs: 1500000 })
       if (created.code !== 0) return fail((created.stderr || created.stdout).trim().slice(-1500))
       registry.vms[name] = {
         workspace,
         image: String(image),
         tier: String(tier),
+        gpu: gpu === true,
         cpu: Number(cpu) || 2,
         memory: Number(memory) || 4,
         createdAt: new Date().toISOString(),
@@ -644,10 +663,11 @@ const handlers = {
       await ensureRuntime()
       const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : meta.image
       if (snapshot !== null) copyFileSync(snapshot, bootImage)
-      result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, bootImage), { timeoutMs: 1500000 })
+      if (meta.gpu === true) preferSystemQemu()
+      result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, bootImage, meta.gpu === true), { timeoutMs: 1500000 })
       if (result.code !== 0 && snapshot !== null) {
         log(`restore from checkpoint failed for ${name}; falling back to ${meta.image}`)
-        result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, meta.image), { timeoutMs: 1500000 })
+        result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, meta.image, meta.gpu === true), { timeoutMs: 1500000 })
       }
       if (result.code !== 0) return fail((result.stderr || result.stdout).trim().slice(-800))
     }

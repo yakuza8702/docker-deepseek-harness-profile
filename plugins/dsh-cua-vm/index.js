@@ -149,7 +149,8 @@ export function apply(ctx, config = {}) {
       'You can also drive its desktop with `cua_vm_gui`: screenshot, click, type, hotkeys, drag.',
       'Choose the surface deliberately: the shell for anything a command can do (gradle, adb, blender -b, apt, tests), the desktop when the work is visual or only exists as a window — a login screen, an app with no CLI, a UI you must look at to judge, or when the user says show me, click, or test the UI.',
       'Before clicking, get the position from `a11y` (element bounds) or `windows`, then screenshot to confirm the result. If you cannot see images, use the a11y bounds rather than guessing pixels.',
-      'Before you create a computer for the user, ask with `ask_user_question` for its name, vCPU/RAM and image unless they already said so; never invent a spec silently. Debian and Arch need a built Cua disk, so say that instead of substituting an image.'
+      'Before you create a computer for the user, ask with `ask_user_question` for its name, vCPU/RAM and image unless they already said so; never invent a spec silently. Debian and Arch need a built Cua disk, so say that instead of substituting an image.',
+      'For Android, Blender, WebGL or any 3D work, create the computer with `cua_vm_create` and gpu enabled (gpu: true) unless the user says otherwise, and tell them when the image or the host cannot provide it.'
     ].join(' ')
   })
 
@@ -201,6 +202,28 @@ export function apply(ctx, config = {}) {
         waitDesktop: args.waitForDesktop === true
       })
       return { text: `${result.created ? 'Created' : 'Resumed'} ${result.name} (tier=${result.tier}, state=${result.state}). Use this name with cua_vm_exec.` }
+    }
+  })
+
+  ctx.tools.register({
+    name: 'cua_vm_create',
+    description: 'Create a named computer with an explicit spec: name, vCPU, RAM, image and whether it gets a GPU. Ask the user for the name and spec first unless they already gave them. Set gpu true for Android, Blender, WebGL or any 3D work; it needs an image built with virgl support and a GPU render node on the host.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['name'],
+      properties: {
+        name: { type: 'string', description: 'Computer name: lowercase letters, digits and dashes.' },
+        cpu: { type: 'number', description: 'vCPUs (default 2).' },
+        memory: { type: 'number', description: 'RAM in GB (default 4).' },
+        image: { type: 'string', description: 'Image reference. Default "linux" (Ubuntu 24.04 slim Cua disk).' },
+        gpu: { type: 'boolean', description: 'Give the computer a virgl GPU (3D/Android/Blender). Default false.' }
+      }
+    },
+    output: textOutput('The created computer and whether it has a GPU.'),
+    async execute(input) {
+      const answer = await call({ op: 'vmCreate', ...input })
+      return { text: `${answer.name} is ${answer.state}${input.gpu === true ? ' with a GPU (virgl)' : ''}.` }
     }
   })
 

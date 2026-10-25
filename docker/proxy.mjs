@@ -624,7 +624,11 @@ const BOOT_WATCHDOG = `<script>(function(){
   function booted() {
     if (document.querySelector('[class*="footArea"]')) return true;
     if (document.querySelector('[class*="sidebarCol"] button')) return true;
-    return document.querySelectorAll("button").length >= 5;
+    if (document.querySelectorAll("button").length >= 5) return true;
+    // A shell that has rendered anything into the root is not "timed out",
+    // even if its chrome is still catching up.
+    var root = document.getElementById("root") || document.body;
+    return Boolean(root && root.children.length > 0 && document.body.innerText.trim() !== "");
   }
   function handoff(why) {
     if (fired || failed() === false && booted()) return;
@@ -635,7 +639,9 @@ const BOOT_WATCHDOG = `<script>(function(){
   var observer = new MutationObserver(function(){ if (failed()) handoff("client-failed"); });
   try { observer.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
   // Give a healthy shell real time to mount before the timeout path can fire.
-  setTimeout(function(){ observer.disconnect(); handoff("client-timeout"); }, 12000);
+  // 25 s: a busy browser (many tabs, a cold profile) legitimately needs more
+  // than the old 12 s, and a false "recovery" is worse than a later one.
+  setTimeout(function(){ observer.disconnect(); handoff("client-timeout"); }, 25000);
 })();</script>`;
 
 function injectPolyfill(html) {

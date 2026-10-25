@@ -200,11 +200,12 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState(null)
       const [note, setNote] = useState(null)
       const [showNew, setShowNew] = useState(false)
-      const [draft, setDraft] = useState({ name: '', cpu: 2, memory: 4, image: 'linux' })
+      const [draft, setDraft] = useState({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false })
       const [pending, setPending] = useState(null)
       const [exec, setExec] = useState(null)
       const [form, setForm] = useState(null)
       const [view, setView] = useState(null)
+      const [metricFor, setMetricFor] = useState(null)
 
       const load = useCallback(async () => {
         try {
@@ -248,9 +249,9 @@ window.__ModuleLoader__.load({
         setPending({ name: draft.name, action: 'create' })
         setNote(`Creating ${draft.name}… it boots on first use.`)
         try {
-          await api('create', { name: draft.name, cpu: draft.cpu, memory: draft.memory, image: draft.image })
+          await api('create', { name: draft.name, cpu: draft.cpu, memory: draft.memory, image: draft.image, gpu: draft.gpu })
           setShowNew(false)
-          setDraft({ name: '', cpu: 2, memory: 4, image: 'linux' })
+          setDraft({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false })
           await load()
           setNote(`${draft.name} is up.`)
         } catch (error) {
@@ -284,6 +285,7 @@ window.__ModuleLoader__.load({
       const metrics = async (name) => {
         try {
           const m = await api('metrics', { name })
+          setMetricFor(name)
           setNote(`${name}: load ${m.load} · mem ${m.memUsedMb}/${m.memTotalMb} MB · disk ${m.diskUsed}/${m.diskSize} (${m.diskUsePct}) · ${m.cpus} vCPU`)
         } catch (error) {
           setNote(clean(error?.message ?? error))
@@ -340,7 +342,7 @@ window.__ModuleLoader__.load({
               placeholder: 'name (a-z, 0-9, dashes)', value: draft.name, style: S.input,
               onChange: (event) => setDraft({ ...draft, name: event.target.value })
             }),
-            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 2fr', gap: 8 } },
+            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 2fr auto', gap: 8, alignItems: 'end' } },
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'vCPU'),
                 h('input', { type: 'number', min: 1, max: 8, value: draft.cpu, style: S.input, onChange: (event) => setDraft({ ...draft, cpu: Number(event.target.value) }) })),
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'RAM (GB)'),
@@ -349,7 +351,14 @@ window.__ModuleLoader__.load({
                 h('select', { value: draft.image, style: S.input, onChange: (event) => setDraft({ ...draft, image: event.target.value }) },
                   h('option', { value: 'linux' }, 'Ubuntu 24.04 slim (Cua disk)'),
                   h('option', { value: 'ghcr.io/trycua/linux:24.04' }, 'Ubuntu 24.04 full')
-                ))
+                )),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, paddingBottom: 6 } },
+                h('input', {
+                  type: 'checkbox', checked: draft.gpu === true,
+                  onChange: (event) => setDraft({ ...draft, gpu: event.target.checked })
+                }),
+                'Enable GPU'
+              )
             ),
             h('div', { style: S.muted }, 'Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field.'),
             h('div', { style: S.row },
@@ -370,18 +379,32 @@ window.__ModuleLoader__.load({
                 h('div', { style: S.row },
                   h('span', { style: { fontWeight: 600, fontSize: 13 } }, name),
                   h('span', { style: S.badge(ready) }, vm.state ?? 'unknown'),
+                  vm.gpu === true && h('span', { style: { ...S.badge(false), color: T.info } }, 'GPU'),
                   h('span', { style: { ...S.muted, marginLeft: 'auto' } }, `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · ${vm.image ?? 'linux'}`)
                 ),
                 h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
                   h('button', {
                     type: 'button', style: S.button, disabled: busy,
-                    onClick: () => ready
-                      ? void act(name, `Shutting down ${name}…`, 'stop', { name })
-                      : void act(name, `Starting ${name}…`, 'start', { name })
+                    onClick: () => {
+                      if (ready === false) return void act(name, `Starting ${name}…`, 'start', { name })
+                      if (!window.confirm(`Do you want to shutdown ${name}?`)) return
+                      void act(name, `Shutting down ${name}…`, 'stop', { name })
+                    }
                   }, busy && busyLabel !== null ? busyLabel : ready ? 'Shutdown' : 'Start'),
                   h('button', { type: 'button', style: S.button, onClick: () => void showVm(name) }, 'Show VM'),
-                  h('button', { type: 'button', style: S.button, onClick: () => setExec({ name, cmd: '', out: '', busy: false }) }, 'Terminal'),
-                  h('button', { type: 'button', style: S.button, onClick: () => void metrics(name) }, 'Metrics'),
+                  h('button', {
+                    type: 'button',
+                    style: { ...S.button, background: exec !== null && exec.name === name ? T.hover : 'transparent' },
+                    onClick: () => setExec((current) => (current !== null && current.name === name ? null : { name, cmd: '', out: '', busy: false }))
+                  }, 'Terminal'),
+                  h('button', {
+                  type: 'button',
+                  style: { ...S.button, background: metricFor === name ? T.hover : 'transparent' },
+                  onClick: () => {
+                    if (metricFor === name) { setMetricFor(null); setNote(null); return }
+                    void metrics(name)
+                  }
+                }, 'Metrics'),
                   h('button', {
                     type: 'button', style: { ...S.button, color: T.error },
                     onClick: () => { if (window.confirm(`Delete ${name}? Its disk goes with it.`)) void act(name, `Deleted ${name}.`, 'delete', { name }) }
@@ -410,8 +433,8 @@ window.__ModuleLoader__.load({
             'Suspend idle computers automatically'
           ),
           field('idleSuspendMinutes', 'Idle timeout (minutes)', '0 disables. Checked every minute; a running command postpones it.'),
-          field('diskQuotaGb', 'Store quota (GB)', 'Base image + QEMU + every disk in /cua-vm. A create above it is refused.'),
-          field('maxRunning', 'Max running computers', 'Shutdown frees a slot; disks are untouched.'),
+          field('diskQuotaGb', 'Disk Size (GB)', 'Base image + QEMU + every disk in /cua-vm.'),
+          field('maxRunning', 'Max running computers', 'Shutdown frees a slot, disks are untouched.'),
           h('div', { style: S.row }, h('button', { type: 'button', style: S.primary, onClick: () => void savePolicy() }, 'Save policy'))
         ),
 
