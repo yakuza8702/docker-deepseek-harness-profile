@@ -828,6 +828,10 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/cua; \
     /usr/local/bin/cua.real --version
 COPY --chmod=0755 docker/cua-vm-supervisor.mjs /usr/local/bin/cua-vm-supervisor
+# Guest provisioning runs INSIDE the VM, piped through `sudo bash` by the
+# supervisor. Kept as real files (not a base64 blob in the supervisor) so
+# they can be read, diffed and run by hand to debug a guest.
+COPY --chmod=0644 docker/cua-guest-provision.sh docker/cua-guest-android.sh /usr/local/bin/
 COPY plugins/dsh-cua-vm /opt/dsh-cua-vm
 RUN set -eux; \
     installed=0; \

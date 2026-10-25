@@ -57,21 +57,27 @@ Components:
 
 ## 3. Current state — verified
 
+Round 2 verified all of this on the RTX 3060 host (omv-docker, kernel 6.12,
+NVIDIA 610.57) with a computer created at 4 vCPU / 8 GB / 40 GB / GPU:
+
 | Area | Evidence |
 |---|---|
-| VM lifecycle | create → ready, start/stop, checkpoint/recreate, delete |
-| GPU passthrough (virgl) | host `nvidia-smi` shows the QEMU process; guest `eglinfo` → `virgl (NVIDIA GeForce RTX 3060)` |
-| Accelerated desktop | after provisioning: `Xorg :1` + `glxinfo -B` → `virgl (NVIDIA GeForce RTX 3060/PCIe/SSE2)` |
-| Capture | PNG 1280×800 of the guest desktop; `cua-desktop` stays active |
-| Screenshots to the model | saved in the guest (`/home/cua/shots/…`), fetchable with `cua_vm_get` |
-| `cua_vm_get` | creates missing local dirs (`test/house/shots/…` works) |
-| Clicks | absolute **and** fractional: `x:0.5,y:0.5,relative:true` → pointer `640,400` on 1280×800 |
-| Crops | `screenshot {region:{x,y,width,height,scale}}` → 100×100@4x = 400×400, with the inverse mapping printed |
-| a11y | falls back to display size + window list when AT-SPI is absent (Blender) |
+| VM lifecycle | create → ready, start/unstart, checkpoint/recreate, delete |
+| **Desktop resolution** | provisioning sets 1200×750 and the XF86 mode sticks (`xrandr` → `current 1200 x 750`) |
+| **Screenshot = display** | `cua do screenshot` → `1200x750`; capture is 1:1, so image pixels *are* display pixels |
+| **Pointer mapping** | `cua_vm_gui click x:600,y:375` → pointer reported at `600,375` (was `640,400` before the fix) |
+| **GPU** | guest `glxinfo -B` → `virgl (NVIDIA GeForce RTX 3060/PCIe/SSE2)`; OpenGL 4.3 core with the session override |
+| **Blender 4.0.2** | starts on the GPU (window `(Unsaved) - Blender 4.0`), no `LIBGL_ALWAYS_SOFTWARE` needed |
+| **Nested KVM** | guest `/dev/kvm` is `0666`; `KVM_GET_API_VERSION` → 12 inside the guest |
+| **Workspace share** | 9p mount at `/workspace`; `echo x > /workspace/f` in the guest appears in the harness workspace at once (bidirectional, node-owned) |
+| **Disk growth** | QMP `block_resize` 20→40 GB under the live QEMU, `growpart` + `resize2fs` online → `40G 36G free`, no reboot |
+| **Android** | SDK + platform-tools + emulator 37.2.12 + `system-images;android-35;google_apis;x86_64` + AVD; `cua-emulator -no-window` boots **Android 15** inside the VM with `sys.boot_completed=1`, `system_server` running, `adb shell` + `screencap` (1080×2400) working — KVM nested, not software |
+| Crops / zoom | `screenshot {region}` prints the inverse mapping; `zoom <window>` crops to a window and keeps coordinates valid |
+| a11y | still absent for Blender; falls back to display + window list with bounds from `cua do window ls` |
 | Panel | themed (dark/light), left-nav entry, self-updating list |
 
-Not yet re-verified after the Xorg switch: Chromium WebGL inside the desktop
-(previous failure was on Xvfb/llvmpipe), and Blender GUI interaction end to end.
+Not re-verified: Chromium WebGL on the Xorg desktop, and the video viewer over
+HTTPS (both unchanged from round 1).
 
 ---
 
@@ -112,6 +118,39 @@ Not yet re-verified after the Xorg switch: Chromium WebGL inside the desktop
 11. **The client wrapper hid the store.** A shell `HOME` of `/workspace` made
     every `cua` call look in the wrong state dir; the image wraps the CLI with
     `HOME=/cua-vm/home`.
+12. **cua 0.7.0 never runs the `.cua/bin/qemu-system-x86_64` wrapper.** It
+    resolves `qemu-system-x86_64` from **PATH**. Every "swap cua's wrapper"
+    trick in round 1 was therefore a no-op — virgl worked all along because the
+    distro QEMU happened to be on PATH, and the 9p/venus args that were
+    appended to that wrapper never reached QEMU (proved with a shim that logs
+    its argv: nothing, while a shim in a PATH prefix logged 44 args). The
+    supervisor now owns a real shim at `/cua-vm/bin/qemu-system-x86_64` and
+    prepends that directory to `PATH` for every cua call.
+13. **The capture is not the screen.** cua caps a capture at ~900k pixels:
+    1280×800 comes back as **1200×750** (factor 0.9375). The old code took the
+    screenshot from cua and clicked with `xdotool` in *display* pixels, so every
+    click landed 6% short — that was the whole "mouse control is unreliable"
+    report. cua's own `do` verbs take **screenshot pixels** and map them
+    (`cua do click 600 375` → pointer `640,400`); all input now goes through
+    them.
+14. **virgl caps the *reported* GL version at 4.2, not the feature set.** The
+    4.3 extensions are all present (`GL_ARB_compute_shader`,
+    `GL_ARB_shader_storage_buffer_object`, `GL_ARB_program_interface_query`,
+    `GL_ARB_multi_bind`), so Blender 4.x refuses on the version string alone.
+    `MESA_GL_VERSION_OVERRIDE=4.3FC` in the desktop **and** `cua-spacesd`
+    drop-ins makes both GUI and `cua sb exec` see 4.3 — GPU rendering instead of
+    the llvmpipe fallback.
+15. **Venus is out of reach on this host.** virtio-gpu blob resources need
+    `/dev/udmabuf`, which the container does not have (kernel 6.12, no module),
+    so `venus=on`/`blob=on` cannot be enabled and zink has no Vulkan ICD to
+    bind. GL 4.2/4.3 virgl + llvmpipe for the rest is the ceiling here.
+16. **Nested KVM already works; permissions were the only block.** `-cpu host`
+    passes `vmx` and `/dev/kvm` exists in the guest, but it is `root:kvm 0660`
+    and `cua` is not in `kvm`. A udev rule + `chmod 0666` makes the official
+    Android emulator hardware-accelerated inside the VM.
+17. **A disk cannot be grown with `qemu-img`.** cua has no `stop` (suspend
+    pauses QEMU and keeps the qcow2 open). QMP `block_resize` on the live
+    machine, then `growpart`/`resize2fs` in the guest, grows it online.
 
 ---
 
@@ -119,6 +158,15 @@ Not yet re-verified after the Xorg switch: Chromium WebGL inside the desktop
 
 | Commit | Fix |
 |---|---|
+| round 2 | **input through `cua do`**: every click/dblclick/move/drag/type/key/hotkey/scroll is a cua verb taking screenshot pixels, so the 0.9375 capture factor cannot shift a click; one priming screenshot per VM makes the mapping deterministic; `zoom`/`unzoom`; window list with bounds |
+| round 2 | **PATH QEMU shim** at `/cua-vm/bin` (`-virtfs` + distro build) — the only injection point cua 0.7.0 honours |
+| round 2 | **9p workspace share**: guest `/workspace` *is* the harness workspace, bidirectional |
+| round 2 | **1:1 desktop** (1200×750 via an Xorg modeline autostart) so screenshot pixels are display pixels |
+| round 2 | **GPU provisioning rewritten as `docker/cua-guest-provision.sh`** (real file, not a base64 blob): apt repair, packages, render/kvm udev + groups, Xorg, GL override for the desktop *and* spacesd, 9p mount, marker with renderer/kvm |
+| round 2 | **`MESA_GL_VERSION_OVERRIDE=4.3FC`**: Blender 4.x on virgl instead of llvmpipe |
+| round 2 | **`cua_vm_disk`** (QMP `block_resize` + `growpart`/`resize2fs`, online) and `diskGb` on create |
+| round 2 | **`cua_vm_android`** (`docker/cua-guest-android.sh`): SDK, platform-tools, emulator, system image, AVD, `cua-emulator` launcher |
+| round 2 | provisioning runs on every start (version-checked) and has an explicit `provision` op |
 | `da91f4b` | fractional clicks (`relative`), server-side `region` crops with printed mapping, screenshot size in the result, `sb exec` retries while spacesd restarts |
 | `1543a44` | screenshots saved in the guest, `get` creates destination dirs, `a11y` degrades to geometry, stale QEMU wrapper restored |
 | `ce10243` | agent cursor in the **video** view (mapped onto the viewer canvas), focus+pointer reported after every input action |
@@ -138,8 +186,8 @@ Not yet re-verified after the Xorg switch: Chromium WebGL inside the desktop
 ## 6. Deploy
 
 ```bash
-git checkout feat/cua-web          # head da91f4b
-docker build --build-arg DSH_VERSION=0.2.1-rc.2 \
+git checkout feat/cua-web
+docker build --build-arg DSH_VERSION=0.2.1-rc.3 \
   --build-arg WITH_VIRGL_QEMU=1 -t dsh-harness:trim-cua .
 docker compose -f compose.yaml -f compose.gpu.yaml up -d
 ```
@@ -148,60 +196,68 @@ GPU compose needs: `devices: [/dev/kvm, /dev/dri]`, `group_add` with the host
 `render`/`video` GIDs, `DSH_CUA_VM_GPU=virgl`, and the NVIDIA reservation with
 `capabilities: [gpu, utility, graphics, video, compute]`.
 
+Env knobs the supervisor reads:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DSH_CUA_VM_GPU` | unset | `virgl` = pass `--gpu virgl` on create |
+| `DSH_CUA_VM_SHARE_WORKSPACE` | `1` | mount the workspace into the guest over 9p |
+| `DSH_CUA_VM_SHARE_TAG` | `dshworkspace` | 9p mount tag |
+| `DSH_CUA_VM_RESOLUTION` | `1200x750` | desktop geometry (900k pixels = 1:1 capture) |
+| `DSH_CUA_PROVISION_SCRIPT` | `/usr/local/bin/cua-guest-provision.sh` | guest provisioning |
+| `DSH_CUA_ANDROID_SCRIPT` | `/usr/local/bin/cua-guest-android.sh` | Android bootstrap |
+
 Verify:
 
 ```bash
-docker exec <c> tail -n 40 /cua-vm/supervisor.log      # "qemu: using … (virgl enabled)"
-docker exec <c> cua sb ls --local
-# inside the VM, for a GPU computer:
-DISPLAY=:1 glxinfo -B | head -3      # renderer: virgl …
-eglinfo -B | head -3                 # core profile renderer: virgl …
-cat /var/log/cua-gpu-provision.log   # provisioning transcript
+docker exec <c> tail -n 40 /cua-vm/supervisor.log    # "qemu: shim -> … + 9p share …"
+docker exec <c> cat /cua-vm/bin/qemu-system-x86_64   # the shim
+# inside the VM:
+DISPLAY=:1 xrandr | head -2          # current 1200 x 750
+DISPLAY=:1 glxinfo -B | grep renderer # virgl (NVIDIA …)
+echo $MESA_GL_VERSION_OVERRIDE        # 4.3FC (spacesd drop-in)
+mountpoint /workspace && ls /workspace
+ls -l /dev/kvm                        # crw-rw-rw-
+cat /var/lib/cua-provision            # version=6 … kvm=yes
 ```
-
-Then **Personal VM (CUA) → New computer → Enable GPU**. The first start takes
-1–2 minutes longer (apt + Xorg switch); the VM is usable during it.
 
 ---
 
 ## 7. Open issues
 
-1. **Chromium WebGL on the accelerated desktop is unverified.** The observed
-   failure (`ANGLE (Mesa, llvmpipe …)`, `BindToCurrentSequence failed`) came from
-   the Xvfb session. If it persists on Xorg, suspect the GPU sandbox
-   (`--disable-gpu-sandbox`) before virgl. This build rejects `--use-gl=egl`;
-   only `angle=default` is allowed, so use the default or
-   `--use-gl=angle --use-angle=gl`.
-2. **Menu hunting is still visual.** AT-SPI does not exist for custom-drawn apps
-   (Blender), so the model reads pixels. Cheap mitigations are in place
-   (geometry, fractional clicks, one-shot crops); the structural fix is to
-   prefer keyboard/programmatic control for authoring tools and the browser tool
-   for web pages.
-3. **Video needs HTTPS.** On plain HTTP the viewer falls back to frames. Behind
-   Pangolin, `Bypass Auth` is required on `/vm/view/media` (the stream), while
-   `/api/*`, `/cua/*`, `/desktop/*` stay protected.
-4. **The Xorg switch patches a guest file** (`/opt/cua/desktop/start-desktop.sh`,
-   backup `.orig`, marker `/var/lib/cua-gpu`). A future cua image that rewrites
-   that script must be re-checked; the script is idempotent and verifies the
-   renderer before keeping the change.
-5. **A container restart kills QEMU**; cua 0.7.0 cannot start it again. The
-   supervisor recreates it from the checkpoint (flat qcow2), so guest files
-   survive, but the running processes do not.
-6. **Debian/Arch are not Cua disks** — the dropdown offers Ubuntu slim/full; a
-   custom disk needs `cua images build`.
-7. **The MCP-manager filter is content-anchored** against a third-party bundle;
-   a plugin update that moves the anchor logs a warning and leaves the list
-   unfiltered.
+1. **Chromium WebGL on the accelerated desktop is still unverified.** Try the
+   default ANGLE path first; this Chromium build rejects `--use-gl=egl`
+   (`--use-gl=angle --use-angle=gl` is the allowed spelling).
+2. **The GL override is a report, not a capability.** virgl exposes the 4.3
+   extension set but reports 4.2; the session lifts the string. If an app uses a
+   function that is genuinely missing, it will fail on the GPU instead of
+   falling back. That is still better than the old behaviour (refuse to start,
+   or run at llvmpipe speed), and `LIBGL_ALWAYS_SOFTWARE=1` remains the escape
+   hatch.
+3. **The scratch mode is copy-then-build.** 9p is fine for source and results,
+   not for object files; the prompt tells the model to build in the VM's own
+   `/tmp/build` when a build writes thousands of files.
+4. **Video needs HTTPS.** On plain HTTP the viewer falls back to frames. Behind
+   Pangolin, `Bypass Auth` is required on `/vm/view/media`.
+5. **A container restart kills QEMU**; the supervisor recreates from the
+   flattened checkpoint, so files survive but running processes do not.
+6. **Debian/Arch are not Cua disks.**
+7. **The MCP-manager filter is content-anchored** against a third-party bundle.
+8. **Android needs the disk grown first.** The bootstrap refuses with a clear
+   message under 12 GB free; `diskGb: 40` on create is the intended path.
+9. **`cua_vm_android` downloads ~3.5 GB.** It is one-off per computer and the
+   script is idempotent, but a slow link makes the first run long.
 
 ---
 
 ## 8. Next
 
-1. Re-run the Blender test on `da91f4b`: confirm the cursor is visible in the
-   video view, clicks land where the model looks, and the focus line replaces
-   trial and error.
-2. Re-test Chromium WebGL on the Xorg desktop; decide whether the GPU sandbox
-   flag belongs in the guest's Chromium defaults.
-3. HTTPS in front of the harness so Show VM uses the real viewer everywhere.
-4. VM over MCP: `cua mcp` behind a stdio→HTTP bridge at `/vm/mcp` with the same
-   gate, so other agents can use the same per-workspace computer.
+1. Re-run the Blender + emulator round trip on a built image (not the patched
+   container): Blender viewport interaction, then `cua-emulator` +
+   `adb install` + a Compose screenshot.
+2. Decide whether the 9p share stays default-on for every deployment (it gives
+   the guest write access to the workspace, which is the point, but it is a
+   wider surface than the copy-in model).
+3. VM over MCP (`cua mcp` behind a stdio→HTTP bridge at `/vm/mcp`) so other
+   agents can use the same per-workspace computer.
+4. HTTPS in front of the harness so Show VM uses the real viewer everywhere.

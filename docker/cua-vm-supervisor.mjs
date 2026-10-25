@@ -60,9 +60,24 @@ const WORKSPACE_ROOT = process.env.CUA_WORKSPACE_ROOT || '/workspace'
 const REGISTRY = path.join(STORE, 'registry.json')
 const LOG_PREFIX = '[cua-vm]'
 
+/**
+ * THE QEMU PATH SHIM
+ * ------------------
+ * cua 0.7.0 does not exec a wrapper script: it resolves `qemu-system-x86_64`
+ * from PATH (verified: a shim in a PATH prefix is executed, and its extra
+ * argv reaches QEMU). Our shim lives in the volume, is prepended to PATH for
+ * every cua call, and does two things the launcher cannot do for us:
+ *   * run the distro QEMU (the only build with virtio-gpu-gl-pci), and
+ *   * append `-virtfs local,path=/workspace`, which shares the project into
+ *     the guest as a real mount at /workspace.
+ * Rewritten on every start, so a `cua runtime setup` cannot drop it.
+ */
+const QEMU_SHIM_DIR = path.join(STORE, 'bin')
+
 const CUA_ENV = {
   ...process.env,
   HOME: CUA_HOME,
+  PATH: `${QEMU_SHIM_DIR}:${process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}`,
   DO_NOT_TRACK: '1',
   CUA_TELEMETRY: '0'
 }
@@ -327,35 +342,126 @@ async function ensureRuntime() {
     if (setup.code !== 0) throw new Error(`cua runtime setup qemu failed: ${(setup.stderr || setup.stdout).trim().slice(-800)}`)
   }
   repairQemuData()
-  // Runs every time: a re-provision would otherwise put cua's non-virgl binary
-  // back and silently drop the GPU. Swapped only when something asks for it.
-  if (GPU_MODE === 'virgl' || Object.values(readRegistry().vms).some((vm) => vm && vm.gpu === true)) preferSystemQemu()
+  // Runs every time: a re-provision puts cua's non-virgl binary back and would
+  // silently drop the GPU, and the 9p share lives in the same wrapper.
+  installQemuShim()
   return existsSync(wrapper)
 }
 
 /**
- * A GPU computer should not need a manual apt-get and an Xorg patch. The guest
- * ships Xvfb (software GL), so on the first start of a GPU computer we install
- * xserver-xorg-core + mesa-utils, add an `xorg` branch to the desktop launcher
- * and switch the systemd drop-in to it. The script verifies the renderer and
- * reverts to Xvfb if it is not virgl, so a host without a usable render node
- * keeps a working desktop instead of a black one.
+ * Guest provisioning lives in real scripts inside the image
+ * (docker/cua-guest-provision.sh, docker/cua-guest-android.sh), not in a
+ * base64 blob buried in this file. They repair the placeholder apt sources,
+ * install the X server and mesa-utils, open the render node and /dev/kvm,
+ * mount the workspace share, force a capture-sized desktop and — on a GPU
+ * computer — move the desktop from Xvfb to Xorg and lift the OpenGL version
+ * virgl under-reports. A file can be read, diffed and run by hand; the
+ * previous inline blob could not.
  */
-const GPU_GUEST_SCRIPT = 'IyEvYmluL2Jhc2gKc2V0IC11CkxPRz0vdmFyL2xvZy9jdWEtZ3B1LXByb3Zpc2lvbi5sb2cKZXhlYyA+ID4oc3VkbyB0ZWUgLWEgIiRMT0ciKSAyPiYxCmV4cG9ydCBERUJJQU5fRlJPTlRFTkQ9bm9uaW50ZXJhY3RpdmUKZWNobyAiPT09ICQoZGF0ZSAtSXNlY29uZHMpIGdwdSBwcm92aXNpb25pbmcgPT09IgpTQ1JJUFQ9L29wdC9jdWEvZGVza3RvcC9zdGFydC1kZXNrdG9wLnNoCmlmIFsgLWYgIiRTQ1JJUFQub3JpZyIgXTsgdGhlbiBzdWRvIGNwICIkU0NSSVBULm9yaWciICIkU0NSSVBUIjsgc3VkbyBybSAtZiAiJFNDUklQVC5vcmlnIjsgZmkKc3VkbyBta2RpciAtcCAvZXRjL3N5c3RlbWQvc3lzdGVtL2N1YS1kZXNrdG9wLnNlcnZpY2UuZApwcmludGYgJ1tTZXJ2aWNlXVxuRW52aXJvbm1lbnQ9Q1VBX1hfU0VSVkVSPXh2ZmJcbicgfCBzdWRvIHRlZSAvZXRjL3N5c3RlbWQvc3lzdGVtL2N1YS1kZXNrdG9wLnNlcnZpY2UuZC94LXNlcnZlci5jb25mID4vZGV2L251bGwKc3VkbyBzeXN0ZW1jdGwgZGFlbW9uLXJlbG9hZDsgc3VkbyBzeXN0ZW1jdGwgcmVzdGFydCBjdWEtZGVza3RvcDsgc2xlZXAgMgoKYXB0X3JlYWR5KCkgewogIGNvbW1hbmQgLXYgWG9yZyA+L2Rldi9udWxsICYmIGNvbW1hbmQgLXYgZ2x4aW5mbyA+L2Rldi9udWxsCn0KdHJ5X2luc3RhbGwoKSB7CiAgc3VkbyBhcHQtZ2V0IHVwZGF0ZSAtcXEgPi9kZXYvbnVsbCAyPiYxIHx8IHRydWUKICBzdWRvIGFwdC1nZXQgaW5zdGFsbCAteSAtcXEgeHNlcnZlci14b3JnLWNvcmUgbWVzYS11dGlscyA+L2Rldi9udWxsIDI+JjEgfHwgdHJ1ZQogIGFwdF9yZWFkeQp9CmlmICEgdHJ5X2luc3RhbGw7IHRoZW4KICAjIFRoZSBDVUEgaW1hZ2Ugc2hpcHMgcGxhY2Vob2xkZXIgc291cmNlcyAoIlVOQVZBSUxBQkxFIik7IHdpdGhvdXQgYSByZWFsCiAgIyBsaXN0IG5vdGhpbmcgaW5zdGFsbHMsIGFuZCB0aGUgZGVza3RvcCB3b3VsZCBzaWxlbnRseSBzdGF5IG9uIFh2ZmIuCiAgaWYgZ3JlcCAtcSBVTkFWQUlMQUJMRSAvZXRjL2FwdC9zb3VyY2VzLmxpc3QuZC91YnVudHUuc291cmNlcyAyPi9kZXYvbnVsbDsgdGhlbgogICAgZWNobyAicmVwYWlyaW5nIGFwdCBzb3VyY2VzIgogICAgc3VkbyBjcCAvZXRjL2FwdC9zb3VyY2VzLmxpc3QuZC91YnVudHUuc291cmNlcyAvZXRjL2FwdC9zb3VyY2VzLmxpc3QuZC91YnVudHUuc291cmNlcy5vcmlnIDI+L2Rldi9udWxsIHx8IHRydWUKICAgIHByaW50ZiAnVHlwZXM6IGRlYlxuVVJJczogaHR0cDovL2FyY2hpdmUudWJ1bnR1LmNvbS91YnVudHUvXG5TdWl0ZXM6IG5vYmxlIG5vYmxlLXVwZGF0ZXMgbm9ibGUtYmFja3BvcnRzXG5Db21wb25lbnRzOiBtYWluIHVuaXZlcnNlIHJlc3RyaWN0ZWQgbXVsdGl2ZXJzZVxuU2lnbmVkLUJ5OiAvdXNyL3NoYXJlL2tleXJpbmdzL3VidW50dS1hcmNoaXZlLWtleXJpbmcuZ3BnXG5cblR5cGVzOiBkZWJcblVSSXM6IGh0dHA6Ly9zZWN1cml0eS51YnVudHUuY29tL3VidW50dS9cblN1aXRlczogbm9ibGUtc2VjdXJpdHlcbkNvbXBvbmVudHM6IG1haW4gdW5pdmVyc2UgcmVzdHJpY3RlZCBtdWx0aXZlcnNlXG5TaWduZWQtQnk6IC91c3Ivc2hhcmUva2V5cmluZ3MvdWJ1bnR1LWFyY2hpdmUta2V5cmluZy5ncGdcbicgfCBzdWRvIHRlZSAvZXRjL2FwdC9zb3VyY2VzLmxpc3QuZC91YnVudHUuc291cmNlcyA+L2Rldi9udWxsCiAgICB0cnlfaW5zdGFsbCB8fCB0cnVlCiAgZmkKZmkKaWYgISBhcHRfcmVhZHk7IHRoZW4KICBlY2hvICJNSVNTSU5HLVBBQ0tBR0VTIgogIGV4aXQgMwpmaQojIEVHTCBhcHBzIChDaHJvbWl1bSwgZW11bGF0b3IsIEJsZW5kZXIpIHJ1biBhcyBjdWEsIGFuZCByZW5kZXJEMTI4IGlzIHJvb3Q6cmVuZGVyLgpwcmludGYgJ1NVQlNZU1RFTT09ImRybSIsIEtFUk5FTD09InJlbmRlckQqIiwgTU9ERT0iMDY2NiJcbicgfCBzdWRvIHRlZSAvZXRjL3VkZXYvcnVsZXMuZC85OS1yZW5kZXIucnVsZXMgPi9kZXYvbnVsbApzdWRvIGNobW9kIDY2NiAvZGV2L2RyaS9yZW5kZXJEKiAyPi9kZXYvbnVsbCB8fCB0cnVlCnN1ZG8gdXNlcm1vZCAtYUcgcmVuZGVyIGN1YSAyPi9kZXYvbnVsbCB8fCB0cnVlCnN1ZG8gdGVlIC9ldGMvWDExL3hvcmctdmlydGlvLmNvbmYgPi9kZXYvbnVsbCA8PCdYQ0ZHJwpTZWN0aW9uICJEZXZpY2UiCiAgICBJZGVudGlmaWVyICJ2aXJ0aW8iCiAgICBEcml2ZXIgIm1vZGVzZXR0aW5nIgogICAgT3B0aW9uICJrbXNkZXYiICIvZGV2L2RyaS9jYXJkMCIKRW5kU2VjdGlvbgpTZWN0aW9uICJTY3JlZW4iCiAgICBJZGVudGlmaWVyICJzY3JlZW4iCiAgICBEZXZpY2UgInZpcnRpbyIKICAgIERlZmF1bHREZXB0aCAyNAogICAgU3ViU2VjdGlvbiAiRGlzcGxheSIKICAgICAgICBEZXB0aCAyNAogICAgICAgIE1vZGVzICIxMjgweDgwMCIKICAgIEVuZFN1YlNlY3Rpb24KRW5kU2VjdGlvbgpTZWN0aW9uICJTZXJ2ZXJMYXlvdXQiCiAgICBJZGVudGlmaWVyICJsYXlvdXQiCiAgICBTY3JlZW4gInNjcmVlbiIKRW5kU2VjdGlvbgpYQ0ZHCnByaW50ZiAnYWxsb3dlZF91c2Vycz1hbnlib2R5XG5uZWVkc19yb290X3JpZ2h0cz15ZXNcbicgfCBzdWRvIHRlZSAvZXRjL1gxMS9Yd3JhcHBlci5jb25maWcgPi9kZXYvbnVsbAppZiAhIGdyZXAgLXEgJ154b3JnKScgIiRTQ1JJUFQiOyB0aGVuCiAgc3VkbyBjcCAiJFNDUklQVCIgIiRTQ1JJUFQub3JpZyIKICBzdWRvIHB5dGhvbjMgLSAiJFNDUklQVCIgPDwnWFBBVENIJwppbXBvcnQgc3lzCnAgPSBzeXMuYXJndlsxXQpzID0gb3BlbihwKS5yZWFkKCkKaW5zID0gKCd4b3JnKVxuJwogICAgICAgJyAgICBsb2cgIlhvcmcgJHtESVNQTEFZX05VTX0gJHtHRU9NRVRSWX0iXG4nCiAgICAgICAnICAgIHN1ZG8gLW4gL3Vzci9iaW4vWG9yZyAiJHtESVNQTEFZX05VTX0iIC1jb25maWcgL2V0Yy9YMTEveG9yZy12aXJ0aW8uY29uZiAtbm9yZXNldCArZXh0ZW5zaW9uIEdMWCAtZHBpIDk2ICZcbicKICAgICAgICcgICAgOztcbicpCm5lZWRsZSA9ICdcbnh2bmMpXG4nCmlmIG5lZWRsZSBub3QgaW4gczoKICAgIHJhaXNlIFN5c3RlbUV4aXQoJ2Nhc2UgYnJhbmNoIG5vdCBmb3VuZCcpCnMgPSBzLnJlcGxhY2UobmVlZGxlLCAnXG4nICsgaW5zICsgJ3h2bmMpXG4nLCAxKQpvcGVuKHAsICd3Jykud3JpdGUocykKWFBBVENICiAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuIHN1ZG8gY3AgIiRTQ1JJUFQub3JpZyIgIiRTQ1JJUFQiOyBzdWRvIHJtIC1mICIkU0NSSVBULm9yaWciOyBlY2hvIFBBVENILUZBSUxFRDsgZXhpdCAyOyBmaQpmaQpwcmludGYgJ1tTZXJ2aWNlXVxuRW52aXJvbm1lbnQ9Q1VBX1hfU0VSVkVSPXhvcmdcbicgfCBzdWRvIHRlZSAvZXRjL3N5c3RlbWQvc3lzdGVtL2N1YS1kZXNrdG9wLnNlcnZpY2UuZC94LXNlcnZlci5jb25mID4vZGV2L251bGwKc3VkbyBzeXN0ZW1jdGwgZGFlbW9uLXJlbG9hZDsgc3VkbyBzeXN0ZW1jdGwgcmVzdGFydCBjdWEtZGVza3RvcApmb3IgaSBpbiAkKHNlcSAxIDQwKTsgZG8gWyAtUyAvdG1wLy5YMTEtdW5peC9YMSBdICYmIGJyZWFrOyBzbGVlcCAwLjU7IGRvbmUKUj0kKERJU1BMQVk9OjEgZ2x4aW5mbyAtQiAyPi9kZXYvbnVsbCB8IGdyZXAgLW0xICJPcGVuR0wgcmVuZGVyZXIiKQplY2hvICJyZW5kZXJlcjogJFIiCmNhc2UgIiRSIiBpbgogICp2aXJnbCopCiAgICBzdWRvIHRvdWNoIC92YXIvbGliL2N1YS1ncHUKICAgIGVjaG8gT0sKICAgIDs7CiAgKikKICAgIHByaW50ZiAnW1NlcnZpY2VdXG5FbnZpcm9ubWVudD1DVUFfWF9TRVJWRVI9eHZmYlxuJyB8IHN1ZG8gdGVlIC9ldGMvc3lzdGVtZC9zeXN0ZW0vY3VhLWRlc2t0b3Auc2VydmljZS5kL3gtc2VydmVyLmNvbmYgPi9kZXYvbnVsbAogICAgaWYgWyAtZiAiJFNDUklQVC5vcmlnIiBdOyB0aGVuIHN1ZG8gY3AgIiRTQ1JJUFQub3JpZyIgIiRTQ1JJUFQiOyBzdWRvIHJtIC1mICIkU0NSSVBULm9yaWciOyBmaQogICAgc3VkbyBzeXN0ZW1jdGwgZGFlbW9uLXJlbG9hZDsgc3VkbyBzeXN0ZW1jdGwgcmVzdGFydCBjdWEtZGVza3RvcAogICAgZWNobyBSRVZFUlRFRDsgZXhpdCAxIDs7CmVzYWMK'
+function readProvisionScript(file) {
+  try { return readFileSync(file, 'utf8') } catch { return null }
+}
 
-async function provisionGpuGuest(name) {
-  const ready = await runCua(['sb', 'exec', '--local', name, '--timeout', '20', 'test -f /var/lib/cua-gpu && echo ready || echo no'], { timeoutMs: 60000 })
-  if (ready.stdout.includes('ready')) return true
-  log(`gpu: provisioning ${name} (Xorg + mesa-utils inside the guest)`)
-  const result = await runCua(['sb', 'exec', '--local', name, '--timeout', '420', `printf %s ${GPU_GUEST_SCRIPT} | base64 -d | sudo -n bash`], { timeoutMs: 600000 })
-  const output = `${result.stdout}${result.stderr}`.trim()
-  const renderer = (/renderer:\s*(.+)/u.exec(output) || [])[1] || 'unknown'
-  if (result.code !== 0 || !/\bOK\b/u.test(output)) {
-    log(`gpu: ${name} kept Xvfb (${output.slice(-300)})`)
-    return false
+/** Pipe a guest script through `sudo bash`; the base64 removes every quoting risk. */
+async function runGuestScript(name, file, env, { timeoutSec = 900, timeoutMs = 960000 } = {}) {
+  const script = readProvisionScript(file)
+  if (script === null) {
+    log(`provision: ${file} is missing from this image (rebuild with the current Dockerfile)`)
+    return { code: 127, stdout: '', stderr: `${file} missing from the image` }
   }
-  log(`gpu: ${name} desktop is ${renderer}`)
-  return true
+  const b64 = Buffer.from(script, 'utf8').toString('base64')
+  const assigns = Object.entries(env)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(' ')
+  const command = `printf %s ${b64} | base64 -d | sudo -n env ${assigns} bash`
+  return runCua(['sb', 'exec', '--local', name, '--timeout', String(timeoutSec), command], { timeoutMs })
+}
+
+/**
+ * Make the guest a workstation. Idempotent and versioned: the script writes
+ * /var/lib/cua-provision and returns immediately when it matches.
+ */
+async function provisionGuest(name, { gpu = false } = {}) {
+  const result = await runGuestScript(name, PROVISION_SCRIPT, {
+    GPU: gpu === true ? 1 : 0,
+    SHARE_TAG: SHARE_WORKSPACE ? SHARE_TAG : '',
+    RESOLUTION: DESKTOP_RESOLUTION
+  })
+  let output = `${result.stdout}${result.stderr}`.trim()
+  const renderer = (/\[provision\] OK.*?renderer=([^\n]*)/u.exec(output) || [])[1]
+    || (/renderer: ([^\n]*)/u.exec(output) || [])[1]
+    || 'unknown'
+  if (result.code !== 0 || !/\[provision\] (OK|already provisioned)/u.test(output)) {
+    log(`provision: ${name} incomplete (${output.slice(-400)})`)
+    return { ok: false, renderer, output }
+  }
+  // The script restarts cua-spacesd in the background so the GPU environment
+  // reaches `cua sb exec` children too. Wait for it, then prove it took.
+  if (gpu === true) {
+    const deadline = Date.now() + 60000
+    let override = ''
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 4000))
+      const check = await guestExec(name, 'printf %s "$MESA_GL_VERSION_OVERRIDE"')
+      override = check.stdout.trim()
+      if (override !== '') break
+    }
+    log(`provision: ${name} shell GL override ${override || '(not set)'}`)
+    output += `\n[provision] shell override: ${override || '(not set — GUI session only)'}`
+  }
+  log(`provision: ${name} ready (${renderer})`)
+  return { ok: true, renderer, output }
+}
+
+/** Android SDK + AVD inside the guest. Slow (a few GB) but one-off per computer. */
+async function provisionAndroidGuest(name, { api = 35, variant = 'google_apis', arch = 'x86_64', avd = 'cua' } = {}) {
+  const result = await runGuestScript(name, ANDROID_SCRIPT, { API: api, VARIANT: variant, ARCH: arch, AVD: avd }, { timeoutSec: 3000, timeoutMs: 3300000 })
+  const output = `${result.stdout}${result.stderr}`.trim()
+  if (result.code !== 0 || !/\[android\] OK/u.test(output)) {
+    log(`android: ${name} failed (${output.slice(-400)})`)
+    return { ok: false, output }
+  }
+  log(`android: ${name} ready (${avd})`)
+  return { ok: true, output }
+}
+
+/**
+ * Window titles with the desktop's own furniture removed. XFCE registers the
+ * session, the WM, the settings daemon, the panel and one window per panel
+ * plugin; none of them is a click target and together they pushed the real
+ * app off the end of the list the model reads.
+ */
+function cleanWindowList(raw) {
+  const noise = /^(xfce4-session|xfwm4|Xfwm4|xfsettingsd|xfce4-panel|xfdesktop|wrapper-2\.0|Desktop|Cua\.AgentCursorOverlay.*|\s*)$/u
+  const seen = new Set()
+  return String(raw || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !/^\d+\s+\d+$/u.test(line) && !/^[XY]=/u.test(line) && !noise.test(line))
+    .filter((line) => {
+      if (seen.has(line)) return false
+      seen.add(line)
+      return true
+    })
+    .slice(0, 16)
+}
+
+/**
+ * `cua do window ls` prints one window per line as
+ *   <handle>  <app>  <title>  [x,y,w,h]  <flags>
+ * The bounds are the click targets; the titles are what `zoom` matches on.
+ */
+function listWindows(raw) {
+  const rows = []
+  for (const line of String(raw || '').split('\n')) {
+    const matched = /^(\S+)\s+(.+?)\s{2,}(.+?)\s{2,}\[(\d+),(-?\d+),(\d+),(\d+)\]/u.exec(line.trim())
+    if (!matched) continue
+    const noise = /^(xfce4-session|xfwm4|Xfwm4|xfsettingsd|xfce4-panel|xfdesktop|wrapper-2\.0|Desktop|Cua\.AgentCursorOverlay.*)$/u
+    if (noise.test(matched[2]) || noise.test(matched[3])) continue
+    rows.push({ handle: matched[1], app: matched[2], title: matched[3], rect: `${matched[4]},${matched[5]} ${matched[6]}x${matched[7]}` })
+  }
+  return rows.slice(0, 12)
 }
 
 /** Focus + pointer context, so the model can tell whether its action landed. */
@@ -433,6 +539,33 @@ const CHECKPOINT_DIR = path.join(STORE, 'checkpoints')
 const GPU_MODE = String(process.env.DSH_CUA_VM_GPU || '').trim().toLowerCase()
 const SYSTEM_QEMU = '/usr/bin/qemu-system-x86_64'
 
+/**
+ * THE WORKSPACE SHARE (9p)
+ * ------------------------
+ * "Use the VM as your computer" only works when the VM sees the project. A
+ * bind mount cannot cross the QEMU boundary, virtiofs needs /dev/fuse (absent
+ * in the harness container), so 9p it is: the QEMU shim below adds
+ *   -virtfs local,path=/workspace,mount_tag=dshworkspace,security_model=none
+ * and the guest mounts it at /workspace. QEMU runs as the same user that owns
+ * /workspace, so writes from the guest land as ordinary workspace files and
+ * `cua_vm_get` stops being the only way out of the VM.
+ *
+ * Turn it off with DSH_CUA_VM_SHARE_WORKSPACE=0 (the guest then keeps only
+ * its own filesystem and the put/get tools are the only bridge).
+ */
+const SHARE_WORKSPACE = String(process.env.DSH_CUA_VM_SHARE_WORKSPACE ?? '1') !== '0'
+const SHARE_TAG = String(process.env.DSH_CUA_VM_SHARE_TAG || 'dshworkspace')
+/**
+ * Desktop geometry. cua captures at most ~900k pixels, so a 1280x800 display
+ * is delivered as a 1200x750 PNG and every pixel coordinate the model reads
+ * is 0.9375 of the one it must click. 1200x750 is exactly 900k pixels: the
+ * capture is 1:1 and the ambiguity disappears even for tools that bypass
+ * cua's own coordinate mapping.
+ */
+const DESKTOP_RESOLUTION = String(process.env.DSH_CUA_VM_RESOLUTION || '1200x750')
+const PROVISION_SCRIPT = String(process.env.DSH_CUA_PROVISION_SCRIPT || '/usr/local/bin/cua-guest-provision.sh')
+const ANDROID_SCRIPT = String(process.env.DSH_CUA_ANDROID_SCRIPT || '/usr/local/bin/cua-guest-android.sh')
+
 let systemQemuChecked = false
 let systemQemuHasVirgl = false
 
@@ -450,21 +583,151 @@ function systemQemuSupportsVirgl() {
   return systemQemuHasVirgl
 }
 
-function preferSystemQemu() {
-  if (!systemQemuSupportsVirgl()) {
-    if (GPU_MODE === 'virgl') log('DSH_CUA_VM_GPU=virgl but this image has no virgl QEMU (build with WITH_VIRGL_QEMU=1)')
-    return
+/**
+ * Write the PATH shim. `real` is whatever QEMU this image actually has: the
+ * distro build when the image was built with WITH_VIRGL_QEMU=1, otherwise
+ * cua's own unpacked binary (no virgl, but the share still works).
+ */
+function installQemuShim() {
+  const real = existsSync(SYSTEM_QEMU)
+    ? SYSTEM_QEMU
+    : path.join(CUA_HOME, '.cua', 'qemu', 'usr', 'bin', 'qemu-system-x86_64')
+  if (!existsSync(real)) {
+    log('qemu: no QEMU binary found yet; the shim is written after `runtime setup`')
+    return false
   }
-  const wrapper = path.join(CUA_HOME, '.cua', 'bin', 'qemu-system-x86_64')
+  const target = path.join(QEMU_SHIM_DIR, 'qemu-system-x86_64')
+  const lines = [
+    '#!/bin/bash',
+    '# Installed by the DSH CUA supervisor (PATH prefix). Rewritten on every start.',
+    'args=()',
+    'skip=0',
+    'for a in "$@"; do',
+    '  if [ "$skip" = 1 ]; then skip=0; continue; fi',
+    '  case "$a" in',
+    '    -virtfs) skip=1 ;;',
+    '    *) args+=("$a") ;;',
+    '  esac',
+    'done'
+  ]
+  if (SHARE_WORKSPACE) {
+    lines.push(`args+=("-virtfs" "local,path=${WORKSPACE_ROOT},mount_tag=${SHARE_TAG},security_model=none,multidevs=remap")`)
+  }
+  lines.push(`exec ${real} "\${args[@]}"`)
+  const body = `${lines.join('\n')}\n`
   try {
-    // Keep cua's own wrapper: the store can outlive the image that swapped it,
-    // and pointing at a binary this image does not have breaks every sandbox.
-    if (!existsSync(`${wrapper}.cua`)) copyFileSync(wrapper, `${wrapper}.cua`)
-    writeFileSync(wrapper, `#!/bin/sh\nexec ${SYSTEM_QEMU} "$@"\n`)
-    chmodSync(wrapper, 0o755)
-    log(`qemu: using ${SYSTEM_QEMU} (virgl enabled)`)
+    mkdirSync(QEMU_SHIM_DIR, { recursive: true })
+    let current = ''
+    try { current = readFileSync(target, 'utf8') } catch {}
+    if (current !== body) writeFileSync(target, body)
+    chmodSync(target, 0o755)
+    if (current !== body) log(`qemu: shim -> ${real}${SHARE_WORKSPACE ? ` + 9p share ${SHARE_TAG} -> ${WORKSPACE_ROOT}` : ''}`)
+    return true
   } catch (error) {
-    log(`qemu: could not switch to the system build: ${error && error.message}`)
+    log(`qemu: could not write the shim: ${error && error.message}`)
+    return false
+  }
+}
+
+/**
+ * QMP, because a disk can be grown *while the guest runs* — and that is the
+ * only way to do it here. cua 0.7.0 has no `stop` (suspend pauses QEMU and
+ * keeps the qcow2 open), so `qemu-img resize` has no window. QMP's
+ * `block_resize` grows the virtual size under a live QEMU; the guest then
+ * grows its partition and filesystem online. No downtime, no data loss.
+ */
+function qmpCommands(port, commands, { timeoutMs = 15000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = netConnect(port, '127.0.0.1')
+    let buffer = ''
+    let stage = 'caps'
+    let index = 0
+    let settled = false
+    const results = []
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      reject(new Error(`QMP did not answer within ${timeoutMs} ms`))
+    }, timeoutMs)
+    const write = (command) => socket.write(`${JSON.stringify(command)}\n`)
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.destroy()
+      resolve(results)
+    }
+    const advance = () => {
+      if (index >= commands.length) {
+        finish()
+        return
+      }
+      write(commands[index])
+    }
+    socket.setEncoding('utf8')
+    socket.on('connect', () => write({ execute: 'qmp_capabilities' }))
+    socket.on('data', (chunk) => {
+      buffer += chunk
+      let newline = buffer.indexOf('\n')
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        newline = buffer.indexOf('\n')
+        if (line.trim() === '') continue
+        let message
+        try { message = JSON.parse(line) } catch { continue }
+        if (message.QMP || message.event) continue
+        if (stage === 'caps') {
+          stage = 'run'
+          advance()
+          continue
+        }
+        results.push(message)
+        index += 1
+        advance()
+      }
+    })
+    socket.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+}
+
+/**
+ * Grow a computer's disk. QMP grows the qcow2 under the running QEMU, then
+ * growpart + resize2fs grow the guest filesystem online. Called at create
+ * time (android) and by the cua_vm_disk tool.
+ */
+async function growGuestDisk(name, sizeGb) {
+  const bytes = Math.round(Number(sizeGb) * 1024 ** 3)
+  if (!Number.isFinite(bytes) || bytes < 8 * 1024 ** 3) throw new Error('disk size must be at least 8 GB')
+  const cmdlinePath = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name, 'cmdline')
+  if (!existsSync(cmdlinePath)) return { ok: false, error: 'this computer has no QEMU cmdline (is it running?)' }
+  const cmdline = readFileSync(cmdlinePath, 'utf8')
+  const port = Number((/-qmp tcp:127\.0\.0\.1:(\d+)/u.exec(cmdline) || [])[1])
+  if (!port) return { ok: false, error: 'no QMP socket in the QEMU cmdline' }
+  const before = await qmpCommands(port, [{ execute: 'query-block' }])
+  const block = (before[0]?.return || []).find((entry) => entry.device === 'disk0')
+  const current = Number(block?.inserted?.image?.['virtual-size'] || 0)
+  if (current >= bytes) {
+    return { ok: true, sizeGb: Math.round(current / 1024 ** 3), changed: false }
+  }
+  const resized = await qmpCommands(port, [{ execute: 'block_resize', arguments: { device: 'disk0', size: bytes } }])
+  if (resized[0]?.error) throw new Error(`block_resize refused: ${resized[0].error.desc || 'unknown'}`)
+  // The guest has to notice the bigger block device before the filesystem
+  // can. growpart issues BLKPG itself; partprobe is the fallback.
+  const grown = await guestExec(name, `sudo -n growpart /dev/vda 3 >/dev/null 2>&1 || sudo -n partprobe /dev/vda >/dev/null 2>&1 || true
+sudo -n resize2fs /dev/vda3 >/dev/null 2>&1 || true
+df -BG --output=size,avail / | tail -1`, 180000)
+  return {
+    ok: true,
+    sizeGb: Math.round(bytes / 1024 ** 3),
+    changed: true,
+    guest: grown.stdout.trim()
   }
 }
 
@@ -489,6 +752,9 @@ function checkpointSandbox(name) {
     return null
   }
 }
+
+/** VMs whose screenshot space cua already knows (see the gui pointer branch). */
+const SHOT_STATE = new Set()
 
 const handlers = {
   async ping() {
@@ -535,7 +801,7 @@ const handlers = {
               await ensureRuntime()
               const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : 'linux'
               if (snapshot !== null) copyFileSync(snapshot, bootImage)
-              if (known?.gpu === true) preferSystemQemu()
+              installQemuShim()
               let recreated = await runCua(createArgs(name, known?.tier || tier, known?.cpu || cpu, known?.memory || memory, waitDesktop, bootImage, known?.gpu === true), { timeoutMs: 1500000 })
               if (recreated.code !== 0 && snapshot !== null) {
                 log(`restore from checkpoint failed for ${name}; falling back to the base image`)
@@ -686,7 +952,7 @@ const handlers = {
    * substitution. Debian/Arch are not Cua disk images: they need
    * `cua images build` and a pinned reference, so the UI offers aliases only.
    */
-  async vmCreate({ name, cpu = 2, memory = 4, image = 'linux', tier = 'slim', workspace = WORKSPACE_ROOT, waitDesktop = false, gpu = false }) {
+  async vmCreate({ name, cpu = 2, memory = 4, image = 'linux', tier = 'slim', workspace = WORKSPACE_ROOT, waitDesktop = false, gpu = false, diskGb = 0, android = false }) {
     if (!/^[a-z0-9][a-z0-9-]{1,30}$/.test(String(name || ''))) {
       throw new Error('name must be 2-31 chars: lowercase letters, digits and dashes')
     }
@@ -703,7 +969,7 @@ const handlers = {
         return fail(`VM store quota reached (${(used / 1024 ** 3).toFixed(1)} GB of ${config.diskQuotaGb} GB). Delete a computer or raise the quota above.`)
       }
       await ensureRuntime()
-      if (gpu === true) preferSystemQemu()
+      installQemuShim()
       const created = await runCua(createArgs(name, tier, Number(cpu) || 2, Number(memory) || 4, waitDesktop, String(image || 'linux'), gpu === true), { timeoutMs: 1500000 })
       if (created.code !== 0) return fail((created.stderr || created.stdout).trim().slice(-1500))
       registry.vms[name] = {
@@ -718,8 +984,23 @@ const handlers = {
         state: 'ready'
       }
       writeRegistry(registry)
-      if (gpu === true) await provisionGpuGuest(name)
-      return ok({ name, state: 'ready', created: true })
+      // Provision first (it needs the desktop, not the other way round), then
+      // grow the disk: Android's SDK + AVD do not fit in the stock 20 GB.
+      const provisioned = await provisionGuest(name, { gpu: gpu === true })
+      let disk = null
+      if (Number(diskGb) > 0) disk = await growGuestDisk(name, Number(diskGb))
+      let androidResult = null
+      if (android === true) androidResult = await provisionAndroidGuest(name, {})
+      return ok({
+        name,
+        state: 'ready',
+        created: true,
+        renderer: provisioned.renderer,
+        provisioned: provisioned.ok,
+        disk,
+        android: androidResult ? androidResult.ok : undefined,
+        output: `${(provisioned.output || '').slice(-1200)}${androidResult ? `\n${(androidResult.output || '').slice(-1200)}` : ''}`
+      })
     })
   },
 
@@ -738,7 +1019,7 @@ const handlers = {
       await ensureRuntime()
       const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : meta.image
       if (snapshot !== null) copyFileSync(snapshot, bootImage)
-      if (meta.gpu === true) preferSystemQemu()
+      installQemuShim()
       result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, bootImage, meta.gpu === true), { timeoutMs: 1500000 })
       if (result.code !== 0 && snapshot !== null) {
         log(`restore from checkpoint failed for ${name}; falling back to ${meta.image}`)
@@ -749,7 +1030,22 @@ const handlers = {
     meta.state = 'ready'
     meta.lastUsed = new Date().toISOString()
     writeRegistry(registry)
-    return ok({ name, state: 'ready' })
+    // Version-checked: an up-to-date disk answers in one exec, an outdated one
+    // is re-provisioned here (the first start after an image update takes a
+    // minute longer and the result says so).
+    const provisioned = await provisionGuest(name, { gpu: meta.gpu === true })
+    return ok({ name, state: 'ready', provisioned: provisioned.ok, renderer: provisioned.renderer, output: provisioned.ok ? undefined : provisioned.output.slice(-1200) })
+  },
+
+  /** Force a re-provision of an existing computer (after an image update). */
+  async provision({ name }) {
+    const registry = readRegistry()
+    const meta = registry.vms[name]
+    if (!meta) return fail(`no computer named "${name}"`)
+    const result = await provisionGuest(name, { gpu: meta.gpu === true })
+    return result.ok
+      ? ok({ name, renderer: result.renderer, output: result.output.slice(-1500) })
+      : fail(`provisioning failed:\n${result.output.slice(-1200)}`)
   },
 
   async vmDelete({ name }) {
@@ -812,11 +1108,19 @@ const handlers = {
   },
 
   /**
-   * GUI control. Pointer actions are animated; screenshots are taken on the
-   * host but ALSO copied into the guest, because `cua_vm_get` reads guest paths
-   * and a host path there is a dead end the model cannot reason about.
+   * COORDINATES: one space, and it is the screenshot.
+   *
+   * cua captures at most ~900k pixels, so a 1280x800 display comes back as a
+   * 1200x750 PNG — every "the click landed 6% off" report was this, because
+   * the old code took the screenshot from cua but clicked with xdotool in
+   * *display* pixels. cua's own input verbs take **screenshot pixels** and
+   * map them internally (`cua do click 600 375` on a 1280x800 display puts
+   * the pointer at 640,400 — verified). So every pointer and keyboard action
+   * goes through `cua do` and the model can use the pixels it sees, with no
+   * arithmetic and no fractional guesswork. Pair this with a 1200x750
+   * desktop (cua-guest-provision.sh) and image pixels are display pixels too.
    */
-  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, path: target, save, region = null, scale = 1, relative = false, smooth = true, steps = 24, durationMs = 380 }) {
+  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, window: windowName, path: target, save, region = null, scale = 1, relative = false, smooth = true, steps = 3, durationMs = 200 }) {
     const num = (value) => {
       const parsed = Math.round(Number(value))
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('coordinates must be positive numbers')
@@ -825,39 +1129,92 @@ const handlers = {
     const pointer = ['click', 'dclick', 'move', 'drag'].includes(action)
     await runCua(['sb', 'resume', '--local', name], { timeoutMs: 120000 })
 
+    const switched = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
+    if (switched.code !== 0) return fail((switched.stderr || switched.stdout).trim().slice(-400))
+
+    /** Run one `cua do` verb, retrying while spacesd restarts with the desktop. */
+    const doAct = async (argv) => {
+      let result = await runCua(['do', ...argv], { timeoutMs: 120000 })
+      let output = `${result.stdout}${result.stderr}`.trim()
+      if (result.code !== 0 && /spacesd is not available|not answering|connection reset/iu.test(output)) {
+        await new Promise((resolve) => setTimeout(resolve, 5000))
+        await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
+        result = await runCua(['do', ...argv], { timeoutMs: 120000 })
+        output = `${result.stdout}${result.stderr}`.trim()
+      }
+      return { code: result.code, output }
+    }
+
+    /** Where the pointer actually is, in screen points, after an action. */
+    const pointerNow = async () => {
+      const read = await doAct(['cursor', '--json'])
+      const matched = /\((-?\d+),\s*(-?\d+)\)/u.exec(read.output)
+      return matched ? `${matched[1]},${matched[2]}` : ''
+    }
+
     if (pointer) {
-      const read = await guestExec(name, 'DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell')
-      const fromX = Number((/X=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
-      const fromY = Number((/Y=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
-      // Fractional coordinates survive a scaled preview: the model measures a
-      // position in whatever image it sees and does 0..1 instead of guessing.
+      // cua maps screenshot pixels to the display only once it knows the
+      // capture size: its first click in a fresh daemon session is 1:1 screen
+      // coordinates, every later one is scaled by image/display. Priming one
+      // screenshot per VM makes the mapping deterministic, so the model never
+      // gets a 6%-off click because it skipped looking first.
+      if (!SHOT_STATE.has(name)) {
+        await doAct(['screenshot', '-s', `/tmp/cua-prime-${process.pid}.png`, '--json'])
+        SHOT_STATE.add(name)
+      }
+      // Fractional coordinates (0..1) still work for a caller that only ever
+      // saw a resized preview. A fraction is invariant across the
+      // image→screen mapping, so resolve it against the *capture* size —
+      // cua caps captures at ~900k pixels, hence the scale below.
       let toX = num(x)
       let toY = num(y)
-      if (relative === true || (Number(x) <= 1 && Number(y) <= 1 && Number(x) >= 0 && Number(y) >= 0)) {
+      if (relative === true) {
         const size = await guestExec(name, 'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry')
         const matched = /^(\d+)\s+(\d+)$/mu.exec(size.stdout)
         if (matched) {
-          toX = Math.round(Number(x) * Number(matched[1]))
-          toY = Math.round(Number(y) * Number(matched[2]))
+          const width = Number(matched[1])
+          const height = Number(matched[2])
+          const factor = Math.min(1, Math.sqrt(900000 / (width * height)))
+          toX = Math.round(Number(x) * width * factor)
+          toY = Math.round(Number(y) * height * factor)
         }
       }
-      const total = Math.max(2, Math.min(120, Math.round(Number(steps) || 24)))
-      const perStep = Math.max(0.004, Math.min(0.05, (Number(durationMs) || 380) / 1000 / total))
-      const parts = []
-      const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2)
-      if (action === 'drag') parts.push('mousedown 1')
-      for (let index = 1; index <= total; index += 1) {
-        const t = ease(index / total)
-        const jitter = smooth && index < total ? (Math.random() * 2 - 1) : 0
-        parts.push(`mousemove ${Math.max(0, Math.round(fromX + (toX - fromX) * t + jitter))} ${Math.max(0, Math.round(fromY + (toY - fromY) * t + jitter))}`, `sleep ${perStep.toFixed(3)}`)
+      let argv
+      let result
+      if (action === 'drag') {
+        const fromX = num(x)
+        const fromY = num(y)
+        const endX = num(x2)
+        const endY = num(y2)
+        result = await doAct(['drag', String(fromX), String(fromY), String(endX), String(endY)])
+        toX = endX
+        toY = endY
+      } else {
+        const steps_ = smooth === false ? 1 : Math.max(1, Math.min(8, Math.round(Number(steps) || 3)))
+        if (steps_ > 1 && action !== 'move') {
+          // A few intermediate moves make the agent's cursor animate for a
+          // human watching the shared desktop; the last one is redundant.
+          const read = await doAct(['cursor', '--json'])
+          const from = /\((-?\d+),\s*(-?\d+)\)/u.exec(read.output)
+          if (from) {
+            const fx = Number(from[1])
+            const fy = Number(from[2])
+            for (let index = 1; index < steps_; index += 1) {
+              const t = index / steps_
+              const ease = (value) => (value < 0.5 ? 2 * value * value : 1 - ((-2 * value + 2) ** 2) / 2)
+              const at = ease(t)
+              await doAct(['move', String(Math.round(fx + (toX - fx) * at)), String(Math.round(fy + (toY - fy) * at))])
+            }
+          }
+        }
+        if (action === 'click') result = await doAct(['click', String(toX), String(toY)])
+        else if (action === 'dclick') result = await doAct(['dclick', String(toX), String(toY)])
+        else result = await doAct(['move', String(toX), String(toY)])
       }
-      if (action === 'click') parts.push('click 1')
-      if (action === 'dclick') parts.push('click --repeat 2 --delay 80 1')
-      if (action === 'drag') parts.push('mouseup 1')
-      const moved = await guestExec(name, `DISPLAY=\${DISPLAY:-:1} xdotool ${parts.join(' ')}`, 120000)
-      if (moved.code !== 0) return fail((moved.stderr || moved.stdout).trim().slice(-400))
+      if (result.code !== 0) return fail(result.output.slice(-600))
+      const at = await pointerNow()
       const context = await guiContext(name)
-      return ok({ name, action, output: `${action} at ${toX},${toY} (${total} steps over ${Math.round(perStep * total * 1000)} ms)\n${context}` })
+      return ok({ name, action, output: `${action} at screenshot pixel ${toX},${toY} (cua maps it to the display)${at ? `\npointer now at screen ${at}` : ''}\n${context}` })
     }
 
     if (action === 'screenshot') {
@@ -867,8 +1224,6 @@ const handlers = {
       const guestFile = typeof save === 'string' && save.startsWith('/') ? save : `/home/cua/shots/${name}-${stamp}.png`
       const guestDir = guestFile.slice(0, guestFile.lastIndexOf('/')) || '/home/cua'
       await guestExec(name, `mkdir -p ${guestDir}`)
-      const shot = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
-      if (shot.code !== 0) return fail((shot.stderr || shot.stdout).trim().slice(-400))
       const taken = await runCua(['do', 'screenshot', '-s', hostFile, '--json'], { timeoutMs: 120000 })
       if (taken.code !== 0) return fail((taken.stderr || taken.stdout).trim().slice(-400))
 
@@ -887,35 +1242,57 @@ const handlers = {
         try {
           execFileSync('/usr/bin/convert', [hostFile, '-crop', `${rw}x${rh}+${rx}+${ry}`, '+repage', '-resize', `${Math.round(zoom * 100)}%`, hostCrop], { timeout: 30000 })
           source = hostCrop
-          mapping = `crop ${rw}x${rh} at (${rx},${ry}) magnified ${zoom}x → image pixel (px,py) = guest (${rx} + px/${zoom}, ${ry} + py/${zoom}).\n`
+          mapping = `crop ${rw}x${rh} at screenshot (${rx},${ry}) magnified ${zoom}x → this image is only for reading: to click, divide by ${zoom} and add the origin, i.e. click at (${rx} + px/${zoom}, ${ry} + py/${zoom}).\n`
         } catch (error) {
           mapping = `crop failed (${error && error.message}); the full frame below is unchanged.\n`
         }
       }
 
       const copied = await runCua(['sb', 'cp', source, `${name}:${guestFile}`], { timeoutMs: 120000 })
-      if (copied.code !== 0) {
-        return ok({ name, action, output: `${mapping}screenshot on the host: ${source} (copy into the guest failed; use this host path only from the panel)` })
-      }
       const dimensions = (() => {
         try {
-          const info = execFileSync('/usr/bin/identify', ['-format', '%w %h', source], { timeout: 20000 }).toString().trim()
-          return info
+          return execFileSync('/usr/bin/identify', ['-format', '%w %h', source], { timeout: 20000 }).toString().trim()
         } catch { return 'unknown' }
       })()
-      return ok({ name, action, output: `${mapping}screenshot saved in the guest: ${guestFile} (${dimensions})
-The display is the guest resolution; image pixels are guest pixels unless a crop line above says otherwise.
+      const space = `screenshot ${dimensions} — these are the pixels every pointer action takes (cua maps them). The desktop is ${DESKTOP_RESOLUTION}; when the two match, image pixels are display pixels.`
+      if (copied.code !== 0) {
+        return ok({ name, action, output: `${mapping}${space}\nscreenshot on the host: ${source} (copy into the guest failed; use this host path only from the panel)` })
+      }
+      return ok({ name, action, output: `${mapping}${space}\nscreenshot saved in the guest: ${guestFile}
 fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}` })
     }
 
     if (action === 'geometry') {
       const read = await runCua(['sb', 'exec', '--local', name, '--timeout', '20',
-        'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry; DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell 2>/dev/null | head -2; DISPLAY=${DISPLAY:-:1} xdotool search --name "." getwindowname %@ 2>/dev/null | head -12'], { timeoutMs: 60000 })
+        'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry; DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell 2>/dev/null | head -2; DISPLAY=${DISPLAY:-:1} xdotool search --name "." getwindowname %@ 2>/dev/null | head -14'], { timeoutMs: 60000 })
       const geometry = /^(\d+)\s+(\d+)$/mu.exec(read.stdout)
       const px = (/X=(-?\d+)/u.exec(read.stdout) || [])[1]
       const py = (/Y=(-?\d+)/u.exec(read.stdout) || [])[1]
-      const windows = read.stdout.split('\n').filter((line) => line.trim() !== '' && !/^\d+\s+\d+$/u.test(line) && !/^[XY]=/u.test(line)).slice(0, 12)
-      return ok({ name, action, output: `display: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}, pointer: ${px ?? '?'},${py ?? '?'}\nwindows:\n${windows.map((w) => `- ${w}`).join('\n') || '- none'}` })
+      const windows = cleanWindowList(read.stdout)
+      // cua's own window list carries the bounds, which is what a click needs.
+      const listed = await doAct(['window', 'ls'])
+      const bounds = listWindows(listed.output)
+      const at = await pointerNow()
+      return ok({
+        name,
+        action,
+        output: `display: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'} (screenshot pixels are the click space; they match when the desktop is ${DESKTOP_RESOLUTION})\npointer: ${at || `${px ?? '?'},${py ?? '?'}`} (screen points)\nwindows:\n${bounds.length > 0 ? bounds.map((w) => `- "${w.title}" at [${w.rect}]${w.app && w.app !== w.title ? ` (app: ${w.app})` : ''}`).join('\n') : (windows.map((w) => `- ${w}`).join('\n') || '- none')}\nuse \`zoom\` with one of these titles to crop the desktop to that window (coordinates stay correct).`
+      })
+    }
+
+    if (action === 'zoom' || action === 'unzoom') {
+      const target_ = action === 'zoom' ? String(windowName ?? app ?? '').trim() : ''
+      if (action === 'zoom' && target_ === '') return fail('zoom needs a window title (see the windows list from geometry)')
+      const result = action === 'zoom'
+        ? await doAct(['zoom', target_])
+        : await doAct(['unzoom'])
+      if (result.code !== 0) return fail(result.output.slice(-500))
+      const shot = await doAct(['screenshot', '-s', `/tmp/cua-zoom-${process.pid}.png`, '--json'])
+      let size = ''
+      try {
+        size = execFileSync('/usr/bin/identify', ['-format', '%w %h', `/tmp/cua-zoom-${process.pid}.png`], { timeout: 20000 }).toString().trim()
+      } catch {}
+      return ok({ name, action, output: `${result.output}\n${action === 'zoom' ? `zoomed to "${target_}"` : 'back to the full screen'}${size ? `; screenshots are now ${size} and coordinates are relative to that image` : ''}. Take a screenshot to see it.` })
     }
 
     const argv = (() => {
@@ -934,7 +1311,7 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
           if (!['up', 'down', 'left', 'right'].includes(dir)) throw new Error('direction must be up, down, left or right')
           return ['scroll', dir, String(Math.max(1, Math.min(50, Math.round(Number(amount) || 3))))]
         }
-        case 'windows': return ['window', 'list']
+        case 'windows': return ['window', 'ls']
         case 'a11y': return ['a11y', 'tree', '--json']
         case 'clipboard': return ['clipboard']
         case 'launch': return ['launch', String(app ?? '')]
@@ -943,15 +1320,8 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
       }
     })()
 
-    const switched = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
-    if (switched.code !== 0) return fail((switched.stderr || switched.stdout).trim().slice(-400))
-    let acted = await runCua(['do', ...argv], { timeoutMs: 120000 })
-    let output = `${acted.stdout}${acted.stderr}`.trim()
-    if (acted.code !== 0 && /spacesd is not available|not answering/i.test(output)) {
-      await new Promise((resolve) => setTimeout(resolve, 5000))
-      acted = await runCua(['do', ...argv], { timeoutMs: 120000 })
-      output = `${acted.stdout}${acted.stderr}`.trim()
-    }
+    const acted = await doAct(argv)
+    let output = acted.output
     if (acted.code !== 0) {
       // AT-SPI is missing on most custom-drawn apps (Blender) and its error is a
       // dead end for the model. Answer with what IS available instead.
@@ -959,7 +1329,7 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
         const fallback = await runCua(['sb', 'exec', '--local', name, '--timeout', '20',
           'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry; DISPLAY=${DISPLAY:-:1} xdotool getactivewindow getwindowname 2>/dev/null; DISPLAY=${DISPLAY:-:1} xdotool search --name "." getwindowname %@ 2>/dev/null | head -12'], { timeoutMs: 60000 })
         const geometry = /^(\d+)\s+(\d+)$/mu.exec(fallback.stdout)
-        return ok({ name, action, output: `accessibility tree is unavailable for this app (AT-SPI not exposed).\ndisplay: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}\nwindows:\n${fallback.stdout.split('\n').filter((l) => l.trim() !== '' && !/^\d+\s+\d+$/u.test(l)).slice(0, 12).map((w) => `- ${w}`).join('\n') || '- none'}\nUse cua_vm_gui screenshot + pixel coordinates, or script the app instead of clicking.` })
+        return ok({ name, action, output: `accessibility tree is unavailable for this app (AT-SPI not exposed).\ndisplay: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}\nwindows:\n${cleanWindowList(fallback.stdout).map((w) => `- ${w}`).join('\n') || '- none'}\nUse zoom + screenshot + screenshot pixels, or drive the app from its own scripting API.` })
       }
       return fail(output.slice(-600))
     }
@@ -968,6 +1338,29 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
       if (context !== '') output = `${output}\n${context}`
     }
     return ok({ name, action, output })
+  },
+
+  /** Grow the disk of a running computer; the filesystem grows online. */
+  async vmDisk({ name, sizeGb }) {
+    const registry = readRegistry()
+    if (!registry.vms[name]) return fail(`no computer named "${name}"`)
+    try {
+      const result = await growGuestDisk(name, Number(sizeGb))
+      if (result.changed) log(`disk: ${name} grew to ${result.sizeGb} GB`)
+      return ok({ name, ...result })
+    } catch (error) {
+      return fail(`${error && error.message}`)
+    }
+  },
+
+  /** Install the Android SDK + an AVD inside the guest (several GB, one-off). */
+  async vmAndroid({ name, api = 35, variant = 'google_apis', arch = 'x86_64', avd = 'cua' }) {
+    const registry = readRegistry()
+    if (!registry.vms[name]) return fail(`no computer named "${name}"`)
+    const result = await provisionAndroidGuest(name, { api: Number(api) || 35, variant, arch, avd })
+    return result.ok
+      ? ok({ name, installed: true, output: result.output.slice(-1500) })
+      : fail(`android provisioning failed:\n${result.output.slice(-1200)}`)
   },
 
   async stop({ name }) {

@@ -293,3 +293,114 @@ NVIDIA toolkit reservation with the `graphics` capability, and
 `NVIDIA_DRIVER_CAPABILITIES=all`. Without a render node the create fails with
 "No GPU render node (/dev/dri/renderD*)" — a clear refusal, not a silent
 software fallback. CUDA inside the VM still requires VFIO and a dedicated GPU.
+
+---
+
+## Round 2: input that lands, a shared workspace, Android in the VM
+
+The first round could draw a desktop but not reliably *use* one: clicks landed
+6% off, Blender refused on OpenGL, nothing reached the guest but copies, and the
+Android emulator was out of the image with no path back. Each of those was a
+concrete bug, not a mystery.
+
+### 1. One coordinate space: the screenshot
+
+cua caps a capture at ~900k pixels, so a 1280×800 desktop is delivered as a
+**1200×750** PNG (factor 0.9375). cua's input verbs take **screenshot pixels**
+and map them to the display (`cua do click 600 375` → pointer `640,400`), but
+the first implementation captured with cua and clicked with `xdotool` in display
+coordinates. That mismatch is the entire "mouse control is unreliable" report.
+
+Now:
+
+* every pointer action is a `cua do` verb (`click`, `dclick`, `move`, `drag`,
+  `scroll`) with screenshot pixels;
+* one priming screenshot per VM makes cua's mapping deterministic (its first
+  click in a fresh daemon session is unscaled);
+* `zoom <window>` / `unzoom` crop to a window through cua, so small controls
+  stay clickable and coordinates stay valid;
+* `geometry` lists windows **with bounds** from `cua do window ls`;
+* provisioning sets the desktop to 1200×750 (an Xorg modeline; Xorg ignores the
+  config's `Modes` because the virtio EDID does not advertise it), which makes
+  the capture 1:1 — image pixels are display pixels, `xdotool` and `a11y`
+  bounds line up too.
+
+### 2. The QEMU shim lives on PATH, not in `.cua/bin`
+
+cua 0.7.0 does not execute `$CUA_HOME/.cua/bin/qemu-system-x86_64`; it resolves
+`qemu-system-x86_64` through **PATH** (proved by a shim that logs its argv).
+Round 1's "swap the wrapper for virgl" was therefore a no-op — virgl worked
+because the distro build happened to be first on PATH, and any argument added to
+that wrapper never reached QEMU.
+
+The supervisor now writes `/cua-vm/bin/qemu-system-x86_64` and prepends that
+directory to `PATH` for every `cua` call. The shim:
+
+* execs the distro QEMU (virtio-gpu-gl-pci) when the image has it, otherwise
+  cua's own build;
+* appends `-virtfs local,path=/workspace,mount_tag=dshworkspace,
+  security_model=none,multidevs=remap`;
+* is rewritten on every start, so `cua runtime setup` cannot drop it.
+
+### 3. `/workspace` is the same directory on both sides
+
+The guest mounts the 9p share at `/workspace` (fstab entry, `nofail`), so a file
+the model writes in the VM is a workspace file the harness can read — verified
+both ways. 9p is for source and results; the prompt says to copy into
+`/tmp/build` for a build that writes thousands of files.
+
+Turn it off with `DSH_CUA_VM_SHARE_WORKSPACE=0`; `cua_vm_put`/`cua_vm_get` stay
+as the explicit bridge.
+
+### 4. OpenGL 4.3 on virgl
+
+virgl reports **4.2** although every 4.3 extension is present
+(`GL_ARB_compute_shader`, `GL_ARB_shader_storage_buffer_object`,
+`GL_ARB_program_interface_query`, `GL_ARB_multi_bind`). Blender 4.x refuses on
+the version string, so round 1's answer was `LIBGL_ALWAYS_SOFTWARE=1` — a GPU
+computer rendering on the CPU.
+
+`MESA_GL_VERSION_OVERRIDE=4.3FC` is now set in two places:
+
+* `cua-desktop.service` → the whole XFCE session (GUI launches);
+* `cua-spacesd.service` → `cua sb exec` children (`blender -b`, `glxinfo`,
+  tests), which otherwise see the un-overridden value.
+
+The provision script restarts spacesd **detached** (it is the channel the script
+itself runs on) and the supervisor waits for `$MESA_GL_VERSION_OVERRIDE` to
+appear before reporting success.
+
+Venus/zink is not an option on this host: blob resources need `/dev/udmabuf`,
+which the container does not have.
+
+### 5. Nested KVM and the Android emulator
+
+The VM already runs with `-cpu host`, so `vmx` reaches the guest and `/dev/kvm`
+exists there — it was only `root:kvm 0660` with `cua` outside `kvm`. A udev rule
+plus `chmod 0666` fixes it; `KVM_GET_API_VERSION` returns 12 inside the guest.
+
+`docker/cua-guest-android.sh` installs the official SDK (command-line tools,
+platform-tools, emulator, `system-images;android-35;google_apis;x86_64`), creates
+an AVD and a `cua-emulator` launcher (`-gpu swiftshader_indirect -no-audio
+-no-boot-anim -no-snapshot`, `-no-window` for adb-driven runs). Nothing Android
+lives in the harness image.
+
+Create with `cua_vm_create {gpu: true, cpu: 4, memory: 8, diskGb: 40}`, then
+`cua_vm_android`. The bootstrap refuses under 12 GB free with a clear message.
+
+### 6. Growing a disk without stopping the computer
+
+cua has no `stop` (suspend pauses QEMU and keeps the qcow2 open), so
+`qemu-img resize` has no window. The supervisor talks QMP to the running machine
+(`block_resize` on `disk0`), then `growpart /dev/vda 3` + `resize2fs /dev/vda3`
+in the guest. Verified 20 → 40 GB online with the filesystem at 40 G and 36 G
+free. `cua_vm_disk` exposes it; `diskGb` does it during create.
+
+### 7. Provisioning is a file now
+
+`docker/cua-guest-provision.sh` and `docker/cua-guest-android.sh` are real
+scripts copied into the image, run through `sudo -n bash` over base64. The old
+version was a base64 blob inside the supervisor: unreadable, untestable, and
+impossible to debug when the guest rejected a line. The script is versioned
+(`/var/lib/cua-provision`) and re-runs when the version changes, so an existing
+computer gets the fixes on its next Start.
