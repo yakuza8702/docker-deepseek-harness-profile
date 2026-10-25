@@ -70,11 +70,7 @@ window.__ModuleLoader__.load({
       const [text, setText] = useState('')
       const [frameAt, setFrameAt] = useState(0)
       const [pos, setPos] = useState(null)
-      const [active, setActive] = useState(false)
-      const [cursor, setCursor] = useState(null)
       const frameRef = React.useRef(null)
-      const lastPos = React.useRef(null)
-      const lastMoved = React.useRef(0)
 
       const send = async (payload) => {
         try {
@@ -105,8 +101,11 @@ window.__ModuleLoader__.load({
         const timer = setInterval(() => { void tick() }, 1200)
         return () => { alive = false; clearInterval(timer) }
       }, [frames, name, frameAt])
-      // X11 renders the cursor as an overlay the capture does not include, so
-      // the real pointer moves invisibly. Poll it and draw our own.
+      // FRAMES ONLY. A static PNG carries no cursor, so this view draws one at
+      // the guest pointer. The video view deliberately draws nothing: the
+      // viewer paints the real pointer itself, and a second marker there was
+      // the "double mouse" report — one of them lagging on a 400 ms poll.
+      // This is also how the upstream build behaves.
       useEffect(() => {
         if (!frames) { setPos(null); return undefined }
         let alive = true
@@ -122,64 +121,6 @@ window.__ModuleLoader__.load({
         const timer = setInterval(() => { void tick() }, 400)
         return () => { alive = false; clearInterval(timer) }
       }, [name, frames])
-
-      // The guest desktop already carries the real X pointer in the video
-      // stream, so a permanent marker was a second, laggier mouse. Mirror
-      // cua's own demo instead: show the agent's cursor only while it moves,
-      // then let it disappear, so an idle desktop shows one cursor.
-      useEffect(() => {
-        if (frames) { setActive(false); return undefined }
-        let alive = true
-        const tick = async () => {
-          try {
-            const p = await api('pointer', { name })
-            if (!alive || p === null || p.width <= 0 || p.height <= 0) return
-            const prev = lastPos.current
-            if (prev === null || prev.x !== p.x || prev.y !== p.y) {
-              lastMoved.current = Date.now()
-              setActive(true)
-            }
-            lastPos.current = p
-            setPos(p)
-          } catch { /* the VM may be busy; the next tick retries */ }
-        }
-        void tick()
-        const timer = setInterval(() => { void tick() }, 400)
-        return () => { alive = false; clearInterval(timer) }
-      }, [name, frames])
-
-      useEffect(() => {
-        if (!active) return undefined
-        const timer = setInterval(() => {
-          if (Date.now() - lastMoved.current > 2200) setActive(false)
-        }, 300)
-        return () => clearInterval(timer)
-      }, [active])
-
-      // Map the guest pointer onto the viewer's canvas while it is active.
-      useEffect(() => {
-        if (frames || !active || pos === null) { setCursor(null); return }
-        const frame = frameRef.current
-        if (frame === null) { setCursor(null); return }
-        try {
-          const doc = frame.contentDocument
-          if (doc === null) { setCursor(null); return }
-          const elements = [...doc.querySelectorAll('canvas, video')]
-            .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))
-          const target = elements[0]
-          if (target === undefined) { setCursor(null); return }
-          const outer = frame.getBoundingClientRect()
-          const inner = target.getBoundingClientRect()
-          if (inner.width === 0 || inner.height === 0) { setCursor(null); return }
-          const scale = Math.min(inner.width / pos.width, inner.height / pos.height)
-          setCursor({
-            left: outer.left + inner.left + (inner.width - pos.width * scale) / 2 + pos.x * scale,
-            top: outer.top + inner.top + (inner.height - pos.height * scale) / 2 + pos.y * scale
-          })
-        } catch {
-          setCursor(null)
-        }
-      }, [pos, frames, active])
 
       return h('div', {
         role: 'dialog', 'aria-modal': 'true', 'aria-label': `VM desktop ${name}`,
@@ -269,17 +210,6 @@ window.__ModuleLoader__.load({
               style: { width: '100%', height: '100%', border: 'none', borderRadius: T.radiusLg, background: '#000' },
               allow: 'clipboard-read; clipboard-write; fullscreen'
             }),
-        cursor !== null && active && h('div', {
-          'aria-hidden': true,
-          style: {
-            position: 'fixed', pointerEvents: 'none', zIndex: 71,
-            left: cursor.left, top: cursor.top, transform: 'translate(-2px,-2px)', width: 16, height: 16,
-            // Glide between 400 ms samples instead of jumping; the marker is
-            // removed when the agent stops (2.2 s of no movement).
-            transition: 'left .35s linear, top .35s linear'
-          }
-        }, h('svg', { width: 16, height: 16, viewBox: '0 0 16 16' },
-          h('path', { d: 'M2 1 L2 13 L5.5 9.8 L8 15 L10.2 14 L7.8 8.9 L12.5 8.4 Z', fill: '#fff', stroke: '#111', strokeWidth: 1 })))
       )
     }
 
