@@ -757,6 +757,8 @@ function checkpointSandbox(name) {
 const SHOT_STATE = new Set()
 /** Which computer `cua do` is pointed at — switching resets the zoom state. */
 let DO_TARGET = ''
+/** Display size per VM, so a twice-a-second pointer poll costs one call. */
+const POINTER_SPACE = new Map()
 
 const handlers = {
   async ping() {
@@ -1122,7 +1124,7 @@ const handlers = {
    * arithmetic and no fractional guesswork. Pair this with a 1200x750
    * desktop (cua-guest-provision.sh) and image pixels are display pixels too.
    */
-  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, window: windowName, path: target, save, region = null, scale = 1, relative = false, smooth = true, steps = 3, durationMs = 200 }) {
+  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, window: windowName, path: target, save, region = null, scale = 1, relative = false, smooth = true, steps = 6, durationMs = 200 }) {
     const num = (value) => {
       const parsed = Math.round(Number(value))
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('coordinates must be positive numbers')
@@ -1202,7 +1204,7 @@ const handlers = {
         toX = endX
         toY = endY
       } else {
-        const steps_ = smooth === false ? 1 : Math.max(1, Math.min(8, Math.round(Number(steps) || 3)))
+        const steps_ = smooth === false ? 1 : Math.max(1, Math.min(12, Math.round(Number(steps) || 6)))
         if (steps_ > 1 && action !== 'move') {
           // A few intermediate moves make the agent's cursor animate for a
           // human watching the shared desktop; the last one is redundant.
@@ -1350,6 +1352,37 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
       if (context !== '') output = `${output}\n${context}`
     }
     return ok({ name, action, output })
+  },
+
+  /**
+   * The panel's cursor. X11 paints the pointer outside the capture, so the
+   * frames view draws one from this position. It is also the cheapest way to
+   * tell whether the model actually moved the mouse or just ran a shell
+   * command. Deliberately does NOT `do switch` (that clears the agent's zoom).
+   */
+  async pointer({ name }) {
+    if (DO_TARGET !== name) {
+      const switched = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
+      if (switched.code !== 0) return fail((switched.stderr || switched.stdout).trim().slice(-300))
+      DO_TARGET = name
+    }
+    const read = await runCua(['do', 'cursor', '--json'], { timeoutMs: 30000 })
+    const matched = /\((-?\d+),\s*(-?\d+)\)/u.exec(`${read.stdout}${read.stderr}`)
+    if (!matched) return fail('the guest did not report a pointer position')
+    // Display size is cached: it only changes when the desktop restarts.
+    const cached = POINTER_SPACE.get(name)
+    let width = cached?.width || 0
+    let height = cached?.height || 0
+    if (width === 0 || Date.now() - cached.at > 30000) {
+      const size = await guestExec(name, 'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry')
+      const dims = /^(\d+)\s+(\d+)$/mu.exec(size.stdout)
+      if (dims) {
+        width = Number(dims[1])
+        height = Number(dims[2])
+        POINTER_SPACE.set(name, { width, height, at: Date.now() })
+      }
+    }
+    return ok({ name, x: Number(matched[1]), y: Number(matched[2]), width, height })
   },
 
   /** Grow the disk of a running computer; the filesystem grows online. */

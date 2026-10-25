@@ -238,7 +238,7 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState(null)
       const [note, setNote] = useState(null)
       const [showNew, setShowNew] = useState(false)
-      const [draft, setDraft] = useState({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false })
+      const [draft, setDraft] = useState({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false, diskGb: 20, android: false })
       const [pending, setPending] = useState(null)
       const [exec, setExec] = useState(null)
       const [form, setForm] = useState(null)
@@ -285,11 +285,11 @@ window.__ModuleLoader__.load({
 
       const create = async () => {
         setPending({ name: draft.name, action: 'create' })
-        setNote(`Creating ${draft.name}… it boots on first use.`)
+        setNote(`Creating ${draft.name}${draft.gpu ? ' with GPU' : ''}${draft.android ? ' + Android SDK' : ''}… the first start also provisions the guest (a minute or two).`)
         try {
-          await api('create', { name: draft.name, cpu: draft.cpu, memory: draft.memory, image: draft.image, gpu: draft.gpu })
+          await api('create', { name: draft.name, cpu: draft.cpu, memory: draft.memory, image: draft.image, gpu: draft.gpu, diskGb: draft.diskGb, android: draft.android })
           setShowNew(false)
-          setDraft({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false })
+          setDraft({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false, diskGb: 20, android: false })
           await load()
           setNote(`${draft.name} is up.`)
         } catch (error) {
@@ -380,7 +380,7 @@ window.__ModuleLoader__.load({
               placeholder: 'name (a-z, 0-9, dashes)', value: draft.name, style: S.input,
               onChange: (event) => setDraft({ ...draft, name: event.target.value })
             }),
-            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 2fr auto', gap: 8, alignItems: 'end' } },
+            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 2fr 1fr auto auto', gap: 8, alignItems: 'end' } },
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'vCPU'),
                 h('input', { type: 'number', min: 1, max: 8, value: draft.cpu, style: S.input, onChange: (event) => setDraft({ ...draft, cpu: Number(event.target.value) }) })),
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'RAM (GB)'),
@@ -390,15 +390,24 @@ window.__ModuleLoader__.load({
                   h('option', { value: 'linux' }, 'Ubuntu 24.04 slim (Cua disk)'),
                   h('option', { value: 'ghcr.io/trycua/linux:24.04' }, 'Ubuntu 24.04 full')
                 )),
+              h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'Disk (GB)'),
+                h('input', { type: 'number', min: 20, max: 200, step: 10, value: draft.diskGb, style: S.input, onChange: (event) => setDraft({ ...draft, diskGb: Number(event.target.value) }) })),
               h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, paddingBottom: 6 } },
                 h('input', {
                   type: 'checkbox', checked: draft.gpu === true,
                   onChange: (event) => setDraft({ ...draft, gpu: event.target.checked })
                 }),
                 'Enable GPU'
+              ),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, paddingBottom: 6 } },
+                h('input', {
+                  type: 'checkbox', checked: draft.android === true,
+                  onChange: (event) => setDraft({ ...draft, android: event.target.checked })
+                }),
+                'Android SDK'
               )
             ),
-            h('div', { style: S.muted }, 'Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field.'),
+            h('div', { style: S.muted }, 'Everything the guest needs is provisioned automatically on the first start when Enable GPU is on: Xorg on virgl, OpenGL 4.3, render/KVM access, a 1200x750 desktop and the workspace share. Android SDK adds ~7 GB inside the VM and takes a few minutes; grow Disk (GB) to 40 for it. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field.'),
             h('div', { style: S.row },
               h('button', { type: 'button', style: S.primary, disabled: pending !== null || draft.name.trim() === '', onClick: () => void create() }, pending?.action === 'create' ? 'Creating…' : 'Create computer')
             )
