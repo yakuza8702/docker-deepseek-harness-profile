@@ -305,6 +305,23 @@ function repairQemuData() {
 /** Make sure the VMM exists in the store before the first create. */
 async function ensureRuntime() {
   const wrapper = path.join(CUA_HOME, '.cua', 'bin', 'qemu-system-x86_64')
+  // A wrapper swapped by an image that had the system QEMU is dead weight in an
+  // image that does not: restore cua's own, or force a re-provision.
+  if (existsSync(wrapper) && !existsSync(SYSTEM_QEMU)) {
+    try {
+      if (readFileSync(wrapper, 'utf8').includes(SYSTEM_QEMU)) {
+        if (existsSync(`${wrapper}.cua`)) {
+          renameSync(`${wrapper}.cua`, wrapper)
+          log('qemu: restored cua\'s wrapper (the system QEMU is not in this image)')
+        } else {
+          unlinkSync(wrapper)
+          log('qemu: dropped a stale system wrapper; re-provisioning')
+        }
+      }
+    } catch (error) {
+      log(`qemu: could not restore the wrapper: ${error && error.message}`)
+    }
+  }
   if (!existsSync(wrapper)) {
     const setup = await runCua(['runtime', 'setup', 'qemu'], { timeoutMs: 900000 })
     if (setup.code !== 0) throw new Error(`cua runtime setup qemu failed: ${(setup.stderr || setup.stdout).trim().slice(-800)}`)
@@ -427,6 +444,9 @@ function preferSystemQemu() {
   }
   const wrapper = path.join(CUA_HOME, '.cua', 'bin', 'qemu-system-x86_64')
   try {
+    // Keep cua's own wrapper: the store can outlive the image that swapped it,
+    // and pointing at a binary this image does not have breaks every sandbox.
+    if (!existsSync(`${wrapper}.cua`)) copyFileSync(wrapper, `${wrapper}.cua`)
     writeFileSync(wrapper, `#!/bin/sh\nexec ${SYSTEM_QEMU} "$@"\n`)
     chmodSync(wrapper, 0o755)
     log(`qemu: using ${SYSTEM_QEMU} (virgl enabled)`)
@@ -603,8 +623,13 @@ const handlers = {
   async get({ name, guest, local }) {
     if (!name) throw new Error('name is required')
     if (typeof guest !== 'string' || !guest.startsWith('/')) throw new Error('guest must be an absolute guest path')
+    // Create the destination directory first: a fresh project has no shots/
+    // folder, and "no such path" is a dead end the model cannot fix cheaply.
+    const root = realpathSync(WORKSPACE_ROOT)
+    const absolute = path.isAbsolute(local) ? path.normalize(local) : path.join(root, local)
+    if (absolute !== root && !absolute.startsWith(root + path.sep)) throw new Error(`path escapes the workspace: ${local}`)
+    mkdirSync(path.dirname(absolute), { recursive: true })
     const target = workspacePath(local, { forWrite: true })
-    mkdirSync(path.dirname(target), { recursive: true })
     const result = await runCua(['sb', 'cp', '--local', `${name}:${guest}`, target], { timeoutMs: 600000 })
     if (result.code !== 0) return fail(`vm_get failed: ${(result.stderr || result.stdout).trim().slice(-1000)}`)
     return ok({ guest, local: target, bytes: statSync(target).size })
@@ -774,10 +799,9 @@ const handlers = {
   },
 
   /**
-   * GUI control. Pointer actions are animated: a single `mousemove` teleports
-   * the cursor, which reads as a machine; a short eased path with sub-pixel
-   * jitter reads as a hand, and it is what makes the streamed desktop look like
-   * the upstream demo. Everything else goes through `cua do`.
+   * GUI control. Pointer actions are animated; screenshots are taken on the
+   * host but ALSO copied into the guest, because `cua_vm_get` reads guest paths
+   * and a host path there is a dead end the model cannot reason about.
    */
   async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, path: target, save, smooth = true, steps = 24, durationMs = 380 }) {
     const num = (value) => {
@@ -790,10 +814,8 @@ const handlers = {
 
     if (pointer) {
       const read = await runCua(['sb', 'exec', '--local', name, '--timeout', '20', 'DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell'], { timeoutMs: 60000 })
-      const matchX = /X=(-?\d+)/u.exec(read.stdout)
-      const matchY = /Y=(-?\d+)/u.exec(read.stdout)
-      const fromX = matchX === null ? 0 : Number(matchX[1])
-      const fromY = matchY === null ? 0 : Number(matchY[1])
+      const fromX = Number((/X=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
+      const fromY = Number((/Y=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
       const toX = num(x)
       const toY = num(y)
       const total = Math.max(2, Math.min(120, Math.round(Number(steps) || 24)))
@@ -804,18 +826,43 @@ const handlers = {
       for (let index = 1; index <= total; index += 1) {
         const t = ease(index / total)
         const jitter = smooth && index < total ? (Math.random() * 2 - 1) : 0
-        const px = Math.round(fromX + (toX - fromX) * t + jitter)
-        const py = Math.round(fromY + (toY - fromY) * t + jitter)
-        parts.push(`mousemove ${Math.max(0, px)} ${Math.max(0, py)}`, `sleep ${perStep.toFixed(3)}`)
+        parts.push(`mousemove ${Math.max(0, Math.round(fromX + (toX - fromX) * t + jitter))} ${Math.max(0, Math.round(fromY + (toY - fromY) * t + jitter))}`, `sleep ${perStep.toFixed(3)}`)
       }
       if (action === 'click') parts.push('click 1')
       if (action === 'dclick') parts.push('click --repeat 2 --delay 80 1')
       if (action === 'drag') parts.push('mouseup 1')
-      const script = `DISPLAY=\${DISPLAY:-:1} xdotool ${parts.join(' ')}`
-      const moved = await runCua(['sb', 'exec', '--local', name, '--timeout', '60', script], { timeoutMs: 120000 })
+      const moved = await runCua(['sb', 'exec', '--local', name, '--timeout', '60', `DISPLAY=\${DISPLAY:-:1} xdotool ${parts.join(' ')}`], { timeoutMs: 120000 })
       if (moved.code !== 0) return fail((moved.stderr || moved.stdout).trim().slice(-400))
       const context = await guiContext(name)
       return ok({ name, action, output: `${action} at ${toX},${toY} (${total} steps over ${Math.round(perStep * total * 1000)} ms)\n${context}` })
+    }
+
+    if (action === 'screenshot') {
+      mkdirSync('/cua-vm/shots', { recursive: true })
+      const stamp = Date.now()
+      const hostFile = `/cua-vm/shots/${name}-${stamp}.png`
+      const guestFile = typeof save === 'string' && save.startsWith('/') ? save : `/home/cua/shots/${name}-${stamp}.png`
+      const guestDir = guestFile.slice(0, guestFile.lastIndexOf('/')) || '/home/cua'
+      await runCua(['sb', 'exec', '--local', name, '--timeout', '20', `mkdir -p ${guestDir}`], { timeoutMs: 60000 })
+      const shot = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
+      if (shot.code !== 0) return fail((shot.stderr || shot.stdout).trim().slice(-400))
+      const taken = await runCua(['do', 'screenshot', '-s', hostFile, '--json'], { timeoutMs: 120000 })
+      if (taken.code !== 0) return fail((taken.stderr || taken.stdout).trim().slice(-400))
+      const copied = await runCua(['sb', 'cp', hostFile, `${name}:${guestFile}`], { timeoutMs: 120000 })
+      if (copied.code !== 0) {
+        return ok({ name, action, output: `screenshot on the host: ${hostFile} (copy into the guest failed; use this host path only from the panel)` })
+      }
+      return ok({ name, action, output: `screenshot saved in the guest: ${guestFile}\nfetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${hostFile}` })
+    }
+
+    if (action === 'geometry') {
+      const read = await runCua(['sb', 'exec', '--local', name, '--timeout', '20',
+        'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry; DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell 2>/dev/null | head -2; DISPLAY=${DISPLAY:-:1} xdotool search --name "." getwindowname %@ 2>/dev/null | head -12'], { timeoutMs: 60000 })
+      const geometry = /^(\d+)\s+(\d+)$/mu.exec(read.stdout)
+      const px = (/X=(-?\d+)/u.exec(read.stdout) || [])[1]
+      const py = (/Y=(-?\d+)/u.exec(read.stdout) || [])[1]
+      const windows = read.stdout.split('\n').filter((line) => line.trim() !== '' && !/^\d+\s+\d+$/u.test(line) && !/^[XY]=/u.test(line)).slice(0, 12)
+      return ok({ name, action, output: `display: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}, pointer: ${px ?? '?'},${py ?? '?'}\nwindows:\n${windows.map((w) => `- ${w}`).join('\n') || '- none'}` })
     }
 
     const argv = (() => {
@@ -834,10 +881,6 @@ const handlers = {
           if (!['up', 'down', 'left', 'right'].includes(dir)) throw new Error('direction must be up, down, left or right')
           return ['scroll', dir, String(Math.max(1, Math.min(50, Math.round(Number(amount) || 3))))]
         }
-        case 'screenshot': {
-          mkdirSync('/cua-vm/shots', { recursive: true })
-          return ['screenshot', '-s', String(save || `/cua-vm/shots/${name}-${Date.now()}.png`), '--json']
-        }
         case 'windows': return ['window', 'list']
         case 'a11y': return ['a11y', 'tree', '--json']
         case 'clipboard': return ['clipboard']
@@ -851,38 +894,27 @@ const handlers = {
     if (switched.code !== 0) return fail((switched.stderr || switched.stdout).trim().slice(-400))
     let acted = await runCua(['do', ...argv], { timeoutMs: 120000 })
     let output = `${acted.stdout}${acted.stderr}`.trim()
-    // A freshly resumed VM takes a moment to answer on spacesd; retry once
-    // instead of reporting a failure the caller cannot act on.
     if (acted.code !== 0 && /spacesd is not available|not answering/i.test(output)) {
       await new Promise((resolve) => setTimeout(resolve, 5000))
       acted = await runCua(['do', ...argv], { timeoutMs: 120000 })
       output = `${acted.stdout}${acted.stderr}`.trim()
     }
-    if (acted.code !== 0) return fail(output.slice(-600))
+    if (acted.code !== 0) {
+      // AT-SPI is missing on most custom-drawn apps (Blender) and its error is a
+      // dead end for the model. Answer with what IS available instead.
+      if (action === 'a11y') {
+        const fallback = await runCua(['sb', 'exec', '--local', name, '--timeout', '20',
+          'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry; DISPLAY=${DISPLAY:-:1} xdotool getactivewindow getwindowname 2>/dev/null; DISPLAY=${DISPLAY:-:1} xdotool search --name "." getwindowname %@ 2>/dev/null | head -12'], { timeoutMs: 60000 })
+        const geometry = /^(\d+)\s+(\d+)$/mu.exec(fallback.stdout)
+        return ok({ name, action, output: `accessibility tree is unavailable for this app (AT-SPI not exposed).\ndisplay: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}\nwindows:\n${fallback.stdout.split('\n').filter((l) => l.trim() !== '' && !/^\d+\s+\d+$/u.test(l)).slice(0, 12).map((w) => `- ${w}`).join('\n') || '- none'}\nUse cua_vm_gui screenshot + pixel coordinates, or script the app instead of clicking.` })
+      }
+      return fail(output.slice(-600))
+    }
     if (['type', 'key', 'hotkey', 'scroll', 'launch', 'open'].includes(action)) {
       const context = await guiContext(name)
       if (context !== '') output = `${output}\n${context}`
     }
     return ok({ name, action, output })
-  },
-
-  /**
-   * Where the guest's pointer is. X11 draws the cursor as an overlay the
-   * capture path does not composite, so screenshots and the stream show no
-   * cursor even though the agent is moving it — the panel draws one instead.
-   */
-  async pointer({ name }) {
-    const read = await runCua(['sb', 'exec', '--local', name, '--timeout', '15',
-      'DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell; DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry'], { timeoutMs: 60000 })
-    if (read.code !== 0) return fail((read.stderr || read.stdout).trim().slice(-300))
-    const x = Number((/X=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
-    const y = Number((/Y=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
-    const geometry = /^(\d+)\s+(\d+)$/mu.exec(read.stdout)
-    return ok({
-      name, x, y,
-      width: geometry === null ? 0 : Number(geometry[1]),
-      height: geometry === null ? 0 : Number(geometry[2])
-    })
   },
 
   async stop({ name }) {

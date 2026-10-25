@@ -229,7 +229,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_gui',
-    description: 'Drive the desktop of the personal VM the way a person would: screenshot, click, double-click, move, drag, type text, press keys or hotkeys, scroll, list windows, read the accessibility tree, read the clipboard, launch an app or open a file. Coordinates are pixels in the last screenshot, origin top-left. Use `a11y` first when you need to know where an element is, then click its bounds, then screenshot to confirm. Pointer moves are animated (eased path, slight jitter) so a human watching the shared desktop sees a hand, not a teleport; set smooth=false only when you need an instant jump.',
+    description: 'Drive the desktop of the personal VM the way a person would: screenshot, click, double-click, move, drag, type text, press keys or hotkeys, scroll, list windows, read the accessibility tree, read the clipboard, launch an app or open a file. Coordinates are pixels in the last screenshot, origin top-left. Use `a11y` first when you need to know where an element is, then click its bounds, then screenshot to confirm. `geometry` returns the display size, the pointer and the window list in one call — use it before clicking; `a11y` falls back to that list when an app (Blender) exposes no accessibility tree. Screenshots are saved in the guest, so cua_vm_get can fetch them. Pointer moves are animated (eased path, slight jitter) so a human watching the shared desktop sees a hand, not a teleport; set smooth=false only when you need an instant jump.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -237,7 +237,7 @@ export function apply(ctx, config = {}) {
       properties: {
         action: {
           type: 'string',
-          enum: ['screenshot', 'click', 'dclick', 'move', 'drag', 'type', 'key', 'hotkey', 'scroll', 'windows', 'a11y', 'clipboard', 'launch', 'open'],
+          enum: ['screenshot', 'geometry', 'click', 'dclick', 'move', 'drag', 'type', 'key', 'hotkey', 'scroll', 'windows', 'a11y', 'clipboard', 'launch', 'open'],
           description: 'What to do on the VM desktop.'
         },
         name: { type: 'string', description: 'Computer name from cua_vm_status / cua_vm_ensure.' },
@@ -251,7 +251,7 @@ export function apply(ctx, config = {}) {
         amount: { type: 'number', description: 'Scroll steps (default 3).' },
         app: { type: 'string', description: 'Application name for launch.' },
         path: { type: 'string', description: 'File or URL for open.' },
-        save: { type: 'string', description: 'Where to save the screenshot, inside the VM (default /cua-vm/shots/<name>-<timestamp>.png).' },
+        save: { type: 'string', description: 'Guest path for the screenshot, e.g. /home/cua/shots/gui.png. Defaults to /home/cua/shots/<name>-<timestamp>.png; the panel also keeps a copy under /cua-vm/shots.' },
         smooth: { type: 'boolean', description: 'Animate the pointer along an eased path instead of teleporting. Default true.' },
         steps: { type: 'number', description: 'Pointer path steps (2-120, default 24).' },
         durationMs: { type: 'number', description: 'Pointer travel time in milliseconds (default 380).' }
