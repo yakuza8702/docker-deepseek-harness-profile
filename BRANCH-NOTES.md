@@ -455,3 +455,24 @@ description exceeds its cap, or the JSON-RPC stream is disturbed. The Dockerfile
 runs it at build time. The Brave plugin's own gate runs with `MCP_SLIM=0`,
 because it asks whether the *wrapper* reaches a working server — what the model
 sees is the trimmed catalogue, and that is what this gate measures.
+
+---
+
+## Hiding the built-in MCP rows from the MCP manager
+
+`browser-mcp` and `brave-devtools-mcp` are owned by the image's bundles and
+switched on the Plugins page. The MCP manager lists every loader-owned row
+read-only, which gives the same capability two controls, one of them inert.
+
+The first fix patched `@xxxyz/dsh-mcp-manager`'s own `lib/index.js` at boot.
+That held until the plugin was **installed or updated**, which rewrites that
+file — measured: the manager's file was rewritten at 14:17 by a plugin install,
+the boot patch had already run at 11:13, and both rows stayed visible until the
+next container start. A boot-time patch cannot survive a live dependency update.
+
+It is a response filter in `docker/proxy.mjs` now: for `/dsh-mcp-manager/api`
+the proxy buffers the JSON and drops rows where `readOnlyReason === 'loader'`
+and the id is in `DSH_MCP_MANAGER_HIDDEN` (default
+`browser-mcp,brave-devtools-mcp`). Live, version-independent, no restart, and
+`DSH_MCP_MANAGER_HIDDEN=""` shows everything again. The boot patch is still
+there as a belt-and-braces for the server-side list the tools read.

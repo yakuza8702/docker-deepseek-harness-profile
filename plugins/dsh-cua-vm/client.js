@@ -16,6 +16,7 @@ window.__ModuleLoader__.load({
       hover: 'var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.06))',
       accent: 'var(--dsw-alias-interactive-bg-hover-accent, rgba(43,127,255,.12))',
       info: 'var(--dsw-alias-button-info-fill, #4d6bfe)',
+      success: 'var(--dsw-alias-state-success-primary, #7ee787)',
       brand: 'var(--dsw-alias-brand-primary, #111)',
       onBrand: 'var(--dsw-alias-label-primary-inverted, #fff)',
       radiusSm: 'var(--dsw-radius-sm, 6px)',
@@ -478,7 +479,7 @@ window.__ModuleLoader__.load({
                   h('span', { style: { fontWeight: 600, fontSize: 13 } }, name),
                   h('span', { style: S.badge(ready) }, vm.state ?? 'unknown'),
                   vm.gpu === true && h('span', { style: { ...S.badge(false), color: T.info } }, 'GPU'),
-                  vm.android === true && h('span', { style: { ...S.badge(false), color: T.accent, border: `1px solid ${T.line}`, background: T.accent } }, 'Android'),
+                  vm.android === true && h('span', { style: { ...S.badge(false), color: T.success, border: `1px solid ${T.line}`, background: 'rgba(126, 231, 135, .14)' } }, 'Android'),
                   vm.diskGb > 0 && h('span', { style: { ...S.badge(false), color: T.caption } }, `${vm.diskGb} GB`),
                   h('span', { style: { ...S.muted, marginLeft: 'auto' } }, `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · ${vm.image ?? 'linux'}`)
                 ),

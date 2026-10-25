@@ -670,6 +670,51 @@ function pipeSockets(client, upstream, head) {
 }
 
 // Buffer a text response, run `fn`, and send the (possibly rewritten) body.
+/**
+ * The MCP manager lists every loader-owned MCP row read-only. `browser-mcp` and
+ * `brave-devtools-mcp` are owned by this image's bundles and switched on the
+ * Plugins page, so listing them again is a second, inert control for the same
+ * thing.
+ *
+ * This filter lives in the proxy instead of a patch on the plugin's own file
+ * because the plugin is a profile dependency: `pnpm add`/`update` rewrites
+ * `lib/index.js`, and a boot-time patch is only re-applied on the next
+ * container start — measured: the manager's file was rewritten at 14:17 by a
+ * plugin install and both rows came back until the container restarted.
+ * Filtering the response needs no restart and survives any version of the
+ * plugin, as long as a row still carries `readOnlyReason: 'loader'`.
+ *
+ * DSH_MCP_MANAGER_HIDDEN="" shows everything again.
+ */
+const MANAGER_API_PREFIX = "/dsh-mcp-manager/api";
+const HIDDEN_MCP_ROWS = new Set(
+  (process.env.DSH_MCP_MANAGER_HIDDEN ?? "browser-mcp,brave-devtools-mcp")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
+function isMcpManagerApi(url) {
+  return typeof url === "string" && url.startsWith(MANAGER_API_PREFIX);
+}
+
+/** Drop the loader-owned rows that the Plugins page owns; anything else passes. */
+function filterManagerRows(body) {
+  let payload;
+  try {
+    payload = JSON.parse(body.toString("utf8"));
+  } catch {
+    return body; // not JSON (or not the list action): pass through untouched
+  }
+  const rows = payload?.rows ?? payload?.result?.rows;
+  if (!Array.isArray(rows)) return body;
+  const kept = rows.filter((row) => !(row && HIDDEN_MCP_ROWS.has(row.id) && row.readOnlyReason === "loader"));
+  if (kept.length === rows.length) return body;
+  if (Array.isArray(payload.rows)) payload.rows = kept;
+  else payload.result.rows = kept;
+  return Buffer.from(JSON.stringify(payload));
+}
+
 function bufferAndRewrite(upRes, res, fn) {
   const parts = [];
   let size = 0;
@@ -775,6 +820,10 @@ function forwardToUpstream(req, res, autoAuthTried) {
           }
         });
         authed.end();
+        return;
+      }
+      if (!upRes.headers["content-encoding"] && isMcpManagerApi(req.url)) {
+        bufferAndRewrite(upRes, res, filterManagerRows);
         return;
       }
       const ctype = String(upRes.headers["content-type"] || "");
