@@ -160,7 +160,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_status',
-    description: 'Report the personal VM for this workspace: whether it exists, its state, tier, size and the last command run in it. Call this before vm_ensure if you are unsure whether a VM is already running.',
+    description: 'VM for this workspace: state, spec, last command.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     output: textOutput('Human-readable VM status.'),
     async execute() {
@@ -183,16 +183,16 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_ensure',
-    description: 'Create or resume the personal Linux VM for this workspace. Idempotent: calling it on an existing VM just resumes it and returns the same name. The first call downloads the base image and can take several minutes.',
+    description: 'Create or resume the workspace VM. Idempotent; the first call downloads the image.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        workspace: { type: 'string', description: 'Workspace path or a path relative to the configured workspace root. Defaults to the root.' },
-        tier: { type: 'string', enum: ['slim', 'full'], description: 'Image tier. slim is the default and smaller; full adds the larger desktop payload.' },
+        workspace: { type: 'string', description: 'Workspace path (default: root).' },
+        tier: { type: 'string', enum: ['slim', 'full'], description: 'slim (default) or full.' },
         cpu: { type: 'integer', minimum: 1, maximum: 16 },
         memory: { type: 'integer', minimum: 1, maximum: 64, description: 'Guest memory in GB.' },
-        waitForDesktop: { type: 'boolean', description: 'Wait until the desktop session accepts input, not just until the guest daemon answers.' }
+        waitForDesktop: { type: 'boolean', description: 'Wait for the desktop, not just the daemon.' }
       }
     },
     output: textOutput('Creation result and the VM name to use in later calls.'),
@@ -211,7 +211,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_create',
-    description: 'Create a named computer with an explicit spec: name, vCPU, RAM, image and whether it gets a GPU. Ask the user for the name and spec first unless they already gave them. Set gpu true for Android, Blender, WebGL or any 3D work; it needs an image built with virgl support and a GPU render node on the host.',
+    description: 'New computer: name, vCPU, RAM, image, gpu, diskGb, android. Ask the user for the spec first.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -221,12 +221,12 @@ export function apply(ctx, config = {}) {
         cpu: { type: 'number', description: 'vCPUs (default 2).' },
         memory: { type: 'number', description: 'RAM in GB (default 4).' },
         image: { type: 'string', description: 'Image reference. Default "linux" (Ubuntu 24.04 slim Cua disk).' },
-        gpu: { type: 'boolean', description: 'Give the computer a virgl GPU (3D/Android/Blender). Default false.' },
-        diskGb: { type: 'number', description: 'Grow the disk to this many GB. Android needs ~40; the filesystem grows online, no reboot.' },
-        android: { type: 'boolean', description: 'Provision the Android SDK and an AVD inside it right after creating (several GB, several minutes). Implies gpu and at least 8 GB RAM / 40 GB disk are sensible.' }
+        gpu: { type: 'boolean', description: 'virgl GPU for 3D/Android/Blender.' },
+        diskGb: { type: 'number', description: 'Disk size in GB (Android: 40).' },
+        android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating.' }
       }
     },
-    output: textOutput('The created computer, its renderer and whether disk/Android provisioning ran.'),
+    output: textOutput('The computer, its renderer, disk and Android status.'),
     async execute(input) {
       const answer = await call({ op: 'vmCreate', ...input })
       const parts = [`${answer.name} is ${answer.state}${input.gpu === true ? ' with a GPU (virgl)' : ''}.`]
@@ -241,7 +241,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_gui',
-    description: 'Drive the desktop of the personal VM the way a person would: screenshot, click, double-click, move, drag, type text, press keys or hotkeys, scroll, list windows, read the accessibility tree, read the clipboard, launch an app, open a file, and zoom the desktop to a single window. COORDINATES are pixels in the screenshot you took, origin top-left; the tool maps them to the display, so click what you see and never scale. The default desktop is 1200x750, which is exactly what a screenshot returns. Start with `screenshot` (see the screen), `geometry` (display size, pointer, window titles) or `a11y` (element bounds, when the app exposes it), then act, then screenshot to confirm. `zoom <window>` crops to a window and keeps coordinates relative to that crop — the reliable way to click small controls; `unzoom` returns to the full screen. Screenshots are also saved in the guest, so cua_vm_get can fetch them.',
+    description: 'Drive the VM desktop. x/y are pixels in the last screenshot and the tool maps them: click what you see. Start with `screenshot` or `geometry`; `zoom` a window for small controls.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -262,25 +262,25 @@ export function apply(ctx, config = {}) {
         direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Scroll direction.' },
         amount: { type: 'number', description: 'Scroll steps (default 3).' },
         app: { type: 'string', description: 'Application name for launch.' },
-        window: { type: 'string', description: 'Window title for `zoom` — any substring of a title listed by `geometry` or `windows` (e.g. "Blender", "Calculator").' },
+        window: { type: 'string', description: 'Window title for zoom (substring, from geometry/windows).' },
         path: { type: 'string', description: 'File or URL for open.' },
-        save: { type: 'string', description: 'Guest path for the screenshot, e.g. /home/cua/shots/gui.png. Defaults to /home/cua/shots/<name>-<timestamp>.png; the panel also keeps a copy under /cua-vm/shots.' },
+        save: { type: 'string', description: 'Guest path for the PNG (default /home/cua/shots/…).' },
         region: {
           type: 'object',
-          description: 'Read-only crop for a magnified look at part of the screenshot. The result prints the inverse mapping; prefer `zoom` when you intend to click.',
+          description: 'Read-only crop; prefer `zoom` before clicking.',
           properties: {
             x: { type: 'number' }, y: { type: 'number' },
             width: { type: 'number' }, height: { type: 'number' },
             scale: { type: 'number', description: 'Magnification, 1-4 (default 1).' }
           }
         },
-        relative: { type: 'boolean', description: 'Treat x and y as fractions (0-1) instead of pixels. Only for callers that saw a resized preview; x=0.5 is the centre.' },
-        smooth: { type: 'boolean', description: 'Animate the pointer for a human watching the shared desktop. Default true; set false for speed.' },
-        steps: { type: 'number', description: 'Pointer animation steps (1-8, default 3).' },
-        durationMs: { type: 'number', description: 'Unused; kept for compatibility.' }
+        relative: { type: 'boolean', description: 'Fractions 0-1 instead of pixels.' },
+        smooth: { type: 'boolean', description: 'Animate the pointer (default true).' },
+        steps: { type: 'number', description: 'Animation steps 1-8 (default 6).' },
+        durationMs: { type: 'number', description: 'Unused.' }
       }
     },
-    output: textOutput('What the action did, or the screenshot path.'),
+    output: textOutput('What happened, or the screenshot path.'),
     async execute(input) {
       const target = input.name
       const answer = await call({ op: 'gui', ...input, name: target })
@@ -290,7 +290,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_disk',
-    description: 'Grow the disk of a running computer. The qcow2 grows under the live QEMU (QMP block_resize) and the guest grows its partition and ext4 filesystem online, so nothing reboots and no data is lost. Use it before installing something large (the Android SDK needs ~12 GB free). Shrinking is not supported.',
+    description: 'Grow the disk online (QMP block_resize + growpart). No reboot; cannot shrink.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -310,7 +310,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_android',
-    description: 'Install the official Google Android SDK, platform-tools and an AVD inside the computer (several GB, several minutes; needs /dev/kvm and ~12 GB free — grow the disk with cua_vm_disk first). Afterwards run the emulator inside the guest with `cua-emulator` (or `cua-emulator -no-window` for adb-driven tests); it is hardware-accelerated because KVM is nested in the VM.',
+    description: 'Install Google Android SDK + AVD inside the VM (~7 GB, needs 12 GB free). Boot with `cua-emulator`.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -323,7 +323,7 @@ export function apply(ctx, config = {}) {
         avd: { type: 'string', description: 'AVD name (default cua).' }
       }
     },
-    output: textOutput('Whether the SDK and AVD are installed, plus the tail of the provisioning log.'),
+    output: textOutput('Installed, plus the provisioning log tail.'),
     async execute(input) {
       const answer = await call({ op: 'vmAndroid', ...input })
       return { text: `Android SDK ready on ${input.name}. Start it with: cua-emulator\n${answer.output || ''}` }
@@ -332,7 +332,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_exec',
-    description: 'Run a shell command inside the personal VM and return its exit code, stdout and stderr. Use it for builds, tests and troubleshooting. The command runs as one `sh -c` line; pass a cwd to start elsewhere.',
+    description: 'Run a shell command in the VM; returns exit code, stdout, stderr.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -374,7 +374,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_put',
-    description: 'Copy a file or directory from the workspace INTO the VM. The local path must stay inside the workspace; the guest path must be absolute.',
+    description: 'Copy a workspace path into the VM.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -394,7 +394,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_get',
-    description: 'Copy a finished artifact OUT of the VM into the workspace. This is the only way VM output reaches the workspace, so use it deliberately and only for the product, not for scratch files.',
+    description: 'Copy an artifact out of the VM into the workspace.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -414,7 +414,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_port',
-    description: 'Expose a port from the VM so it can be reached from this machine, e.g. to check a web app the build produced. Returns the local address to open.',
+    description: 'Expose a guest port as /vm/port/<name>/.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -434,7 +434,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_suspend',
-    description: 'Stop the VM while keeping its disk, so the next cua_vm_ensure resumes the same computer. Use it when the work is finished but the user may come back.',
+    description: 'Stop the VM, keep its disk. Start/ensure resumes it.',
     parameters: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] },
     output: textOutput('Suspend result.'),
     async execute(args = {}) {
@@ -445,7 +445,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_destroy',
-    description: 'Permanently delete the VM and its disk. Only call this when the user has explicitly asked to destroy the VM; never as cleanup after a task.',
+    description: 'Delete the VM and its disk. Only when the user asks.',
     parameters: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] },
     output: textOutput('Destroy result.'),
     async execute(args = {}) {

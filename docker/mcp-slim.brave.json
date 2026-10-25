@@ -1,0 +1,40 @@
+{
+  "server": "brave-devtools",
+  "maxDescription": 170,
+  "maxParamDescription": 60,
+  "drop": [
+    "click",
+    "click_at",
+    "hover",
+    "fill",
+    "fill_form",
+    "type_text",
+    "drag",
+    "press_key",
+    "navigate_page",
+    "new_page",
+    "list_pages",
+    "select_page",
+    "close_page",
+    "resize_page",
+    "take_screenshot",
+    "take_snapshot",
+    "evaluate_script",
+    "wait_for",
+    "handle_dialog",
+    "get_tab_id",
+    "upload_file"
+  ],
+  "overrides": {
+    "list_console_messages": "Console messages with source-mapped stacks. This is the 'why did it break' list.",
+    "get_console_message": "One console message in full, by its msgid.",
+    "list_network_requests": "Every request since load with status and timing.",
+    "get_network_request": "One request or response in full: headers, cookies, body.",
+    "emulate": "Throttle CPU/network, set geolocation, user agent, viewport, colour scheme or extra headers.",
+    "performance_start_trace": "Record a performance trace (LCP/INP/CLS, insights). Reload first if you want a cold load.",
+    "performance_stop_trace": "Stop the trace and keep the raw file.",
+    "performance_analyze_insight": "Explain one insight from the last trace.",
+    "lighthouse_audit": "Lighthouse scores and reports for accessibility, SEO, best practices and agentic browsing.",
+    "take_heapsnapshot": "Heap snapshot of the page for memory analysis."
+  }
+}

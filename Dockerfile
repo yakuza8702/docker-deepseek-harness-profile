@@ -327,6 +327,14 @@ RUN printf '%s\n' \
 # integrity unless the URL is git-hosted, so one Market install of a curated
 # release-archive plugin bricks every install in that profile.
 COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs docker/lockfile-integrity.mjs /opt/seek-harness/
+# The MCP tool-catalogue trimmer (see docker/mcp-slim.mjs): one proxy in front of
+# the two browser MCP servers, dropping the verbs the other one already offers and
+# compressing what is left. Its gate runs here so a policy that drops a tool the
+# catalog does not have, or leaks a long description, fails the build.
+COPY --chmod=0644 docker/mcp-slim.mjs docker/mcp-slim.browser.json docker/mcp-slim.brave.json /opt/seek-harness/
+COPY --chmod=0644 tools/check-tool-trim.mjs /opt/seek-harness/check-tool-trim.mjs
+RUN DSH_SLIM_BIN=/opt/seek-harness/mcp-slim.mjs DSH_SLIM_POLICIES=/opt/seek-harness \
+    node /opt/seek-harness/check-tool-trim.mjs
 # Hide the image-owned MCP rows from a user-installed MCP manager (see the file).
 COPY --chmod=0644 tools/patch-mcp-manager.mjs /opt/seek-harness/patch-mcp-manager.mjs
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
@@ -492,7 +500,10 @@ RUN set -eux; \
       '# source channel (/opt/dsh-src).' \
       'for root in /opt/dsh /opt/dsh-src; do' \
       '  cli="$root/node_modules/@playwright/mcp/cli.js"' \
-      '  if [ -f "$cli" ]; then exec node "$cli" "$@"; fi' \
+      '  if [ -f "$cli" ]; then' \
+      '    [ "${DSH_MCP_SLIM:-1}" = "0" ] && exec node "$cli" "$@"' \
+      '    exec node /opt/seek-harness/mcp-slim.mjs --policy /opt/seek-harness/mcp-slim.browser.json -- node "$cli" "$@"' \
+      '  fi' \
       'done' \
       'echo "dsh-playwright-mcp: @playwright/mcp is not installed in this image" >&2' \
       'exit 127' \
@@ -544,7 +555,8 @@ RUN set -eux; \
       '# ships inside the image, started in attach mode against the visible Brave' \
       '# desktop over loopback CDP. A stable path, so the row never has to know' \
       '# where the package lives — and never runs npx.' \
-      'exec node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
+      '[ "${DSH_MCP_SLIM:-1}" = "0" ] && exec node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
+      'exec node /opt/seek-harness/mcp-slim.mjs --policy /opt/seek-harness/mcp-slim.brave.json -- node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
       > /usr/local/bin/dsh-brave-devtools-mcp; \
     chmod 0755 /usr/local/bin/dsh-brave-devtools-mcp; \
     echo "browser DevTools: brave-mcp ${installed} behind /usr/local/bin/dsh-brave-devtools-mcp"
