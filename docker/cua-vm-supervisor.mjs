@@ -316,6 +316,31 @@ async function ensureRuntime() {
   return existsSync(wrapper)
 }
 
+/**
+ * A GPU computer should not need a manual apt-get and an Xorg patch. The guest
+ * ships Xvfb (software GL), so on the first start of a GPU computer we install
+ * xserver-xorg-core + mesa-utils, add an `xorg` branch to the desktop launcher
+ * and switch the systemd drop-in to it. The script verifies the renderer and
+ * reverts to Xvfb if it is not virgl, so a host without a usable render node
+ * keeps a working desktop instead of a black one.
+ */
+const GPU_GUEST_SCRIPT = 'IyEvYmluL2Jhc2gKc2V0IC11CmV4cG9ydCBERUJJQU5fRlJPTlRFTkQ9bm9uaW50ZXJhY3RpdmUKU0NSSVBUPS9vcHQvY3VhL2Rlc2t0b3Avc3RhcnQtZGVza3RvcC5zaAppZiBbIC1mICIkU0NSSVBULm9yaWciIF07IHRoZW4gc3VkbyBjcCAiJFNDUklQVC5vcmlnIiAiJFNDUklQVCI7IHN1ZG8gcm0gLWYgIiRTQ1JJUFQub3JpZyI7IGZpCnN1ZG8gbWtkaXIgLXAgL2V0Yy9zeXN0ZW1kL3N5c3RlbS9jdWEtZGVza3RvcC5zZXJ2aWNlLmQKcHJpbnRmICdbU2VydmljZV1cbkVudmlyb25tZW50PUNVQV9YX1NFUlZFUj14dmZiXG4nIHwgc3VkbyB0ZWUgL2V0Yy9zeXN0ZW1kL3N5c3RlbS9jdWEtZGVza3RvcC5zZXJ2aWNlLmQveC1zZXJ2ZXIuY29uZiA+L2Rldi9udWxsCnN1ZG8gc3lzdGVtY3RsIGRhZW1vbi1yZWxvYWQ7IHN1ZG8gc3lzdGVtY3RsIHJlc3RhcnQgY3VhLWRlc2t0b3A7IHNsZWVwIDIKc3VkbyBhcHQtZ2V0IGluc3RhbGwgLXkgLXFxIHhzZXJ2ZXIteG9yZy1jb3JlIG1lc2EtdXRpbHMgPi9kZXYvbnVsbCAyPiYxIHx8IHRydWUKc3VkbyB0ZWUgL2V0Yy9YMTEveG9yZy12aXJ0aW8uY29uZiA+L2Rldi9udWxsIDw8J1hDRkcnClNlY3Rpb24gIkRldmljZSIKICAgIElkZW50aWZpZXIgInZpcnRpbyIKICAgIERyaXZlciAibW9kZXNldHRpbmciCiAgICBPcHRpb24gImttc2RldiIgIi9kZXYvZHJpL2NhcmQwIgpFbmRTZWN0aW9uClNlY3Rpb24gIlNjcmVlbiIKICAgIElkZW50aWZpZXIgInNjcmVlbiIKICAgIERldmljZSAidmlydGlvIgogICAgRGVmYXVsdERlcHRoIDI0CiAgICBTdWJTZWN0aW9uICJEaXNwbGF5IgogICAgICAgIERlcHRoIDI0CiAgICAgICAgTW9kZXMgIjEyODB4ODAwIgogICAgRW5kU3ViU2VjdGlvbgpFbmRTZWN0aW9uClNlY3Rpb24gIlNlcnZlckxheW91dCIKICAgIElkZW50aWZpZXIgImxheW91dCIKICAgIFNjcmVlbiAic2NyZWVuIgpFbmRTZWN0aW9uClhDRkcKcHJpbnRmICdhbGxvd2VkX3VzZXJzPWFueWJvZHlcbm5lZWRzX3Jvb3RfcmlnaHRzPXllc1xuJyB8IHN1ZG8gdGVlIC9ldGMvWDExL1h3cmFwcGVyLmNvbmZpZyA+L2Rldi9udWxsCmlmICEgZ3JlcCAtcSAnXnhvcmcpJyAiJFNDUklQVCI7IHRoZW4KICBzdWRvIGNwICIkU0NSSVBUIiAiJFNDUklQVC5vcmlnIgogIHN1ZG8gcHl0aG9uMyAtICIkU0NSSVBUIiA8PCdYUEFUQ0gnCmltcG9ydCBzeXMKcCA9IHN5cy5hcmd2WzFdCnMgPSBvcGVuKHApLnJlYWQoKQppbnMgPSAoJ3hvcmcpXG4nCiAgICAgICAnICAgIGxvZyAiWG9yZyAke0RJU1BMQVlfTlVNfSAke0dFT01FVFJZfSJcbicKICAgICAgICcgICAgc3VkbyAtbiAvdXNyL2Jpbi9Yb3JnICIke0RJU1BMQVlfTlVNfSIgLWNvbmZpZyAvZXRjL1gxMS94b3JnLXZpcnRpby5jb25mIC1ub3Jlc2V0ICtleHRlbnNpb24gR0xYIC1kcGkgOTYgJlxuJwogICAgICAgJyAgICA7O1xuJykKbmVlZGxlID0gJ1xueHZuYylcbicKaWYgbmVlZGxlIG5vdCBpbiBzOgogICAgcmFpc2UgU3lzdGVtRXhpdCgnY2FzZSBicmFuY2ggbm90IGZvdW5kJykKcyA9IHMucmVwbGFjZShuZWVkbGUsICdcbicgKyBpbnMgKyAneHZuYylcbicsIDEpCm9wZW4ocCwgJ3cnKS53cml0ZShzKQpYUEFUQ0gKICBpZiBbICQ/IC1uZSAwIF07IHRoZW4gc3VkbyBjcCAiJFNDUklQVC5vcmlnIiAiJFNDUklQVCI7IHN1ZG8gcm0gLWYgIiRTQ1JJUFQub3JpZyI7IGVjaG8gUEFUQ0gtRkFJTEVEOyBleGl0IDI7IGZpCmZpCnByaW50ZiAnW1NlcnZpY2VdXG5FbnZpcm9ubWVudD1DVUFfWF9TRVJWRVI9eG9yZ1xuJyB8IHN1ZG8gdGVlIC9ldGMvc3lzdGVtZC9zeXN0ZW0vY3VhLWRlc2t0b3Auc2VydmljZS5kL3gtc2VydmVyLmNvbmYgPi9kZXYvbnVsbApzdWRvIHN5c3RlbWN0bCBkYWVtb24tcmVsb2FkOyBzdWRvIHN5c3RlbWN0bCByZXN0YXJ0IGN1YS1kZXNrdG9wCmZvciBpIGluICQoc2VxIDEgNDApOyBkbyBbIC1TIC90bXAvLlgxMS11bml4L1gxIF0gJiYgYnJlYWs7IHNsZWVwIDAuNTsgZG9uZQpSPSQoRElTUExBWT06MSBnbHhpbmZvIC1CIDI+L2Rldi9udWxsIHwgZ3JlcCAtbTEgIk9wZW5HTCByZW5kZXJlciIpCmVjaG8gInJlbmRlcmVyOiAkUiIKY2FzZSAiJFIiIGluCiAgKnZpcmdsKikKICAgIHN1ZG8gdG91Y2ggL3Zhci9saWIvY3VhLWdwdQogICAgZWNobyBPSwogICAgOzsKICAqKQogICAgcHJpbnRmICdbU2VydmljZV1cbkVudmlyb25tZW50PUNVQV9YX1NFUlZFUj14dmZiXG4nIHwgc3VkbyB0ZWUgL2V0Yy9zeXN0ZW1kL3N5c3RlbS9jdWEtZGVza3RvcC5zZXJ2aWNlLmQveC1zZXJ2ZXIuY29uZiA+L2Rldi9udWxsCiAgICBpZiBbIC1mICIkU0NSSVBULm9yaWciIF07IHRoZW4gc3VkbyBjcCAiJFNDUklQVC5vcmlnIiAiJFNDUklQVCI7IHN1ZG8gcm0gLWYgIiRTQ1JJUFQub3JpZyI7IGZpCiAgICBzdWRvIHN5c3RlbWN0bCBkYWVtb24tcmVsb2FkOyBzdWRvIHN5c3RlbWN0bCByZXN0YXJ0IGN1YS1kZXNrdG9wCiAgICBlY2hvIFJFVkVSVEVEOyBleGl0IDEgOzsKZXNhYwo='
+
+async function provisionGpuGuest(name) {
+  const ready = await runCua(['sb', 'exec', '--local', name, '--timeout', '20', 'test -f /var/lib/cua-gpu && echo ready || echo no'], { timeoutMs: 60000 })
+  if (ready.stdout.includes('ready')) return true
+  log(`gpu: provisioning ${name} (Xorg + mesa-utils inside the guest)`)
+  const result = await runCua(['sb', 'exec', '--local', name, '--timeout', '420', `printf %s ${GPU_GUEST_SCRIPT} | base64 -d | sudo -n bash`], { timeoutMs: 600000 })
+  const output = `${result.stdout}${result.stderr}`.trim()
+  const renderer = (/renderer:\s*(.+)/u.exec(output) || [])[1] || 'unknown'
+  if (result.code !== 0 || !/\bOK\b/u.test(output)) {
+    log(`gpu: ${name} kept Xvfb (${output.slice(-300)})`)
+    return false
+  }
+  log(`gpu: ${name} desktop is ${renderer}`)
+  return true
+}
+
 const CREATE_LOCK = new Map()
 
 function withLock(key, fn) {
@@ -644,6 +669,7 @@ const handlers = {
         state: 'ready'
       }
       writeRegistry(registry)
+      if (gpu === true) await provisionGpuGuest(name)
       return ok({ name, state: 'ready', created: true })
     })
   },
