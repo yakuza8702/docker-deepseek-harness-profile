@@ -366,7 +366,20 @@ async function guiContext(name) {
   const lines = read.stdout.trim().split('\n').filter(Boolean)
   const x = (/X=(-?\d+)/u.exec(read.stdout) || [])[1]
   const y = (/Y=(-?\d+)/u.exec(read.stdout) || [])[1]
-  return `focus: ${lines[0] || 'none'}, pointer: ${x ?? '?'},${y ?? '?'}`
+  const title = lines.find((line) => !/^(X|Y|WINDOW|SCREEN)=/u.test(line)) || 'none'
+  return `focus: ${title}, pointer: ${x ?? '?'},${y ?? '?'}`
+}
+
+/** sb exec, but patient: the guest daemon restarts with the desktop. */
+async function guestExec(name, command, timeoutMs = 60000, attempts = 3) {
+  let last = null
+  for (let index = 0; index < attempts; index += 1) {
+    last = await runCua(['sb', 'exec', '--local', name, '--timeout', '20', command], { timeoutMs })
+    const text = `${last.stdout}${last.stderr}`
+    if (last.code === 0 || !/spacesd is not available|nothing answered|connection reset|timed out/iu.test(text)) return last
+    await new Promise((resolve) => setTimeout(resolve, 3000))
+  }
+  return last
 }
 
 const CREATE_LOCK = new Map()
@@ -803,7 +816,7 @@ const handlers = {
    * host but ALSO copied into the guest, because `cua_vm_get` reads guest paths
    * and a host path there is a dead end the model cannot reason about.
    */
-  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, path: target, save, smooth = true, steps = 24, durationMs = 380 }) {
+  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, path: target, save, region = null, scale = 1, relative = false, smooth = true, steps = 24, durationMs = 380 }) {
     const num = (value) => {
       const parsed = Math.round(Number(value))
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('coordinates must be positive numbers')
@@ -813,11 +826,21 @@ const handlers = {
     await runCua(['sb', 'resume', '--local', name], { timeoutMs: 120000 })
 
     if (pointer) {
-      const read = await runCua(['sb', 'exec', '--local', name, '--timeout', '20', 'DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell'], { timeoutMs: 60000 })
+      const read = await guestExec(name, 'DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell')
       const fromX = Number((/X=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
       const fromY = Number((/Y=(-?\d+)/u.exec(read.stdout) || [])[1] ?? 0)
-      const toX = num(x)
-      const toY = num(y)
+      // Fractional coordinates survive a scaled preview: the model measures a
+      // position in whatever image it sees and does 0..1 instead of guessing.
+      let toX = num(x)
+      let toY = num(y)
+      if (relative === true || (Number(x) <= 1 && Number(y) <= 1 && Number(x) >= 0 && Number(y) >= 0)) {
+        const size = await guestExec(name, 'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry')
+        const matched = /^(\d+)\s+(\d+)$/mu.exec(size.stdout)
+        if (matched) {
+          toX = Math.round(Number(x) * Number(matched[1]))
+          toY = Math.round(Number(y) * Number(matched[2]))
+        }
+      }
       const total = Math.max(2, Math.min(120, Math.round(Number(steps) || 24)))
       const perStep = Math.max(0.004, Math.min(0.05, (Number(durationMs) || 380) / 1000 / total))
       const parts = []
@@ -831,7 +854,7 @@ const handlers = {
       if (action === 'click') parts.push('click 1')
       if (action === 'dclick') parts.push('click --repeat 2 --delay 80 1')
       if (action === 'drag') parts.push('mouseup 1')
-      const moved = await runCua(['sb', 'exec', '--local', name, '--timeout', '60', `DISPLAY=\${DISPLAY:-:1} xdotool ${parts.join(' ')}`], { timeoutMs: 120000 })
+      const moved = await guestExec(name, `DISPLAY=\${DISPLAY:-:1} xdotool ${parts.join(' ')}`, 120000)
       if (moved.code !== 0) return fail((moved.stderr || moved.stdout).trim().slice(-400))
       const context = await guiContext(name)
       return ok({ name, action, output: `${action} at ${toX},${toY} (${total} steps over ${Math.round(perStep * total * 1000)} ms)\n${context}` })
@@ -843,16 +866,46 @@ const handlers = {
       const hostFile = `/cua-vm/shots/${name}-${stamp}.png`
       const guestFile = typeof save === 'string' && save.startsWith('/') ? save : `/home/cua/shots/${name}-${stamp}.png`
       const guestDir = guestFile.slice(0, guestFile.lastIndexOf('/')) || '/home/cua'
-      await runCua(['sb', 'exec', '--local', name, '--timeout', '20', `mkdir -p ${guestDir}`], { timeoutMs: 60000 })
+      await guestExec(name, `mkdir -p ${guestDir}`)
       const shot = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
       if (shot.code !== 0) return fail((shot.stderr || shot.stdout).trim().slice(-400))
       const taken = await runCua(['do', 'screenshot', '-s', hostFile, '--json'], { timeoutMs: 120000 })
       if (taken.code !== 0) return fail((taken.stderr || taken.stdout).trim().slice(-400))
-      const copied = await runCua(['sb', 'cp', hostFile, `${name}:${guestFile}`], { timeoutMs: 120000 })
-      if (copied.code !== 0) {
-        return ok({ name, action, output: `screenshot on the host: ${hostFile} (copy into the guest failed; use this host path only from the panel)` })
+
+      // A region crop, magnified here, so the model does not have to crop and
+      // zoom screenshots by hand (and lose track of the coordinate mapping).
+      let source = hostFile
+      let mapping = ''
+      const area = region === null || region === undefined ? null : region
+      if (area !== null) {
+        const rx = Math.max(0, Math.round(Number(area.x) || 0))
+        const ry = Math.max(0, Math.round(Number(area.y) || 0))
+        const rw = Math.max(16, Math.min(4096, Math.round(Number(area.width ?? area.w) || 320)))
+        const rh = Math.max(16, Math.min(4096, Math.round(Number(area.height ?? area.h) || 200)))
+        const zoom = Math.max(1, Math.min(4, Number(area.scale ?? scale ?? 1) || 1))
+        const hostCrop = `/cua-vm/shots/${name}-${stamp}-crop.png`
+        try {
+          execFileSync('/usr/bin/convert', [hostFile, '-crop', `${rw}x${rh}+${rx}+${ry}`, '+repage', '-resize', `${Math.round(zoom * 100)}%`, hostCrop], { timeout: 30000 })
+          source = hostCrop
+          mapping = `crop ${rw}x${rh} at (${rx},${ry}) magnified ${zoom}x → image pixel (px,py) = guest (${rx} + px/${zoom}, ${ry} + py/${zoom}).\n`
+        } catch (error) {
+          mapping = `crop failed (${error && error.message}); the full frame below is unchanged.\n`
+        }
       }
-      return ok({ name, action, output: `screenshot saved in the guest: ${guestFile}\nfetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${hostFile}` })
+
+      const copied = await runCua(['sb', 'cp', source, `${name}:${guestFile}`], { timeoutMs: 120000 })
+      if (copied.code !== 0) {
+        return ok({ name, action, output: `${mapping}screenshot on the host: ${source} (copy into the guest failed; use this host path only from the panel)` })
+      }
+      const dimensions = (() => {
+        try {
+          const info = execFileSync('/usr/bin/identify', ['-format', '%w %h', source], { timeout: 20000 }).toString().trim()
+          return info
+        } catch { return 'unknown' }
+      })()
+      return ok({ name, action, output: `${mapping}screenshot saved in the guest: ${guestFile} (${dimensions})
+The display is the guest resolution; image pixels are guest pixels unless a crop line above says otherwise.
+fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}` })
     }
 
     if (action === 'geometry') {

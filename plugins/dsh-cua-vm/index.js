@@ -252,6 +252,16 @@ export function apply(ctx, config = {}) {
         app: { type: 'string', description: 'Application name for launch.' },
         path: { type: 'string', description: 'File or URL for open.' },
         save: { type: 'string', description: 'Guest path for the screenshot, e.g. /home/cua/shots/gui.png. Defaults to /home/cua/shots/<name>-<timestamp>.png; the panel also keeps a copy under /cua-vm/shots.' },
+        region: {
+          type: 'object',
+          description: 'Crop to this part of the screen instead of the full frame, optionally magnified. The result states the mapping, e.g. "image pixel (px,py) = guest (X + px/2, Y + py/2)".',
+          properties: {
+            x: { type: 'number' }, y: { type: 'number' },
+            width: { type: 'number' }, height: { type: 'number' },
+            scale: { type: 'number', description: 'Magnification, 1-4 (default 1).' }
+          }
+        },
+        relative: { type: 'boolean', description: 'Treat x and y as fractions of the screen (0-1), so a scaled preview cannot shift the click. x=0.5 is the centre.' },
         smooth: { type: 'boolean', description: 'Animate the pointer along an eased path instead of teleporting. Default true.' },
         steps: { type: 'number', description: 'Pointer path steps (2-120, default 24).' },
         durationMs: { type: 'number', description: 'Pointer travel time in milliseconds (default 380).' }
