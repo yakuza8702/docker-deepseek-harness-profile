@@ -75,7 +75,6 @@ NVIDIA 610.57) with a computer created at 4 vCPU / 8 GB / 40 GB / GPU:
 | Crops / zoom | `screenshot {region}` prints the inverse mapping; `zoom <window>` crops to a window and keeps coordinates valid |
 | a11y | still absent for Blender; falls back to display + window list with bounds from `cua do window ls` |
 | Panel | themed (dark/light), left-nav entry, self-updating list |
-
 | **Chromium WebGL** | works on the accelerated desktop — the page renders WebGL on the Xorg/virgl session, so the round-1 llvmpipe failure does not come back |
 
 Still un-re-verified: the video viewer over HTTPS (the frames fallback is what
