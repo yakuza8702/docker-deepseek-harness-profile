@@ -341,6 +341,17 @@ async function provisionGpuGuest(name) {
   return true
 }
 
+/** Focus + pointer context, so the model can tell whether its action landed. */
+async function guiContext(name) {
+  const read = await runCua(['sb', 'exec', '--local', name, '--timeout', '20',
+    'DISPLAY=${DISPLAY:-:1} xdotool getactivewindow getwindowname 2>/dev/null; DISPLAY=${DISPLAY:-:1} xdotool getmouselocation --shell 2>/dev/null | head -2'], { timeoutMs: 60000 })
+  if (read.code !== 0) return ''
+  const lines = read.stdout.trim().split('\n').filter(Boolean)
+  const x = (/X=(-?\d+)/u.exec(read.stdout) || [])[1]
+  const y = (/Y=(-?\d+)/u.exec(read.stdout) || [])[1]
+  return `focus: ${lines[0] || 'none'}, pointer: ${x ?? '?'},${y ?? '?'}`
+}
+
 const CREATE_LOCK = new Map()
 
 function withLock(key, fn) {
@@ -803,7 +814,8 @@ const handlers = {
       const script = `DISPLAY=\${DISPLAY:-:1} xdotool ${parts.join(' ')}`
       const moved = await runCua(['sb', 'exec', '--local', name, '--timeout', '60', script], { timeoutMs: 120000 })
       if (moved.code !== 0) return fail((moved.stderr || moved.stdout).trim().slice(-400))
-      return ok({ name, action, output: `${action} at ${toX},${toY} (${total} steps over ${Math.round(perStep * total * 1000)} ms)` })
+      const context = await guiContext(name)
+      return ok({ name, action, output: `${action} at ${toX},${toY} (${total} steps over ${Math.round(perStep * total * 1000)} ms)\n${context}` })
     }
 
     const argv = (() => {
@@ -847,6 +859,10 @@ const handlers = {
       output = `${acted.stdout}${acted.stderr}`.trim()
     }
     if (acted.code !== 0) return fail(output.slice(-600))
+    if (['type', 'key', 'hotkey', 'scroll', 'launch', 'open'].includes(action)) {
+      const context = await guiContext(name)
+      if (context !== '') output = `${output}\n${context}`
+    }
     return ok({ name, action, output })
   },
 

@@ -69,6 +69,8 @@ window.__ModuleLoader__.load({
       const [text, setText] = useState('')
       const [frameAt, setFrameAt] = useState(0)
       const [pos, setPos] = useState(null)
+      const [cursor, setCursor] = useState(null)
+      const frameRef = React.useRef(null)
 
       const send = async (payload) => {
         try {
@@ -104,9 +106,36 @@ window.__ModuleLoader__.load({
           } catch { /* the VM may be busy; the next tick retries */ }
         }
         void tick()
-        const timer = setInterval(() => { void tick() }, 500)
+        const timer = setInterval(() => { void tick() }, 400)
         return () => { alive = false; clearInterval(timer) }
       }, [name])
+
+      // Map the guest pointer onto the viewer's canvas so the shared video view
+      // shows the agent's cursor too. The stream itself never contains it (X11
+      // draws the cursor outside the capture).
+      useEffect(() => {
+        if (pos === null || frames) { setCursor(null); return }
+        const frame = frameRef.current
+        if (frame === null) { setCursor(null); return }
+        try {
+          const doc = frame.contentDocument
+          if (doc === null) { setCursor(null); return }
+          const elements = [...doc.querySelectorAll('canvas, video')]
+            .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))
+          const target = elements[0]
+          if (target === undefined) { setCursor(null); return }
+          const outer = frame.getBoundingClientRect()
+          const inner = target.getBoundingClientRect()
+          if (inner.width === 0 || inner.height === 0) { setCursor(null); return }
+          const scale = Math.min(inner.width / pos.width, inner.height / pos.height)
+          setCursor({
+            left: outer.left + inner.left + (inner.width - pos.width * scale) / 2 + pos.x * scale,
+            top: outer.top + inner.top + (inner.height - pos.height * scale) / 2 + pos.y * scale
+          })
+        } catch {
+          setCursor(null)
+        }
+      }, [pos, frames])
       return h('div', {
         role: 'dialog', 'aria-modal': 'true', 'aria-label': `VM desktop ${name}`,
         style: {
@@ -187,11 +216,20 @@ window.__ModuleLoader__.load({
               h('div', { style: S.muted }, 'Frames refresh every 1.2 s. Click the screen to click in the computer, type above to type.')
             )
           : h('iframe', {
+              ref: frameRef,
               title: `${name} desktop`,
               src: `/vm/view/${name}/${hash}`,
               style: { width: '100%', height: '100%', border: 'none', borderRadius: T.radiusLg, background: '#000' },
               allow: 'clipboard-read; clipboard-write; fullscreen'
-            })
+            }),
+        cursor !== null && h('div', {
+          'aria-hidden': true,
+          style: {
+            position: 'fixed', pointerEvents: 'none', zIndex: 71,
+            left: cursor.left, top: cursor.top, transform: 'translate(-2px,-2px)', width: 16, height: 16
+          }
+        }, h('svg', { width: 16, height: 16, viewBox: '0 0 16 16' },
+          h('path', { d: 'M2 1 L2 13 L5.5 9.8 L8 15 L10.2 14 L7.8 8.9 L12.5 8.4 Z', fill: '#fff', stroke: '#111', strokeWidth: 1 })))
       )
     }
 
