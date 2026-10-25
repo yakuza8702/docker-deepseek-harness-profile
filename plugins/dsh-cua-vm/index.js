@@ -146,7 +146,9 @@ export function apply(ctx, config = {}) {
       'Build, run and test inside it; keep the workspace clean. Copy only finished artifacts back with `cua_vm_get`.',
       'The VM persists across turns and is stopped only when the user asks. If a tool reports that no VM exists, call `cua_vm_ensure` once, then `cua_vm_exec`.',
       'The VM is a different machine: paths inside it are not workspace paths, and it cannot see /workspace until you copy a file in.',
-      'You can also drive its desktop with `cua_vm_gui`: screenshot, click, type, hotkeys, drag. Find an element with `a11y` (or list windows) before clicking its bounds, and prefer the shell when a command can do the job.',
+      'You can also drive its desktop with `cua_vm_gui`: screenshot, click, type, hotkeys, drag.',
+      'Choose the surface deliberately: the shell for anything a command can do (gradle, adb, blender -b, apt, tests), the desktop when the work is visual or only exists as a window — a login screen, an app with no CLI, a UI you must look at to judge, or when the user says show me, click, or test the UI.',
+      'Before clicking, get the position from `a11y` (element bounds) or `windows`, then screenshot to confirm the result. If you cannot see images, use the a11y bounds rather than guessing pixels.',
       'Before you create a computer for the user, ask with `ask_user_question` for its name, vCPU/RAM and image unless they already said so; never invent a spec silently. Debian and Arch need a built Cua disk, so say that instead of substituting an image.'
     ].join(' ')
   })
