@@ -755,6 +755,8 @@ function checkpointSandbox(name) {
 
 /** VMs whose screenshot space cua already knows (see the gui pointer branch). */
 const SHOT_STATE = new Set()
+/** Which computer `cua do` is pointed at — switching resets the zoom state. */
+let DO_TARGET = ''
 
 const handlers = {
   async ping() {
@@ -1129,16 +1131,26 @@ const handlers = {
     const pointer = ['click', 'dclick', 'move', 'drag'].includes(action)
     await runCua(['sb', 'resume', '--local', name], { timeoutMs: 120000 })
 
-    const switched = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
-    if (switched.code !== 0) return fail((switched.stderr || switched.stdout).trim().slice(-400))
+    // `do switch` also clears `zoom`, so it must not run on every call: the
+    // model zooms to a window, takes two screenshots and clicks. Only switch
+    // when the daemon is pointed at another computer (it keeps the target
+    // across processes).
+    if (DO_TARGET !== name) {
+      const switched = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
+      if (switched.code !== 0) return fail((switched.stderr || switched.stdout).trim().slice(-400))
+      DO_TARGET = name
+    }
 
     /** Run one `cua do` verb, retrying while spacesd restarts with the desktop. */
     const doAct = async (argv) => {
       let result = await runCua(['do', ...argv], { timeoutMs: 120000 })
       let output = `${result.stdout}${result.stderr}`.trim()
       if (result.code !== 0 && /spacesd is not available|not answering|connection reset/iu.test(output)) {
+        // The daemon restarted with the desktop: it lost the target (and the
+        // zoom), so re-select and retry once.
         await new Promise((resolve) => setTimeout(resolve, 5000))
-        await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
+        const again = await runCua(['do', 'switch', `local:${name}`], { timeoutMs: 60000 })
+        DO_TARGET = again.code === 0 ? name : ''
         result = await runCua(['do', ...argv], { timeoutMs: 120000 })
         output = `${result.stdout}${result.stderr}`.trim()
       }
