@@ -818,7 +818,15 @@ RUN set -eux; \
     tar -xzf /tmp/cua.tgz -C /usr/local/bin cua; \
     chmod 0755 /usr/local/bin/cua; \
     rm -f /tmp/cua.tgz; \
-    cua --version
+    # The harness shell runs with HOME=/workspace (the dir-selector fix), while
+    # cua keeps its sandboxes under the VM store. Without this wrapper every
+    # `cua sb ...` typed in a shell — by the model or a human — looks at
+    # /workspace/.cua, finds nothing and answers "not found: sandbox <name>".
+    # CUA_CLI_HOME overrides it for a different store.
+    mv /usr/local/bin/cua /usr/local/bin/cua.real; \
+    printf '%s\n' '#!/bin/sh' 'exec env HOME="${CUA_CLI_HOME:-/cua-vm/home}" /usr/local/bin/cua.real "$@"' > /usr/local/bin/cua; \
+    chmod 0755 /usr/local/bin/cua; \
+    /usr/local/bin/cua.real --version
 COPY --chmod=0755 docker/cua-vm-supervisor.mjs /usr/local/bin/cua-vm-supervisor
 COPY plugins/dsh-cua-vm /opt/dsh-cua-vm
 RUN set -eux; \
