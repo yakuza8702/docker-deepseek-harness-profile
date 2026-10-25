@@ -206,8 +206,8 @@ Env knobs the supervisor reads:
 | `DSH_CUA_VM_RESOLUTION` | `1200x750` | desktop geometry (900k pixels = 1:1 capture) |
 | `DSH_CUA_PROVISION_SCRIPT` | `/usr/local/bin/cua-guest-provision.sh` | guest provisioning |
 | `DSH_CUA_ANDROID_SCRIPT` | `/usr/local/bin/cua-guest-android.sh` | Android bootstrap |
-| `DSH_MCP_SLIM` | `1` | trim the browser MCP tool catalogue (`0` = full upstream surface) |
-| `DSH_MCP_SLIM_VERBOSE` | unset | `1` logs the per-server tool/char/token delta to stderr |
+| `MCP_SLIM` | `1` | trim the browser MCP tool catalogue (`0` = full upstream surface). No `DSH_` prefix: the MCP client strips those from a child env |
+| `MCP_SLIM_VERBOSE` | unset | `1` logs the per-server tool/char/token delta to stderr |
 
 Verify:
 

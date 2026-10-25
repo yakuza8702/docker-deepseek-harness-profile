@@ -501,7 +501,7 @@ RUN set -eux; \
       'for root in /opt/dsh /opt/dsh-src; do' \
       '  cli="$root/node_modules/@playwright/mcp/cli.js"' \
       '  if [ -f "$cli" ]; then' \
-      '    [ "${DSH_MCP_SLIM:-1}" = "0" ] && exec node "$cli" "$@"' \
+      '    [ "${MCP_SLIM:-1}" = "0" ] && exec node "$cli" "$@"' \
       '    exec node /opt/seek-harness/mcp-slim.mjs --policy /opt/seek-harness/mcp-slim.browser.json -- node "$cli" "$@"' \
       '  fi' \
       'done' \
@@ -555,7 +555,7 @@ RUN set -eux; \
       '# ships inside the image, started in attach mode against the visible Brave' \
       '# desktop over loopback CDP. A stable path, so the row never has to know' \
       '# where the package lives — and never runs npx.' \
-      '[ "${DSH_MCP_SLIM:-1}" = "0" ] && exec node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
+      '[ "${MCP_SLIM:-1}" = "0" ] && exec node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
       'exec node /opt/seek-harness/mcp-slim.mjs --policy /opt/seek-harness/mcp-slim.brave.json -- node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
       > /usr/local/bin/dsh-brave-devtools-mcp; \
     chmod 0755 /usr/local/bin/dsh-brave-devtools-mcp; \
@@ -565,7 +565,7 @@ RUN set -eux; \
 # that mounts the row, the Plugins-page switch (host table + client row) and the
 # page's duplicate-card suppression.
 #
-# The gate below runs with DSH_MCP_SLIM=0: it asks whether the WRAPPER reaches a
+# The gate below runs with MCP_SLIM=0: it asks whether the WRAPPER reaches a
 # working server, i.e. the upstream surface. What the model actually sees is the
 # trimmed catalogue, and that is checked separately (tools/check-tool-trim.mjs
 # for the policy, and the measured 30 -> 12 tools / -66% in the commit). One of them missing still produces a healthy
@@ -574,7 +574,7 @@ RUN set -eux; \
 # is needed at build time) and reads the other three out of the installed files.
 # See tools/check-brave-mcp.mjs.
 COPY --chmod=0644 tools/check-brave-mcp.mjs /tmp/check-brave-mcp.mjs
-RUN DSH_MCP_SLIM=0 node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
+RUN MCP_SLIM=0 node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
  && rm -f /tmp/check-brave-mcp.mjs
 
 # ---------------------------------------------------------------------

@@ -34,8 +34,13 @@
  *
  * USAGE
  *   node mcp-slim.mjs --policy <file.json> -- <command> [args...]
- *   DSH_MCP_SLIM=0            bypass (the wrapper execs the server directly)
- *   DSH_MCP_SLIM_VERBOSE=1    log a one-line before/after summary to stderr
+ *   MCP_SLIM=0                bypass (the wrapper execs the server directly)
+ *   MCP_SLIM_VERBOSE=1        log a one-line before/after summary to stderr
+ *
+ * NOTE the names do not start with DSH_: the MCP client builds a child
+ * environment by dropping every DSH_* name (packages/mcp/mcp-client/src/
+ * transport.ts, scrubbedParentEnv), so a DSH_MCP_SLIM set in compose would
+ * never reach this process.
  */
 
 import { spawn } from 'node:child_process'
@@ -135,7 +140,7 @@ function rewrite(message) {
   before = JSON.stringify(tools).length
   const trimmed = kept.map(trimTool)
   after = JSON.stringify(trimmed).length
-  if (!reported && process.env.DSH_MCP_SLIM_VERBOSE === '1') {
+  if (!reported && process.env.MCP_SLIM_VERBOSE === '1') {
     reported = true
     process.stderr.write(`mcp-slim[${policy.server ?? 'mcp'}]: ${tools.length} -> ${kept.length} tools, `
       + `${before} -> ${after} chars (~${Math.round(before / 4)} -> ~${Math.round(after / 4)} tokens)\n`)

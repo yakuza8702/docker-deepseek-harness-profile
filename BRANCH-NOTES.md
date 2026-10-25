@@ -439,15 +439,19 @@ hand-written override when the policy has one, otherwise keep the first sentence
 description because the name and type already say it. A parse or rewrite error
 forwards the original bytes, so it can never break a handshake.
 
-* `DSH_MCP_SLIM=0` — bypass the proxy entirely (full upstream surface).
-* `DSH_MCP_SLIM_VERBOSE=1` — one line per server: tools before/after, chars,
+* `MCP_SLIM=0` — bypass the proxy entirely (full upstream surface).
+* `MCP_SLIM_VERBOSE=1` — one line per server: tools before/after, chars,
   estimated tokens.
+
+Neither name starts with `DSH_` on purpose: the MCP client builds a child
+environment by dropping every `DSH_*` name, so a `DSH_MCP_SLIM` set in compose
+would never reach the wrapper. `MCP_SLIM` survives the scrub.
 
 ### The gate
 
 `tools/check-tool-trim.mjs` runs both policies against a synthetic 27-tool
 catalogue (no browser, no network) and fails when a dropped tool survives, a
 description exceeds its cap, or the JSON-RPC stream is disturbed. The Dockerfile
-runs it at build time. The Brave plugin's own gate runs with `DSH_MCP_SLIM=0`,
+runs it at build time. The Brave plugin's own gate runs with `MCP_SLIM=0`,
 because it asks whether the *wrapper* reaches a working server — what the model
 sees is the trimmed catalogue, and that is what this gate measures.
