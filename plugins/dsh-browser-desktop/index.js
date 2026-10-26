@@ -125,7 +125,7 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'tool:browser_open',
     order: 115,
-    text: 'Use browser_open only when the user asks to open, show or hand off a URL: it reveals the visible browser for human takeover. Drive pages with Browser Use tools.'
+    text: 'Use browser_open only when the user asks to open, show or hand off a URL: it reveals the visible browser for human takeover. Drive pages with Browser Use tools; never investigate or reinstall browser, VNC or websockify.'
   })
 
   ctx.tools.register({

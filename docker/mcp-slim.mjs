@@ -38,6 +38,7 @@
  *
  * USAGE
  *   node mcp-slim.mjs --policy <file.json> -- <command> [args...]
+ *   node mcp-slim.mjs --selftest   # the `__proto__` rebuild guard (exit 0/1)
  *   MCP_SLIM=0                bypass (the wrapper execs the server directly)
  *   MCP_SLIM_VERBOSE=1        log a one-line before/after summary to stderr
  *
@@ -51,9 +52,10 @@ import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 
 const argv = process.argv.slice(2)
+const selftest = argv.includes('--selftest')
 const policyAt = argv.indexOf('--policy')
 const sepAt = argv.indexOf('--')
-if (policyAt === -1 || sepAt === -1 || sepAt <= policyAt + 1) {
+if (!selftest && (policyAt === -1 || sepAt === -1 || sepAt <= policyAt + 1)) {
   process.stderr.write('mcp-slim: usage: mcp-slim.mjs --policy <file> -- <command> [args...]\n')
   process.exit(64)
 }
@@ -61,7 +63,22 @@ const policyPath = argv[policyAt + 1]
 const command = argv[sepAt + 1]
 const commandArgs = argv.slice(sepAt + 2)
 
-let policy = { drop: [], overrides: {}, stripKeys: [], maxDescription: 160, maxParamDescription: 80 }
+let policy = {
+  drop: new Set(),
+  overrides: {},
+  stripKeys: new Set(),
+  maxDescription: 160,
+  maxParamDescription: 80
+}
+
+// Run before any policy is read: the guard is about the JSON rebuild, not the
+// catalogue, and the build gate calls this so it is exercised, not assumed.
+if (selftest) {
+  const ok = selfTest()
+  if (!ok) process.stderr.write('mcp-slim: self-test failed: a literal __proto__ key did not survive the rebuild as data\n')
+  process.exit(ok ? 0 : 1)
+}
+
 try {
   const parsed = JSON.parse(readFileSync(policyPath, 'utf8'))
   policy = {
@@ -101,6 +118,21 @@ function compress(text, max) {
   return out
 }
 
+/**
+ * Define an OWN enumerable data property.
+ *
+ * `out[key] = value` is not equivalent for the one key that is both legal JSON
+ * and special to JS: a literal `"__proto__"` hits `Object.prototype`'s setter,
+ * so the key vanishes from the JSON and its value is installed as the object's
+ * prototype (or dropped outright when it is not an object). Both rebuilds below
+ * iterate keys that come from a remote catalogue, so they write through here.
+ * `defineProperty` never consults the prototype chain.
+ */
+function setOwn(target, key, value) {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true })
+  return target
+}
+
 /** Compress one parameter's description; booleans lose it entirely. */
 function compressProperty(name, node) {
   if (node === null || typeof node !== 'object') return node
@@ -113,7 +145,7 @@ function compressProperty(name, node) {
   }
   if (copy.properties && typeof copy.properties === 'object') {
     const properties = {}
-    for (const [key, value] of Object.entries(copy.properties)) properties[key] = compressProperty(key, value)
+    for (const [key, value] of Object.entries(copy.properties)) setOwn(properties, key, compressProperty(key, value))
     copy.properties = properties
   }
   if (copy.items) copy.items = compressProperty(name, copy.items)
@@ -145,9 +177,29 @@ function prune(value) {
   const out = {}
   for (const [key, child] of Object.entries(value)) {
     if (policy.stripKeys.has(key)) continue
-    out[key] = prune(child)
+    setOwn(out, key, prune(child))
   }
   return out
+}
+
+/**
+ * Guard for the `__proto__` hazard above, run by `--selftest` (and by the build
+ * gate, which calls that). A remote catalogue may carry a literal `__proto__`
+ * key at any depth; both rebuilds must keep it as an own property, leave the
+ * object's prototype alone, and survive a JSON round-trip.
+ */
+function selfTest() {
+  const raw = '{"__proto__":{"type":"string","description":"Kept as a key, not a prototype."},"type":"object"}'
+  const rebuilt = [
+    prune(JSON.parse(raw)),
+    compressProperty('', { properties: JSON.parse(raw) }).properties
+  ]
+  return rebuilt.every((value) => value !== null
+    && typeof value === 'object'
+    && Object.getPrototypeOf(value) === Object.prototype
+    && Object.prototype.hasOwnProperty.call(value, '__proto__')
+    && JSON.stringify(value).includes('"__proto__":')
+    && Object.prototype.hasOwnProperty.call(JSON.parse(JSON.stringify(value)), '__proto__'))
 }
 
 let before = 0

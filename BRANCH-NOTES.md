@@ -451,7 +451,12 @@ would never reach the wrapper. `MCP_SLIM` survives the scrub.
 
 `tools/check-tool-trim.mjs` runs both policies against a synthetic 27-tool
 catalogue (no browser, no network) and fails when a dropped tool survives, a
-description exceeds its cap, or the JSON-RPC stream is disturbed. The Dockerfile
+description exceeds its cap, or the JSON-RPC stream is disturbed. The drop list
+is checked against a frozen copy of the pinned servers' catalogues — never
+against the policy itself — so a typo'd or renamed verb is a red gate instead of
+a silent no-op (a name the pinned package defines only behind an opt-in flag is
+listed as such, and the row enables neither), and a literal `__proto__` parameter
+is pushed through the proxy to prove the rewrite keeps it as data. The Dockerfile
 runs it at build time. The Brave plugin's own gate runs with `MCP_SLIM=0`,
 because it asks whether the *wrapper* reaches a working server — what the model
 sees is the trimmed catalogue, and that is what this gate measures.
