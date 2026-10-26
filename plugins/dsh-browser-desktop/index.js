@@ -125,12 +125,12 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'tool:browser_open',
     order: 115,
-    text: 'Use browser_open only when the user asks to open, show, or hand off a URL in the visible browser desktop. It opens the persistent container Chromium and reveals it for human takeover. When Browser Use tools are available, use those tools for page inspection and interaction instead of treating browser_open as an automation tool. Do not investigate or reinstall browser, VNC, noVNC, or websockify.'
+    text: 'Use browser_open only when the user asks to open, show or hand off a URL: it reveals the visible browser for human takeover. Drive pages with Browser Use tools.'
   })
 
   ctx.tools.register({
     name: 'browser_open',
-    description: 'Open an HTTP or HTTPS URL in the visible persistent Chromium desktop and reveal it for human takeover. Use Browser Use tools for page inspection and interaction.',
+    description: 'Open a URL in the visible Chromium desktop; reveals it for human takeover.',
     parameters: {
       type: 'object',
       additionalProperties: false,

@@ -142,19 +142,18 @@ export function apply(ctx, config = {}) {
     name: 'tool:cua_vm',
     order: 120,
     text: [
-      'You have a personal Linux computer for this workspace (a QEMU VM), managed by the `cua_vm_*` tools; the user also manages computers from Plugins → Personal VM (Computers).',
-      'Treat it as your own machine, not as a sandbox to poke: install what the task needs there (apt, npm, pip, SDKs, the Android SDK, Blender), build and test there, and copy only the finished artifact back with `cua_vm_get`. Never install project toolchains into the harness image itself.',
-      'Its `/workspace` is the SAME directory as this workspace (a 9p share set up by the supervisor). Files you write with the file tools are visible there and files it writes appear here — a build inside the VM lands in the project. If the share is missing, `cua_vm_put`/`cua_vm_get` still copy explicitly.',
-      'Build in the VM, not over the share, when the build writes thousands of small files: copy the source to /tmp/build (or /home/cua/build) inside the VM, build there, then copy the artifact back to /workspace. 9p is for source and results, not for object files.',
-      'You can drive its desktop with `cua_vm_gui`: screenshot, click, type, hotkeys, drag, scroll, and `zoom` to crop the desktop to one window.',
-      'COORDINATES: every x/y is a pixel in the screenshot you just took, origin top-left. `cua_vm_gui` maps that to the display for you, so click the pixel you see — never rescale, never add an offset. The desktop is 1200x750 by default, which is exactly what the capture returns.',
-      'Choose the surface deliberately: the shell for anything a command can do (gradle, adb, blender -b, apt, tests), the desktop when the work is visual or only exists as a window — a login screen, an app with no CLI, a UI you must look at to judge, or when the user says show me, click, or test the UI.',
-      'Before clicking, get the position from `a11y` (element bounds) or `windows`, then screenshot to confirm the result. If you cannot see images, use the a11y bounds rather than guessing pixels.',
-      'Before you create a computer for the user, ask with `ask_user_question` for its name, vCPU/RAM and image unless they already said so; never invent a spec silently. Debian and Arch need a built Cua disk, so say that instead of substituting an image.',
-      'For Android, Blender, WebGL or any 3D work, create the computer with `cua_vm_create` and gpu enabled (gpu: true) unless the user says otherwise, and tell them when the image or the host cannot provide it.',
-      'For an Android app: `cua_vm_create` with gpu, cpu 4, memory 8 and diskGb 40, then `cua_vm_android` once (SDK + AVD, a few GB). Boot it with `cua-emulator` (or `cua-emulator -no-window` for adb-driven tests) and check `adb devices` before installing the APK. KVM is nested inside the VM, so the emulator is hardware-accelerated; confirm it with `cua_vm_exec` → `ls -l /dev/kvm`.',
-      'On a GPU computer the desktop runs Xorg on virgl and reports OpenGL 4.3 (Mesa under-reports virgl as 4.2; the session lifts the reported version so Blender 4.x starts on the GPU). If an app still refuses, check `cua_vm_gui geometry` or `glxinfo -B`; only fall back to `LIBGL_ALWAYS_SOFTWARE=1` (llvmpipe, GL 4.5, much slower) when the GPU path genuinely fails, and say so.',
-      'The VM persists across turns and is stopped only when the user asks. If a tool reports that no VM exists, call `cua_vm_ensure` once, then `cua_vm_exec`.'
+      'This workspace has a personal Linux computer (a QEMU VM) driven by `cua_vm_*`; the user manages theirs in Plugins → Personal VM.',
+      'Treat it as your own machine: install what the task needs there (apt, npm, pip, SDKs), build and test there, copy the artifact back with `cua_vm_get`, never install project toolchains into the harness image.',
+      'Its `/workspace` is this same directory over 9p (files appear on both sides); if the share is missing, `cua_vm_put`/`cua_vm_get` still copy.',
+      'Build inside the VM, not over the share, for thousand-file builds: copy the source to /tmp/build (or /home/cua/build), build, copy the artifact back — 9p carries source and results, not object files.',
+      'Drive the desktop with `cua_vm_gui`: screenshot, click, type, hotkeys, drag, scroll, `zoom` to crop.',
+      'COORDINATES: x/y is a pixel in the screenshot you just took, origin top-left; `cua_vm_gui` maps it to the display, so click the pixel you see — never rescale, never offset — the desktop is 1200x750.',
+      'Choose deliberately: the shell for anything a command can do (gradle, adb, blender -b, apt, tests), the desktop for visual work or when the user says show me, click or test the UI.',
+      'Before clicking, take the position from `a11y` (element bounds) or `windows`, then screenshot to confirm; without vision, trust the a11y bounds over guessed pixels.',
+      'Before creating a computer, ask with `ask_user_question` for name, vCPU/RAM and image unless the user said so — never invent a spec silently — and say Debian and Arch need a built Cua disk, not a substitute image.',
+      'For Android, Blender, WebGL or 3D work create it with `gpu: true` unless told otherwise (say so if the image or host cannot); an Android app is `cua_vm_create` with gpu, cpu 4, memory 8, diskGb 40, then `cua_vm_android` once (SDK + AVD), `cua-emulator` (`-no-window` for adb tests), `adb devices` before the APK, `cua_vm_exec` → `ls -l /dev/kvm` for nested KVM.',
+      'On a GPU computer Xorg runs on virgl and reports OpenGL 4.3 (Mesa under-reports 4.2; the session lifts it); if an app refuses, check `cua_vm_gui geometry` or `glxinfo -B`, and use `LIBGL_ALWAYS_SOFTWARE=1` (llvmpipe, slower) only as a genuine, stated fallback.',
+      'The VM persists across turns and stops only when the user asks; if a tool reports no VM, call `cua_vm_ensure` once, then `cua_vm_exec`.'
     ].join(' ')
   })
 
