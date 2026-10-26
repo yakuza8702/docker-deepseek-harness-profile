@@ -2,7 +2,12 @@
   "server": "playwright-mcp",
   "maxDescription": 110,
   "maxParamDescription": 38,
-  "drop": [],
+  "drop": [
+    "browser_resize",
+    "browser_console_messages",
+    "browser_network_requests",
+    "browser_network_request"
+  ],
   "overrides": {
     "browser_navigate": "Open a URL in the shared page.",
     "browser_navigate_back": "Go back one history entry.",
@@ -21,14 +26,10 @@
     "browser_evaluate": "Evaluate a JavaScript function in the page and return its JSON result.",
     "browser_run_code_unsafe": "Run a Playwright snippet against the page. Powerful and unsafe: it can do anything the browser can.",
     "browser_find": "Search the accessibility snapshot for text or a regular expression; returns matching nodes with refs.",
-    "browser_console_messages": "Console messages. onlyErrors hides info/log; pattern filters them.",
     "browser_console_clear": "Clear the captured console log.",
-    "browser_network_requests": "Requests made since load, as a numbered list. filter is a URL regex.",
-    "browser_network_request": "Full headers and body of one request, by the number from browser_network_requests.",
     "browser_handle_dialog": "Answer a browser dialog (alert/confirm/prompt).",
     "browser_wait_for": "Wait for text to appear or disappear, or for N seconds.",
     "browser_tabs": "List, open, close or select tabs.",
-    "browser_resize": "Resize the viewport.",
     "browser_file_upload": "Upload files into a file input.",
     "browser_drop": "Drop files or MIME data onto an element.",
     "browser_close": "Close the page.",

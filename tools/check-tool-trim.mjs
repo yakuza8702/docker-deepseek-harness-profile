@@ -52,7 +52,9 @@ process.stdin.on('data', (chunk) => {
       continue
     }
     if (message.method === 'tools/list') {
-      const names = ['click','hover','fill','type_text','drag','press_key','navigate_page','new_page','list_pages','select_page','close_page','resize_page','take_screenshot','take_snapshot','evaluate_script','wait_for','handle_dialog','get_tab_id','list_console_messages','get_console_message','list_network_requests','get_network_request','emulate','lighthouse_audit','performance_start_trace','performance_stop_trace','performance_analyze_insight']
+      const names = process.env.FAKE_NAMES
+        ? JSON.parse(process.env.FAKE_NAMES)
+        : ['click','hover','fill','type_text','drag','press_key','navigate_page','new_page','list_pages','select_page','close_page','resize_page','take_screenshot','take_snapshot','evaluate_script','wait_for','handle_dialog','get_tab_id','list_console_messages','get_console_message','list_network_requests','get_network_request','emulate','lighthouse_audit','performance_start_trace','performance_stop_trace','performance_analyze_insight']
       const tools = names.map((name, index) => ({
         name,
         description: 'This tool is used to ' + name.replace(/_/gu, ' ') + ' in the target page. It is the recommended entry point when you need to inspect or manipulate that part of the page, and the response includes enough detail to continue without another round trip. Prefer taking a snapshot before acting if you are unsure about element ids.',
@@ -82,12 +84,13 @@ process.stdin.on('data', (chunk) => {
 })
 `
 
-function catalogue(name, { proxy = true } = {}) {
+function catalogue(name, { proxy = true, names } = {}) {
   return new Promise((resolve, reject) => {
     const policy = JSON.parse(readFileSync(POLICIES[name], 'utf8'))
+    const env = names === undefined ? process.env : { ...process.env, FAKE_NAMES: JSON.stringify(names) }
     const child = proxy
-      ? spawn(process.execPath, [SLIM, '--policy', POLICIES[name], '--', process.execPath, '-e', FAKE_SERVER], { stdio: ['pipe', 'pipe', 'pipe'] })
-      : spawn(process.execPath, ['-e', FAKE_SERVER], { stdio: ['pipe', 'pipe', 'pipe'] })
+      ? spawn(process.execPath, [SLIM, '--policy', POLICIES[name], '--', process.execPath, '-e', FAKE_SERVER], { stdio: ['pipe', 'pipe', 'pipe'], env })
+      : spawn(process.execPath, ['-e', FAKE_SERVER], { stdio: ['pipe', 'pipe', 'pipe'], env })
     let out = ''
     let err = ''
     child.stderr.setEncoding('utf8')
@@ -160,6 +163,24 @@ for (const name of ['browser', 'brave']) {
   const beforeStripped = STRIPPED.reduce((total, key) => total + baselineJson.split(JSON.stringify(key) + ':').length - 1, 0)
   const afterStripped = STRIPPED.reduce((total, key) => total + trimmedJson.split(JSON.stringify(key) + ':').length - 1, 0)
   console.log(`  stripKeys: ${beforeStripped} -> ${afterStripped} occurrences of ${STRIPPED.join('/')}`)
+  // The measured catalogue uses canonical DevTools names, so a playwright drop
+  // entry (`browser_resize`) never appears in it. Audit each drop list against a
+  // catalogue built from the list itself: a typo or a renamed verb cannot pass.
+  const sentinel = 'drop_audit_sentinel'
+  const auditNames = [...new Set([...(policy.drop ?? []), sentinel])]
+  const audit = await catalogue(name, { names: auditNames })
+  const auditBaseline = await catalogue(name, { proxy: false, names: auditNames })
+  const survivors = audit.tools.map((tool) => tool.name)
+  const auditBefore = JSON.stringify(auditBaseline.tools).length
+  const auditAfter = JSON.stringify(audit.tools).length
+  if (survivors.length !== 1 || survivors[0] !== sentinel) {
+    const leaked = survivors.filter((tool) => tool !== sentinel)
+    console.error(`  FAIL drop list leaked: ${leaked.length > 0 ? leaked.join(', ') : `sentinel ${sentinel} was dropped too`}`)
+    failures += 1
+  } else {
+    console.log(`  drop audit: ${auditNames.length - 1} named tools -> 0, ${auditBefore} -> ${auditAfter} chars `
+      + `(${auditBefore - auditAfter} saved), sentinel kept`)
+  }
   const sample = tools[0]
   if (sample !== undefined && sample.inputSchema) {
     console.log(`  schema keys on ${sample.name}: ${Object.keys(sample.inputSchema).join(', ')}`)
