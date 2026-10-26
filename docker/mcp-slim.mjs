@@ -23,7 +23,11 @@
  *   3. otherwise keeps the first sentence, strips the "This tool is used to…"
  *      throat-clearing, and caps it at `maxDescription` characters;
  *   4. caps each parameter description at `maxParamDescription`, and removes it
- *      entirely when the parameter is a boolean whose name already says it.
+ *      entirely when the parameter is a boolean whose name already says it;
+ *   5. deletes the JSON keys named in `stripKeys` (`$schema`,
+ *      `additionalProperties`) at every depth of the final tool object. They are
+ *      validator boilerplate: no tool-calling model reads them, and they are
+ *      paid on every turn like everything else in the catalogue.
  *
  * WHAT IT NEVER DOES
  *   * never touches a request, a notification, or any other response;
@@ -57,17 +61,19 @@ const policyPath = argv[policyAt + 1]
 const command = argv[sepAt + 1]
 const commandArgs = argv.slice(sepAt + 2)
 
-let policy = { drop: [], overrides: {}, maxDescription: 160, maxParamDescription: 80 }
+let policy = { drop: [], overrides: {}, stripKeys: [], maxDescription: 160, maxParamDescription: 80 }
 try {
   const parsed = JSON.parse(readFileSync(policyPath, 'utf8'))
   policy = {
     server: typeof parsed.server === 'string' ? parsed.server : undefined,
     drop: new Set(Array.isArray(parsed.drop) ? parsed.drop : []),
     overrides: parsed.overrides && typeof parsed.overrides === 'object' ? parsed.overrides : {},
+    stripKeys: new Set(Array.isArray(parsed.stripKeys) ? parsed.stripKeys.filter((key) => typeof key === 'string') : []),
     maxDescription: Number.isFinite(parsed.maxDescription) ? parsed.maxDescription : 160,
     maxParamDescription: Number.isFinite(parsed.maxParamDescription) ? parsed.maxParamDescription : 80
   }
   if (!(policy.drop instanceof Set)) policy.drop = new Set()
+  if (!(policy.stripKeys instanceof Set)) policy.stripKeys = new Set()
 } catch (error) {
   process.stderr.write(`mcp-slim: cannot read policy ${policyPath}: ${error.message}; passing everything through\n`)
 }
@@ -124,6 +130,26 @@ function trimTool(tool) {
   return out
 }
 
+/**
+ * Delete `policy.stripKeys` from every object in the tool, at any depth.
+ *
+ * `$schema` and `additionalProperties` are JSON-Schema validator boilerplate
+ * that no tool-calling model acts on, but every server that publishes a strict
+ * schema repeats them once per tool (and `additionalProperties` once per
+ * parameter object). Arrays are walked element-wise, null and primitives are
+ * returned untouched, and nothing is invented: a missing key stays missing.
+ */
+function prune(value) {
+  if (Array.isArray(value)) return value.map((entry) => prune(entry))
+  if (value === null || typeof value !== 'object') return value
+  const out = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (policy.stripKeys.has(key)) continue
+    out[key] = prune(child)
+  }
+  return out
+}
+
 let before = 0
 let after = 0
 let reported = false
@@ -138,7 +164,7 @@ function rewrite(message) {
     kept.push(tool)
   }
   before = JSON.stringify(tools).length
-  const trimmed = kept.map(trimTool)
+  const trimmed = kept.map((tool) => prune(trimTool(tool)))
   after = JSON.stringify(trimmed).length
   if (!reported && process.env.MCP_SLIM_VERBOSE === '1') {
     reported = true

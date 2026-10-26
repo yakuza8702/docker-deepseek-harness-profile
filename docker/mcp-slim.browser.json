@@ -1,7 +1,7 @@
 {
   "server": "playwright-mcp",
-  "maxDescription": 150,
-  "maxParamDescription": 55,
+  "maxDescription": 110,
+  "maxParamDescription": 38,
   "drop": [],
   "overrides": {
     "browser_navigate": "Open a URL in the shared page.",
@@ -41,5 +41,9 @@
     "browser_highlight": "Highlight an element on the page.",
     "browser_hide_highlight": "Remove highlights.",
     "browser_annotate": "Draw annotations on the page and screenshot them."
-  }
+  },
+  "stripKeys": [
+    "$schema",
+    "additionalProperties"
+  ]
 }

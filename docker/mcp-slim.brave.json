@@ -1,7 +1,7 @@
 {
   "server": "brave-devtools",
-  "maxDescription": 170,
-  "maxParamDescription": 60,
+  "maxDescription": 110,
+  "maxParamDescription": 40,
   "drop": [
     "click",
     "click_at",
@@ -36,5 +36,9 @@
     "performance_analyze_insight": "Explain one insight from the last trace.",
     "lighthouse_audit": "Lighthouse scores and reports for accessibility, SEO, best practices and agentic browsing.",
     "take_heapsnapshot": "Heap snapshot of the page for memory analysis."
-  }
+  },
+  "stripKeys": [
+    "$schema",
+    "additionalProperties"
+  ]
 }

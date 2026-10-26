@@ -10,8 +10,10 @@
  *   node tools/check-tool-trim.mjs                 # both policies, synthetic
  *   node tools/check-tool-trim.mjs --live brave    # the real server, if present
  *
- * Exit 1 when a dropped tool survives, a description exceeds the cap, or the
- * proxy breaks the JSON-RPC stream.
+ * Exit 1 when a dropped tool survives, a description exceeds the cap, a
+ * `stripKeys` key (`$schema`, `additionalProperties`) survives, the fixture stops
+ * carrying those keys (which would make the assertion vacuous), or the proxy
+ * breaks the JSON-RPC stream.
  */
 
 import { spawn } from 'node:child_process'
@@ -55,12 +57,21 @@ process.stdin.on('data', (chunk) => {
         name,
         description: 'This tool is used to ' + name.replace(/_/gu, ' ') + ' in the target page. It is the recommended entry point when you need to inspect or manipulate that part of the page, and the response includes enough detail to continue without another round trip. Prefer taking a snapshot before acting if you are unsure about element ids.',
         inputSchema: {
+          $schema: 'https://json-schema.org/draft/2020-12/schema',
           type: 'object',
+          additionalProperties: false,
           properties: {
             pageId: { type: 'number', description: 'Targets a specific page by ID. Required when more than one page is open, which is usually the case after a redirect or a popup.' },
             verbose: { type: 'boolean', description: 'Whether to include all possible information available in the full accessibility tree. Default is false.' },
             selector: { type: 'string', description: 'Optional CSS selector. When omitted the tool uses the element uid you pass, and that uid must come from the most recent snapshot.' },
-            index: { type: 'number', description: 'Which of the listed entries to act on, counted from one, in the order the previous call printed them.' }
+            index: { type: 'number', description: 'Which of the listed entries to act on, counted from one, in the order the previous call printed them.' },
+            options: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                timeout: { type: 'number', description: 'How long to wait before giving up, in milliseconds. Defaults to the server value.' }
+              }
+            }
           },
           required: ['pageId']
         }
@@ -113,6 +124,7 @@ if (live) {
 }
 
 let failures = 0
+const STRIPPED = ['$schema', 'additionalProperties']
 for (const name of ['browser', 'brave']) {
   const baseline = await catalogue(name, { proxy: false })
   const { tools, policy } = await catalogue(name)
@@ -131,7 +143,27 @@ for (const name of ['browser', 'brave']) {
     console.error(`  FAIL descriptions over ${policy.maxDescription}: ${tooLong.map((t) => `${t.name}(${t.description.length})`).join(', ')}`)
     failures += 1
   }
+  // Validator boilerplate is pure overhead in a tool catalogue: the proxy must
+  // delete it, and the fixture must prove the strip actually had work to do.
+  const baselineJson = JSON.stringify(baseline.tools)
+  const trimmedJson = JSON.stringify(tools)
+  const leaks = STRIPPED.filter((key) => trimmedJson.includes(JSON.stringify(key) + ':'))
+  if (leaks.length > 0) {
+    console.error(`  FAIL stripped keys survived the proxy: ${leaks.join(', ')}`)
+    failures += 1
+  }
+  const unexercised = STRIPPED.filter((key) => !baselineJson.includes(JSON.stringify(key) + ':'))
+  if (unexercised.length > 0) {
+    console.error(`  FAIL fixture never carried ${unexercised.join(', ')}; the strip assertion would be vacuous`)
+    failures += 1
+  }
+  const beforeStripped = STRIPPED.reduce((total, key) => total + baselineJson.split(JSON.stringify(key) + ':').length - 1, 0)
+  const afterStripped = STRIPPED.reduce((total, key) => total + trimmedJson.split(JSON.stringify(key) + ':').length - 1, 0)
+  console.log(`  stripKeys: ${beforeStripped} -> ${afterStripped} occurrences of ${STRIPPED.join('/')}`)
   const sample = tools[0]
+  if (sample !== undefined && sample.inputSchema) {
+    console.log(`  schema keys on ${sample.name}: ${Object.keys(sample.inputSchema).join(', ')}`)
+  }
   if (sample !== undefined) console.log(`  e.g. ${sample.name}: "${sample.description}"`)
 }
 process.exit(failures === 0 ? 0 : 1)
