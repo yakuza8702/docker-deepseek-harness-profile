@@ -200,7 +200,6 @@ fi
 [ -x "$GHIDRA_DIR/support/analyzeHeadless" ] || die "$GHIDRA_DIR/support/analyzeHeadless is missing"
 compgen -G "$GHIDRA_DIR/Ghidra/Features/Decompiler/os/*/decompile" >/dev/null 2>&1 \
   || die "Ghidra has no Decompiler/os/*/decompile binary — analysis would run but produce nothing"
-ln -sfn "$GHIDRA_DIR" /opt/ghidra
 chmod 0755 "$GHIDRA_DIR/support/analyzeHeadless" 2>/dev/null || true
 say "ghidra: $("$GHIDRA_DIR/support/analyzeHeadless" 2>&1 | grep -oE 'Ghidra [0-9.]+' | head -1 || echo "$GHIDRA_VERSION")"
 

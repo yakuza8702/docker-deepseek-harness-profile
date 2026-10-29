@@ -437,13 +437,21 @@ async function provisionAndroidGuest(name, { api = 35, variant = 'google_apis', 
 async function provisionReaGuest(name) {
   const result = await runGuestScript(name, REA_SCRIPT, {}, { timeoutSec: 3600, timeoutMs: 3900000 })
   const output = `${result.stdout}${result.stderr}`.trim()
-  if (result.code !== 0 || !/\[rea\] OK/u.test(output)) {
+  // A provisioned disk answers `[rea] already provisioned (v1)` and exits 0,
+  // exactly like the desktop layer's `[provision] already provisioned`.
+  // Without that arm a fully installed kit read as rea:false on every start,
+  // provision and recovery.
+  if (result.code !== 0 || !/\[rea\] OK|\[rea\] already provisioned/u.test(output)) {
     log(`rea: ${name} failed (${output.slice(-400)})`)
     return { ok: false, node: 'unknown', output }
   }
   // `say "OK node=... rea=... ghidra=... jdk=... jadx=..."` is the contract;
-  // the node version is the one field the panel cannot re-derive.
-  const node = (/\[rea\] OK[^\n]*\bnode=(v[0-9][^\s]*)/u.exec(output) || [])[1] || 'unknown'
+  // the node version is the one field the panel cannot re-derive. The
+  // already-provisioned early exit prints no such line, so fall back to the
+  // banner's own `node=v...` and finally to 'unknown'.
+  const node = (/\[rea\] OK[^\n]*\bnode=(v[0-9][^\s]*)/u.exec(output) || [])[1]
+    || (/\bnode=(v[0-9][^\s]*)/u.exec(output) || [])[1]
+    || 'unknown'
   log(`rea: ${name} ready (node ${node})`)
   return { ok: true, node, output }
 }
@@ -606,6 +614,35 @@ const REA_SCRIPT = String(process.env.DSH_CUA_REA_SCRIPT || '/usr/local/bin/cua-
  * the guest script's own free-space preflight is the backstop.
  */
 const REA_MIN_DISK_GB = 40
+/**
+ * The disk a record must actually have: the REA floor for a RE computer, the
+ * recorded size (20 GB when unset) otherwise. `cua sb create` always builds the
+ * stock disk, so every rebuild has to re-apply this — the same floor vmCreate
+ * applies at create time.
+ */
+function effectiveDiskGbFor(meta) {
+  const configured = Number(meta?.diskGb) > 0 ? Number(meta.diskGb) : 20
+  return meta?.rea === true ? Math.max(configured, REA_MIN_DISK_GB) : configured
+}
+
+/**
+ * Re-apply that size after a rebuild, mirroring vmCreate's own
+ * `effectiveDiskGb > 20` grow. growGuestDisk no-ops when the block device is
+ * already big enough. Android's identical rebuild gap is pre-existing and
+ * deliberately untouched here.
+ */
+async function regrowDiskAfterRebuild(name, meta) {
+  const needGb = effectiveDiskGbFor(meta)
+  if (meta?.rea !== true || needGb <= 20) return null
+  try {
+    const grown = await growGuestDisk(name, needGb)
+    log(`disk: ${name} ${grown && grown.changed ? `regrown to ${grown.sizeGb} GB` : `already ${grown && grown.sizeGb} GB`}`)
+    return grown
+  } catch (error) {
+    log(`disk: ${name} regrow failed (${error.message}); provisioning continues`)
+    return null
+  }
+}
 
 let systemQemuChecked = false
 let systemQemuHasVirgl = false
@@ -870,6 +907,11 @@ const handlers = {
                 state: 'ready'
               }
               writeRegistry(registry)
+              // The rebuilt disk is the base image at the stock build size, so
+              // the 40 GB REA floor vmCreate applied is gone even though the
+              // row still says diskGb: 40. Put the size back BEFORE the kit
+              // unpacks Ghidra into it.
+              await regrowDiskAfterRebuild(name, registry.vms[name])
               // The rebuilt disk is the base image, so every provisioned layer
               // is gone with it. Put the RE kit back when this computer had
               // one; the desktop provisioning happens on the next exec.
@@ -1110,6 +1152,10 @@ const handlers = {
         result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, meta.image, meta.gpu === true), { timeoutMs: 1500000 })
       }
       if (result.code !== 0) return fail((result.stderr || result.stdout).trim().slice(-800))
+      // Same rebuild, same lost floor: this disk came from base/meta.image (or
+      // a checkpoint whose size is not guaranteed), so re-apply the REA size
+      // before the kit is asked to fit into it.
+      await regrowDiskAfterRebuild(name, meta)
     }
     meta.state = 'ready'
     meta.lastUsed = new Date().toISOString()
