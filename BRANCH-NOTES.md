@@ -9,6 +9,11 @@ which is what `.github/workflows/docker-build.yml` resolves when
 `DSH_VERSION_PIN=""`. The build below pins that version explicitly so the image
 is reproducible.
 
+> **`rea` (from `feat/tool-trim`, `9d8033c`).** This branch adds the REA
+> reverse-engineering kit to the personal VM (§14). Everything above §14 is the
+> untouched `feat/cua-web` history; the tool-trim work landed in its own
+> section and is inherited through `feat/tool-trim`.
+
 ## 1. Cut: Android emulator (~5.16 GB uncompressed)
 
 Removed from the image:
@@ -481,3 +486,118 @@ and the id is in `DSH_MCP_MANAGER_HIDDEN` (default
 `browser-mcp,brave-devtools-mcp`). Live, version-independent, no restart, and
 `DSH_MCP_MANAGER_HIDDEN=""` shows everything again. The boot patch is still
 there as a belt-and-braces for the server-side list the tools read.
+
+---
+
+## §14 REA in the personal VM
+
+The model can already build and test inside the computer. What it could not do
+is answer *"how does this app work?"* with evidence: a stripped binary, an APK,
+a `.dll`, an Electron `app.asar`, a model file. REA (`rea`, Reverse Engineer
+Anything) is that answer, and it is a heavy one — its own Node, a JDK, Ghidra
+and JADX, ~3.5 GB installed.
+
+### Why it is a separate layer
+
+The desktop provisioning (`docker/cua-guest-provision.sh`, marker
+`/var/lib/cua-provision`, `MARKER_VERSION=6`) is about making a usable Linux
+machine: Xorg on virgl, 1200×750, the 9p share, KVM access. REA is a specialty
+toolchain that most workspaces never touch, and folding it in would charge every
+computer ~3.5 GB and several minutes for something it does not need. So it lives
+in `docker/cua-guest-rea.sh` with its **own marker, `/var/lib/cua-rea`**, versioned
+by `REA_MARKER_VERSION` (default `1`, independent of the provision script's `6`)
+and written **last**, only after `rea doctor --provider ghidra --json` passes.
+Two markers, two lifecycles: bumping the desktop provision to 7 must not
+re-download Ghidra, and fixing a JADX pin must not re-run Xorg. A computer
+created without `rea: true` never runs the script at all; Start on a RE
+computer re-runs it, and the marker makes that a no-op when nothing changed.
+
+### The 40 GB floor exists in three places
+
+Ghidra unpacks to ~1.4 GB; with the JDK, JADX, Node and `rea-agents` the kit is
+roughly 3.5 GB installed. On a stock 20 GB disk the unzip dies with `ENOSPC`,
+which looks like a corrupt download, not a sizing decision. So:
+
+* **the panel** raises the Disk field to 40 the moment *Enable REA* is ticked,
+  and floors the input at 40 while it is ticked (client-side, so the number on
+  screen is the number sent);
+* **the supervisor** clamps independently — `REA_MIN_DISK_GB = 40`,
+  `effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb`
+  — and returns `diskGbRaised`, so a tool-created computer is floored even with
+  no panel in the loop;
+* **the tool schema** says `Disk size in GB (Android and REA: 40)` and the `rea`
+  property says it is raised to 40.
+
+The **store quota is deliberately not raised**. `diskQuotaGb` is the user's
+budget for the whole volume, and silently spending another 20 GB of their disk
+would be the wrong fix. The panel refuses instead, with the exact sentence:
+"The VM store quota is N GB, so a 40 GB REA disk cannot be created. Raise Disk
+Size in the Policy tab first."
+
+### Awareness is gated, so a non-REA workspace pays nothing
+
+A paragraph telling the model to reach for Ghidra is worth its tokens on a
+reverse-engineering turn and is noise on every other one — worse, it would point
+at a `rea` binary the computer does not have. But the prompt path is
+synchronous and must never wait on a socket.
+
+So `index.js` keeps `reaCache = { at: 0, vms: [] }` filled out of band, and the
+section is a closure:
+
+* `text: () => …` reads `reaCache.vms` synchronously; when the cache is older
+  than `REA_CACHE_TTL_MS` (30 s) it schedules a refresh with `void` and answers
+  from what it already knows;
+* one initial `vmList` plus a 30 s interval, both inside `ctx.effect`, the timer
+  `unref()`'d and cleared by the effect's disposer, so the cache is warm for a
+  session that never opens the page and cannot keep the process alive;
+* the cheap write-through points — `/cua/state` (which the panel already polls),
+  `/cua/create`, `/cua/start`, `/cua/delete`, and `cua_vm_create` — call
+  `refreshReaCache()`, so creating a RE computer adds the paragraph immediately
+  and deleting the last one removes it;
+* a refresh that fails does not retry per assembly: it moves `at` forward and
+  keeps the names it had.
+
+Empty cache, ordinary prompt: byte-identical to before, no socket, no tokens.
+One or more RE computers, and exactly one extra paragraph names them.
+
+### The registry-persistence trap
+
+`ensure()` rebuilds a VM by re-creating it from the registry row. Its recovery
+path used to write a **fresh literal** for the rebuilt entry — dropping
+`gpu`, `android`, `diskGb` and `image` — so a RE computer that recovered from a
+dead QEMU process came back as a plain desktop and quietly lost its kit. Both
+literals now start from `...(known || {})` and the recovery path re-provisions
+with `known?.rea === true` (`rea: rea === true` is kept in the created row, so
+the next Start sees it). One thing is still out of scope: the recovered disk is
+the base image, so a computer bigger than 20 GB does **not** get its disk grown
+back automatically — `cua_vm_disk` is the explicit fix, and the size is still in
+the row for the panel to show before it is grown.
+
+### The build gate
+
+`tools/check-cua-rea.mjs` asserts the chain hop by hop, because every hop is a
+string: the guest script's marker, pin and doctor call; the supervisor's
+`DSH_CUA_REA_SCRIPT`, `REA_MIN_DISK_GB`, `provisionReaGuest` call sites and
+`...(known || {})` spreads; the Dockerfile's `COPY` of the script and its `RUN`
+of the checker; and — the two files that only agree by spelling — `client.js`
+(`rea: false`, `rea: draft.rea`) and `index.js`
+(`rea: { type: 'boolean'`, `input.rea === true`). It accepts `--root` for the
+flat image layout and prints every missing needle at once.
+
+The Dockerfile copies the script at build time, and at the bottom of the stage
+copies the five files flat into `/opt/seek-harness/cua-check/` and runs
+`node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check`,
+then deletes the scratch directory (including the Dockerfile copy, which is only
+there to prove the two lines above still exist). A renamed script or a dropped
+`rea` field fails the build instead of shipping a plain desktop that reads like
+a RE workstation.
+
+### Evidence
+
+Stage 1 (`9d8033c`, guest script + supervisor + gate + Dockerfile): `bash -n`
+on both new/edited scripts green, `node --check` on the supervisor green,
+`node tools/check-cua-rea.mjs` at **60/66** — the three stage-1 files fully green
+and exactly the six stage-2 needles (three in `client.js`, three in `index.js`)
+red, which is what a gate is supposed to look like before its half exists.
+This commit closes those six: the gate is **66/66** with `node --check` green on
+both plugin files.

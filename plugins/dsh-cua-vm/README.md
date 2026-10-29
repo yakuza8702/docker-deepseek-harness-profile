@@ -38,6 +38,70 @@ write to a unix socket under `/tmp`, which `workspace-write` already allows.
 One VM per workspace, named `ws-<sha256(workspace)[0:12]>`, recorded in
 `/cua-vm/registry.json` — never in the workspace.
 
+## REA in the computer
+
+`cua_vm_create` with `rea: true` (or **Enable REA** in New computer) installs
+the reverse-engineering kit *inside* the guest, from
+`docker/cua-guest-rea.sh` — a real file, not a blob in the supervisor, so it can
+be read, diffed and run by hand.
+
+| Component | What lands in the guest |
+|---|---|
+| Node | `v22.23.4` in `/opt/node22`, symlinked into `/usr/local/bin` (`node`, `npm`, `npx`) |
+| `rea-agents` | CLI + MCP server from npm (global root), entry `…/rea-agents/scripts/rea.mjs` |
+| JDK | `openjdk-21-jdk-headless` — Ghidra and JADX both run on it |
+| Ghidra | `12.1.4` unpacked at `/opt/ghidra`, `support/analyzeHeadless` + the native `decompile` binary |
+| JADX | `1.5.6` plus the pinned `jadx-headless-mcp-0.7.1-all.jar` (sha256-verified) in `/opt/rea/android` |
+| `procps` | `ps`/`top` for the doctor's process probes |
+
+**Disk floor: 40 GB.** Ghidra unpacks to ~1.4 GB and the JDK, JADX, Node and
+`rea-agents` add up to roughly 3.5 GB installed; on a stock 20 GB disk the unzip
+dies with `ENOSPC`, which reads like a corrupt download rather than a sizing
+mistake. So the floor exists in three places: the panel raises the Disk field to
+40 when the box is ticked, the supervisor clamps `effectiveDiskGb` to
+`REA_MIN_DISK_GB` and reports `diskGbRaised`, and the tool schema says so. The
+store quota is *not* raised automatically — if `/cua-vm/config.json` still has
+`diskQuotaGb: 20`, the create is refused and the panel says: "The VM store quota
+is N GB, so a 40 GB REA disk cannot be created. Raise Disk Size in the Policy
+tab first."
+
+**The environment reaches the guest three ways.** `/etc/profile.d/rea.sh` for
+login shells (`JAVA_HOME`, `GHIDRA_INSTALL_DIR`, `REA_ANALYSIS_PROVIDER=ghidra`,
+`REA_JADX_MCP_JAR`, and `/opt/node22/bin` prepended to `PATH`),
+`/etc/environment` as `KEY="value"` for PAM sessions, and
+`/etc/systemd/system/cua-spacesd.service.d/20-rea.conf` for the desktop session
+— which is the one that matters, because `cua sb exec` children inherit *that*
+session, not the provisioning shell. The drop-in is applied with a detached
+`setsid sh -c 'sleep 5; systemctl daemon-reload; systemctl restart cua-spacesd'`,
+so restarting spacesd does not kill the script that is restarting it.
+
+**Registration is non-interactive.** `rea setup --client dsh --yes --json` writes
+the MCP row itself; if it does not, the script appends the same fragment by hand
+to `/home/cua/.dsh/cordis.patch.yml` — row `id: rea-mcp`, `name:
+'@deepseek-ai/dsh-mcp-client'`, `serverName: rea`, stdio through the pinned
+`node` with `GHIDRA_INSTALL_DIR`/`JAVA_HOME`/`REA_ANALYSIS_PROVIDER`/
+`REA_JADX_MCP_JAR` in `env`. `rea setup --skill --yes --json` installs the
+skills. Note what this is **not**: the harness image needs no MCP row of its own
+— agents reach REA through `cua_vm_exec`, and the row belongs to a DSH instance
+running *inside* the guest.
+
+The marker `/var/lib/cua-rea` is written **last**, only after
+`rea doctor --provider ghidra --json` passes, so a half-installed kit is retried
+instead of remembered as done.
+
+Verify from the model side:
+
+```
+cua_vm_status                     # the row carries rea=yes
+cua_vm_exec → node -v             # v22.23.4
+cua_vm_exec → rea --version
+cua_vm_exec → rea doctor --provider ghidra --json
+cua_vm_exec → java -version       # 21
+cua_vm_exec → ls -l $GHIDRA_INSTALL_DIR/support/analyzeHeadless
+cua_vm_exec → ls -l $REA_JADX_MCP_JAR
+cua_vm_exec → cat /var/lib/cua-rea   # version/node/rea/ghidra/jdk/jadx/registered
+```
+
 ## Isolation rules the supervisor enforces
 
 * every host path is resolved and must stay under `CUA_WORKSPACE_ROOT`;
@@ -60,6 +124,7 @@ holds `autoSuspend`, `idleSuspendMinutes` (default 30, `0` disables),
 Plugins page (Personal VM → Settings). The supervisor re-reads it every minute,
 so a saved change needs no restart; a command in flight postpones the suspend.
 | `CUA_SUPERVISOR_SOCK` | `/tmp/cua-vm/supervisor.sock` | control socket |
+| `DSH_CUA_REA_SCRIPT` | `/usr/local/bin/cua-guest-rea.sh` | Guest script path (debugging) |
 
 ## Requirements
 

@@ -80,6 +80,45 @@ const textOutput = (description) => ({
   render: (_args, value) => [{ type: 'text', text: value.text }]
 })
 
+/**
+ * The prompt the model always reads. Kept as lines so the REA paragraph can be
+ * appended as one more sentence-pair, not rewrapped by hand.
+ */
+const CUA_PROMPT_LINES = [
+  'This workspace has a personal Linux computer (a QEMU VM) driven by `cua_vm_*`; the user manages theirs in Plugins → Personal VM.',
+  'Treat it as your own machine: install what the task needs there (apt, npm, pip, SDKs), build and test there, copy the artifact back with `cua_vm_get`, never install project toolchains into the harness image.',
+  'Its `/workspace` is this same directory over 9p (files appear on both sides); if the share is missing, `cua_vm_put`/`cua_vm_get` still copy.',
+  'Build inside the VM, not over the share, for thousand-file builds: copy the source to /tmp/build (or /home/cua/build), build, copy the artifact back — 9p carries source and results, not object files.',
+  'Drive the desktop with `cua_vm_gui`: screenshot, click, type, hotkeys, drag, scroll, `zoom` to crop.',
+  'COORDINATES: x/y is a pixel in the screenshot you just took, origin top-left; `cua_vm_gui` maps it to the display, so click the pixel you see — never rescale, never offset — the desktop is 1200x750.',
+  'Choose deliberately: the shell for anything a command can do (gradle, adb, blender -b, apt, tests), the desktop for visual work or when the user says show me, click or test the UI.',
+  'Before clicking, take the position from `a11y` (element bounds) or `windows`, then screenshot to confirm; without vision, trust the a11y bounds over guessed pixels.',
+  'Before creating a computer, ask with `ask_user_question` for name, vCPU/RAM and image unless the user said so — never invent a spec silently — and say Debian and Arch need a built Cua disk, not a substitute image.',
+  'For Android, Blender, WebGL or 3D work create it with `gpu: true` unless told otherwise (say so if the image or host cannot); an Android app is `cua_vm_create` with gpu, cpu 4, memory 8, diskGb 40, then `cua_vm_android` once (SDK + AVD), `cua-emulator` (`-no-window` for adb tests), `adb devices` before the APK, `cua_vm_exec` → `ls -l /dev/kvm` for nested KVM.',
+  'On a GPU computer Xorg runs on virgl and reports OpenGL 4.3 (Mesa under-reports 4.2; the session lifts it); if an app refuses, check `cua_vm_gui geometry` or `glxinfo -B`, and use `LIBGL_ALWAYS_SOFTWARE=1` (llvmpipe, slower) only as a genuine, stated fallback.',
+  'The VM persists across turns and stops only when the user asks; if a tool reports no VM, call `cua_vm_ensure` once, then `cua_vm_exec`.',
+  'For reverse-engineering work — a feature to reimplement, a suspicious binary, an APK, an Electron app, a model file — create the computer with `rea: true` (and let the disk be at least 40 GB); REA is not installed on a computer created without it, and installing it by hand inside a 20 GB disk is the wrong fix.'
+]
+
+const CUA_PROMPT_BASE = CUA_PROMPT_LINES.join(' ')
+
+/**
+ * REA awareness, appended only when `reaCache` knows a computer has the kit.
+ * Six sentences: where it is, how to call it, the analysis verbs, the coverage
+ * the JSON actually proves, how to report evidence, and where the engine lives.
+ */
+function reaParagraph(names) {
+  const where = names.length === 1 ? `the computer ${names[0]}` : `the computers ${names.join(', ')}`
+  return [
+    `REA (\`rea\`, Reverse Engineer Anything) is installed in ${where} and is the right tool for "how does this app work, show me the evidence".`,
+    'Run it through `cua_vm_exec`, never from the harness shell: `rea --help`, then `rea doctor --json` and `rea doctor --provider ghidra --json` before trusting an analysis.',
+    'Analysis verbs: `rea analyze ghidra` for a native binary, `rea search --kind procedures` to find a symbol, `rea analyze-javascript-application` for a JS or Electron tree, `rea inspect-managed-artifact` and `rea inspect-managed-members` for .NET, `rea inspect-android-package`, `rea search-android-classes`, `rea inspect-android-method` and `rea trace-android-references` for an APK, `rea inspect-analysis-view` to page through whatever was already analyzed.',
+    'Coverage comes from the JSON, not from a hunch: `analyze ghidra`, `search --kind procedures`, `analyze-javascript-application`, `inspect-managed-artifact`, `inspect-managed-members`, `inspect-android-package`, `search-android-classes`, `inspect-android-method`, `trace-android-references`, `inspect-analysis-view` — each one answers what it ran on and what it could not see.',
+    'Read the JSON, not the banner: state only what the evidence supports, name the unknowns explicitly, and when an output is large write it to a file and page it with `rea inspect-analysis-view` instead of pasting it.',
+    'Static JavaScript and .NET need no native engine, so only native work needs Ghidra — the provider here — and a provider error is usually a missing or relative `GHIDRA_INSTALL_DIR` path; build and test the reimplementation in the same computer, then copy the artifact back with `cua_vm_get`.'
+  ].join(' ')
+}
+
 export function apply(ctx, config = {}) {
   const socketPath = config.socketPath ?? '/tmp/cua-vm/supervisor.sock'
   const workspaceRoot = config.workspaceRoot ?? '/workspace'
@@ -89,6 +128,40 @@ export function apply(ctx, config = {}) {
   const maxOutputChars = config.maxOutputChars ?? 8000
 
   const call = (payload) => request(socketPath, payload)
+
+  /**
+   * REA AWARENESS IS GATED, NOT FREE.
+   *
+   * A paragraph telling the model to reach for Ghidra is worth its tokens on a
+   * reverse-engineering turn and is noise on every other one — worse, it would
+   * point at a `rea` binary the computer does not have. So the paragraph is
+   * appended only while a computer in this registry carries `rea: true`, and
+   * the answer comes from a cache filled out of band: the prompt path reads
+   * `reaCache.vms` synchronously and never touches the socket. A refresh that
+   * runs anyway (30 s TTL, on /cua/state, after create/start/delete) is a
+   * single `vmList`, so a non-REA workspace pays zero prompt-path cost.
+   */
+  const REA_CACHE_TTL_MS = 30_000
+  const reaCache = { at: 0, vms: [] }
+
+  /** The registry is `{ name: meta }`; a computer opts in with `rea: true`. */
+  function rememberRea(registry) {
+    reaCache.vms = Object.entries(registry ?? {})
+      .filter(([, vm]) => vm?.rea === true)
+      .map(([name]) => name)
+      .sort()
+    reaCache.at = Date.now()
+  }
+
+  async function refreshReaCache() {
+    try {
+      rememberRea((await call({ op: 'vmList' })).registry)
+    } catch {
+      // A supervisor that is not up yet must not make every assembly retry:
+      // back the same 30 s window off, and keep the names already known.
+      reaCache.at = Date.now()
+    }
+  }
 
   /**
    * The Personal VM page's own API. It speaks the same socket as the tools, so
@@ -116,13 +189,32 @@ export function apply(ctx, config = {}) {
         switch (action) {
           case 'state': {
             const [config, list] = await Promise.all([call({ op: 'configGet' }), call({ op: 'vmList' })])
+            // The page polls this every few seconds while a machine starts, so
+            // it is also the cheapest place to keep the REA cache warm.
+            rememberRea(list.registry)
             return send(200, { ok: true, config: config.config, usedBytes: config.usedBytes, vms: list.registry })
           }
           case 'config': return send(200, { ok: true, ...(await call({ op: 'configSet', config: await body() })) })
-          case 'create': return send(200, { ok: true, ...(await call({ op: 'vmCreate', ...(await body()) })) })
-          case 'start': return send(200, { ok: true, ...(await call({ op: 'vmStart', ...(await body()) })) })
+          case 'create': {
+            const answer = await call({ op: 'vmCreate', ...(await body()) })
+            // A computer created with `rea: true` is provisioned by the time
+            // this answers, so the awareness paragraph can appear at once
+            // instead of up to 30 s later.
+            void refreshReaCache()
+            return send(200, { ok: true, ...answer })
+          }
+          case 'start': {
+            const answer = await call({ op: 'vmStart', ...(await body()) })
+            void refreshReaCache()
+            return send(200, { ok: true, ...answer })
+          }
           case 'stop': return send(200, { ok: true, ...(await call({ op: 'stop', ...(await body()) })) })
-          case 'delete': return send(200, { ok: true, ...(await call({ op: 'vmDelete', ...(await body()) })) })
+          case 'delete': {
+            const answer = await call({ op: 'vmDelete', ...(await body()) })
+            // Deleting the last REA computer has to take the paragraph with it.
+            void refreshReaCache()
+            return send(200, { ok: true, ...answer })
+          }
           case 'exec': return send(200, { ok: true, ...(await call({ op: 'exec', ...(await body()) })) })
           case 'metrics': return send(200, { ok: true, ...(await call({ op: 'vmMetrics', ...(await body()) })) })
           case 'view': return send(200, { ok: true, ...(await call({ op: 'view', ...(await body()) })) })
@@ -141,21 +233,24 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'tool:cua_vm',
     order: 120,
-    text: [
-      'This workspace has a personal Linux computer (a QEMU VM) driven by `cua_vm_*`; the user manages theirs in Plugins → Personal VM.',
-      'Treat it as your own machine: install what the task needs there (apt, npm, pip, SDKs), build and test there, copy the artifact back with `cua_vm_get`, never install project toolchains into the harness image.',
-      'Its `/workspace` is this same directory over 9p (files appear on both sides); if the share is missing, `cua_vm_put`/`cua_vm_get` still copy.',
-      'Build inside the VM, not over the share, for thousand-file builds: copy the source to /tmp/build (or /home/cua/build), build, copy the artifact back — 9p carries source and results, not object files.',
-      'Drive the desktop with `cua_vm_gui`: screenshot, click, type, hotkeys, drag, scroll, `zoom` to crop.',
-      'COORDINATES: x/y is a pixel in the screenshot you just took, origin top-left; `cua_vm_gui` maps it to the display, so click the pixel you see — never rescale, never offset — the desktop is 1200x750.',
-      'Choose deliberately: the shell for anything a command can do (gradle, adb, blender -b, apt, tests), the desktop for visual work or when the user says show me, click or test the UI.',
-      'Before clicking, take the position from `a11y` (element bounds) or `windows`, then screenshot to confirm; without vision, trust the a11y bounds over guessed pixels.',
-      'Before creating a computer, ask with `ask_user_question` for name, vCPU/RAM and image unless the user said so — never invent a spec silently — and say Debian and Arch need a built Cua disk, not a substitute image.',
-      'For Android, Blender, WebGL or 3D work create it with `gpu: true` unless told otherwise (say so if the image or host cannot); an Android app is `cua_vm_create` with gpu, cpu 4, memory 8, diskGb 40, then `cua_vm_android` once (SDK + AVD), `cua-emulator` (`-no-window` for adb tests), `adb devices` before the APK, `cua_vm_exec` → `ls -l /dev/kvm` for nested KVM.',
-      'On a GPU computer Xorg runs on virgl and reports OpenGL 4.3 (Mesa under-reports 4.2; the session lifts it); if an app refuses, check `cua_vm_gui geometry` or `glxinfo -B`, and use `LIBGL_ALWAYS_SOFTWARE=1` (llvmpipe, slower) only as a genuine, stated fallback.',
-      'The VM persists across turns and stops only when the user asks; if a tool reports no VM, call `cua_vm_ensure` once, then `cua_vm_exec`.'
-    ].join(' ')
+    // Synchronous by construction: the cache may be up to 30 s old, and a
+    // prompt must never wait on a socket. A stale read schedules the refresh
+    // and answers from what it already knows.
+    text: () => {
+      if (Date.now() - reaCache.at > REA_CACHE_TTL_MS) void refreshReaCache()
+      return reaCache.vms.length === 0 ? CUA_PROMPT_BASE : CUA_PROMPT_BASE + ' ' + reaParagraph(reaCache.vms)
+    }
   })
+
+  // Keep the cache warm even for a session that never opens the page: one
+  // vmList every 30 s, unref'd so it can never hold the process open, and
+  // cleared with the plugin. The initial fill is the same call.
+  ctx.effect(() => {
+    void refreshReaCache()
+    const timer = setInterval(() => { void refreshReaCache() }, REA_CACHE_TTL_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => clearInterval(timer)
+  }, 'cua-vm: rea awareness cache')
 
   ctx.tools.register({
     name: 'cua_vm_status',
@@ -174,6 +269,7 @@ export function apply(ctx, config = {}) {
         `cpu=${vm.cpu}`,
         `memory=${vm.memory}GB`,
         vm.lastUsed ? `lastUsed=${vm.lastUsed}` : null,
+        vm.rea === true ? 'rea=yes' : null,
         vm.lastCommand ? `lastCommand=${vm.lastCommand}` : null
       ].filter(Boolean).join(' · '))
       return { text: lines.join('\n') }
@@ -210,7 +306,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_create',
-    description: 'New computer: name, vCPU, RAM, image, gpu, diskGb, android. Ask the user for the spec first.',
+    description: 'New computer: name, vCPU, RAM, image, gpu, diskGb, android, rea. Ask the user for the spec first.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -221,11 +317,12 @@ export function apply(ctx, config = {}) {
         memory: { type: 'number', description: 'RAM in GB (default 4).' },
         image: { type: 'string', description: 'Image reference. Default "linux" (Ubuntu 24.04 slim Cua disk).' },
         gpu: { type: 'boolean', description: 'virgl GPU for 3D/Android/Blender.' },
-        diskGb: { type: 'number', description: 'Disk size in GB (Android: 40).' },
-        android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating.' }
+        diskGb: { type: 'number', description: 'Disk size in GB (Android and REA: 40).' },
+        android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating.' },
+        rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true.' }
       }
     },
-    output: textOutput('The computer, its renderer, disk and Android status.'),
+    output: textOutput('The computer, its renderer, disk, Android and REA status.'),
     async execute(input) {
       const answer = await call({ op: 'vmCreate', ...input })
       const parts = [`${answer.name} is ${answer.state}${input.gpu === true ? ' with a GPU (virgl)' : ''}.`]
@@ -233,6 +330,15 @@ export function apply(ctx, config = {}) {
       if (answer.disk && answer.disk.ok === false) parts.push(`Disk: ${answer.disk.error}`)
       else if (answer.disk && answer.disk.changed) parts.push(`Disk grown to ${answer.disk.sizeGb} GB (guest: ${answer.disk.guest || 'unknown'}).`)
       if (input.android === true) parts.push(answer.android ? 'Android SDK provisioned; boot it with `cua-emulator`.' : 'Android provisioning did not finish — see the output below.')
+      // `rea` is true only when the guest's own marker was written after a
+      // passing `rea doctor`; undefined/false means the kit is not there, and
+      // Start re-runs the idempotent script.
+      if (input.rea === true) parts.push(answer.rea ? 'REA is ready. Verify with `cua_vm_exec` → `rea doctor --provider ghidra --json`.' : 'REA provisioning did not finish — see the output below, then `cua_vm_start` once to retry (it is idempotent).')
+      // The supervisor's own floor; the panel raises the field too, but the
+      // tool is reachable without the panel.
+      if (answer.diskGbRaised !== undefined) parts.push(`Disk was raised to ${answer.diskGbRaised} GB: the REA kit does not fit below 40 GB.`)
+      // The paragraph must follow the create, not the next 30 s tick.
+      if (input.rea === true) void refreshReaCache()
       if (answer.output) parts.push(`\n${answer.output}`)
       return { text: parts.join(' ') }
     }

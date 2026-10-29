@@ -48,6 +48,11 @@ Components:
   Terminal, Metrics, Delete. Terminal and Metrics are **toggles**.
 * **New computer**: name, vCPU, RAM (GB), Image, **Enable GPU** — one row.
   Shutdown asks "Do you want to shutdown <name>?" first.
+* **Enable REA** — third checkbox in New computer: installs Node 22,
+  rea-agents, JDK 21, Ghidra 12.1.4, JADX and the pinned jadx-headless-mcp jar,
+  roughly 3.5 GB installed on a 40 GB disk; the Disk field rises to 40 when
+  ticked and the card warns when the store quota is below it. Computers carry an
+  **REA** badge.
 * **Policy**: auto-suspend, idle minutes, **Disk Size (GB)**, max running.
   "Shutdown frees a slot, disks are untouched."
 * **Viewer**: `Video` (cua stream, HTTPS) or `Frames (http)`; the agent's cursor
@@ -156,6 +161,12 @@ plain HTTP gets).
 ---
 
 ## 5. Fixes shipped (newest first)
+
+* **REA kit + gated awareness.** `rea: true` provisions the stack through its
+  own idempotent script/marker; the prompt gains an REA paragraph only when a
+  computer in the workspace has it, via a sync cache over vmList that never
+  touches the socket on the prompt path. Also fixes `ensure()` dropping
+  `gpu`/`android`/`diskGb`/`image`. Build gate: `tools/check-cua-rea.mjs`.
 
 | Commit | Fix |
 |---|---|

@@ -218,7 +218,7 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState(null)
       const [note, setNote] = useState(null)
       const [showNew, setShowNew] = useState(false)
-      const [draft, setDraft] = useState({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false, diskGb: 20, android: false })
+      const [draft, setDraft] = useState({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false, diskGb: 20, android: false, rea: false })
       const [pending, setPending] = useState(null)
       const [exec, setExec] = useState(null)
       const [form, setForm] = useState(null)
@@ -265,11 +265,11 @@ window.__ModuleLoader__.load({
 
       const create = async () => {
         setPending({ name: draft.name, action: 'create' })
-        setNote(`Creating ${draft.name}${draft.gpu ? ' with GPU' : ''}${draft.android ? ' + Android SDK' : ''}… the first start also provisions the guest (a minute or two).`)
+        setNote(`Creating ${draft.name}${draft.gpu ? ' with GPU' : ''}${draft.android ? ' + Android SDK' : ''}${draft.rea ? ' + REA' : ''}… the first start also provisions the guest (a minute or two).${draft.rea ? ' The REA kit adds several minutes for Node 22, rea-agents, a JDK, Ghidra and JADX.' : ''}`)
         try {
-          await api('create', { name: draft.name, cpu: draft.cpu, memory: draft.memory, image: draft.image, gpu: draft.gpu, diskGb: draft.diskGb, android: draft.android })
+          await api('create', { name: draft.name, cpu: draft.cpu, memory: draft.memory, image: draft.image, gpu: draft.gpu, diskGb: draft.diskGb, android: draft.android, rea: draft.rea })
           setShowNew(false)
-          setDraft({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false, diskGb: 20, android: false })
+          setDraft({ name: '', cpu: 2, memory: 4, image: 'linux', gpu: false, diskGb: 20, android: false, rea: false })
           await load()
           setNote(`${draft.name} is up.`)
         } catch (error) {
@@ -336,6 +336,11 @@ window.__ModuleLoader__.load({
       }
 
       const vms = Object.entries(state.vms ?? {})
+      // The REA kit does not fit in a stock 20 GB disk (Ghidra alone unpacks to
+      // ~1.4 GB and the JDK, JADX and Node pile on top), so the field floors at
+      // 40 the moment the box is ticked — before the supervisor's own clamp has
+      // to save the create.
+      const diskFloorGb = draft.rea === true ? 40 : 20
 
       return h('div', { style: S.page },
         h('div', { style: S.head },
@@ -371,7 +376,10 @@ window.__ModuleLoader__.load({
                   h('option', { value: 'ghcr.io/trycua/linux:24.04' }, 'Ubuntu 24.04 full')
                 )),
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'Disk (GB)'),
-                h('input', { type: 'number', min: 20, max: 200, step: 10, value: draft.diskGb, style: S.input, onChange: (event) => setDraft({ ...draft, diskGb: Number(event.target.value) }) })),
+                h('input', {
+                  type: 'number', min: diskFloorGb, max: 200, step: 10, value: draft.diskGb, style: S.input,
+                  onChange: (event) => setDraft({ ...draft, diskGb: Math.max(diskFloorGb, Number(event.target.value)) })
+                })),
               h('div', { style: { display: 'grid', gap: 4, paddingBottom: 2 } },
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 } },
                   h('input', {
@@ -386,10 +394,21 @@ window.__ModuleLoader__.load({
                     onChange: (event) => setDraft({ ...draft, android: event.target.checked })
                   }),
                   'Install Android'
+                ),
+                h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 } },
+                  h('input', {
+                    type: 'checkbox', checked: draft.rea === true,
+                    // Ticking REA raises the disk with it: the kit is ~3.5 GB
+                    // installed and Ghidra refuses to unpack on a full volume.
+                    onChange: (event) => setDraft({ ...draft, rea: event.target.checked, diskGb: event.target.checked ? Math.max(40, draft.diskGb) : draft.diskGb })
+                  }),
+                  'Enable REA'
                 )
               )
             ),
-            h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field.'),
+            h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Enable REA adds Node 22, rea-agents, a JDK 21, Ghidra 12.1.4 and JADX to the computer, roughly 3.5 GB installed, and lifts the disk to at least a 40 GB one. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field.'),
+            draft.rea === true && form.diskQuotaGb < 40 && h('div', { style: { ...S.muted, color: T.error } },
+              `The VM store quota is ${form.diskQuotaGb} GB, so a 40 GB REA disk cannot be created. Raise Disk Size in the Policy tab first.`),
             h('div', { style: S.row },
               h('button', { type: 'button', style: S.primary, disabled: pending !== null || draft.name.trim() === '', onClick: () => void create() }, pending?.action === 'create' ? 'Creating…' : 'Create computer')
             )
@@ -410,6 +429,7 @@ window.__ModuleLoader__.load({
                   h('span', { style: S.badge(ready) }, vm.state ?? 'unknown'),
                   vm.gpu === true && h('span', { style: { ...S.badge(false), color: T.info } }, 'GPU'),
                   vm.android === true && h('span', { style: { ...S.badge(false), color: T.success, border: `1px solid ${T.line}`, background: 'rgba(126, 231, 135, .14)' } }, 'Android'),
+                  vm.rea === true && h('span', { style: { ...S.badge(false), color: T.info, border: `1px solid ${T.line}`, background: 'rgba(138, 180, 255, .14)' } }, 'REA'),
                   vm.diskGb > 0 && h('span', { style: { ...S.badge(false), color: T.caption } }, `${vm.diskGb} GB`),
                   h('span', { style: { ...S.muted, marginLeft: 'auto' } }, `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · ${vm.image ?? 'linux'}`)
                 ),
