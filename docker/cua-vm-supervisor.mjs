@@ -427,6 +427,28 @@ async function provisionAndroidGuest(name, { api = 35, variant = 'google_apis', 
 }
 
 /**
+ * The REA kit inside the guest: JDK, its own Node, rea-agents, Ghidra 12.1.4,
+ * jadx + jadx-headless-mcp, the persisted environment, and the MCP row in the
+ * guest user's own profile. One-off per computer and slow (a 1.4 GB Ghidra
+ * download), hence an hour of headroom: a 15-minute timeout here would kill
+ * healthy downloads on a slow link and then report a provisioning failure that
+ * was really a too-short deadline.
+ */
+async function provisionReaGuest(name) {
+  const result = await runGuestScript(name, REA_SCRIPT, {}, { timeoutSec: 3600, timeoutMs: 3900000 })
+  const output = `${result.stdout}${result.stderr}`.trim()
+  if (result.code !== 0 || !/\[rea\] OK/u.test(output)) {
+    log(`rea: ${name} failed (${output.slice(-400)})`)
+    return { ok: false, node: 'unknown', output }
+  }
+  // `say "OK node=... rea=... ghidra=... jdk=... jadx=..."` is the contract;
+  // the node version is the one field the panel cannot re-derive.
+  const node = (/\[rea\] OK[^\n]*\bnode=(v[0-9][^\s]*)/u.exec(output) || [])[1] || 'unknown'
+  log(`rea: ${name} ready (node ${node})`)
+  return { ok: true, node, output }
+}
+
+/**
  * Window titles with the desktop's own furniture removed. XFCE registers the
  * session, the WM, the settings daemon, the panel and one window per panel
  * plugin; none of them is a click target and together they pushed the real
@@ -565,6 +587,25 @@ const SHARE_TAG = String(process.env.DSH_CUA_VM_SHARE_TAG || 'dshworkspace')
 const DESKTOP_RESOLUTION = String(process.env.DSH_CUA_VM_RESOLUTION || '1200x750')
 const PROVISION_SCRIPT = String(process.env.DSH_CUA_PROVISION_SCRIPT || '/usr/local/bin/cua-guest-provision.sh')
 const ANDROID_SCRIPT = String(process.env.DSH_CUA_ANDROID_SCRIPT || '/usr/local/bin/cua-guest-android.sh')
+/**
+ * THE REVERSE-ENGINEERING KIT (REA)
+ * ---------------------------------
+ * Ghidra + jadx + the rea-agents MCP server, installed INSIDE the guest as its
+ * own layer with its own marker (/var/lib/cua-rea). It is deliberately not
+ * folded into the desktop provisioning: a computer created without `rea: true`
+ * must never pay for a ~2 GB download, and a version bump on one layer must not
+ * invalidate the other. Same contract as provisionGuest — idempotent, and the
+ * marker is written only after `rea doctor` passes.
+ */
+const REA_SCRIPT = String(process.env.DSH_CUA_REA_SCRIPT || '/usr/local/bin/cua-guest-rea.sh')
+/**
+ * A REA computer is never smaller than this. Ghidra unpacks to ~1.4 GB, the
+ * JDK and its own Node add ~1 GB, jadx another ~150 MB on top of a 20 GB
+ * desktop — a 20 GB disk dies mid-unzip with ENOSPC, and the failure reads
+ * like a corrupt download rather than a sizing mistake. Create-time floors it;
+ * the guest script's own free-space preflight is the backstop.
+ */
+const REA_MIN_DISK_GB = 40
 
 let systemQemuChecked = false
 let systemQemuHasVirgl = false
@@ -815,6 +856,11 @@ const handlers = {
                 return fail(`the VM could not be resumed or recreated: ${(recreated.stderr || recreated.stdout).trim().slice(-1200)}`)
               }
               registry.vms[name] = {
+                // Everything the old row knew (rea, diskGb, image, android …)
+                // survives the rebuild. Only the disk did not — and dropping
+                // `rea` here would quietly turn a RE computer back into a
+                // plain desktop the next time it restarted.
+                ...(known || {}),
                 workspace: real,
                 tier: String(known?.tier || tier),
                 cpu: known?.cpu || cpu,
@@ -824,7 +870,12 @@ const handlers = {
                 state: 'ready'
               }
               writeRegistry(registry)
-              return ok({ name, state: 'ready', created: true, recovered: true, tier: registry.vms[name].tier })
+              // The rebuilt disk is the base image, so every provisioned layer
+              // is gone with it. Put the RE kit back when this computer had
+              // one; the desktop provisioning happens on the next exec.
+              const reaBack = known?.rea === true ? await provisionReaGuest(name) : null
+              if (reaBack !== null) log(`recovering ${name}: rea ${reaBack.ok ? 're-provisioned' : 're-provision failed'}`)
+              return ok({ name, state: 'ready', created: true, recovered: true, tier: registry.vms[name].tier, rea: reaBack ? reaBack.ok : undefined })
             }
           }
         }
@@ -854,6 +905,9 @@ const handlers = {
         tier: String(tier),
         cpu,
         memory,
+        // A plain computer gets no RE kit. `rea: true` at create opts in, and
+        // the field is what makes every later start re-provision it.
+        rea: false,
         createdAt: new Date().toISOString(),
         lastUsed: new Date().toISOString(),
         state: 'ready'
@@ -956,7 +1010,7 @@ const handlers = {
    * substitution. Debian/Arch are not Cua disk images: they need
    * `cua images build` and a pinned reference, so the UI offers aliases only.
    */
-  async vmCreate({ name, cpu = 2, memory = 4, image = 'linux', tier = 'slim', workspace = WORKSPACE_ROOT, waitDesktop = false, gpu = false, diskGb = 0, android = false }) {
+  async vmCreate({ name, cpu = 2, memory = 4, image = 'linux', tier = 'slim', workspace = WORKSPACE_ROOT, waitDesktop = false, gpu = false, diskGb = 0, android = false, rea = false }) {
     if (!/^[a-z0-9][a-z0-9-]{1,30}$/.test(String(name || ''))) {
       throw new Error('name must be 2-31 chars: lowercase letters, digits and dashes')
     }
@@ -968,9 +1022,21 @@ const handlers = {
       if (running >= config.maxRunning) {
         return fail(`VM limit reached (${running}/${config.maxRunning} running). Start/suspend one, or raise the limit above.`)
       }
+      // Disk sizing happens BEFORE the quota check, because a REA computer's
+      // minimum is a property of the workload, not of what the caller typed.
+      const wantedDiskGb = Number(diskGb) > 0 ? Number(diskGb) : 20
+      const effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb
       const used = await storeUsedBytes()
       if (used > config.diskQuotaGb * 1024 ** 3) {
         return fail(`VM store quota reached (${(used / 1024 ** 3).toFixed(1)} GB of ${config.diskQuotaGb} GB). Delete a computer or raise the quota above.`)
+      }
+      // FAIL FAST, NEVER RAISE. A REA computer that does not fit is a question
+      // for the person who owns the machine, not something to solve by quietly
+      // editing their policy: 40 GB of RE kit on a 20 GB quota would otherwise
+      // be discovered as ENOSPC in the middle of the Ghidra download.
+      if (rea === true && used + effectiveDiskGb * 1024 ** 3 > config.diskQuotaGb * 1024 ** 3) {
+        const freeGb = Math.max(0, (config.diskQuotaGb * 1024 ** 3 - used) / 1024 ** 3).toFixed(1)
+        return fail(`REA needs a ${effectiveDiskGb} GB computer (Ghidra + JDK + jadx), but the VM store has ${freeGb} GB free of its ${config.diskQuotaGb} GB quota. Delete a computer, or raise the quota under Plugins → Personal VM (CUA) → Policy — the quota is yours to change, not the plugin's.`)
       }
       await ensureRuntime()
       installQemuShim()
@@ -981,10 +1047,12 @@ const handlers = {
         image: String(image),
         tier: String(tier),
         gpu: gpu === true,
-        // Kept so the panel can show a GPU / Android indicator per computer
-        // long after creation, without asking the guest.
+        // Kept so the panel can show a GPU / Android / REA indicator per
+        // computer long after creation, without asking the guest.
         android: android === true,
-        diskGb: Number(diskGb) > 0 ? Number(diskGb) : 20,
+        rea: rea === true,
+        // The disk this computer was actually given, after the REA floor.
+        diskGb: effectiveDiskGb,
         cpu: Number(cpu) || 2,
         memory: Number(memory) || 4,
         createdAt: new Date().toISOString(),
@@ -993,10 +1061,14 @@ const handlers = {
       }
       writeRegistry(registry)
       // Provision first (it needs the desktop, not the other way round), then
-      // grow the disk: Android's SDK + AVD do not fit in the stock 20 GB.
+      // grow the disk: the Android SDK and the REA kit do not fit in the stock
+      // 20 GB. REA comes before Android because it is the smaller, more
+      // frequently used half — a failure there must not be hidden behind an
+      // 8 GB emulator download.
       const provisioned = await provisionGuest(name, { gpu: gpu === true })
       let disk = null
-      if (Number(diskGb) > 0) disk = await growGuestDisk(name, Number(diskGb))
+      if (effectiveDiskGb > 20) disk = await growGuestDisk(name, effectiveDiskGb)
+      const reaResult = rea === true ? await provisionReaGuest(name) : null
       let androidResult = null
       if (android === true) androidResult = await provisionAndroidGuest(name, {})
       return ok({
@@ -1006,8 +1078,12 @@ const handlers = {
         renderer: provisioned.renderer,
         provisioned: provisioned.ok,
         disk,
+        // The panel says "disk raised to 40 GB" from this, instead of
+        // discovering the floor by reading the registry.
+        diskGbRaised: effectiveDiskGb > wantedDiskGb ? effectiveDiskGb : undefined,
+        rea: reaResult ? reaResult.ok : undefined,
         android: androidResult ? androidResult.ok : undefined,
-        output: `${(provisioned.output || '').slice(-1200)}${androidResult ? `\n${(androidResult.output || '').slice(-1200)}` : ''}`
+        output: `${(provisioned.output || '').slice(-1200)}${reaResult ? `\n${(reaResult.output || '').slice(-1200)}` : ''}${androidResult ? `\n${(androidResult.output || '').slice(-1200)}` : ''}`
       })
     })
   },
@@ -1040,20 +1116,38 @@ const handlers = {
     writeRegistry(registry)
     // Version-checked: an up-to-date disk answers in one exec, an outdated one
     // is re-provisioned here (the first start after an image update takes a
-    // minute longer and the result says so).
+    // minute longer and the result says so). The REA layer has its own marker,
+    // so a plain computer returns from it in one exec as well.
     const provisioned = await provisionGuest(name, { gpu: meta.gpu === true })
-    return ok({ name, state: 'ready', provisioned: provisioned.ok, renderer: provisioned.renderer, output: provisioned.ok ? undefined : provisioned.output.slice(-1200) })
+    const rea = meta.rea === true ? await provisionReaGuest(name) : null
+    return ok({
+      name,
+      state: 'ready',
+      provisioned: provisioned.ok,
+      rea: rea ? rea.ok : undefined,
+      renderer: provisioned.renderer,
+      output: provisioned.ok ? (rea && !rea.ok ? rea.output.slice(-1200) : undefined) : provisioned.output.slice(-1200)
+    })
   },
 
-  /** Force a re-provision of an existing computer (after an image update). */
+  /**
+   * Force a re-provision of an existing computer (after an image update). Both
+   * layers are re-run: the desktop one is version-guarded, the REA one has its
+   * own marker. Success means BOTH answered — a start that restores the
+   * desktop but silently drops the RE kit would be the worst of both.
+   */
   async provision({ name }) {
     const registry = readRegistry()
     const meta = registry.vms[name]
     if (!meta) return fail(`no computer named "${name}"`)
     const result = await provisionGuest(name, { gpu: meta.gpu === true })
-    return result.ok
-      ? ok({ name, renderer: result.renderer, output: result.output.slice(-1500) })
-      : fail(`provisioning failed:\n${result.output.slice(-1200)}`)
+    const rea = meta.rea === true ? await provisionReaGuest(name) : null
+    const both = result.ok && (rea === null || rea.ok)
+    if (!both) {
+      const reaPart = rea !== null && !rea.ok ? `\nrea:\n${rea.output.slice(-900)}` : ''
+      return fail(`provisioning failed:\n${result.output.slice(-1200)}${reaPart}`)
+    }
+    return ok({ name, renderer: result.renderer, rea: rea ? rea.ok : undefined, output: `${result.output.slice(-1500)}${rea ? `\n${rea.output.slice(-900)}` : ''}` })
   },
 
   async vmDelete({ name }) {

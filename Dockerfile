@@ -335,6 +335,10 @@ COPY --chmod=0644 docker/mcp-slim.mjs docker/mcp-slim.browser.json docker/mcp-sl
 COPY --chmod=0644 tools/check-tool-trim.mjs /opt/seek-harness/check-tool-trim.mjs
 RUN DSH_SLIM_BIN=/opt/seek-harness/mcp-slim.mjs DSH_SLIM_POLICIES=/opt/seek-harness \
     node /opt/seek-harness/check-tool-trim.mjs
+# The REA wiring gate (see tools/check-cua-rea.mjs). Collected here; run at the
+# bottom of this stage, after the plugin exists, because it asserts the plugin
+# surface as well as the guest script and the supervisor.
+COPY --chmod=0644 tools/check-cua-rea.mjs /opt/seek-harness/check-cua-rea.mjs
 # Hide the image-owned MCP rows from a user-installed MCP manager (see the file).
 COPY --chmod=0644 tools/patch-mcp-manager.mjs /opt/seek-harness/patch-mcp-manager.mjs
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
@@ -847,8 +851,9 @@ RUN set -eux; \
 COPY --chmod=0755 docker/cua-vm-supervisor.mjs /usr/local/bin/cua-vm-supervisor
 # Guest provisioning runs INSIDE the VM, piped through `sudo bash` by the
 # supervisor. Kept as real files (not a base64 blob in the supervisor) so
-# they can be read, diffed and run by hand to debug a guest.
-COPY --chmod=0644 docker/cua-guest-provision.sh docker/cua-guest-android.sh /usr/local/bin/
+# they can be read, diffed and run by hand to debug a guest. rea is its own
+# layer with its own marker, so a computer without `rea: true` never runs it.
+COPY --chmod=0644 docker/cua-guest-provision.sh docker/cua-guest-android.sh docker/cua-guest-rea.sh /usr/local/bin/
 COPY plugins/dsh-cua-vm /opt/dsh-cua-vm
 RUN set -eux; \
     installed=0; \
@@ -867,6 +872,19 @@ RUN set -eux; \
       [ -d "$root/dsh-cua-vm" ] || continue; \
       node -e 'const fs=require("node:fs");const a=process.argv[1];const r=process.argv[2];const m=JSON.parse(fs.readFileSync(a,"utf8"));const v=JSON.parse(fs.readFileSync(r+"/dsh-cua-vm/package.json","utf8")).version;m.dependencies={...(m.dependencies??{}),"dsh-cua-vm":v};fs.writeFileSync(a,JSON.stringify(m,null,2)+"\n");console.log("declared dsh-cua-vm",v,"in",a)' "$anchor" "$root"; \
     done
+
+# ---------------------------------------------------------------------
+# REA GATE. The kit is five files joined only by strings: the shell script the
+# supervisor looks up by name, the supervisor's call sites, this Dockerfile's
+# COPY, and the plugin's `rea: true`. None of that is type-checked, so a rename
+# or a dropped field ships a plain desktop that reads like a RE workstation.
+# The copies below are flat (pick() in the checker handles both layouts) and
+# the Dockerfile is copied only for the length of this RUN.
+# ---------------------------------------------------------------------
+COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-vm-supervisor.mjs Dockerfile /opt/seek-harness/cua-check/
+COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js /opt/seek-harness/cua-check/
+RUN node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check \
+ && rm -f /opt/seek-harness/cua-check/Dockerfile
 
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \
