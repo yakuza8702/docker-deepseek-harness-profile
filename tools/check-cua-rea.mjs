@@ -142,6 +142,7 @@ const NEEDLES = {
     ['async function provisionReaGuest(name)', 1],
     ['timeoutSec: 3600, timeoutMs: 3900000', 1],
     ['\\[rea\\] OK', 1],
+    ['already provisioned', 1],
     ['node=(v[0-9][^\\s]*)', 1],
     ['...(known || {}),', 1],
     ['const reaBack = known?.rea === true ? await provisionReaGuest(name) : null', 1],

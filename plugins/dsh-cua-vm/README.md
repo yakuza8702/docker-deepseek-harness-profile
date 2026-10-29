@@ -29,6 +29,10 @@ write to a unix socket under `/tmp`, which `workspace-write` already allows.
 |---|---|
 | `cua_vm_status` | which VM exists, its state, tier, last command |
 | `cua_vm_ensure` | create or resume the VM for this workspace (idempotent) |
+| `cua_vm_create` | New computer: name, vCPU, RAM, image, `gpu`, `diskGb`, `android`, `rea` |
+| `cua_vm_gui` | drive the desktop: screenshot, geometry, click/drag, type/key, windows, a11y, zoom, launch |
+| `cua_vm_disk` | grow the disk online (QMP `block_resize` + `growpart`), no reboot, cannot shrink |
+| `cua_vm_android` | install the Google Android SDK + AVD inside the VM, boot with `cua-emulator` |
 | `cua_vm_exec` | run a shell command, return exit code + stdout/stderr |
 | `cua_vm_put` / `cua_vm_get` | copy in / copy the product out |
 | `cua_vm_port` | open a forward and publish it at `/vm/port/<name>/` |
@@ -117,14 +121,14 @@ cua_vm_exec → cat /var/lib/cua-rea   # version/node/rea/ghidra/jdk/jadx/regist
 | `CUA_VM_STORE` | `/cua-vm` | volume holding images, disks, QEMU, logs |
 | `CUA_WORKSPACE_ROOT` | `/workspace` | the only host tree the tools may touch |
 | `CUA_VM_TIER` | `slim` | `slim` or `full` guest image |
+| `CUA_SUPERVISOR_SOCK` | `/tmp/cua-vm/supervisor.sock` | control socket |
+| `DSH_CUA_REA_SCRIPT` | `/usr/local/bin/cua-guest-rea.sh` | Guest script path (debugging) |
 
 Runtime policy is **not** environment configuration: `/cua-vm/config.json`
 holds `autoSuspend`, `idleSuspendMinutes` (default 30, `0` disables),
 `diskQuotaGb` (default 20) and `maxRunning` (default 1), and is edited from the
-Plugins page (Personal VM → Settings). The supervisor re-reads it every minute,
+Plugins page (Personal VM → Policy). The supervisor re-reads it every minute,
 so a saved change needs no restart; a command in flight postpones the suspend.
-| `CUA_SUPERVISOR_SOCK` | `/tmp/cua-vm/supervisor.sock` | control socket |
-| `DSH_CUA_REA_SCRIPT` | `/usr/local/bin/cua-guest-rea.sh` | Guest script path (debugging) |
 
 ## Requirements
 

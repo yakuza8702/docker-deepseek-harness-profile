@@ -407,8 +407,8 @@ window.__ModuleLoader__.load({
               )
             ),
             h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Enable REA adds Node 22, rea-agents, a JDK 21, Ghidra 12.1.4 and JADX to the computer, roughly 3.5 GB installed, and lifts the disk to at least a 40 GB one. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field.'),
-            draft.rea === true && form.diskQuotaGb < 40 && h('div', { style: { ...S.muted, color: T.error } },
-              `The VM store quota is ${form.diskQuotaGb} GB, so a 40 GB REA disk cannot be created. Raise Disk Size in the Policy tab first.`),
+            draft.rea === true && (form.diskQuotaGb < 40 || form.diskQuotaGb - (state.usedBytes ?? 0) / 1024 ** 3 < draft.diskGb) && h('div', { style: { ...S.muted, color: T.error } },
+              `The VM store quota is ${form.diskQuotaGb} GB, so a 40 GB or larger REA disk cannot be created. Raise Disk Size in the Policy tab first.`),
             h('div', { style: S.row },
               h('button', { type: 'button', style: S.primary, disabled: pending !== null || draft.name.trim() === '', onClick: () => void create() }, pending?.action === 'create' ? 'Creating…' : 'Create computer')
             )

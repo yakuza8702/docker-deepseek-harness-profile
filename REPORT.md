@@ -1,6 +1,6 @@
 # Report — CUA personal computers for the DeepSeek Harness
 
-Branch: `feat/cua-web` · head `da91f4b` · base `@deepseek-ai/dsh` 0.2.1-rc.2
+Branch: `rea` (REA in the personal computer, from `feat/tool-trim`) · head `31d1913` · base `@deepseek-ai/dsh` 0.2.1-rc.2
 Image: built from this branch with `WITH_VIRGL_QEMU=1` (6.43 GB) · GPU adds virgl QEMU
 `main` keeps the old emulator/APK build; this branch deliberately drops it.
 
@@ -44,8 +44,9 @@ Components:
 
 ## 2. UI (Personal VM (CUA))
 
-* **Computers**: per-VM state badge (+ `GPU` badge), Start/Shutdown, Show VM,
-  Terminal, Metrics, Delete. Terminal and Metrics are **toggles**.
+* **Computers**: per-VM state badge (+ `GPU`, `Android` and `REA` badges),
+  Start/Shutdown, Show VM, Terminal, Metrics, Delete. Terminal and Metrics are
+  **toggles**.
 * **New computer**: name, vCPU, RAM (GB), Image, **Enable GPU** — one row.
   Shutdown asks "Do you want to shutdown <name>?" first.
 * **Enable REA** — third checkbox in New computer: installs Node 22,

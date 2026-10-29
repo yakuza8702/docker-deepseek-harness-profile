@@ -636,7 +636,7 @@ async function regrowDiskAfterRebuild(name, meta) {
   if (meta?.rea !== true || needGb <= 20) return null
   try {
     const grown = await growGuestDisk(name, needGb)
-    log(`disk: ${name} ${grown && grown.changed ? `regrown to ${grown.sizeGb} GB` : `already ${grown && grown.sizeGb} GB`}`)
+    log(`disk: ${name} ${grown && grown.changed ? `regrown to ${grown.sizeGb} GB` : `already ${grown?.sizeGb ?? 'unknown'} GB`}`)
     return grown
   } catch (error) {
     log(`disk: ${name} regrow failed (${error.message}); provisioning continues`)

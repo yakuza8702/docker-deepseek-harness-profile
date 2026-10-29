@@ -587,10 +587,11 @@ flat image layout and prints every missing needle at once.
 The Dockerfile copies the script at build time, and at the bottom of the stage
 copies the five files flat into `/opt/seek-harness/cua-check/` and runs
 `node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check`,
-then deletes the scratch directory (including the Dockerfile copy, which is only
-there to prove the two lines above still exist). A renamed script or a dropped
-`rea` field fails the build instead of shipping a plain desktop that reads like
-a RE workstation.
+then removes only the Dockerfile copy (`rm -f
+/opt/seek-harness/cua-check/Dockerfile`, which is there to prove the two lines
+above still exist); the other four flat copies stay in the image. A renamed
+script or a dropped `rea` field fails the build instead of shipping a plain
+desktop that reads like a RE workstation.
 
 ### Evidence
 
