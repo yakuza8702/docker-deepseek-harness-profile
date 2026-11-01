@@ -1,0 +1,84 @@
+# =====================================================================
+# anchor-probe — tell us the DAY upstream moves an anchor the build
+# depends on, instead of discovering it when a scheduled build goes red.
+#
+# The image patches two upstream client bundles at build time
+# (tools/patch-plugin-manager-page.mjs and tools/patch-sidebar-footer.mjs).
+# Both are content-anchored by design and fail the build loudly when
+# upstream moves the code. That is correct — but a red scheduled build is
+# a late signal, and it costs a full image build to learn it.
+#
+# This job answers the same anchor questions in about ten seconds: it
+# downloads the bundles a `latest` build would install and reports
+# whether every anchor still resolves. Nothing is built, nothing is
+# pushed, and no repository file is touched.
+#
+# * exit 0 : anchors resolve — the next build will patch cleanly.
+# * exit 1 : an anchor moved — re-anchor tools/patch-plugin-manager-page.mjs
+#            (or tools/patch-sidebar-footer.mjs) BEFORE building.
+#
+# Deliberately NOT wired into docker-build: a probe failure must never
+# stop the image from being produced. It is a heads-up, not a gate.
+# =====================================================================
+name: anchor-probe
+
+on:
+  schedule:
+    # Daily, a few minutes before the 6h build cron would pick up a new
+    # release, so the answer usually arrives first.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact @deepseek-ai/dsh-client-ui-plugin-manager version (default: dist-tag next)"
+        required: false
+        default: ""
+  push:
+    paths:
+      - "tools/patch-plugin-manager-page.mjs"
+      - "tools/patch-sidebar-footer.mjs"
+      - "tools/probe-anchors.mjs"
+      - ".github/workflows/anchor-probe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Probe the anchors
+        id: probe
+        run: |
+          set +e
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            node tools/probe-anchors.mjs --version "${{ github.event.inputs.version }}" | tee probe.txt
+          else
+            node tools/probe-anchors.mjs | tee probe.txt
+          fi
+          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Anchor probe"
+            echo ""
+            echo '```'
+            cat probe.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when an anchor moved
+        if: steps.probe.outputs.status != '0'
+        run: |
+          echo "::error::An upstream anchor moved. Re-anchor the patch script named in the report above before the next build."
+          exit 1
