@@ -50,7 +50,11 @@
 # docker-build.yml exposes the same arg as an opt-in input. Here it defaults
 # to ON — this workflow exists to prove the GPU path is not broken, and a
 # toggle that is off by default is never exercised. Override per run with
-# the `virgl` input, or repo-wide with `vars.DSH_WITH_VIRGL_QEMU=0`.
+# the `virgl` input. The repo variable `vars.DSH_WITH_VIRGL_QEMU` is NOT read
+# here on purpose: it already exists to gate the PUBLISHED image in
+# docker-build.yml, and honouring it would let a stale `0` silently turn off the
+# path this workflow exists to exercise. An explicit run input is the only way
+# to disable it.
 #
 # TAG TRIGGER
 # -----------
@@ -92,9 +96,9 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
-  # Default for the virgl toggle — the workflow's whole point is to exercise the
-  # GPU path. The expression below still lets a run input or the repo variable
-  # turn it off.
+  # The virgl default, in one place. Every expression below reads THIS value
+  # (post-processed by the `virgl` dispatch input), so "on unless a run says
+  # otherwise" is stated once instead of copied into three expressions.
   DSH_WITH_VIRGL_QEMU: "1"
 
 jobs:
@@ -155,7 +159,7 @@ jobs:
   # job 2 — the image itself, with the wiring job 1 just proved.
   # -------------------------------------------------------------------
   build:
-    name: Build image (virgl ${{ (github.event.inputs.virgl == 'false' || vars.DSH_WITH_VIRGL_QEMU == '0') && 'off' || 'on' }})
+    name: Build image (virgl ${{ github.event.inputs.virgl == 'false' && 'off' || 'on' }})
     needs: [gates]
     runs-on: ubuntu-latest
     timeout-minutes: 240
@@ -192,12 +196,12 @@ jobs:
           # default is `latest`; docker-build.yml resolves it dynamically).
           # WITH_VIRGL_QEMU: the Dockerfile's own GPU feature (ARG, off by
           # default there) — distro QEMU + qemu-system-modules-opengl +
-          # virgl/Mesa. ON here unless the run input or
-          # vars.DSH_WITH_VIRGL_QEMU=0 says otherwise, so the GPU path is
-          # actually exercised on every push instead of only when remembered.
+          # virgl/Mesa. ON here (env DSH_WITH_VIRGL_QEMU=1) on every push and
+          # tag, so the GPU path is actually exercised instead of only when
+          # somebody remembers the toggle; a dispatch run may turn it off.
           build-args: |
             DSH_VERSION=${{ github.event.inputs.dsh_version || 'latest' }}
-            WITH_VIRGL_QEMU=${{ (github.event.inputs.virgl == 'false' || vars.DSH_WITH_VIRGL_QEMU == '0') && '0' || '1' }}
+            WITH_VIRGL_QEMU=${{ github.event.inputs.virgl == 'false' && '0' || env.DSH_WITH_VIRGL_QEMU }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.tags.outputs.ref_tag }}
           cache-from: type=gha
@@ -215,6 +219,6 @@ jobs:
             echo "| Commit | \`${{ github.sha }}\` |"
             echo "| Gates | ${{ needs.gates.result }} |"
             echo "| Build | ${{ job.status }} |"
-            echo "| virgl QEMU | \`${{ (github.event.inputs.virgl == 'false' || vars.DSH_WITH_VIRGL_QEMU == '0') && 'off' || 'on' }}\` |"
+            echo "| virgl QEMU | \`${{ github.event.inputs.virgl == 'false' && 'off' || 'on' }}\` |"
             echo "| Pushed | \`${{ github.event.inputs.push_image == 'true' }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
