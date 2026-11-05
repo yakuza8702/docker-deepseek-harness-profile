@@ -70,6 +70,13 @@
         # PUBLIC GitHub OAuth App client id (device flow). Empty = set it inline
         # from the Login panel; it is a public identifier, not a secret.
         githubDeviceClientId: ""
+        # THE SCOPES THE DEVICE FLOW ASKS FOR (space-delimited, PUBLIC configuration:
+        # they travel in the POST /login/device/code body, never a credential).
+        # OMITTED from the request = an IDENTITY-ONLY token: private repositories
+        # answer anonymously and `git push` answers 403. "repo workflow" is the
+        # grant the rest of this plugin needs (private reads + push, Actions runs).
+        # Set it to "" only to request an identity-only token on purpose.
+        githubRequestedScopes: "repo workflow"
         # PUBLIC Gitea OAuth2 application client id (authorization-code flow).
         giteaOAuthClientId: ""
         # PUBLIC Cloudflare OAuth client id (Manage Account → OAuth clients). The

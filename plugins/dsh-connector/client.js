@@ -17,6 +17,12 @@
  * page is not a second console: it exists to answer "which reference does this
  * alias use, and does it resolve?" and nothing else.
  *
+ * One exception is a SHAPE, not a surface: `FailureCard` is the standard card a
+ * typed operation failure renders through (title, the host's reason line
+ * verbatim, and — for `CONNECTOR_PUSH_FORBIDDEN` — the Contents-write fix). It
+ * is exported so the push path's 403 has one place to land instead of a bespoke
+ * string, and the page mounts it wherever such a failure is surfaced.
+ *
  * CREDENTIALS IN, CREDENTIALS OUT — OAUTH ONLY (owner decision)
  * ------------------------------------------------------------
  * There is NO token paste field on this page, for any provider. The two moves
@@ -165,7 +171,13 @@ window.__ModuleLoader__.load({
       // (those routes answer `{ ok: false, error }` with a non-2xx status); only
       // an `error` string or a non-JSON body is treated as one here.
       if (payload === null || typeof payload?.error === 'string') {
-        throw new Error(payload?.error ?? `HTTP ${response.status}`)
+        // The host sends its CLASS alongside the sentence (routes.js). Keeping it
+        // on the thrown error is what lets a caller render a code-aware failure
+        // card instead of matching prose.
+        const failure = new Error(payload?.error ?? `HTTP ${response.status}`)
+        if (typeof payload?.code === 'string') failure.code = payload.code
+        if (typeof payload?.reason === 'string') failure.reason = payload.reason
+        throw failure
       }
       return payload
     }
@@ -220,6 +232,10 @@ window.__ModuleLoader__.load({
       'status.saveUrl': 'Save URL',
       'status.foot': 'This plugin stores credential REFERENCE names only. The credential values live in DSH — .credentials.yaml, the environment, or a .env — and are resolved per call:',
       'status.toolsHint': 'Repository, file, CI, issue and pull-request actions run through the connector_* agent tools, not this page.',
+      // The standard failure card: title + the host's own reason line, and the
+      // one extra line a push refusal needs (the App's own permission grant).
+      'failure.title': 'Something failed.',
+      'push.forbidden.hint': 'Expand the OAuth App\'s permissions (Repository access = All repositories + \'Contents: Read and write\') or re-consent with Contents write, then retry. Alternate cause: the login granted no scopes (a scopeless login is the most common cause — re-Login fixes it).',
       'busy': 'Working…',
       'loading': 'Loading…',
 
@@ -276,6 +292,10 @@ window.__ModuleLoader__.load({
       'login.autoOpened': 'Opened github.com/login/device in a new tab. If it was blocked, use the link below.',
       'login.expired': 'The code expired. Start the device flow again.',
       'login.denied': 'The authorization was denied at GitHub. You can start again.',
+      // The grant the token ACTUALLY received. Public: a scope name is
+      // configuration, never a credential — and a missing `repo` is the fact that
+      // explains a push 403 the App's settings alone would not.
+      'login.scopesGranted': 'Granted scopes: {scopes}.',
 
       // ── Gitea authorization-code flow ────────────────────────────────────
       'gitea.clientId': 'Application Client ID',
@@ -306,11 +326,12 @@ window.__ModuleLoader__.load({
         '"Authorization callback URL" (the app page also calls it the Redirect URI; max 10 registered, "Add callback URL" adds more): fill {origin} — this deployment\'s origin. It must EXACTLY match the origin this page is served from at authorize time; http://127.0.0.1:<port> is accepted for loopback, and the device flow never uses it.',
         'Tick "Enable Device Flow" — REQUIRED. The device grant then answers with verification_uri https://github.com/login/device, an 8-character user_code (XXXX-XXXX), expires_in 900 s and interval 5 s.',
         '"Expire user access tokens" is checked by default: with it ON an access token lives 8 hours and a refresh token 6 months — this plugin stores BOTH, silently refreshes ONCE when GitHub rejects the expired access token, and only asks you to Login again if the refresh itself is refused; with it OFF you get a long-lived token that never expires. ON is recommended.',
+        'If GitHub push answers "denied to <user>", the OAuth App lacks Contents write — expand the App\'s permissions (Repository access All + Contents R/W) or re-consent with Contents write, then retry.',
         'Press "Register application". The "Client ID" is at the top of the app page; NO client secret is needed for the device flow.',
         'Back on this card press Login: with no Client ID yet, the panel shows "Client ID:" with an Edit control — paste the id, press Save.',
         'The primary action becomes "Start device flow". Press it: the code appears LARGE and github.com/login/device opens in a NEW TAB.',
         'If no tab opened (a popup blocker), press the "Open github.com/login/device" link instead; Copy puts the code on your clipboard. The code expires 15 minutes after it is issued — start again for a fresh one.',
-        'Enter the code at github.com/login/device and press "Authorize".',
+        'Enter the code at github.com/login/device and press "Authorize". The consent screen asks for the "repo" and "workflow" scopes — ACCEPT BOTH: repo is what lets this token read private repositories and push, workflow is what lets it read and dispatch Actions runs. A login that grants no scopes still succeeds but yields an IDENTITY-ONLY token: private reads fall back to public data and every push answers 403 until you re-Login and accept repo.',
         'The plugin saves the token by itself — the panel closes, a short success note appears and the badge turns resolved.',
       ],
       'login.guide.github.note': 'Login is OAuth only: there is no token field anywhere. Swapping apps is the same panel — press Edit beside "Client ID:", paste the new id, Save, then Start device flow; the previous app\'s login is abandoned the moment the change lands.',
@@ -1380,9 +1401,20 @@ window.__ModuleLoader__.load({
               // Authorized: the panel closes (the slot is cleared, so the code
               // goes with it), the badge re-reads from `state`, and a short
               // success note stands where the card was.
+              //
+              // The note also carries the GRANT the provider actually issued, and
+              // the host's public warning when `repo` is missing: a login that
+              // granted no repository scope still succeeds, so without this line
+              // the first sign of it would be an unexplained push 403.
               resetLogin()
               setCopyState(null)
-              setLocal(t('login.success'))
+              const granted = Array.isArray(answer.grantedScopes) ? answer.grantedScopes : []
+              let note = t('login.success')
+              if (granted.length > 0) {
+                note += ` ${t('login.scopesGranted').split('{scopes}').join(granted.join(' '))}`
+              }
+              if (typeof answer.warning === 'string' && answer.warning !== '') note += ` ${answer.warning}`
+              setLocal(note)
               await onChanged()
               return
             }
@@ -2144,6 +2176,46 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * THE STANDARD FAILURE CARD.
+     *
+     * One shape for a typed OPERATION failure on this page: a title, the reason
+     * line exactly as the host classified it (never rewritten here), and — when
+     * the class is a push refusal — the one extra line that says what to change.
+     *
+     * `code` comes from the host's own receipt (`{ ok:false, error, code }`), so
+     * the card branches on a CLASSIFICATION, never on words inside the sentence.
+     * The reason line is rendered verbatim: the host's message already names the
+     * repository, the account and the fix, and a page that paraphrased it would be
+     * a second, drifting copy of that contract.
+     *
+     * @param props.code - the typed error code (`CONNECTOR_PUSH_FORBIDDEN`, …).
+     * @param props.message - the host's public, actionable sentence.
+     * @param props.t - dictionary lookup.
+     */
+    function FailureCard({ code, message, t }) {
+      const typed = typeof code === 'string' ? code : ''
+      const reason = String(message ?? '')
+      return h('div', {
+        'data-connector-failure-card': 'true',
+        'data-connector-failure-code': typed,
+        role: 'alert',
+        style: { ...S.card, gap: 4, padding: '10px 12px', border: `1px solid ${T.error}`, background: T.hover },
+      },
+        h('div', { style: { fontSize: 12, fontWeight: 600, color: T.error } }, t('failure.title')),
+        h('div', {
+          'data-connector-failure-reason': 'true',
+          style: { ...S.muted, color: T.text, whiteSpace: 'pre-wrap' },
+        }, reason),
+        // The GitHub push refusal has a fix that is NOT in the sentence's first
+        // clause, and the one-line card is where the user actually looks.
+        typed === 'CONNECTOR_PUSH_FORBIDDEN' && h('div', {
+          'data-connector-failure-hint': 'true',
+          style: { ...S.muted, color: T.warning },
+        }, t('push.forbidden.hint')),
+      )
+    }
+
     /** The page: one head, one status surface. No tabs, no other sections. */
     function ConnectorPage(props) {
       const t = useTranslate(props?.ctx?.locale ?? props?.locale)
@@ -2224,6 +2296,9 @@ window.__ModuleLoader__.load({
 
     module.exports.apply = apply
     module.exports.inject = inject
+    // The standard failure card is exported so a same-origin surface (and the
+    // harness) can render a typed operation failure with the same shape.
+    module.exports.failureCard = FailureCard
     return module.exports
   },
 })

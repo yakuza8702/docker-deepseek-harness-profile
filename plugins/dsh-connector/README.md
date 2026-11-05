@@ -26,6 +26,13 @@ pre-flighted with one cheap identity call, so a dead token is refused *before*
 the request (HTTP 401, "no write was attempted") instead of surfacing later as a
 provider 401.
 
+The GitHub device flow asks for `repo workflow` by default (`githubRequestedScopes`);
+a login that grants neither still succeeds but yields an identity-only token, so
+the panel prints the granted scopes and warns when `repo` is missing. A push the
+git transport refuses for want of Contents write is classified as
+`CONNECTOR_PUSH_FORBIDDEN` (HTTP 403, authenticated-but-not-allowed) and names the
+OAuth App permission screens, never re-labelled as a dead token.
+
 **No secret is ever in this package.** Configuration carries credential
 *reference names* (`GITHUB_TOKEN`), never values: DSH resolves a reference per
 call, and the value is handed to one request's `Authorization` header. It is never

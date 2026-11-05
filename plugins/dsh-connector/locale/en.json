@@ -29,6 +29,8 @@
     "status.saveUrl": "Save URL",
     "status.foot": "This plugin stores credential REFERENCE names only. The credential values live in DSH — .credentials.yaml, the environment, or a .env — and are resolved per call:",
     "status.toolsHint": "Repository, file, CI, issue and pull-request actions run through the connector_* agent tools, not this page.",
+    "failure.title": "Something failed.",
+    "push.forbidden.hint": "Expand the OAuth App's permissions (Repository access = All repositories + 'Contents: Read and write') or re-consent with Contents write, then retry. Alternate cause: the login granted no scopes (a scopeless login is the most common cause — re-Login fixes it).",
     "busy": "Working…",
     "loading": "Loading…",
     "login": "Login",
@@ -94,11 +96,12 @@
       "\"Authorization callback URL\" (the app page also calls it the Redirect URI; max 10 registered, \"Add callback URL\" adds more): fill {origin} — this deployment's origin. It must EXACTLY match the origin this page is served from at authorize time; http://127.0.0.1:<port> is accepted for loopback, and the device flow never uses it.",
       "Tick \"Enable Device Flow\" — REQUIRED. The device grant then answers with verification_uri https://github.com/login/device, an 8-character user_code (XXXX-XXXX), expires_in 900 s and interval 5 s.",
       "\"Expire user access tokens\" is checked by default: with it ON an access token lives 8 hours and a refresh token 6 months — this plugin stores BOTH, silently refreshes ONCE when GitHub rejects the expired access token, and only asks you to Login again if the refresh itself is refused; with it OFF you get a long-lived token that never expires. ON is recommended.",
+      "If GitHub push answers \"denied to <user>\", the OAuth App lacks Contents write — expand the App's permissions (Repository access All + Contents R/W) or re-consent with Contents write, then retry.",
       "Press \"Register application\". The \"Client ID\" is at the top of the app page; NO client secret is needed for the device flow.",
       "Back on this card press Login: with no Client ID yet, the panel shows \"Client ID:\" with an Edit control — paste the id, press Save.",
       "The primary action becomes \"Start device flow\". Press it: the code appears LARGE and github.com/login/device opens in a NEW TAB.",
       "If no tab opened (a popup blocker), press the \"Open github.com/login/device\" link instead; Copy puts the code on your clipboard. The code expires 15 minutes after it is issued — start again for a fresh one.",
-      "Enter the code at github.com/login/device and press \"Authorize\".",
+      "Enter the code at github.com/login/device and press \"Authorize\". The consent screen asks for the \"repo\" and \"workflow\" scopes — ACCEPT BOTH: repo is what lets this token read private repositories and push, workflow is what lets it read and dispatch Actions runs. A login that grants no scopes still succeeds but yields an IDENTITY-ONLY token: private reads fall back to public data and every push answers 403 until you re-Login and accept repo.",
       "The plugin saves the token by itself — the panel closes, a short success note appears and the badge turns resolved."
     ],
     "login.guide.github.note": "Login is OAuth only: there is no token field anywhere. Swapping apps is the same panel — press Edit beside \"Client ID:\", paste the new id, Save, then Start device flow; the previous app's login is abandoned the moment the change lands.",
@@ -182,6 +185,7 @@
     "gitea.callbackOriginDerived": "(derived from this tab)",
     "gitea.callbackOriginClearHint": "Clear the field and press Save to fall back to this tab's own origin.",
     "gitea.callbackOriginSaved": "Callback origin saved. Press Login to authorize with it.",
-    "gitea.redirectFromHost": "Built from the origin this host derived from your request (this page has no address bar to read). Register this string on the OAuth2 application as-is."
+    "gitea.redirectFromHost": "Built from the origin this host derived from your request (this page has no address bar to read). Register this string on the OAuth2 application as-is.",
+    "login.scopesGranted": "Granted scopes: {scopes}."
   }
 }

@@ -26,7 +26,7 @@ import {
   DEFAULT_CLIENT_SECRET_REF, DEFAULT_CLOUDFLARE_REFRESH_REF, DEFAULT_GITHUB_REFRESH_REF, DEFAULT_REFS, PROVIDERS,
 } from './lib/credentials.js'
 import { CLOUDFLARE_CALLBACK_PATH, GITEA_CALLBACK_PATH } from './lib/oauth.js'
-import { createOperations } from './lib/operations.js'
+import { createOperations, GITHUB_DEFAULT_SCOPES } from './lib/operations.js'
 import { createRoutes } from './lib/routes.js'
 import { createTools } from './lib/tools.js'
 
@@ -160,6 +160,13 @@ function buildConfig() {
   const githubDeviceClientId = z.string().default('').description(
     'PUBLIC GitHub OAuth App client id for the device flow (no client secret is used or needed). Empty = the Login panel asks for it inline.',
   )
+  // THE SCOPES THE DEVICE FLOW ASKS FOR. `POST /login/device/code` accepts an
+  // OPTIONAL space-delimited `scope`; OMITTED, GitHub issues an IDENTITY-ONLY
+  // token — private reads fall back anonymously and `git push` answers 403.
+  // Public configuration (it travels in the request body), never a secret.
+  const githubRequestedScopes = z.string().default(GITHUB_DEFAULT_SCOPES).description(
+    'Space-separated GitHub OAuth scopes the device flow requests at consent (default "repo workflow": private reads + push). Non-secret. Empty = an IDENTITY-ONLY token: private reads fall back anonymously and git push answers 403 until you re-Login with repo.',
+  )
   // The Cloudflare OAuth client is a PUBLIC client (PKCE, `token_endpoint_auth_method:
   // none`), so it has a client id and NOTHING ELSE: no secret exists to store.
   // The scope list is the user's choice (live catalogue: GET /client/v4/oauth/scopes),
@@ -186,7 +193,7 @@ function buildConfig() {
   return z.object({
     workspaceRoot, github, cloudflare, gitea, giteaOAuthClientId, giteaClientSecretRef,
     cloudflareOAuthClientId, cloudflareOAuthScopes, cloudflareCallbackOrigin, giteaCallbackOrigin,
-    outputLimit, requestTimeoutMs, githubDeviceClientId,
+    outputLimit, requestTimeoutMs, githubDeviceClientId, githubRequestedScopes,
   })
 }
 

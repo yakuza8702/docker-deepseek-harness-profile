@@ -140,6 +140,10 @@ function statusOf(error) {
   if (error instanceof StoreUnavailableError || error?.code === 'CONNECTOR_STORE_UNAVAILABLE') return 503
   if (error?.code === 'CONNECTOR_NO_TOKEN') return 404
   if (error?.code === 'CONNECTOR_TOKEN_DEAD') return 401
+  // AUTHENTICATED BUT NOT ALLOWED TO WRITE: the token is live (the push
+  // pre-flight passed), the OAuth App's grant lacks Contents write. 403 is the
+  // honest answer — not 401 ("log in"), not 424 ("the provider broke").
+  if (error?.code === 'CONNECTOR_PUSH_FORBIDDEN') return 403
   if (error?.code === 'CONNECTOR_BAD_REQUEST' || error instanceof TypeError) return 400
   if (error?.code === 'CONNECTOR_PROVIDER_ERROR') return 424
   return 500
@@ -381,7 +385,15 @@ export function createRoutes({ operations, logger }) {
       // redaction pass is the guarantee that a provider error body cannot leak.
       const message = redact(`connector: ${error?.message ?? error}`)
       logger?.warn?.(message)
-      return send(statusOf(error), { ok: false, error: message })
+      // The CLASS travels with the sentence so a same-origin caller can render a
+      // code-aware failure card without reading prose. Both facts are public
+      // classifications: no value, no length, no fragment.
+      return send(statusOf(error), {
+        ok: false,
+        error: message,
+        ...(typeof error?.code === 'string' ? { code: error.code } : {}),
+        ...(typeof error?.reason === 'string' ? { reason: error.reason } : {}),
+      })
     }
   }
 }

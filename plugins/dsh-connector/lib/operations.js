@@ -78,6 +78,27 @@ const FILE_PATH_PATTERN = /^[A-Za-z0-9._@+~-][A-Za-z0-9._@+~/-]{0,399}$/u
 /** The largest file body this plugin will send in one commit. */
 const MAX_FILE_BYTES = 4 * 1024 * 1024
 
+/**
+ * THE SCOPES A DEVICE-FLOW LOGIN ASKS FOR BY DEFAULT — public configuration.
+ *
+ * `POST /login/device/code` accepts an OPTIONAL space-delimited `scope`. OMITTED,
+ * GitHub issues an IDENTITY-ONLY token: private repositories cannot be read (the
+ * adapter falls back to anonymous public data) and `git push` answers 403 — the
+ * owner's live "Permission … denied" after a login that otherwise looked fine.
+ * `repo` is the private-repository + push grant; `workflow` covers reading and
+ * dispatching Actions runs. Non-secret: it travels in the request body, never a
+ * credential, and the granted answer is reported back as a plain scope list.
+ */
+export const GITHUB_DEFAULT_SCOPES = 'repo workflow'
+
+/**
+ * The public warning a successfully authorized device login carries when the
+ * token answer does NOT include `repo` — the fact that turns an unexplainable
+ * push 403 into one sentence with a fix. Public: scopes are not secrets.
+ */
+export const GITHUB_SCOPELESS_WARNING =
+  'granted scopes lack repo — GitHub push will fail until you re-Login and accept the repo scope'
+
 /** Actions the shared `connector_repo_actions` tool understands as reads. */
 const READ_ACTIONS = new Set(['prs', 'issues', 'branches', 'actions_logs', 'commits', 'blame', 'pr_files', 'pr_diff'])
 /** Actions that write to the remote — these need the caller's go-ahead. */
@@ -1053,6 +1074,61 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
   }
 
   /**
+   * THE PUSH-PERMISSION REFUSAL — the third outcome of a git push, and the one
+   * that used to be indistinguishable from "something broke".
+   *
+   * A token can AUTHENTICATE and still be unable to WRITE: GitHub accepts the
+   * login, then the git transport answers
+   *
+   *   remote: Permission to <owner>/<repo>.git denied to <user>.
+   *   fatal: unable to access 'https://github.com/<owner>/<repo>.git/':
+   *          The requested URL returned error: 403
+   *
+   * which git reports as exit 128. Before this classification that surfaced as a
+   * generic "git push failed with exit 128" and sent the owner looking at the
+   * network. The cause is the OAuth App's OWN grant (Permissions → Repository
+   * access / Contents), not the token being dead and not the repository being
+   * unreachable — so the message names the exact screens to change.
+   *
+   * PRECEDENCE IS STRUCTURAL: this is only reachable from inside `push()`'s
+   * `withSecret` after the `/user` pre-flight has already passed, so a DEAD token
+   * still fails first with `CONNECTOR_TOKEN_DEAD` and no git process is ever
+   * spawned. An unrelated git failure does not match and keeps the `ok:false`
+   * receipt it has always had.
+   */
+  const PUSH_FORBIDDEN_PATTERNS = [
+    // "remote: Permission to owner/repo.git denied to user."
+    /permission to \S+\.git denied/iu,
+    // "denied to user" (the wording that survives a localized remote line).
+    /denied to \S+@?/iu,
+    // "The requested URL returned error: 403"
+    /returned error: 403\b/iu,
+  ]
+
+  /** Whether a failed git push's combined output is a permission refusal. */
+  function isPushForbiddenOutput(output) {
+    return PUSH_FORBIDDEN_PATTERNS.some(pattern => pattern.test(String(output ?? '')))
+  }
+
+  /**
+   * The ACTIONABLE public sentence: what happened, to which repository, as whom,
+   * and the three fixes — the App's permissions, a re-consent, or a fine-grained
+   * PAT. No value, no length, no fragment.
+   */
+  function pushForbiddenError(slug, login) {
+    const who = typeof login === 'string' && login !== '' ? ` as ${login}` : ''
+    const error = new Error(
+      `GitHub accepted the login${who} but this token cannot push to ${slug} (missing Contents write). `
+      + "Fix: GitHub → Settings → Developer settings → OAuth Apps → your Connector app → Permissions: Repository access = All repositories + 'Contents: Read and write' "
+      + '— OR press Login again and accept the Contents write grant at consent — '
+      + 'OR paste a fine-grained PAT with Contents R/W via Connector. Then retry.',
+    )
+    error.code = 'CONNECTOR_PUSH_FORBIDDEN'
+    error.reason = 'push_forbidden'
+    return error
+  }
+
+  /**
    * PRE-FLIGHT for every path that mutates a remote. A dead token is refused
    * HERE, before the write (and, for a push, before any git process exists), so
    * the outcome is instant and explicit instead of a provider 401 after the fact.
@@ -1322,6 +1398,41 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
   function deviceClientId() {
     const value = config?.githubDeviceClientId
     return typeof value === 'string' && value.trim() !== '' ? value.trim() : ''
+  }
+
+  /**
+   * The scope list a device-flow start ASKS GitHub for (space-delimited, public).
+   *
+   * A configured value wins verbatim — including an EMPTY one, which deliberately
+   * means identity-only. Only a MISSING key falls back to
+   * {@link GITHUB_DEFAULT_SCOPES}, so a config object without the field (an old
+   * profile, a test fixture) still asks for the grant the rest of the plugin
+   * needs. Surplus whitespace is collapsed so the POST body is one clean string.
+   */
+  function githubRequestedScopes() {
+    const raw = config?.githubRequestedScopes
+    const text = typeof raw === 'string' ? raw : GITHUB_DEFAULT_SCOPES
+    return text.trim().split(/\s+/u).filter(part => part !== '').join(' ')
+  }
+
+  /**
+   * Parse the public `scope` field of a token answer into a scope list.
+   *
+   * GitHub answers the device exchange with a comma- or space-separated string
+   * (`repo, workflow`); both separators are accepted, duplicates dropped and the
+   * provider's order kept. Nothing here is a credential or a fragment of one.
+   */
+  function parseGrantedScopes(value) {
+    if (typeof value !== 'string') return []
+    const seen = new Set()
+    const out = []
+    for (const part of value.split(/[\s,]+/u)) {
+      const scope = part.trim()
+      if (scope === '' || seen.has(scope)) continue
+      seen.add(scope)
+      out.push(scope)
+    }
+    return out
   }
 
   /**
@@ -2268,6 +2379,10 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         supported: clientId !== '' && writable,
         clientIdConfigured: clientId !== '',
         canSaveClientId,
+        // PUBLIC configuration: the exact scope string this host will send on the
+        // device/code POST. Empty = an identity-only token (no private reads, no
+        // push), which is the failure the guide and the push card now name.
+        requestedScopes: githubRequestedScopes(),
         // The verification page this deployment uses. PUBLIC and stable, and it
         // is advertised so the page can open the tab synchronously inside the
         // click that starts the flow — a `window.open` after an `await` is what
@@ -2285,11 +2400,15 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
     /**
      * DEVICE FLOW, step 1 — start the login.
      *
-     * `POST https://github.com/login/device/code` with the public client id. The
-     * answer carries `device_code` (a bearer-equivalent secret) and `user_code`
-     * (what the user types at the verification page). The device code NEVER leaves
-     * this module: it is parked in {@link deviceFlows} behind an opaque flow id,
-     * and the page only ever sees the flow id, the user code and the URL.
+     * `POST https://github.com/login/device/code` with the public client id and
+     * the configured `scope` list. The scope field is OPTIONAL and
+     * load-bearing: omitted, GitHub issues an IDENTITY-ONLY token — private reads
+     * fall back anonymously and `git push` answers 403 (see
+     * {@link GITHUB_DEFAULT_SCOPES}). The answer carries `device_code` (a
+     * bearer-equivalent secret) and `user_code` (what the user types at the
+     * verification page). The device code NEVER leaves this module: it is parked
+     * in {@link deviceFlows} behind an opaque flow id, and the page only ever sees
+     * the flow id, the user code and the URL.
      */
     async deviceStart({ provider, alias } = {}) {
       const name = assertProvider(provider)
@@ -2313,10 +2432,18 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       // GitHub Enterprise install serves it at https://HOST (its REST lives under
       // /api/v3). `webOriginOf` is the one mapping already used for push remotes.
       const origin = webOriginOf(config?.github?.apiBase)
+      const requestedScopes = githubRequestedScopes()
       const answer = await request(`${origin}/login/device/code`, {
         method: 'POST',
         headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ client_id: clientId }).toString(),
+        body: new URLSearchParams({
+          client_id: clientId,
+          // GitHub treats `scope` as OPTIONAL, and the omission is silent: the
+          // token then has no repository grants at all. An EMPTY configured value
+          // is the caller asking for exactly that, so the field is omitted rather
+          // than sent blank. Scopes are public: they travel in this body only.
+          ...(requestedScopes === '' ? {} : { scope: requestedScopes }),
+        }).toString(),
       })
       const body = answer.json ?? {}
       if (!answer.ok) {
@@ -2435,10 +2562,18 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       const refreshRef = githubRefreshRefName(config, flow.alias)
       const rotated = typeof body.refresh_token === 'string' ? body.refresh_token : ''
       if (rotated !== '') await setSecret(ctx, refreshRef, rotated)
+      // THE GRANTED SCOPES — the provider's own answer, not a request echo.
+      // A login made WITHOUT a `scope` request (or with one the user unticked)
+      // authorizes fine and is useless for writes, so the receipt says what was
+      // actually granted and names the fix when `repo` is missing. Public facts
+      // only: a scope name is configuration, never a credential.
+      const grantedScopes = parseGrantedScopes(body.scope)
       return {
         ...(await referenceReceipt(flow.provider, flow.ref)),
         status: 'authorized',
         alias: flow.alias,
+        grantedScopes,
+        ...(grantedScopes.includes('repo') ? {} : { warning: GITHUB_SCOPELESS_WARNING }),
         refreshStored: rotated !== '',
       }
     },
@@ -3406,9 +3541,25 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
             env: { GIT_ASKPASS: askpassFile, GIT_ASKPASS_REQUIRE: 'force' },
             timeoutMs: 300000,
           })
+          const combined = `${pushed.stdout}${pushed.stderr === '' ? '' : `\n${pushed.stderr}`}`
+          /**
+           * CLASSIFY BEFORE REPORTING. Exit 128 with "denied to <user>" is not a
+           * transport problem: the token authenticated (the pre-flight above
+           * passed) but the OAuth App's grant lacks Contents write. Throwing the
+           * typed refusal here means the route answers 403 and the caller reads
+           * the fix instead of `exit 128`. Unrelated failures fall through and
+           * keep the plain `ok:false` receipt.
+           */
+          if (pushed.code !== 0 && name === 'github' && isPushForbiddenOutput(combined)) {
+            const denied = /denied to (\S+)/iu.exec(combined)
+            const login = typeof preflight.login === 'string' && preflight.login !== ''
+              ? preflight.login
+              : (denied === null ? '' : denied[1].replace(/[.,;:]+$/u, ''))
+            throw pushForbiddenError(`${owner}/${repo}`, login)
+          }
           // The token cannot appear in this text — but the URL could, and a
           // future git version might echo an askpass answer, so redact anyway.
-          const output = clamp(redact(`${pushed.stdout}${pushed.stderr === '' ? '' : `\n${pushed.stderr}`}`, token), outputLimit)
+          const output = clamp(redact(combined, token), outputLimit)
           return {
             ok: pushed.code === 0,
             dryRun: false,
