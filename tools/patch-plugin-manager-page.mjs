@@ -98,11 +98,12 @@ const OWN_HIDDEN = "DSH_IMAGE_HIDDEN_BUNDLES";
  * the browser tooling (plugins/dsh-browser-mcp), the browser troubleshooting tools
  * (plugins/dsh-brave-devtools-mcp), the visible browser desktop with its
  * browser_open bridge (plugins/dsh-browser-desktop), the Office skills and their
- * Python payload (plugins/dsh-office) and the market the market selector installs.
+ * Python payload (plugins/dsh-office), the personal VM (plugins/dsh-cua-vm), the
+ * Connector (plugins/dsh-connector) and the market the market selector installs.
  * All of them keep their own switch up there, so nothing becomes uncontrollable —
  * they simply stop being listed twice.
  */
-const INTEGRATED_BUNDLES = ["dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-browser-desktop", "dsh-office", "dsh-cua-vm", "dshmarket"];
+const INTEGRATED_BUNDLES = ["dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-browser-desktop", "dsh-office", "dsh-cua-vm", "dsh-connector", "dshmarket"];
 
 /** Occurrences of a literal, counted without regex escaping. */
 const count = (text, needle) => text.split(needle).length - 1;

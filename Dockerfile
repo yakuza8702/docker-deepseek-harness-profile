@@ -418,6 +418,7 @@ COPY plugins/dsh-browser-mcp /opt/dsh-browser-mcp
 COPY plugins/dsh-brave-devtools-mcp /opt/dsh-brave-devtools-mcp
 COPY plugins/dsh-plugins-page-extras /opt/dsh-plugins-page-extras
 COPY plugins/dsh-office /opt/dsh-office-bundle
+COPY plugins/dsh-connector /opt/dsh-connector
 RUN set -eux; \
     installed=0; \
     for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
@@ -429,14 +430,15 @@ RUN set -eux; \
         cp -a /opt/dsh-brave-devtools-mcp "$target/dsh-brave-devtools-mcp"; \
         cp -a /opt/dsh-plugins-page-extras "$target/dsh-plugins-page-extras"; \
         cp -a /opt/dsh-office-bundle "$target/dsh-office"; \
+        cp -a /opt/dsh-connector "$target/dsh-connector"; \
         installed=1; \
       fi; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
-    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras /opt/dsh-office-bundle; \
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras /opt/dsh-office-bundle /opt/dsh-connector; \
     chmod -R a+rX \
-      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras /opt/dsh/node_modules/dsh-office \
-      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras /opt/dsh-src/node_modules/dsh-office 2>/dev/null || true
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras /opt/dsh/node_modules/dsh-office /opt/dsh/node_modules/dsh-connector \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras /opt/dsh-src/node_modules/dsh-office /opt/dsh-src/node_modules/dsh-connector 2>/dev/null || true
 # The workspace plugin's own suite, kept in the image so the ported host logic can
 # be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
 
@@ -458,7 +460,7 @@ RUN set -eux; \
       anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
       [ -d "$root/dsh-browser-desktop" ] || continue; \
-      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "dsh-office", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "dsh-office", "dsh-connector", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
@@ -641,6 +643,33 @@ RUN node /tmp/check-office.mjs \
       --entrypoint /tmp/office-repo/entrypoint.sh \
       --install /opt/dsh/node_modules --install /opt/dsh-src/node_modules \
  && rm -rf /tmp/check-office.mjs /tmp/office-repo
+
+# ---------------------------------------------------------------------
+# CONNECTOR GATE — the row the Plugins page shows under "Personal VM (CUA)".
+#
+# Seven hops, none of them type-checked: the installed bundle in EVERY channel's
+# node_modules, the bundle patch's `id: connector` + `name: dsh-connector` row,
+# the Plugins-page host pair and its client row (ORDER matters: it renders
+# between "Personal VM (CUA)" and "Office documents"), the duplicate-card
+# suppression list, the entrypoint's seeder plus its `@local/connector` link
+# migration, and this Dockerfile's own COPY/staging lines. Any one of them
+# missing builds a green image whose Plugins page simply never shows the
+# connector — or shows it twice, under "Installed". See tools/check-connector.mjs.
+#
+# Placed after the Office gate because both read the same repository
+# declarations (extras index/client, the page patcher, the entrypoint), so a
+# failure here is reported against files the previous gate has already proven
+# present.
+# ---------------------------------------------------------------------
+COPY --chmod=0644 plugins/dsh-connector/cordis.patch.yml /tmp/connector-repo/dsh-connector.cordis.patch.yml
+COPY --chmod=0644 plugins/dsh-plugins-page-extras/index.js /tmp/connector-repo/plugins-page-extras.index.js
+COPY --chmod=0644 plugins/dsh-plugins-page-extras/client.js /tmp/connector-repo/plugins-page-extras.client.js
+COPY --chmod=0644 tools/patch-plugin-manager-page.mjs /tmp/connector-repo/patch-plugin-manager-page.mjs
+COPY --chmod=0644 docker/entrypoint.sh /tmp/connector-repo/entrypoint.sh
+COPY --chmod=0644 Dockerfile /tmp/connector-repo/Dockerfile
+COPY --chmod=0644 tools/check-connector.mjs /tmp/check-connector.mjs
+RUN node /tmp/check-connector.mjs --repo /tmp/connector-repo /opt/dsh/node_modules /opt/dsh-src/node_modules \
+ && rm -rf /tmp/check-connector.mjs /tmp/connector-repo
 
 # ---------------------------------------------------------------------
 # Native LibreOffice layout — soffice --headless + system-python docx/xlsx.

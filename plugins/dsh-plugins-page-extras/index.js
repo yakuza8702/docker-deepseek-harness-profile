@@ -76,7 +76,17 @@ const ROWS = [
    * switching the row off releases the tools and leaves every VM intact; switching
    * it back on re-mounts them against the same socket.
    */
-  { id: 'cua-vm', bundle: 'dsh-cua-vm' }
+  { id: 'cua-vm', bundle: 'dsh-cua-vm' },
+  /**
+   * The connector (GitHub / Cloudflare / Gitea tokens + repo verbs), from
+   * plugins/dsh-connector. Six `connector_*` native tools, the `/api/connector`
+   * Host routes and a `tool:connector` system-prompt section — context in every
+   * request, so it gets its own switch like the other integrated features. The
+   * row id is `connector` (the patch row in the bundle); the bundle is what
+   * carries it, and the credential REFERENCE names it configures are untouched by
+   * switching — only the tools, routes and prompt section are released.
+   */
+  { id: 'connector', bundle: 'dsh-connector' }
 ]
 
 /**

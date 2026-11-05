@@ -10,6 +10,9 @@ Plugin market         Only one can be enabled at a time            (on)
   Browser tools                                                      (on)
   Browser tools brave                                                (on)
   Browser Use                                  [Open panel]          (on)
+  Personal VM (CUA)                                                  (on)
+  Connector                                                          (on)
+  Office documents                                                   (on)
 Official 8
   …
 ```
@@ -19,6 +22,9 @@ Official 8
 | **Browser tools** | the `dsh-browser-mcp` bundle: the Playwright MCP row (24 tools) with its switch. The same shape as Desktop's "Remote Control" row |
 | **Browser tools brave** | the `dsh-brave-devtools-mcp` bundle: the Brave DevTools MCP row (30 tools — console, network, CSS, performance, Lighthouse, heap) with its *own* switch, so releasing one tool surface never releases the other |
 | **Browser Use** | the `dsh-browser-desktop` bundle: the visible desktop itself plus `browser_open` and its prompt section, with **Open panel** and its own switch |
+| **Personal VM (CUA)** | the `dsh-cua-vm` bundle: the `cua_vm_*` tools and their prompt section, with its own switch |
+| **Office documents** | the `dsh-office` bundle: the three Office skills on the pinned Python payload, with its own switch |
+| **Connector** | the `dsh-connector` bundle: the six `connector_*` tools (`status`, `repos_list`, `repo_actions`, `file`, `cloudflare`, `push`), the `/api/connector` routes, the `tool:connector` prompt section and the **Connector** sidebar page (GitHub / Cloudflare / Gitea). Sits directly under **Personal VM (CUA)** — the same order as the sidebar, where the Connector entry is order 21 and the VM is 20 — and has its own switch |
 | **Plugin market** | a master switch + one card per market; only one market can be on at a time. Mirrors Desktop's `MARKET_OPTIONS` (`community-market` / `dsh-market`) and links the same repositories |
 | Server side | `index.js` — four routes under `/dsh-plugins-page-extras/`, driving `ctx.pluginManager` (`listBundles`, `selectBundle`, `installBundle`), i.e. the same calls the page's own switches make |
 | Client side | `client.js` — registers into the `plugins.page.top` slot; the rows come from its `FEATURES` table, in page order |
@@ -56,3 +62,27 @@ The bundles behind these rows are also added to the page's own
 mechanism for keeping a profile-declared bundle out of the ordinary list. Without
 it an integrated feature appears twice: once as this row and again as a card under
 "Installed". In DSH Desktop the native add-ons never appear there either.
+
+## The Connector row
+
+`{ id: 'connector', bundle: 'dsh-connector' }` — the sixth row, added when the
+connector moved from a profile-pinned plugin (`@local/connector`) to a built-in
+bundle (`plugins/dsh-connector`, see its README). It sits **between
+`{ id: 'cua-vm', bundle: 'dsh-cua-vm' }` and `{ id: 'skill-office', bundle:
+'dsh-office' }`**, which is also where it renders: under **Personal VM (CUA)** and
+above **Office documents**, matching the sidebar, where the Connector page is
+order 21 and the VM panel is 20.
+
+The row switches the whole bundle, not one tool: off means the six
+`connector_*` tools, the `/api/connector` routes and the `tool:connector` prompt
+section are all released from the next request, and no stored credential is read,
+moved or deleted. `dsh-connector` is listed in `INTEGRATED_BUNDLES`
+(`tools/patch-plugin-manager-page.mjs`), so it never reappears as a second card
+under "Installed", and in the Market's "Installed" tab it never appears at all —
+selection lives in `dsh.profile.bundles`, never as a profile dependency.
+
+The wiring is asserted by `tools/check-connector.mjs`, which the image runs after
+the Office gate: the installed package in BOTH node_modules roots, the bundle
+patch's `id: connector` + `name: dsh-connector` row, this host/client pair and its
+order, the suppression list entry, the entrypoint's `seed_connector_bundle` +
+`@local/connector` link migration, and the Dockerfile's COPY/staging lines.

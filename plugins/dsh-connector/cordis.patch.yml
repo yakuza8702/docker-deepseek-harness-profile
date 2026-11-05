@@ -1,0 +1,109 @@
+# dsh-connector — one row; ONE config, no secret in it.
+#
+# The Host half registers
+#   * the `connector_*` agent tools,
+#   * the `tool:connector` system-prompt section,
+#   * the `/api/connector` Host routes the page posts to.
+# The Client half (`./client`) registers the sidebar row (order 21, directly
+# under Personal VM (CUA) at 20) and the keyed `main` page.
+#
+# LOGIN IS OAUTH FOR EVERY PROVIDER: GitHub runs a device flow, Gitea an
+# authorization-code flow through /api/connector/oauth/gitea/callback, Cloudflare
+# a PKCE (S256) authorization-code flow through
+# /api/connector/oauth/cloudflare/callback — a user-registered public client with
+# NO secret. There is no token field on the page for any of them.
+#
+# SECURITY: THIS PLUGIN IS REFERENCE-ONLY. Every field below is an endpoint, an
+# alias, a credential REFERENCE NAME, or a limit. A reference name (GITHUB_TOKEN)
+# is configuration, not a secret: DSH resolves it per call from
+# $DSH_HOME/.credentials.yaml <refs>, the environment, or a .env. The value never
+# enters this plugin beyond the single request that needs it, and is never
+# returned, logged, displayed, or characterized (no mask, no length).
+#
+# SWITCHES
+#   CONNECTOR_WORKSPACE_ROOT   the only tree a push may read (default /workspace)
+#   DSH_CONNECTOR=0            do not mount the row (no connector tools at all);
+#                              matches docker/entrypoint.sh's seed_connector_bundle
+- insert:
+    - id: connector
+      name: 'dsh-connector'
+      disabled: !!js "process.env.DSH_CONNECTOR === '0'"
+      config:
+        workspaceRoot: !!js "process.env.CONNECTOR_WORKSPACE_ROOT || '/workspace'"
+        github:
+          defaultAlias: "default"
+          # The DSH credential holding the GitHub token. Change the NAME here (or
+          # on the Connector page); store the token itself in DSH.
+          credentialRef: "GITHUB_TOKEN"
+          aliases: {}
+          apiBase: "https://api.github.com"
+          # The refresh half of the device-flow grant (written by the poll when the
+          # OAuth App has "Expire user access tokens" enabled). A NAME, never a value.
+          refreshCredentialRef: "GITHUB_REFRESH_TOKEN"
+          refreshAliases: {}
+          # OPTIONAL: a confidential app's refresh needs its client secret; this is
+          # the NAME of the reference that holds it. Omitted when it does not resolve.
+          clientSecretRef: "GITHUB_CLIENT_SECRET"
+        cloudflare:
+          defaultAlias: "default"
+          # The OAuth access token (a NAME; the value lives in DSH). Written by the
+          # authorization-code + PKCE callback, never by the page.
+          credentialRef: "CLOUDFLARE_API_TOKEN"
+          aliases: {}
+          # The refresh half of the same grant, under its own NAME. Written by the
+          # same callback when `offline_access` was granted; used once per refresh,
+          # then rotated.
+          refreshCredentialRef: "CLOUDFLARE_REFRESH_TOKEN"
+          refreshAliases: {}
+          apiBase: "https://api.cloudflare.com"
+          # OAuth endpoints (authorize/token/revoke) live on the dashboard host,
+          # not on api.cloudflare.com. Empty = https://dash.cloudflare.com.
+          oauthBase: ""
+        gitea:
+          defaultAlias: "default"
+          credentialRef: "GITEA_TOKEN"
+          aliases: {}
+          # REQUIRED before a Gitea call can work: the user's self-hosted origin,
+          # e.g. https://git.example.com — editable from the Connector page.
+          apiBase: ""
+          allowSelfSigned: false
+        # PUBLIC GitHub OAuth App client id (device flow). Empty = set it inline
+        # from the Login panel; it is a public identifier, not a secret.
+        githubDeviceClientId: ""
+        # PUBLIC Gitea OAuth2 application client id (authorization-code flow).
+        giteaOAuthClientId: ""
+        # PUBLIC Cloudflare OAuth client id (Manage Account → OAuth clients). The
+        # client is PKCE-only (`token_endpoint_auth_method: none`), so there is NO
+        # client secret to configure — a Cloudflare login needs nothing but this.
+        # Editable from the Login panel; empty = the panel asks for it inline.
+        cloudflareOAuthClientId: ""
+        # Space-separated OAuth scopes, DOT form, SINGULAR ids from the dashboard
+        # picker. Empty = the plugin's 20-id want-list (pages, DNS, zones,
+        # zone-settings.*, zone-waf.*, ddos-protection.read +
+        # http-ddos-managed-ruleset.read, account-firewall-access-rules.*,
+        # account-rule-lists.*, config-settings.*, analytics.read, offline_access).
+        # The three ids that used to be guessed wrong, and are now pinned:
+        #   /zones/{id}/settings        -> zone-settings.read|write (NOT config-settings.*)
+        #   firewall/access_rules       -> account-firewall-access-rules.read|write
+        #   rulesets ddos_l7 entrypoint -> ddos-protection.read AND http-ddos-managed-ruleset.read
+        # An Account-wide scope is never requested: not every account exposes one.
+        # offline_access is never ticked in the UI: the client's Refresh Token
+        # grant adds it automatically.
+        cloudflareOAuthScopes: ""
+        # THE RECOMMENDED SETTING FOR A HARNESS BEHIND A REVERSE PROXY: the redirect
+        # ORIGIN (an origin, never a URL and never a secret), e.g.
+        # https://connector.example.com. When set it WINS over every request-derived
+        # origin, at the authorize step AND at the token exchange, so a proxy that
+        # drops https or rewrites Host cannot produce invalid_grant.
+        #   * origin only: the callback path is appended by the plugin;
+        #   * https only, or http for hosts whose suffix is `localhost`;
+        #   * it must ALSO be registered among the OAuth client's redirect
+        #     (callback) URLs, EXACTLY (no trailing slash).
+        # Same field as the Login panel's inline "Callback origin" control — either
+        # surface writes this one value.
+        cloudflareCallbackOrigin: ""
+        # The Gitea client SECRET is NOT here: this is the DSH reference NAME that
+        # holds it, and the value lives in DSH's own store.
+        giteaClientSecretRef: "GITEA_CLIENT_SECRET"
+        outputLimit: 8000
+        requestTimeoutMs: 20000

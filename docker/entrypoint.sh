@@ -647,6 +647,107 @@ seed_cua_vm_bundle() {
   esac
 }
 
+# The Connector as a switchable BUNDLE (see plugins/dsh-connector).
+#
+# Same contract as the five above: the row lives in the bundle's own patch
+# (`id: connector`), the Plugins page's top row (next to Personal VM (CUA)) is
+# what mounts it, and a profile-level `disabled:` override wins. DSH_CONNECTOR=0
+# removes the row entirely, exactly like DSH_CUA_VM=0 removes the VM tools.
+#
+# One thing the five do NOT need: a MIGRATION. An earlier iteration of this
+# feature was shipped by pinning the plugin into the profile manifest as
+# `"@local/connector": "link:/workspace/plugin/connector"`. That predates the
+# rename and the built-in recipe, so on a home seeded by it the plugin would show
+# up TWICE (once under "Installed plugins" as a profile dependency, once as the
+# new built-in bundle) and its old patch row (`name: '@local/connector'`) would
+# no longer resolve at all. Only OUR link is dropped — a user who pinned the
+# package themselves (any other spec, or a different path) keeps their pin — and
+# it runs on every boot so pre-rename homes are repaired the first time they
+# start on this image, whether or not the feature stays selected afterwards.
+CONNECTOR_BUNDLE="dsh-connector"
+
+drop_connector_profile_link() {
+  [[ "${SAFE_MODE:-0}" == "1" ]] && return 0
+  local manifest="$DSH_REAL_HOME/profiles/$PROFILE/package.json"
+  [[ -f "$manifest" ]] || return 0
+  local dropped
+  dropped="$(node -e '
+    const fs = require("fs");
+    const [manifest, name, suffix] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const dependencies = parsed.dependencies;
+    if (dependencies === null || typeof dependencies !== "object" || !Object.hasOwn(dependencies, name)) { process.stdout.write("absent"); process.exit(0); }
+    const spec = dependencies[name];
+    // Ours is a `link:` whose PATH SUFFIX is /plugin/connector (the source
+    // checkout the old image pinned, wherever the checkout was mounted): a
+    // link: into node_modules or any other path is the user\u0027s own pin.
+    const ours = typeof spec === "string" && spec.startsWith("link:") && spec.replace(/\/+$/, "").endsWith(suffix);
+    if (!ours) { process.stdout.write("foreign:" + String(spec)); process.exit(0); }
+    delete dependencies[name];
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("dropped");
+  ' "$manifest" "@local/connector" "/plugin/connector" 2>/dev/null || true)"
+  case "$dropped" in
+    dropped) log "connector: dropped the pre-rename \"@local/connector\" profile link — the name is dsh-connector now, installed as a built-in bundle" ;;
+    foreign:*) log "connector: the profile pins \"@local/connector\" itself (${dropped#foreign:}) — left exactly as the user set it" ;;
+  esac
+}
+
+seed_connector_bundle() {
+  [[ "${SAFE_MODE:-0}" == "1" ]] && { log "connector: Safe Mode — the real profile is left untouched"; return 0; }
+
+  # Repair any pre-rename profile pin FIRST, i.e. before this boot decides whether
+  # the bundle stays selected: a home the old image seeded must not keep a
+  # dependency whose patch row name no longer exists, whether or not the feature
+  # is on. Same ordering as seed_browser_mcp_bundle's drop block.
+  drop_connector_profile_link
+
+  [[ "${DSH_CONNECTOR:-1}" == "0" ]] && { log "connector: not selected (DSH_CONNECTOR=0)"; return 0; }
+
+  local dir="$DSH_REAL_HOME/profiles/$PROFILE"
+  local manifest="$dir/package.json"
+  [[ -f "$manifest" ]] || { log "connector: profile \"$PROFILE\" does not exist yet — it will be selected on the next boot"; return 0; }
+
+  local bundle_dir=""
+  for root in /opt/dsh /opt/dsh-src; do
+    if [[ -d "$root/node_modules/$CONNECTOR_BUNDLE" ]]; then bundle_dir="$root/node_modules/$CONNECTOR_BUNDLE"; break; fi
+  done
+  [[ -n "$bundle_dir" ]] || { log "WARN: $CONNECTOR_BUNDLE is not in this image's node_modules — the connector tools will not be offered"; return 0; }
+
+  local marker="$DSH_REAL_HOME/.connector-bundle-seeded"
+  local seeded=0
+  [[ -f "$marker" ]] && seeded=1
+
+  local how
+  how="$(node -e '
+    const fs = require("fs");
+    const [manifest, name, seeded] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const profile = parsed?.dsh?.profile;
+    if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
+    const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
+    if (seeded === "1") { process.stdout.write("existing-home"); process.exit(0); }
+    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("selected");
+  ' "$manifest" "$CONNECTOR_BUNDLE" "$seeded" 2>/dev/null || true)"
+
+  case "$how" in
+    selected|already-selected)
+      printf '%s\n' "$how" > "$marker" 2>/dev/null || true
+      log "connector: \"$CONNECTOR_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page to release the connector_* tools"
+      ;;
+    existing-home) ;;
+    unreadable|no-profile-block) log "WARN: could not select \"$CONNECTOR_BUNDLE\" ($how) — enable it by hand in the Plugins page" ;;
+    *) log "WARN: could not select \"$CONNECTOR_BUNDLE\" — enable it by hand in the Plugins page" ;;
+  esac
+}
+
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
   write_boot_state failed "$*" "the harness process exited during startup"
@@ -819,6 +920,11 @@ else
   # a Linux VM whose disk lives outside the workspace, with the shell staying
   # confined to workspace-write.
   seed_cua_vm_bundle
+  # …and the Connector as a SIXTH (see plugins/dsh-connector): GitHub /
+  # Cloudflare / Gitea tokens and repo verbs, with the row id `connector`
+  # mounted by the bundle patch and switched by the Extras row next to
+  # Personal VM (CUA). Same contract as the five above.
+  seed_connector_bundle
 fi
 
 # Hide the image's integrated MCP rows from a user-installed MCP manager:
