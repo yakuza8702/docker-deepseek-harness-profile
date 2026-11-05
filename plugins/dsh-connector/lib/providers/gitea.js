@@ -265,6 +265,33 @@ export function createGitea({ apiBase, request, version }) {
     },
 
     /**
+     * THE LIVENESS PROBE — Gitea's half of the same fact.
+     *
+     * A self-hosted PAT or OAuth token can be revoked or expire on the instance
+     * side while the reference still resolves here, so `resolved` alone is not an
+     * answer either. `/user` is the cheapest authenticated route Gitea publishes
+     * and needs no version probe, which is what keeps this to ONE call.
+     *
+     * Same typed contract as the GitHub adapter: `live` (200), `expired` (401 —
+     * Gitea answers 401 for a revoked/expired token), `unreachable` for a network
+     * failure or any other status (403 = a disabled account, not an expiry).
+     *
+     * @param token - the resolved token to classify.
+     * @returns `{ state, login?, status?, reason? }`.
+     */
+    async tokenState(token) {
+      let response
+      try {
+        response = await call(token, '/user')
+      } catch (error) {
+        return { state: 'unreachable', reason: String(error?.message ?? error) }
+      }
+      if (response.ok) return { state: 'live', login: response.json?.login }
+      if (response.status === 401) return { state: 'expired', status: 401, reason: 'Gitea refused the token on /user' }
+      return { state: 'unreachable', status: response.status, reason: `Gitea ${response.status} on /user` }
+    },
+
+    /**
      * Rate limit from the `X-RateLimit-*` headers of one authenticated probe.
      *
      * Gitea emits these only when its rate limiter is enabled (and only from

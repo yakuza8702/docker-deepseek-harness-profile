@@ -63,6 +63,46 @@ const WRITE_MARK = 'WRITE ⚠'
  */
 const SECRECY_MARK = 'no value in or out'
 
+/**
+ * THE ANONYMOUS-FALLBACK NOTE — one line, appended at the END of a result whose
+ * repository read was served WITHOUT the token.
+ *
+ * The receipt already carries `public: true`, but a receipt field is easy to
+ * scroll past — that is exactly how a dead token went unnoticed while public
+ * reads kept succeeding. This line is the part a caller cannot miss: it says the
+ * data did not come from the credential, which is the one fact that explains
+ * every write failing.
+ */
+const ANONYMOUS_NOTE = 'note: served anonymously (your token could not authenticate this path)'
+
+/** Liveness labels — the vocabulary the status line and the tests share. */
+const LIVENESS_LIVE = 'live'
+const LIVENESS_DEAD = 'EXPIRED/DEAD — reads may fall back anonymously; press Login on the Connector page to refresh'
+
+/**
+ * Render one alias's liveness verdict.
+ *
+ * `resolved` describes the REFERENCE; this describes the VALUE. A dead token must
+ * never read as plain "resolved", so the dead case carries both the verdict and
+ * the one action that fixes it.
+ */
+function livenessSuffix(liveness) {
+  if (liveness === undefined || liveness === null) return ''
+  if (liveness.state === 'live') return ` · ${LIVENESS_LIVE}`
+  if (liveness.state === 'expired') return ` · ${LIVENESS_DEAD}`
+  const state = liveness.state ?? 'unreported'
+  const why = typeof liveness.reason === 'string' && liveness.reason !== '' ? ` — ${liveness.reason}` : ''
+  return ` · liveness unknown (${state})${why}`
+}
+
+/**
+ * Append the anonymous note when — and only when — the provider served the read
+ * anonymously. Everything else is returned untouched.
+ */
+function withAnonymousNote(text, result) {
+  return result?.public === true ? `${text}\n${ANONYMOUS_NOTE}` : text
+}
+
 /** Text output envelope shared by every tool here. */
 const textOutput = (description) => ({
   schema: {
@@ -84,9 +124,11 @@ function aliasLines(report) {
       continue
     }
     for (const row of aliases) {
+      // `resolved` is a fact about the REFERENCE; the liveness suffix is the fact
+      // about the VALUE. Both, or the line lies about a dead token.
       const state = row.resolved
-        ? `resolved${row.source === undefined ? '' : ` (${row.source})`}`
-        : 'not resolved — store this credential in DSH'
+        ? `resolved${row.source === undefined ? '' : ` (${row.source})`}${livenessSuffix(row.liveness)}`
+        : `not resolved — store this credential in DSH${livenessSuffix(row.liveness)}`
       lines.push(`${provider.provider} · ${row.alias} · ref ${row.credentialRef || '(none set)'} · ${state}`)
     }
     if (provider.rateLimit !== undefined) {
@@ -149,7 +191,7 @@ export function createTools({ operations }) {
     {
       name: 'connector_status',
       // Read-only. FIRST call: tells the model which alias/ref to use before any other tool.
-      description: `${READ_MARK}. First call: per alias ref name, resolved?, budget, OAuth state; rateLimit:false skips the budget.`,
+      description: `${READ_MARK}. First call: per alias ref name, resolved?, token LIVE/EXPIRED, budget, OAuth state; rateLimit:false or liveness:false skips the probes.`,
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -157,6 +199,7 @@ export function createTools({ operations }) {
           provider: { type: 'string', enum: PROVIDERS, description: 'One provider only.' },
           alias: { type: 'string', description: 'One alias only.' },
           rateLimit: { type: 'boolean', description: 'Budget probe, default true.' },
+          liveness: { type: 'boolean', description: 'Token liveness probe, default true.' },
         },
       },
       output: textOutput('Alias, ref name, resolved state.'),
@@ -167,6 +210,9 @@ export function createTools({ operations }) {
           // On by default: the budget is part of what "status" answers. A caller
           // that wants a cheap, token-free listing passes rateLimit:false.
           rateLimit: args.rateLimit !== false,
+          // LIVENESS IS THE POINT OF THIS TOOL: `resolved` alone let a dead
+          // token read as healthy. On by default, opt out with liveness:false.
+          liveness: args.liveness !== false,
         })
         const lines = aliasLines(report)
         lines.push('the credential value is managed by DSH; this plugin stores only the reference name')
@@ -246,35 +292,37 @@ export function createTools({ operations }) {
       output: textOutput('List, log tail, diff, or write receipt.'),
       async execute(args = {}) {
         const result = await operations.repoAction(args)
+        // ONE exit helper: a result the provider served ANONYMOUSLY gets the note
+        // appended, so a fallback can never be mistaken for a token-authenticated
+        // read.
+        const say = (text) => ({ text: withAnonymousNote(text, result) })
 
         // Capability/unsupported verdicts first: they are the whole answer.
         if (result.supported === false) {
           const head = `${result.action} on ${result.provider}: not supported — ${result.reason}`
-          return { text: result.text === '' || result.text === undefined ? head : `${head}\n${result.text}` }
+          return say(result.text === '' || result.text === undefined ? head : `${head}\n${result.text}`)
         }
         if (typeof result.text === 'string' && result.text !== '') {
-          return {
-            text: `${result.action} ${result.number === undefined ? '' : `#${result.number} `}(${result.truncated === true ? 'tail, truncated' : 'complete'}):\n${result.text}`,
-          }
+          return say(`${result.action} ${result.number === undefined ? '' : `#${result.number} `}(${result.truncated === true ? 'tail, truncated' : 'complete'}):\n${result.text}`)
         }
         if (result.action === 'actions_logs' && Array.isArray(result.items)) {
           const rows = result.items.map(row => `${row.id} · ${row.name ?? row.url ?? ''} · ${row.status ?? ''}${row.conclusion === undefined || row.conclusion === null ? '' : `/${row.conclusion}`}`)
-          return { text: rows.length === 0 ? 'No runs found.' : `${rows.length} run(s):\n${rows.join('\n')}` }
+          return say(rows.length === 0 ? 'No runs found.' : `${rows.length} run(s):\n${rows.join('\n')}`)
         }
         if (Array.isArray(result.items) && result.items.length > 0 && result.action !== 'actions_logs') {
           const lines = itemLines(result)
           const scope = result.path === undefined ? '' : ` · ${result.path}`
-          return { text: `${result.count} ${result.action} in ${result.owner}/${result.repo}${scope} (alias ${result.alias}):\n${lines.join('\n')}` }
+          return say(`${result.count} ${result.action} in ${result.owner}/${result.repo}${scope} (alias ${result.alias}):\n${lines.join('\n')}`)
         }
         if (Array.isArray(result.items) && result.items.length === 0 && READ_ACTIONS.has(result.action)) {
-          return { text: `No ${result.action} found in ${result.owner}/${result.repo}${result.path === undefined ? '' : ` for ${result.path}`}.` }
+          return say(`No ${result.action} found in ${result.owner}/${result.repo}${result.path === undefined ? '' : ` for ${result.path}`}.`)
         }
 
         const receipt = Object.entries(result)
           .filter(([field]) => !ENVELOPE.has(field))
           .map(([field, value]) => `${field}=${value === null || value === undefined ? 'null' : typeof value === 'object' ? JSON.stringify(value) : String(value)}`)
           .join(' · ')
-        return { text: `${result.action} on ${result.provider} ${result.owner}/${result.repo}: ${receipt}` }
+        return say(`${result.action} on ${result.provider} ${result.owner}/${result.repo}: ${receipt}`)
       },
     },
 
@@ -306,21 +354,18 @@ export function createTools({ operations }) {
       output: textOutput('Tree, content, or commit receipt.'),
       async execute(args = {}) {
         const result = await operations.fileAction(args)
+        const say = (text) => ({ text: withAnonymousNote(text, result) })
         if (result.action === 'read_tree') {
-          if (result.supported === false) return { text: `read_tree on ${result.provider}: not available — ${result.reason}` }
+          if (result.supported === false) return say(`read_tree on ${result.provider}: not available — ${result.reason}`)
           const lines = (result.items ?? []).map(row => `${row.type === 'tree' ? 'dir ' : 'file'} ${row.path}${row.size === undefined ? '' : ` (${row.size} B)`}`)
-          return {
-            text: `${result.count} entries at ${result.owner}/${result.repo}@${result.ref}${result.path === '/' ? '' : ` under ${result.path}`}${result.truncated === true ? ' — TRUNCATED by the server, there are more' : ''}:\n${lines.join('\n')}`,
-          }
+          return say(`${result.count} entries at ${result.owner}/${result.repo}@${result.ref}${result.path === '/' ? '' : ` under ${result.path}`}${result.truncated === true ? ' — TRUNCATED by the server, there are more' : ''}:\n${lines.join('\n')}`)
         }
         if (result.action === 'read_file') {
           const header = `${result.path} at ${result.ref} · sha ${String(result.sha ?? '').slice(0, 12)} · ${result.size ?? '?'} B${result.truncated === true ? ' · content not inlined by the server' : ''}`
-          if (typeof result.utf8 === 'string') return { text: `${header}\n\n${result.utf8}` }
-          return { text: `${header}\n\n(binary or unavailable content; base64 payload is ${result.contentBase64 === '' ? 'empty' : `${result.contentBase64.length} chars`})` }
+          if (typeof result.utf8 === 'string') return say(`${header}\n\n${result.utf8}`)
+          return say(`${header}\n\n(binary or unavailable content; base64 payload is ${result.contentBase64 === '' ? 'empty' : `${result.contentBase64.length} chars`})`)
         }
-        return {
-          text: `put_file on ${result.provider} ${result.owner}/${result.repo}: ${result.path} → ${result.branch} · ${result.bytes} B · commit ${String(result.commit ?? '').slice(0, 12) || '(no sha returned)'} · blob ${String(result.contentSha ?? '').slice(0, 12) || '(none)'}`,
-        }
+        return say(`put_file on ${result.provider} ${result.owner}/${result.repo}: ${result.path} → ${result.branch} · ${result.bytes} B · commit ${String(result.commit ?? '').slice(0, 12) || '(no sha returned)'} · blob ${String(result.contentSha ?? '').slice(0, 12) || '(none)'}`)
       },
     },
 
@@ -454,5 +499,5 @@ export function createTools({ operations }) {
 export {
   READ_ACTIONS, WRITE_ACTIONS, FILE_READ_ACTIONS, FILE_WRITE_ACTIONS,
   CLOUDFLARE_READ_ACTIONS, CLOUDFLARE_WRITE_ACTIONS,
-  READ_MARK, WRITE_MARK, SECRECY_MARK,
+  READ_MARK, WRITE_MARK, SECRECY_MARK, ANONYMOUS_NOTE, LIVENESS_LIVE, LIVENESS_DEAD,
 }

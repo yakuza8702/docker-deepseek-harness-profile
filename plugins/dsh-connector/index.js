@@ -176,9 +176,16 @@ function buildConfig() {
   const cloudflareCallbackOrigin = z.string().default('').description(
     'Optional redirect ORIGIN override for Cloudflare, e.g. https://connector.example.com. Must be HTTPS (or http://localhost:<port>) and must be registered among the OAuth client redirect (callback) URLs. Empty = derive it from the page origin.',
   )
+  // THE GITEA EQUIVALENT — the same non-secret origin override, held to the same
+  // rule. A Gitea OAuth2 application compares its registered callback EXACTLY, so
+  // a login pressed on http://127.0.0.1:<port> must be able to name the domain the
+  // application registered instead of sending the loopback origin.
+  const giteaCallbackOrigin = z.string().default('').description(
+    'Optional redirect ORIGIN override for Gitea, e.g. https://connector.example.com. Must be HTTPS (or http://localhost:<port>) and must be registered among the OAuth2 application redirect (callback) URIs, EXACTLY. Empty = derive it from the page origin.',
+  )
   return z.object({
     workspaceRoot, github, cloudflare, gitea, giteaOAuthClientId, giteaClientSecretRef,
-    cloudflareOAuthClientId, cloudflareOAuthScopes, cloudflareCallbackOrigin,
+    cloudflareOAuthClientId, cloudflareOAuthScopes, cloudflareCallbackOrigin, giteaCallbackOrigin,
     outputLimit, requestTimeoutMs, githubDeviceClientId,
   })
 }
@@ -211,7 +218,8 @@ export const Config = z === undefined ? undefined : buildConfig()
  *     Gitea capability probes) and the login/scope-403 answer;
  *   * the one ordering rule that prevents wasted calls (`connector_status` first).
  *
- * Measured budget: this section is 1129 characters. `selftest/harness.mjs`
+ * Measured budget: this section is 1303 characters (1129 before the LIVE-token
+ * clause and the liveness hint). `selftest/harness.mjs`
  * asserts an upper bound and `selftest/measure-text.mjs` reports the exact value
  * beside the tool descriptions, so a future edit cannot re-inflate it unnoticed.
  *
@@ -221,8 +229,9 @@ export const Config = z === undefined ? undefined : buildConfig()
 const CONNECTOR_PROMPT = [
   'Connector (`connector_*`) on GitHub/Gitea/Cloudflare, through DSH credential REFERENCES: an alias names one (`GITHUB_TOKEN`) that DSH resolves per call. Never ask the user for a credential, never repeat one — no value is returned, never derived; `connector_status` prints the reference name only.',
   '`READ ✓` unrestricted; `WRITE ⚠` approval-gated (approval policy: state what changes and why). Slots: provider, alias (default: provider default), owner, repo, action; ids 32-hex, Cloudflare `owner` = account id and `repo` = Pages project. `no value in or out`.',
-  '`connector_status` first (rateLimit:false skips the budget). `connector_file`: read_tree/read_file read, put_file commits (sha replaces, else creates). `connector_repo_actions`: 8 reads, the rest write — issue/label/assignee/branch/tag/PR edits, run_dispatch/run_cancel/run_rerun/delete_run, pr_merge.',
-  'Cloudflare verbs outside `connector_cloudflare` are unsupported; Gitea capability-detects (Swagger), the rest is explicit unsupported; `connector_push` = wrangler deploy there, dryRun:false. 403 = scope not granted; unresolved reference or OAuth: Connector page Login.',
+  'Writes require a LIVE token — if status marks the token dead, direct the user to Login; never route github pushes through arbitrary git remotes.',
+  '`connector_status` first (liveness flags a dead token; rateLimit:false skips the probes). `connector_file`: read_tree/read_file read, put_file commits (sha replaces, else creates). `connector_repo_actions`: 8 reads, the rest write — issue/label/assignee/branch/tag/PR edits, run_dispatch/run_cancel/run_rerun/delete_run, pr_merge.',
+  'Cloudflare verbs outside `connector_cloudflare` are unsupported; Gitea capability-detects (Swagger), the rest is explicit unsupported; `connector_push` = wrangler deploy there, dryRun:false. 401 or an "invalid token" 403 = token expired (refresh once, then Login); a plain 403 = scope not granted; unresolved reference or OAuth: Connector page Login.',
 ].join(' ')
 
 /**

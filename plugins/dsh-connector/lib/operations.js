@@ -45,13 +45,16 @@ import {
   resolveSecret, setSecret, storePath, unsetSecret,
 } from './credentials.js'
 import {
-  CLOUDFLARE_CALLBACK_PATH, CLOUDFLARE_DEFAULT_SCOPES, CLOUDFLARE_OAUTH_ORIGIN,
-  buildCloudflareAuthorizeUrl, buildGiteaAuthorizeUrl, callbackUrlOf, cloudflareCallbackUrlOf,
-  createPkcePair, createStateStore, exchangeCloudflareCode, exchangeGiteaCode, giteaWebOrigin,
-  isCloudflareRedirectOrigin, refreshCloudflareToken, revokeCloudflareToken,
+  CLOUDFLARE_CALLBACK_PATH, CLOUDFLARE_DEFAULT_SCOPES, CLOUDFLARE_OAUTH_ORIGIN, GITEA_CALLBACK_PATH,
+  buildCloudflareAuthorizeUrl, buildGiteaAuthorizeUrl, callbackUrlOf, classifyGiteaExchangeFailure,
+  cloudflareCallbackUrlOf, createPkcePair, createStateStore, exchangeCloudflareCode, exchangeGiteaCode,
+  giteaWebOrigin, isCloudflareRedirectOrigin, isSecureCallbackOrigin, refreshCloudflareToken,
+  revokeCloudflareToken,
 } from './oauth.js'
 import { createGitHub, decodeTextBase64, webOriginOf } from './providers/github.js'
-import { CLOUDFLARE_DDOS_SCOPES, CLOUDFLARE_SCOPE_IDS, createCloudflare } from './providers/cloudflare.js'
+import {
+  CLOUDFLARE_DDOS_SCOPES, CLOUDFLARE_SCOPE_IDS, CLOUDFLARE_TOKEN_EXPIRED_MESSAGE, createCloudflare,
+} from './providers/cloudflare.js'
 import { createGitea, normalizeBaseUrl } from './providers/gitea.js'
 
 /** Refuse a repository identifier that could escape its path segment. */
@@ -733,9 +736,16 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       // Best effort: a store failure here must not mask the provider's refusal.
       await unsetSecret(ctx, ref).catch(() => undefined)
       await unsetSecret(ctx, refreshRef).catch(() => undefined)
-      const refused = new Error('Cloudflare refused to refresh this login; press Login on the Cloudflare card to authorize again')
+      /**
+       * THE MESSAGE STAYS THE EXPIRED-TOKEN ONE. A user whose grant was revoked
+       * gets "press Login", which is the action that actually helps; the reason id
+       * (`refresh_refused`) carries the finer fact for a caller, and the trailing
+       * clause says what was cleared. It never becomes a scope message.
+       */
+      const refused = new Error(`${CLOUDFLARE_TOKEN_EXPIRED_MESSAGE} (The refresh token was refused too, so both references were cleared.)`)
       refused.code = 'CONNECTOR_PROVIDER_ERROR'
       refused.reason = 'refresh_refused'
+      refused.tokenExpired = true
       throw refused
     }
     const { ref } = targetOf('cloudflare', alias)
@@ -870,6 +880,9 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       failure.code = error?.code ?? 'CONNECTOR_PROVIDER_ERROR'
       if (Number.isFinite(error?.status)) failure.status = error.status
       if (error?.tokenRejected === true) failure.tokenRejected = true
+      // The expiry CLASSIFICATION survives the redaction wrapper, so a caller can
+      // tell a dead token from a missing scope without reading prose.
+      if (error?.tokenExpired === true) failure.tokenExpired = true
       if (typeof error?.reason === 'string') failure.reason = error.reason
       // A classification (not a value): the consent vs missing-scope distinction
       // survives the redaction wrapper, so a caller can branch on the reason.
@@ -944,6 +957,114 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
   function targetOf(providerName, alias) {
     const target = assertAlias(alias === undefined || alias === '' ? settings.defaultAlias[providerName] : alias)
     return { alias: target, ref: requireRefName(config, providerName, target) }
+  }
+
+  /** Provider labels for the one message that tells a user what to do next. */
+  const PROVIDER_LABEL = { github: 'GitHub', gitea: 'Gitea', cloudflare: 'Cloudflare' }
+
+  /**
+   * THE FACT `resolved` CANNOT REPORT: does the stored value still authenticate?
+   *
+   * A reference can resolve perfectly and still be a DEAD credential — an
+   * expired 8-hour device-flow access token is the case that produced a live
+   * incident: every read succeeded anonymously on a public repository, so the
+   * agent saw data and never noticed that every write was 401ing.
+   *
+   * One cheap authenticated call (`GET /user` through the adapter) is the whole
+   * answer, and it is classified rather than thrown so a status read can never
+   * fail because a provider is down:
+   *
+   *   * `live`        — the value authenticated;
+   *   * `expired`     — 401: the token itself is dead (press Login);
+   *   * `unreachable` — a network failure or any other status: UNKNOWN, not dead;
+   *   * `unknown`     — no probe exists for this provider/token type.
+   *
+   * Cloudflare has no probe: `/user/tokens/verify` is API-token-only (an OAuth
+   * access token answers 1000/10000 there, which is exactly the misleading
+   * "Invalid API Token" this build already removed from the Test button), and its
+   * expiry is the refresh path's business. Reported as `unknown`, never guessed.
+   *
+   * @param name - provider id.
+   * @param api - the adapter for this alias.
+   * @param token - the resolved value (used for one request only).
+   * @returns `{ state, login?, reason? }`.
+   */
+  async function tokenLiveness(name, api, token) {
+    const probe = api?.tokenState
+    if (typeof probe !== 'function') {
+      return { state: 'unknown', reason: `${PROVIDER_LABEL[name] ?? name} publishes no identity endpoint for this token type` }
+    }
+    let answer
+    try {
+      answer = await probe.call(api, token)
+    } catch (error) {
+      // A probe must never turn a status read into a failure.
+      answer = { state: 'unreachable', reason: String(error?.message ?? error) }
+    }
+    const state = answer?.state === 'live' || answer?.state === 'expired' ? answer.state : 'unreachable'
+    const reason = typeof answer?.reason === 'string' ? redact(answer.reason, token) : undefined
+    return {
+      state,
+      ...(state === 'live' && typeof answer?.login === 'string' ? { login: answer.login } : {}),
+      ...(reason === undefined ? {} : { reason }),
+    }
+  }
+
+  /**
+   * Resolve one alias and classify its token — the entry point for status and for
+   * the push pre-flight, where no value is in hand yet. An unresolved reference
+   * reports `unknown`: that alias is already shown as unresolved, and this
+   * function never invents a second verdict about it.
+   */
+  async function probeToken(name, alias) {
+    const target = targetOf(name, alias)
+    if (name === 'gitea' && settings.gitea.baseUrl === '') {
+      return { state: 'unknown', reason: 'Gitea base URL is not configured' }
+    }
+    let token
+    try {
+      token = await resolveSecret(ctx, target.ref)
+    } catch (error) {
+      return { state: 'unknown', reason: String(error?.message ?? error) }
+    }
+    if (token === undefined) {
+      return { state: 'unknown', reason: `credential reference ${target.ref} does not resolve` }
+    }
+    return tokenLiveness(name, adapters(target.alias)[name], token)
+  }
+
+  /**
+   * THE DEAD-TOKEN REFUSAL — typed, instant, and explicit about what did NOT
+   * happen. `verb` decides the last sentence: a push and a repository write are
+   * different promises, and the caller must be able to repeat either one verbatim.
+   *
+   * No value, no length, no fragment: the message says what the user has to DO.
+   */
+  function deadTokenError(name, verb) {
+    const what = verb === 'push' ? 'No push was attempted.' : 'No write was attempted.'
+    const error = new Error(`${PROVIDER_LABEL[name] ?? name} token expired/invalid — press Login on the Connector page, then retry. ${what}`)
+    error.code = 'CONNECTOR_TOKEN_DEAD'
+    error.reason = 'token_expired'
+    // The same public classification every provider refusal carries, so a caller
+    // never has to distinguish "refused because dead" from "refused because scope"
+    // by reading the sentence.
+    error.tokenExpired = true
+    return error
+  }
+
+  /**
+   * PRE-FLIGHT for every path that mutates a remote. A dead token is refused
+   * HERE, before the write (and, for a push, before any git process exists), so
+   * the outcome is instant and explicit instead of a provider 401 after the fact.
+   *
+   * It is deliberately permissive about everything except `expired`: an
+   * unreachable/unknown state is not evidence that the token is bad, and refusing
+   * on it would break a working login behind a flaky network.
+   */
+  async function assertLiveToken(name, api, token, verb) {
+    const state = await tokenLiveness(name, api, token)
+    if (state.state === 'expired') throw deadTokenError(name, verb)
+    return state
   }
 
   /**
@@ -1059,6 +1180,86 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
     const origin = `${parsed.protocol}//${parsed.host}`
     if (!isCloudflareRedirectOrigin(origin)) {
       throw configError('cloudflareCallbackOrigin must be HTTPS (or http://localhost:<port>) and must be registered among the OAuth client\'s redirect (callback) URLs')
+    }
+    return origin
+  }
+
+  /**
+   * Resolve the redirect that will actually be sent to Gitea.
+   *
+   * THE DEFECT THIS CLOSES. The Gitea flow used to rebuild its `redirect_uri` from
+   * whatever request arrived: a Login pressed on `http://127.0.0.1:3079` sent
+   * `http://127.0.0.1:3079/api/connector/oauth/gitea/callback` even though the
+   * OAuth2 application registered `https://seek-harness.dfm.homes/…`. Gitea
+   * compares the string exactly, so the authorize page refused (or the exchange
+   * answered `invalid_grant`) and the browser got our opaque failure page.
+   *
+   * Same precedence as Cloudflare, deliberately — one rule for both logins:
+   *
+   *   1. the configured `giteaCallbackOrigin` override (an origin; the callback
+   *      path is rebuilt onto it), so a proxied deployment is immune to headers;
+   *   2. the callback URL the caller derived from its request;
+   *   3. the last GUI origin this host observed.
+   *
+   * Nothing is guessed: an unparseable value yields `''`, which the callers report
+   * as "cannot tell the origin" rather than inventing a port.
+   *
+   * @param redirectUri - the callback URL the caller derived from the request.
+   * @returns `{ configured, origin, redirectUri, source }`.
+   */
+  function giteaCallbackTarget(redirectUri) {
+    const configuredRaw = config?.giteaCallbackOrigin
+    const configured = typeof configuredRaw === 'string' ? configuredRaw.trim().replace(/\/+$/u, '') : ''
+    const requested = typeof redirectUri === 'string' && redirectUri !== ''
+      ? redirectUri
+      : callbackUrlOf(settings.guiOrigin ?? '')
+    const candidate = configured !== '' ? configured : requested
+    let origin = ''
+    let bare = false
+    try {
+      const parsed = new URL(candidate)
+      origin = `${parsed.protocol}//${parsed.host}`
+      bare = parsed.pathname === '' || parsed.pathname === '/'
+    } catch {
+      origin = ''
+      bare = false
+    }
+    return {
+      configured,
+      origin,
+      redirectUri: origin === '' ? '' : (configured !== '' || bare ? callbackUrlOf(origin) : candidate),
+      // Where the value came from, so the panel can SAY it instead of implying it:
+      // `configured` (the override), `request` (this caller's own origin).
+      source: configured !== '' ? 'configured' : (origin === '' ? 'none' : 'request'),
+    }
+  }
+
+  /**
+   * Normalize (and gate) the non-secret `giteaCallbackOrigin` setting.
+   *
+   * The SAME rule the Cloudflare override is held to (https, or http only on a
+   * `localhost` suffix), so both cards validate identically and a save can never
+   * configure a redirect the deployment cannot be reached on. An origin only — no
+   * path, because the plugin owns the callback path.
+   *
+   * @param value - candidate origin (`''` clears the override).
+   * @returns the normalized origin.
+   */
+  function normalizeGiteaCallbackOrigin(value) {
+    const text = typeof value === 'string' ? value.trim().replace(/\/+$/u, '') : ''
+    if (text === '') return ''
+    let parsed
+    try {
+      parsed = new URL(text)
+    } catch {
+      throw configError('giteaCallbackOrigin must be an origin such as https://connector.example.com')
+    }
+    if (parsed.pathname !== '/' && parsed.pathname !== '') {
+      throw configError('giteaCallbackOrigin must be an origin only — no path; the callback path is added by the plugin')
+    }
+    const origin = `${parsed.protocol}//${parsed.host}`
+    if (!isSecureCallbackOrigin(origin)) {
+      throw configError('giteaCallbackOrigin must be HTTPS (or http://localhost:<port>) and must be registered among the OAuth2 application\'s redirect (callback) URIs')
     }
     return origin
   }
@@ -1259,12 +1460,32 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
      * The probe is optional and fails soft: a provider that refuses, or whose
      * reference does not resolve, simply contributes no `rateLimit` field — the
      * status answer itself never fails because a budget could not be read.
+     *
+     * LIVENESS — ON BY DEFAULT. `resolved` only means the reference exists; it
+     * says nothing about whether the VALUE still authenticates, and that gap is
+     * exactly what let an expired token read as healthy while every write failed.
+     * Each resolved alias therefore carries a `liveness` verdict from ONE cheap
+     * `GET /user` (`{ state: 'live' | 'expired' | 'unreachable' | 'unknown' }`).
+     * It never refreshes: status reports, it does not self-heal.
+     *
+     * Opt-out, for a caller that wants a token-free listing: `rateLimit:false`
+     * or `liveness:false`. Both are explicit, and either one is enough — a
+     * caller asking for no budget probe is asking for no network at all.
      */
-    async status({ provider, alias, rateLimit, redirectUri, cloudflareRedirectUri } = {}) {
+    async status({ provider, alias, rateLimit, liveness, redirectUri, cloudflareRedirectUri } = {}) {
       const table = await listReferences(ctx, config, { provider, alias })
       const providers = table.providers
-      if (rateLimit === true) {
-        for (const entry of providers) {
+      const probeLiveness = liveness !== false && rateLimit !== false
+      for (const entry of providers) {
+        if (probeLiveness) {
+          for (const row of entry.aliases ?? []) {
+            // An unresolved reference has nothing to probe: the row already says
+            // so, and a second verdict here would be a guess.
+            if (row.resolved !== true) continue
+            row.liveness = await probeToken(entry.provider, row.alias)
+          }
+        }
+        if (rateLimit === true) {
           const usable = (entry.aliases ?? []).filter(row => row.resolved === true)
           if (usable.length === 0) continue
           try {
@@ -1519,9 +1740,14 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       const editor = ctx?.get?.('configEditor')
       const canSaveClientId = typeof editor?.edit === 'function' && ctx?.fiber?.entry !== undefined
       const origin = giteaWebOrigin(settings.gitea.baseUrl)
-      const callback = typeof redirectUri === 'string' && redirectUri !== ''
-        ? redirectUri
-        : callbackUrlOf(settings.guiOrigin ?? '')
+      /**
+       * THE REDIRECT, from the SAME derivation the start uses — never a second
+       * rule. `giteaCallbackTarget` prefers the saved `giteaCallbackOrigin`
+       * override, so the string this predicate shows is the string the authorize
+       * call will carry, which is the string the OAuth2 application must register.
+       */
+      const target = giteaCallbackTarget(redirectUri)
+      const callback = target.redirectUri
       return {
         provider: 'gitea',
         // A click can authorize when the app is configured AND the store can
@@ -1530,11 +1756,18 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         clientIdConfigured: clientId !== '',
         ...(clientId === '' ? {} : { clientId }),
         canSaveClientId,
+        canSaveSettings: canSaveClientId,
         canStoreSecret: writable,
         baseUrlConfigured: origin !== '',
         authorizeBase: origin,
         // The exact URI the OAuth2 application must be registered with.
         redirectUri: callback,
+        // The non-secret override that produced it (`''` = derived from the
+        // request), the origin it resolves to, and where the value came from.
+        callbackOrigin: target.origin,
+        callbackOriginConfigured: target.configured,
+        callbackOriginSource: target.source,
+        callbackPath: GITEA_CALLBACK_PATH,
         ...(writable ? {} : { reason: 'this host mounted no writable credential store' }),
         ...(origin === '' ? { reason: 'the Gitea base URL is not configured yet' } : {}),
         ...(clientId === '' ? { reason: 'no giteaOAuthClientId is configured (set one inline in the Login panel)' } : {}),
@@ -1565,8 +1798,27 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       const clientId = giteaOAuthClientId()
       if (clientId === '') throw configError('no giteaOAuthClientId is configured; enter the OAuth2 application client id in the Login panel')
       if (settings.gitea.baseUrl === '') throw configError('Gitea base URL is not configured; set it on the Gitea card')
-      const callback = typeof redirectUri === 'string' && redirectUri !== '' ? redirectUri : callbackUrlOf(settings.guiOrigin ?? '')
-      const state = oauthStates.issue({ provider: 'gitea', alias: target })
+      // THE REDIRECT THIS ATTEMPT WILL USE — the override first, then the caller's
+      // own origin. It is resolved ONCE, here, and the exact string is parked in
+      // the state entry below.
+      const callbackTarget = giteaCallbackTarget(redirectUri)
+      const callback = callbackTarget.redirectUri
+      if (callback === '' || callbackTarget.origin === '') {
+        throw configError('this host cannot tell which origin the page is on; set Callback origin and start the login again')
+      }
+      /**
+       * THE PARKED REDIRECT (fix: redirect round-trip). The token exchange must
+       * repeat the EXACT `redirect_uri` the authorize step sent; rebuilding it from
+       * the callback request is what turns a Login pressed on 127.0.0.1 into
+       * Gitea's `redirect uri mismatch`. Parking the literal string makes the
+       * round-trip exact by construction, whatever a proxy does to headers — and
+       * it is public data (it travelled in the authorize URL).
+       */
+      const state = oauthStates.issue({
+        provider: 'gitea',
+        alias: target,
+        extra: { redirectUri: callback },
+      })
       const authorizeUrl = buildGiteaAuthorizeUrl({
         apiBase: settings.gitea.baseUrl,
         clientId,
@@ -1580,6 +1832,8 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         authorizeUrl,
         state,
         redirectUri: callback,
+        callbackOrigin: callbackTarget.origin,
+        callbackOriginSource: callbackTarget.source,
         expiresInSeconds: 600,
       }
     },
@@ -1600,51 +1854,118 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
      * @returns `{ ok, provider, alias, credentialRef, resolved, source? }`.
      */
     async oauthGiteaCallback({ code, state, redirectUri } = {}) {
+      /**
+       * The redirect THIS request implies, resolved once and used for diagnostics
+       * on every failure branch (`data-connector-redirect-uri`). It is the override
+       * or the request's own origin; the parked value below still wins for the
+       * actual exchange.
+       */
+      const requestCallback = giteaCallbackTarget(redirectUri).redirectUri
+      /**
+       * One constructor for every typed failure, so no branch can forget the
+       * public redirect or the human reason id the failure page renders.
+       */
+      const fail = (message, errCode, reasonKind, extra = {}) => {
+        const error = new Error(message)
+        error.code = errCode
+        error.reasonKind = reasonKind
+        if (typeof extra.redirectUri === 'string' && extra.redirectUri !== '') error.redirectUri = extra.redirectUri
+        else if (requestCallback !== '') error.redirectUri = requestCallback
+        if (typeof extra.providerMessage === 'string' && extra.providerMessage !== '') error.providerMessage = extra.providerMessage
+        if (typeof extra.stage === 'string') error.stage = extra.stage
+        return error
+      }
       const entry = oauthStates.consume(state)
       if (entry === undefined) {
-        const error = new Error('this login link is unknown, already used, or expired; start the login again')
-        error.code = 'CONNECTOR_BAD_REQUEST'
-        throw error
+        throw fail('this login link is unknown, already used, or expired; start the login again', 'CONNECTOR_BAD_REQUEST', 'state')
       }
       if (entry.provider !== 'gitea') {
-        const error = new Error('this login link was issued for another provider')
-        error.code = 'CONNECTOR_BAD_REQUEST'
-        throw error
+        throw fail('this login link was issued for another provider', 'CONNECTOR_BAD_REQUEST', 'state')
       }
       const authorizationCode = typeof code === 'string' ? code.trim() : ''
       if (authorizationCode === '') {
-        const error = new Error('the provider did not return an authorization code; start the login again')
-        error.code = 'CONNECTOR_BAD_REQUEST'
-        throw error
+        throw fail('the provider did not return an authorization code; start the login again', 'CONNECTOR_BAD_REQUEST', 'state')
       }
       const clientId = giteaOAuthClientId()
-      if (clientId === '') throw configError('no giteaOAuthClientId is configured; start the login again')
+      if (clientId === '') {
+        throw fail('no giteaOAuthClientId is configured; start the login again', 'CONNECTOR_BAD_REQUEST', 'invalid-client')
+      }
       // `targetOf` proves the alias still has a reference NAME to write to.
       const { alias: target, ref } = targetOf('gitea', entry.alias)
       const secretRef = clientSecretRefName(config, target)
       const clientSecret = await resolveSecret(ctx, secretRef)
       if (clientSecret === undefined) {
-        const error = new Error(`the Gitea OAuth2 client secret is not stored (reference ${secretRef}); enter it in the Login panel`)
-        error.code = 'CONNECTOR_NO_TOKEN'
-        throw error
+        throw fail(`the Gitea OAuth2 client secret is not stored (reference ${secretRef}); enter it in the Login panel`, 'CONNECTOR_NO_TOKEN', 'invalid-client')
       }
-      const callback = typeof redirectUri === 'string' && redirectUri !== '' ? redirectUri : callbackUrlOf(settings.guiOrigin ?? '')
-      const exchanged = await exchangeGiteaCode({
-        apiBase: settings.gitea.baseUrl,
-        clientId,
-        clientSecret,
-        code: authorizationCode,
-        redirectUri: callback,
-        request,
-      })
+      /**
+       * THE REDIRECT THIS ATTEMPT USED — the SAME precedence as the authorize step:
+       *
+       *   1. the PARKED value (exact by construction; the normal path, and the fix
+       *      for "Login pressed on 127.0.0.1" — the authorize call sent one string
+       *      and this repeats it, so Gitea's exact comparison passes);
+       *   2. the configured `giteaCallbackOrigin` override rebuilt onto the
+       *      callback path (a login started before an upgrade, or by a caller that
+       *      never went through this host's start);
+       *   3. the callback URL of this request (the old behaviour).
+       *
+       * Cloudflare's callback resolves its redirect the identical way; keeping the
+       * two in step is what stops one provider's proxy bug from being unfixable.
+       */
+      const parked = typeof entry.extra?.redirectUri === 'string' && entry.extra.redirectUri !== ''
+        ? entry.extra.redirectUri
+        : ''
+      const callback = parked !== ''
+        ? parked
+        : (requestCallback !== '' ? requestCallback : callbackUrlOf(settings.guiOrigin ?? ''))
+      if (callback === '') {
+        throw fail('this host cannot tell which origin the page is on; set Callback origin and start the login again', 'CONNECTOR_BAD_REQUEST', 'redirect-uri-mismatch')
+      }
+      /**
+       * The exchange is the ONE step that talks to the network, so its failure
+       * modes are classified HERE rather than escaping as a bare `Error` (a network
+       * failure would otherwise be reported as an untyped 500). Every branch names
+       * the class, the reason and the public redirect — never the code, the secret
+       * or a token.
+       */
+      let exchanged
+      try {
+        exchanged = await exchangeGiteaCode({
+          apiBase: settings.gitea.baseUrl,
+          clientId,
+          clientSecret,
+          code: authorizationCode,
+          redirectUri: callback,
+          request,
+        })
+      } catch (error) {
+        throw fail(
+          `the token exchange could not be completed (${redact(error?.message ?? 'network failure')})`,
+          'CONNECTOR_PROVIDER_ERROR',
+          'token-exchange',
+          { redirectUri: callback, stage: 'exchange' },
+        )
+      }
       if (exchanged.ok !== true) {
-        const error = new Error(`Gitea refused the token exchange${exchanged.status === 0 ? '' : ` (${exchanged.status})`}`)
-        error.code = 'CONNECTOR_PROVIDER_ERROR'
-        throw error
+        // The CLASS stays `CONNECTOR_PROVIDER_ERROR` (routes/424, logs, tests); the
+        // REASON is what the page turns into a fix. Gitea's own sentence rides
+        // along, already bounded and de-identified by the exchange helper.
+        const providerMessage = [exchanged.errorCode, exchanged.errorDescription]
+          .filter(part => typeof part === 'string' && part !== '')
+          .join(': ')
+        throw fail(
+          `Gitea refused the token exchange${exchanged.status === 0 ? '' : ` (${exchanged.status})`}`,
+          'CONNECTOR_PROVIDER_ERROR',
+          classifyGiteaExchangeFailure(exchanged),
+          {
+            redirectUri: callback,
+            stage: 'exchange',
+            ...(providerMessage === '' ? {} : { providerMessage }),
+          },
+        )
       }
       await setSecret(ctx, ref, exchanged.accessToken)
       const receipt = await referenceReceipt('gitea', ref)
-      return { ...receipt, provider: 'gitea', alias: target }
+      return { ...receipt, provider: 'gitea', alias: target, redirectUri: callback }
     },
 
     /**
@@ -2691,6 +3012,10 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
             if (message === '') throw new TypeError('message (the commit message) must not be empty')
             const target = String(input.branch ?? '').trim()
             if (target === '') throw new TypeError('branch is required: a commit needs a branch to land on')
+            // WRITE PRE-FLIGHT, after the local argument checks and before any
+            // request: a commit cannot succeed on a dead token, and saying so now
+            // keeps the failure instant and explicit.
+            await assertLiveToken(name, api, token, 'write')
             const written = await api.putFile(token, owner, repo, {
               path, content, message, branch: refName(target, 'branch'),
               sha: input.sha === undefined || input.sha === '' ? undefined : String(input.sha),
@@ -2731,6 +3056,14 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         const repo = repoPart(input.repo, 'repo')
         assertGiteaReady(name)
         const api = built[name]
+        /**
+         * WRITE PRE-FLIGHT. Every WRITE verb here lands on the remote, so a dead
+         * token must be refused before the verb's own request — and before its
+         * argument validation, because a credential that cannot authenticate
+         * makes every argument moot. One cheap `GET /user`; a live token costs
+         * one call, a dead one gets the explicit "no write was attempted".
+         */
+        if (WRITE_ACTIONS.has(action)) await assertLiveToken(name, api, token, 'write')
         const receipt = { ok: true, provider: name, alias: usedAlias, action, owner, repo }
 
         switch (action) {
@@ -2957,6 +3290,23 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       const info = await stat(projectPath)
       if (!info.isDirectory()) throw configError('the project path must be a directory')
 
+      /**
+       * PRE-FLIGHT: A DEAD TOKEN STOPS THE PUSH BEFORE GIT EXISTS.
+       *
+       * One `GET /user` with the stored token, before ANY git process is spawned.
+       * A 401 aborts here with the typed dead-token error, so the caller learns
+       * immediately and explicitly that nothing was attempted — instead of a git
+       * failure minutes later that invites a workaround.
+       *
+       * WHAT THIS FUNCTION WILL NOT DO, EVER: switch, add or rewrite a remote; fall
+       * back to a shell/SSH remote the user never approved; or attempt an
+       * unauthenticated push. The remote URL is derived from the provider's own
+       * answer and passed to `git push` as an argument, so nothing is configured
+       * and nothing is left behind.
+       */
+      const preflight = await probeToken(name, input.alias)
+      if (preflight.state === 'expired') throw deadTokenError(name, 'push')
+
       const inside = await run('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], { cwd: projectPath })
       if (inside.code !== 0) throw configError('the project path is not a git working tree (run `git init` there first)')
 
@@ -3128,6 +3478,14 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         nextCloudflareCallbackOrigin = normalizeCloudflareCallbackOrigin(input.cloudflareCallbackOrigin)
         next.cloudflareCallbackOrigin = nextCloudflareCallbackOrigin
       }
+      // The GITEA equivalent — the same non-secret origin override, validated by
+      // the same rule. This is the one-line fix for the owner's redirect mismatch:
+      // a Login pressed on any tab can send the domain the OAuth2 app registered.
+      let nextGiteaCallbackOrigin
+      if (input.giteaCallbackOrigin !== undefined) {
+        nextGiteaCallbackOrigin = normalizeGiteaCallbackOrigin(input.giteaCallbackOrigin)
+        next.giteaCallbackOrigin = nextGiteaCallbackOrigin
+      }
       let nextCloudflareScopes
       if (input.cloudflareOAuthScopes !== undefined) {
         // Validate by round-tripping through the same parser the start uses, so a
@@ -3154,6 +3512,7 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         ...(nextCloudflareClientId === undefined ? {} : { cloudflareOAuthClientId: nextCloudflareClientId }),
         ...(nextCloudflareScopes === undefined ? {} : { cloudflareOAuthScopes: nextCloudflareScopes }),
         ...(nextCloudflareCallbackOrigin === undefined ? {} : { cloudflareCallbackOrigin: nextCloudflareCallbackOrigin }),
+        ...(nextGiteaCallbackOrigin === undefined ? {} : { giteaCallbackOrigin: nextGiteaCallbackOrigin }),
       }))
       if (next.gitea?.apiBase !== undefined) settings.gitea.baseUrl = normalizeBaseUrl(next.gitea.apiBase)
       if (next.gitea?.allowSelfSigned !== undefined) settings.gitea.allowSelfSigned = next.gitea.allowSelfSigned === true
@@ -3174,6 +3533,9 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       }
       if (nextCloudflareCallbackOrigin !== undefined && config !== null && typeof config === 'object') {
         config.cloudflareCallbackOrigin = nextCloudflareCallbackOrigin
+      }
+      if (nextGiteaCallbackOrigin !== undefined && config !== null && typeof config === 'object') {
+        config.giteaCallbackOrigin = nextGiteaCallbackOrigin
       }
       // Capabilities belong to one origin; a new origin must be re-probed.
       giteaVersion.at = 0

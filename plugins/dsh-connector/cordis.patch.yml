@@ -102,6 +102,17 @@
         # Same field as the Login panel's inline "Callback origin" control — either
         # surface writes this one value.
         cloudflareCallbackOrigin: ""
+        # THE SAME OVERRIDE FOR GITEA. A Gitea OAuth2 application compares its
+        # registered redirect URI EXACTLY, so a Login pressed on
+        # http://127.0.0.1:<port> would otherwise send the loopback origin and be
+        # refused ("redirect uri mismatch") no matter how right the client id and
+        # secret are. Set this to the origin the application registered and every
+        # authorize call (and the token exchange that must repeat it) uses it.
+        #   * origin only: the callback path is appended by the plugin;
+        #   * https only, or http for hosts whose suffix is `localhost`;
+        #   * it must ALSO be registered on the application, EXACTLY.
+        # Same field as the Gitea Login panel's inline "Callback origin" control.
+        giteaCallbackOrigin: ""
         # The Gitea client SECRET is NOT here: this is the DSH reference NAME that
         # holds it, and the value lives in DSH's own store.
         giteaClientSecretRef: "GITEA_CLIENT_SECRET"

@@ -14,14 +14,17 @@ resolve.
 
 | Tool | Purpose |
 |---|---|
-| `connector_status` | which providers/aliases resolve, and the reference NAMES only |
+| `connector_status` | which providers/aliases resolve, whether the token is LIVE or EXPIRED, and the reference NAMES only (`liveness:false` / `rateLimit:false` skip the probes) |
 | `connector_repos_list` | repositories the alias can see |
 | `connector_repo_actions` | issues, PRs, labels, assignees, branches, tags, workflow runs, `pr_merge` |
 | `connector_file` | read a tree, read a file, commit a file (`sha` replaces, absent creates) |
 | `connector_cloudflare` | zones, DNS, WAF, Access, analytics, DDoS, botnet feed, Pages deploy |
 | `connector_push` | `wrangler deploy` for a Pages project (`dryRun:false` only) |
 
-`READ ✓` calls are unrestricted; every `WRITE ⚠` is approval-gated.
+`READ ✓` calls are unrestricted; every `WRITE ⚠` is approval-gated. A write is
+pre-flighted with one cheap identity call, so a dead token is refused *before*
+the request (HTTP 401, "no write was attempted") instead of surfacing later as a
+provider 401.
 
 **No secret is ever in this package.** Configuration carries credential
 *reference names* (`GITHUB_TOKEN`), never values: DSH resolves a reference per

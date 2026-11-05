@@ -199,6 +199,11 @@ window.__ModuleLoader__.load({
       'status.providers': 'Providers',
       'status.resolved': 'resolved',
       'status.unresolved': 'not resolved',
+      // LIVENESS: `resolved` is about the reference; a token that no longer
+      // authenticates gets its own verdict so it can never read as healthy.
+      'status.live': 'live',
+      'status.dead': 'EXPIRED — press Login',
+      'status.deadHint': 'this token no longer authenticates: reads may fall back anonymously. Press Login to refresh it.',
       'status.noRef': '(no reference set)',
       'status.noAlias': 'This provider has no alias yet.',
       'status.setRef': 'Set reference',
@@ -279,6 +284,16 @@ window.__ModuleLoader__.load({
       'gitea.openManual': 'Open the Gitea authorize page',
       'gitea.blocked': 'The new tab was blocked. Use the link above to continue.',
       'gitea.baseUrlNeeded': 'Set the Gitea base URL on this card first.',
+      // The redirect this deployment sends, and the one-line fix for a mismatch.
+      'gitea.redirectLabel': 'Callback URI to register on the OAuth2 application',
+      'gitea.redirectFromOverride': 'Built from your saved Callback origin. Gitea compares it character for character, so the OAuth2 application must list it as-is.',
+      'gitea.redirectFromTab': 'Built from this tab\'s address bar, and this is exactly what the authorize call sends. Register this string on the OAuth2 application as-is.',
+      'gitea.callbackOriginLabel': 'Callback origin',
+      'gitea.callbackOriginHint': 'Origin only, no path — the plugin appends /api/connector/oauth/gitea/callback. Set it when your OAuth2 application registered a domain this tab is not on (e.g. your public HTTPS host while you are on 127.0.0.1), and every authorize call uses it. Same value as the giteaCallbackOrigin setting.',
+      'gitea.callbackOriginDerived': '(derived from this tab)',
+      'gitea.callbackOriginClearHint': 'Clear the field and press Save to fall back to this tab\'s own origin.',
+      'gitea.callbackOriginSaved': 'Callback origin saved. Press Login to authorize with it.',
+      'gitea.redirectFromHost': 'Built from the origin this host derived from your request (this page has no address bar to read). Register this string on the OAuth2 application as-is.',
       'oauthComplete': 'Login complete — the token is stored and the reference resolves.',
 
       // ── guides ───────────────────────────────────────────────────────────
@@ -304,7 +319,7 @@ window.__ModuleLoader__.load({
         'Make sure the Base URL on this card is your instance origin, e.g. https://git.example.com.',
         'Open {base}/user/settings/applications — the SELF-SERVICE path on the account that will authorize. (Site Administration → Applications is the site-wide admin path; the user path is the one to use.)',
         'Press "Create OAuth2 Application". Fields: "Application Name" (e.g. DSH Connector); "Redirect URI(s)" — an array, each entry matched EXACTLY.',
-        'Redirect URI: {callback} — copy it exactly. Use the 127.0.0.1 form this page shows, not "localhost" (RFC 8252 §8.3 recommends the loopback IP; Gitea matches the string).',
+        'Redirect URI: {callback} — copy it exactly. Use the 127.0.0.1 form this page shows, not "localhost" (RFC 8252 §8.3 recommends the loopback IP; Gitea matches the string). If this tab is not on the origin you registered, set Callback origin below first: this line and the authorize call then use the saved origin.',
         'Tick "Confidential client": this plugin is a confidential client — the code exchange sends its client secret. Untick it and the exchange has no secret and will be refused.',
         'Press Create, then copy the generated Client ID and Client Secret. The secret is shown ONLY once: if you lose it, regenerate the application; this plugin stores it under GITEA_CLIENT_SECRET.',
         'Back on this card press Login: the panel shows "Application Client ID" and "Application Client Secret" — save both (the secret goes into DSH under its own reference and is never shown again).',
@@ -471,6 +486,16 @@ window.__ModuleLoader__.load({
       const aliases = data?.aliases ?? []
       // The dynamic-button predicate: does THIS provider's credential resolve?
       const anyResolved = aliases.some(row => row.resolved === true)
+      /**
+       * A RESOLVED REFERENCE CAN STILL BE A DEAD TOKEN.
+       *
+       * `resolved` is about the reference; `liveness.state` is about the value.
+       * When every resolved alias is expired the CARD is dead too, and it must
+       * say so on its own badge instead of advertising a healthy login.
+       */
+      const resolvedRows = aliases.filter(row => row.resolved === true)
+      const allDead = resolvedRows.length > 0 && resolvedRows.every(row => row.liveness?.state === 'expired')
+      const cardBadge = allDead ? t('status.dead') : anyResolved ? t('status.resolved') : t('status.unresolved')
       // Every provider's Login is a real gesture now, so the only thing that
       // disables it is a request already in flight.
       const loginDisabled = busy !== null
@@ -515,10 +540,47 @@ window.__ModuleLoader__.load({
         }
       })()
       const pageOrigin = browserOrigin !== '' ? browserOrigin : (typeof origin === 'string' ? origin : '')
-      // The exact redirect URI this deployment expects — rendered in the guide.
-      // Built from the page origin, because that is what the browser will send.
+      /**
+       * THE GITEA REDIRECT — the SAME precedence the host uses
+       * (`giteaCallbackTarget`), so the string this panel prints is the string the
+       * authorize call sends and the string the token exchange repeats.
+       *
+       *   1. the non-secret `giteaCallbackOrigin` override (a proxied deployment
+       *      registers its own domain and is then immune to request headers);
+       *   2. THIS TAB's origin — the address bar, which is what the browser will
+       *      actually come back to.
+       *
+       * Before this existed the value was always the tab's origin, so a Login
+       * pressed on http://127.0.0.1:3079 sent the loopback callback to Gitea even
+       * though the OAuth2 application registered the public domain: Gitea compares
+       * exactly and refuses, and the failure page only said
+       * CONNECTOR_PROVIDER_ERROR.
+       */
       const giteaCallbackPath = '/api/connector/oauth/gitea/callback'
-      const callbackUri = pageOrigin !== '' ? `${pageOrigin}${giteaCallbackPath}` : ''
+      const giteaOriginOverride = typeof oauth?.callbackOriginConfigured === 'string'
+        ? oauth.callbackOriginConfigured
+        : ''
+      /**
+       * The HOST's own derivation, used only when this page has no address bar to
+       * read (a headless sandbox, a bundle without `location`). It is the value the
+       * host will fall back to anyway, so rendering it keeps display==sent even
+       * there. With `location` available the browser stays the authority.
+       */
+      const hostRedirect = typeof oauth?.redirectUri === 'string' && /^https?:\/\//u.test(oauth.redirectUri)
+        ? oauth.redirectUri
+        : ''
+      const hostRedirectOrigin = hostRedirect !== '' && hostRedirect.endsWith(giteaCallbackPath)
+        ? hostRedirect.slice(0, -giteaCallbackPath.length)
+        : ''
+      const giteaRedirectOrigin = giteaOriginOverride !== ''
+        ? giteaOriginOverride
+        : (pageOrigin !== '' ? pageOrigin : hostRedirectOrigin)
+      const giteaRedirectSource = giteaOriginOverride !== ''
+        ? 'configured'
+        : (pageOrigin !== '' ? 'tab' : (hostRedirectOrigin !== '' ? 'host' : 'none'))
+      // The exact redirect URI this deployment sends — rendered in the guide, shown
+      // in the panel and posted to `oauth/start` as one value.
+      const callbackUri = giteaRedirectOrigin !== '' ? `${giteaRedirectOrigin}${giteaCallbackPath}` : ''
 
       // The Gitea instance origin, for the guide's self-service URL and the token
       // exchange line. Public, and empty when the card has not been configured.
@@ -611,6 +673,11 @@ window.__ModuleLoader__.load({
       const [cfOriginEditing, setCfOriginEditing] = useState(false)
       const [cfOriginDraft, setCfOriginDraft] = useState('')
       const [cfOriginNote, setCfOriginNote] = useState(null)
+      // The Gitea card's own instance of the SAME kind of field: one non-secret
+      // origin, editable where the Login press happens.
+      const [giteaOriginEditing, setGiteaOriginEditing] = useState(false)
+      const [giteaOriginDraft, setGiteaOriginDraft] = useState('')
+      const [giteaOriginNote, setGiteaOriginNote] = useState(null)
 
       /**
        * Forget everything about the login. Closing the slot IS the reset: the
@@ -982,9 +1049,34 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * Save the Gitea Callback origin — the SAME non-secret setting as the plugin
+       * config's `giteaCallbackOrigin`, editable where the user is standing.
+       *
+       * One field, one effect: from the moment it is saved, EVERY Gitea redirect
+       * this page prints and sends is built from it (`giteaRedirectOrigin` above),
+       * so a tab on http://127.0.0.1 can authorize an app that registered the
+       * public domain. An empty value clears it and the tab's own origin returns.
+       */
+      const saveGiteaOrigin = async () => {
+        setBusy('giteaorigin')
+        setError(null)
+        setGiteaOriginNote(null)
+        try {
+          await api('settings', { giteaCallbackOrigin: giteaOriginDraft.trim() })
+          setGiteaOriginEditing(false)
+          setGiteaOriginDraft('')
+          setGiteaOriginNote(t('gitea.callbackOriginSaved'))
+          await onChanged()
+        } catch (error) {
+          setGiteaOriginNote(String(error?.message ?? error))
+        } finally {
+          setBusy(null)
+        }
+      }
+
       /** Persist the PUBLIC scope list (configuration, not a credential). */
-      const saveCfScopes = async () => {
-        setBusy('cfscopes')
+      const saveCfScopes = async () => {        setBusy('cfscopes')
         setError(null)
         try {
           await api('settings', { cloudflareOAuthScopes: cfScopesDraft })
@@ -1145,6 +1237,85 @@ window.__ModuleLoader__.load({
             'data-connector-cf-origin-note': 'true',
             style: { ...S.muted, color: T.info, fontSize: 12 },
           }, cfOriginNote),
+        )
+      }
+
+      /**
+       * The Gitea Callback origin: the SAME non-secret setting as
+       * `giteaCallbackOrigin` in the plugin config, editable HERE.
+       *
+       * Why the Gitea card needs it too: the owner's OAuth2 application registers
+       * ONE exact callback (`https://seek-harness.dfm.homes/api/connector/oauth/
+       * gitea/callback`), and this page can be opened on any tab — including
+       * `http://127.0.0.1:3079`, whose origin Gitea will refuse. Setting the origin
+       * here makes every later authorize call use the registered domain, without a
+       * trip to a config file, and the readout shows the resulting URL verbatim.
+       *
+       * It is an ORIGIN, not a URL: the plugin appends the callback path, so the
+       * displayed string can never disagree with the path Gitea compares.
+       */
+      const giteaOriginBlock = () => {
+        const canSave = oauth?.canSaveSettings === true || oauth?.canSaveClientId === true
+        if (giteaOriginEditing !== true) {
+          return h('div', {
+            'data-connector-gitea-origin-readout': giteaOriginOverride === '' ? 'derived' : 'configured',
+            style: { display: 'grid', gap: 4, paddingTop: 6, borderTop: `1px solid ${T.line}` },
+          },
+            h('div', { style: S.row },
+              h('span', { style: { ...S.muted, fontSize: 12 } }, t('gitea.callbackOriginLabel')),
+              h('code', {
+                'data-connector-gitea-origin-value': 'true',
+                style: { fontFamily: 'ui-monospace, monospace', fontSize: 12, color: T.text, userSelect: 'all' },
+              }, giteaOriginOverride !== '' ? giteaOriginOverride : t('gitea.callbackOriginDerived')),
+              h('button', {
+                type: 'button', style: { ...S.button, height: 22, padding: '0 8px' },
+                'data-connector-gitea-origin-edit': 'true',
+                disabled: busy !== null || canSave !== true,
+                onClick: () => { setGiteaOriginDraft(giteaOriginOverride); setGiteaOriginEditing(true); setGiteaOriginNote(null) },
+              }, t('cf.edit')),
+            ),
+            h('span', { style: S.muted }, t('gitea.callbackOriginHint')),
+            giteaOriginNote !== null && h('span', {
+              'data-connector-gitea-origin-note': 'true',
+              style: { ...S.muted, color: T.info, fontSize: 12 },
+            }, giteaOriginNote),
+          )
+        }
+        return h('div', {
+          'data-connector-gitea-origin-form': 'true',
+          style: { display: 'grid', gap: 6, paddingTop: 6, borderTop: `1px solid ${T.line}` },
+        },
+          h('span', { style: { ...S.muted, fontSize: 12 } }, t('gitea.callbackOriginLabel')),
+          h('div', { style: S.row },
+            h('input', {
+              type: 'text',
+              'data-connector-gitea-callback-origin': 'true',
+              autoComplete: 'off',
+              spellCheck: false,
+              value: giteaOriginDraft,
+              placeholder: 'https://git.example.com',
+              'aria-label': t('gitea.callbackOriginLabel'),
+              style: { ...S.input, flex: 1, fontFamily: 'ui-monospace, monospace' },
+              onChange: (event) => setGiteaOriginDraft(event.target.value),
+            }),
+            h('button', {
+              type: 'button', style: S.primary,
+              'data-connector-gitea-origin-save': 'true',
+              disabled: busy !== null || canSave !== true,
+              onClick: () => void saveGiteaOrigin(),
+            }, busy === 'giteaorigin' ? t('busy') : t('status.save')),
+            h('button', {
+              type: 'button', style: S.button,
+              'data-connector-gitea-origin-cancel': 'true',
+              onClick: () => { setGiteaOriginEditing(false); setGiteaOriginDraft('') },
+            }, t('cancelEdit')),
+          ),
+          h('span', { style: S.muted }, t('gitea.callbackOriginHint')),
+          h('span', { style: S.muted }, t('gitea.callbackOriginClearHint')),
+          giteaOriginNote !== null && h('span', {
+            'data-connector-gitea-origin-note': 'true',
+            style: { ...S.muted, color: T.info, fontSize: 12 },
+          }, giteaOriginNote),
         )
       }
 
@@ -1549,6 +1720,33 @@ window.__ModuleLoader__.load({
               onClick: () => setSecretEditing(true),
             }, t('secretReplace')),
           ),
+          provider === 'gitea' && h('div', {
+            'data-connector-gitea-redirect': giteaRedirectSource,
+            style: { display: 'grid', gap: 2, paddingTop: 6, borderTop: `1px dashed ${T.line}` },
+          },
+            h('span', { style: { ...S.muted, fontSize: 12 } }, t('gitea.redirectLabel')),
+            // ONE derivation, rendered: this is the string the authorize call
+            // carries (see `startOauth`), so a display that disagrees with the
+            // request cannot happen.
+            callbackUri !== ''
+              ? h('code', {
+                'data-connector-gitea-redirect-value': 'true',
+                style: { fontFamily: 'ui-monospace, monospace', fontSize: 12, color: T.text, userSelect: 'all' },
+              }, callbackUri)
+              : h('code', {
+                'data-connector-gitea-redirect-value': 'unavailable',
+                style: { fontFamily: 'ui-monospace, monospace', fontSize: 12, color: T.warning },
+              }, t('cf.redirectUnavailable')),
+            h('span', { style: S.muted }, giteaRedirectSource === 'configured'
+              ? t('gitea.redirectFromOverride')
+              : (giteaRedirectSource === 'tab'
+                ? t('gitea.redirectFromTab')
+                : (giteaRedirectSource === 'host' ? t('gitea.redirectFromHost') : t('cf.redirectNoneHint')))),
+          ),
+          // THE INLINE FIX, on the card that needs it: set the origin your OAuth2
+          // application registered and every later authorize call uses it — even
+          // from a loopback tab.
+          provider === 'gitea' && giteaOriginBlock(),
           provider === 'gitea' && h('div', { style: S.row },
             h('button', {
               type: 'button', style: S.primary,
@@ -1701,7 +1899,10 @@ window.__ModuleLoader__.load({
       return h('div', { style: S.card, 'data-connector-card': provider },
         h('div', { style: S.row },
           h('span', { style: { fontWeight: 600, fontSize: 13 } }, PROVIDER_LABEL[provider] ?? provider),
-          h('span', { style: S.badge(anyResolved) }, anyResolved ? t('status.resolved') : t('status.unresolved')),
+          h('span', {
+            style: S.badge(anyResolved && !allDead),
+            'data-connector-card-state': allDead ? 'expired' : anyResolved ? 'resolved' : 'unresolved',
+          }, cardBadge),
           data?.defaultAlias !== undefined && h('span', { style: { ...S.muted, marginLeft: 'auto' } }, `default “${data.defaultAlias}”`),
         ),
 
@@ -1709,7 +1910,26 @@ window.__ModuleLoader__.load({
         aliases.map(row => h('div', { key: `${provider}:${row.alias}`, style: S.row },
           h('span', { style: { fontSize: 13, fontWeight: 500 } }, row.alias),
           h('span', { style: { ...S.muted, fontFamily: 'ui-monospace, monospace' } }, row.credentialRef || t('status.noRef')),
-          h('span', { style: S.badge(row.resolved === true) }, row.resolved ? t('status.resolved') : t('status.unresolved')),
+          /**
+           * THE LIVENESS BADGE. `resolved` alone is the lie this build removes: an
+           * expired token resolves and 401s every write while public reads keep
+           * succeeding. A dead token gets its own badge text, a red tone, and the
+           * one sentence that says what to do about it.
+           */
+          row.liveness?.state === 'expired'
+            ? h('span', {
+              style: { ...S.badge(false), color: T.error, borderColor: T.error },
+              'data-connector-liveness': 'expired',
+              'data-connector-dead': provider,
+            }, t('status.dead'))
+            : h('span', {
+              style: S.badge(row.resolved === true && row.liveness?.state !== 'unreachable'),
+              'data-connector-liveness': row.liveness?.state ?? 'unprobed',
+            }, row.resolved ? t('status.resolved') : t('status.unresolved')),
+          row.liveness?.state === 'expired' && h('span', {
+            'data-connector-dead-hint': 'true',
+            style: { ...S.muted, fontSize: 12, color: T.warning },
+          }, t('status.deadHint')),
           row.source !== undefined && h('span', { style: S.muted }, row.source),
           h('div', { style: { display: 'flex', gap: 6, marginLeft: 'auto' } },
             /**

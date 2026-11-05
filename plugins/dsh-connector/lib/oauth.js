@@ -283,6 +283,76 @@ export function originOfRequest(headers, fallback = '') {
 }
 
 /**
+ * Bound, de-identify and clean one piece of PROVIDER-supplied text.
+ *
+ * The token endpoint is allowed to say WHY it refused (Gitea answers
+ * `{ error, error_description }`), and that sentence is the only actionable fact
+ * on an otherwise opaque failure page. It is also text this plugin did not write,
+ * so it is treated as hostile:
+ *
+ *   * control characters are flattened (a page is not a terminal);
+ *   * the ONE secret this call holds is removed if the provider echoes it;
+ *   * the authorization code is removed for the same reason;
+ *   * the result is truncated, so a chatty server cannot fill the tab.
+ *
+ * @param value - candidate provider text.
+ * @param options - `{ secret, code }` values that must never survive.
+ * @returns the safe, short text (possibly empty).
+ */
+function providerText(value, { secret = '', code = '' } = {}) {
+  const raw = typeof value === 'string' ? value : ''
+  if (raw.trim() === '') return ''
+  let text = raw.replace(/[\u0000-\u001f\u007f]+/gu, ' ').replace(/\s+/gu, ' ').trim()
+  if (typeof secret === 'string' && secret !== '') text = text.split(secret).join('[secret]')
+  if (typeof code === 'string' && code.length >= 8) text = text.split(code).join('[code]')
+  return text.length > 200 ? `${text.slice(0, 200)}…` : text
+}
+
+/**
+ * The Gitea failure reasons this plugin can tell apart on the failure page.
+ *
+ * Each one names a DIFFERENT fix, which is the whole point: the owner's report was
+ * that `CONNECTOR_PROVIDER_ERROR` hid the reason, so the class stays (it is what
+ * routes and logs use) and a reason rides beside it for the human block.
+ */
+export const GITEA_FAILURE_REASONS = Object.freeze([
+  'redirect-uri-mismatch',
+  'invalid-client',
+  'token-exchange',
+  'state',
+])
+
+/**
+ * Classify a refused Gitea token exchange into one of {@link GITEA_FAILURE_REASONS}.
+ *
+ * Gitea answers the OAuth2 error shape (`{ error, error_description }`). The rules
+ * are deliberately evidence-based — no probing, no guessing from the status alone:
+ *
+ *   * `invalid_client` (or a bare 401/403 with no code) is a credential problem:
+ *     the id/secret pair does not match an application.
+ *   * `invalid_grant`/`invalid_request` WHOSE OWN TEXT mentions the redirect,
+ *     callback or redirection URI is the mismatch case. Gitea's standard wording
+ *     for this is "…does not match the redirection URI used in the authorization
+ *     request…", so the check looks at the description as well as the code.
+ *   * anything else that reached the token endpoint is `token-exchange`.
+ *
+ * @param result - `{ status?, errorCode?, errorDescription? }` from the exchange.
+ * @returns one reason id.
+ */
+export function classifyGiteaExchangeFailure(result = {}) {
+  const code = String(result.errorCode ?? '').trim().toLowerCase()
+  const text = String(result.errorDescription ?? '').toLowerCase()
+  const status = Number(result.status ?? 0)
+  const mentionsRedirect = /redirect|callback|redirection uri/u.test(text)
+  if (code === 'invalid_client') return 'invalid-client'
+  if ((status === 401 || status === 403) && code === '') return 'invalid-client'
+  if (/invalid client|client authentication failed|client_id and client_secret/u.test(text)) return 'invalid-client'
+  if (mentionsRedirect) return 'redirect-uri-mismatch'
+  if (code === 'redirect_uri_mismatch' || code === 'invalid_redirect_uri') return 'redirect-uri-mismatch'
+  return 'token-exchange'
+}
+
+/**
  * Exchange an authorization code for an access token.
  *
  * The client secret is a parameter of this function and lives only inside the
@@ -291,6 +361,11 @@ export function originOfRequest(headers, fallback = '') {
  * `ctx.credentials.set`, and the answer object below never includes the raw
  * provider body (a server that echoes the request must not reach a log).
  *
+ * A REFUSAL still carries the provider's OWN reason (bounded and de-identified by
+ * {@link providerText}), because "Gitea refused the token exchange (400)" alone was
+ * the opaque failure the owner reported: `invalid_grant` with a redirect sentence
+ * and `invalid_client` need completely different fixes.
+ *
  * @param options - wiring.
  * @param options.apiBase - the configured Gitea base URL.
  * @param options.clientId - the public client id.
@@ -298,7 +373,7 @@ export function originOfRequest(headers, fallback = '') {
  * @param options.code - the authorization code from the callback.
  * @param options.redirectUri - the same `redirect_uri` used in the authorize step.
  * @param options.request - injected HTTP function (`(url, init) => response`).
- * @returns `{ ok, status, accessToken?, scope?, reason? }` — never the code or the secret.
+ * @returns `{ ok, status, accessToken?, scope?, reason?, errorCode?, errorDescription? }` — never the code, the secret or a token on failure.
  */
 export async function exchangeGiteaCode({ apiBase, clientId, clientSecret, code, redirectUri, request }) {
   const origin = giteaWebOrigin(apiBase)
@@ -322,8 +397,21 @@ export async function exchangeGiteaCode({ apiBase, clientId, clientSecret, code,
   })
   const body = answer.json ?? {}
   if (!answer.ok) {
-    // Status only: a provider error body could quote the code or the secret.
-    return { ok: false, status: Number(answer.status ?? 0), reason: 'the token exchange was refused' }
+    // Status AND the provider's own, de-identified reason: a bare status cannot
+    // tell `invalid_client` from a redirect mismatch, and those two have different
+    // fixes. The code/secret are scrubbed by providerText before this returns.
+    const errorCode = providerText(body.error, { secret: clientSecret, code })
+    const errorDescription = providerText(
+      body.error_description ?? body.error_uri ?? body.message,
+      { secret: clientSecret, code },
+    )
+    return {
+      ok: false,
+      status: Number(answer.status ?? 0),
+      reason: 'the token exchange was refused',
+      ...(errorCode === '' ? {} : { errorCode }),
+      ...(errorDescription === '' ? {} : { errorDescription }),
+    }
   }
   const accessToken = typeof body.access_token === 'string' ? body.access_token : ''
   if (accessToken === '') {
@@ -430,23 +518,23 @@ export function cloudflareCallbackUrlOf(origin) {
 }
 
 /**
- * Which redirect origins a provider will actually accept.
+ * Which callback origins the strict providers accept.
  *
- * CLOUDFLARE'S RULE, and the reason a login can fail before any consent screen:
- * a redirect URL must be HTTPS, or HTTP **only** when the host's suffix is
- * exactly `localhost` (`http://localhost:3079` is fine, `http://127.0.0.1:3079`
- * is not). Cloudflare answers `invalid_request` — "Redirect URL is using an
- * insecure protocol" — for anything else, so this is checked BEFORE a state is
- * minted: a login that cannot complete must not leave a pending attempt behind.
+ * THE SHARED RULE, and the reason a login can fail before any consent screen:
+ * a redirect URL must be HTTPS, or HTTP **only** when the host's suffix is exactly
+ * `localhost` (`http://localhost:3079` is fine, `http://127.0.0.1:3079` is not).
+ * Cloudflare answers `invalid_request` — "Redirect URL is using an insecure
+ * protocol" — for anything else.
  *
- * GITEA IS NOT COVERED HERE and stays permissive: a self-hosted instance is
- * routinely reachable over plain HTTP on a LAN address, and Gitea itself only
- * compares the redirect string with what was registered.
+ * Gitea itself only compares the redirect string with what was registered, but the
+ * `Callback origin` override on BOTH cards is validated with this same rule, so a
+ * save can never configure a redirect the deployment cannot be reached on. One
+ * predicate, so the two cards cannot drift apart.
  *
  * @param origin - `scheme://host[:port]`, no path.
- * @returns whether Cloudflare would accept a redirect on this origin.
+ * @returns whether a redirect on this origin is acceptable.
  */
-export function isCloudflareRedirectOrigin(origin) {
+export function isSecureCallbackOrigin(origin) {
   let url
   try {
     url = new URL(String(origin ?? ''))
@@ -455,10 +543,24 @@ export function isCloudflareRedirectOrigin(origin) {
   }
   if (url.protocol === 'https:') return true
   if (url.protocol !== 'http:') return false
-  // Cloudflare's own wording: "http is only allowed for hosts with suffix
-  // localhost". `localhost`, `app.localhost`, `127.0.0.1`? No — 127.0.0.1 has no
+  // The providers' own wording: "http is only allowed for hosts with suffix
+  // localhost". `localhost`, `app.localhost` — yes; `127.0.0.1` — no, it has no
   // localhost suffix, which is exactly the failure this guard names.
   return /(^|\.)localhost$/iu.test(url.hostname)
+}
+
+/**
+ * Cloudflare's redirect-origin rule — the shared predicate under its own name.
+ *
+ * Kept as an exported alias because the Cloudflare flow, its panel copy and the
+ * existing tests name it; Gitea's override uses the same rule through
+ * {@link isSecureCallbackOrigin}.
+ *
+ * @param origin - `scheme://host[:port]`, no path.
+ * @returns whether Cloudflare would accept a redirect on this origin.
+ */
+export function isCloudflareRedirectOrigin(origin) {
+  return isSecureCallbackOrigin(origin)
 }
 
 /**
@@ -685,6 +787,42 @@ function pageShell({ title, tone, body, scripts }) {
 const NUDGE_SCRIPT = 'try{if(window.opener&&!window.opener.closed){window.opener.postMessage({type:"connector:oauth-complete"},window.location.origin)}}catch(e){}'
 
 /**
+ * The one human sentence that turns a typed failure into a fix.
+ *
+ * THE DEFECT THIS EXISTS FOR: the callback page used to print only
+ * `Reason class: CONNECTOR_PROVIDER_ERROR`, which is identical whether the app
+ * registered a different redirect, the secret was rotated, or the token endpoint
+ * refused the grant. The class stays (routes, logs and tests use it); this table
+ * is what the PERSON reads, and each entry names a different next action.
+ *
+ * Everything interpolated is public: the redirect URI was in the authorize URL,
+ * and the provider message was already bounded and de-identified by
+ * `providerText` before it got here (`escapeHtml` is applied by the caller).
+ *
+ * @param options - `{ provider, reason, redirect }`.
+ * @returns the remedy text, or `''` when the reason is unknown.
+ */
+function remedyFor({ provider = '', reason = '', redirect = '' } = {}) {
+  const name = provider === 'gitea' ? 'Gitea' : 'The provider'
+  const registered = typeof redirect === 'string' && redirect !== ''
+    ? redirect
+    : 'the callback URL this deployment prints in its Login panel'
+  switch (reason) {
+    case 'redirect-uri-mismatch':
+      return `${name} rejected the redirect: register EXACTLY ${registered} in the app, open the Connector from that origin, or set Callback origin.`
+    case 'invalid-client':
+      // The requirement's own wording: one sentence, three concrete actions.
+      return 'Client ID or secret rejected — re-paste them (secret is shown once; regenerate in Gitea if lost)'
+    case 'token-exchange':
+      return `${name} refused the token exchange. Check the OAuth2 application's client id/secret and its registered redirect URI, then press Login again.`
+    case 'state':
+      return 'Your login stalled — press Login again from the Connector card.'
+    default:
+      return ''
+  }
+}
+
+/**
  * The tiny completion page the callback answers with.
  *
  * A CONSTANT. It names no reference, no account, no code, no state and no token —
@@ -697,9 +835,14 @@ const NUDGE_SCRIPT = 'try{if(window.opener&&!window.opener.closed){window.opener
  * step is dominated by ONE question: which `redirect_uri` did this host actually
  * send, and was it the one registered on the OAuth client? That string is public
  * — it is in the authorize URL, in the address bar and in every log line at
- * Cloudflare — so the page carries it as a `data-` attribute plus the typed
+ * the provider — so the page carries it as a `data-` attribute plus the typed
  * failure class, and nothing else. The code, the state and both tokens stay out:
  * the attribute set is whitelisted here, not assembled from a provider body.
+ *
+ * A FAILURE also carries a REASON (`data-connector-error-reason`, one of
+ * {@link GITEA_FAILURE_REASONS}) and the matching human block
+ * (`data-connector-remedy`), so the page says WHAT to change instead of repeating
+ * a class name. `providerMessage` is the provider's own bounded sentence, escaped.
  *
  * @param options - wiring.
  * @param options.ok - whether the exchange succeeded.
@@ -707,9 +850,15 @@ const NUDGE_SCRIPT = 'try{if(window.opener&&!window.opener.closed){window.opener
  * @param options.redirectUri - the callback URL this attempt actually used (public).
  * @param options.errorCode - the typed failure class (`CONNECTOR_PROVIDER_ERROR`, …).
  * @param options.manual - whether this looks like a hand-typed visit, not a redirect.
+ * @param options.errorReason - the human reason id (`redirect-uri-mismatch`, …).
+ * @param options.providerMessage - the provider's own bounded refusal text.
+ * @param options.provider - `gitea` / `cloudflare` (picks the remedy wording).
  * @returns the HTML document.
  */
-export function completionPage({ ok, message, redirectUri = '', errorCode = '', manual = false }) {
+export function completionPage({
+  ok, message, redirectUri = '', errorCode = '', manual = false,
+  errorReason = '', providerMessage = '', provider = '',
+}) {
   const tone = ok === true ? '#1f7a3d' : '#a8323a'
   const title = ok === true ? 'Login complete' : 'Login not completed'
   // A success page says ONE thing. The reference name, the alias, the code and
@@ -721,9 +870,17 @@ export function completionPage({ ok, message, redirectUri = '', errorCode = '', 
     : escapeHtml(trimMessage(message))
   const redirect = typeof redirectUri === 'string' && /^https?:\/\//u.test(redirectUri) ? redirectUri : ''
   const kind = typeof errorCode === 'string' && /^[A-Za-z0-9_.-]{1,64}$/u.test(errorCode) ? errorCode : ''
+  const reason = ok === true ? '' : classifyReasonId(errorReason)
+  // ONLY when the provider actually said something: `trimMessage('')` answers a
+  // default sentence, and a "Provider message: Login not completed." line on every
+  // failure would be noise that looks like a provider quote.
+  const detail = ok === true || String(providerMessage ?? '').trim() === '' ? '' : trimMessage(providerMessage)
+  const remedy = reason === '' ? '' : remedyFor({ provider, reason, redirect })
   const diagnostics = [
     redirect === '' ? '' : `<p class="kv">Redirect URI: <code data-connector-redirect-uri="${escapeHtml(redirect)}">${escapeHtml(redirect)}</code></p>`,
     kind === '' ? '' : `<p class="kv">Reason class: <code data-connector-error-kind="${escapeHtml(kind)}">${escapeHtml(kind)}</code></p>`,
+    reason === '' ? '' : `<p class="kv">Reason: <code data-connector-error-reason="${escapeHtml(reason)}">${escapeHtml(reason)}</code></p>`,
+    detail === '' ? '' : `<p class="kv">Provider message: <code data-connector-provider-message="true">${escapeHtml(detail)}</code></p>`,
     manual === true
       ? '<p class="kv">This is the OAuth callback endpoint. Opening it by hand cannot complete a login; start from the Connector card and let the provider redirect here.</p>'
       : '',
@@ -734,6 +891,10 @@ export function completionPage({ ok, message, redirectUri = '', errorCode = '', 
     body: [
       `<strong>${title}</strong>`,
       `<p>${line}</p>`,
+      // THE HUMAN BLOCK, directly under the headline: one reason, one fix. It sits
+      // OUTSIDE the diagnostics section because it is the actionable half, and a
+      // collapsed/technical panel is the wrong home for it.
+      remedy === '' ? '' : `<section data-connector-remedy="${escapeHtml(reason)}"><h2>What to do</h2><p class="kv">${escapeHtml(remedy)}</p></section>`,
       diagnostics.length === 0
         ? ''
         : `<section data-connector-diagnostics="true"><h2>Diagnostics</h2>${diagnostics.join('')}</section>`,
@@ -748,6 +909,20 @@ export function completionPage({ ok, message, redirectUri = '', errorCode = '', 
 }
 
 /**
+ * Whitelist a reason id before it reaches an attribute.
+ *
+ * A `data-` attribute is assembled HERE, from a fixed list — never from a provider
+ * body — so a server that answers `{"error":"<script>"}` cannot name a section.
+ *
+ * @param value - candidate reason id.
+ * @returns the id, or `''` when it is not one of ours.
+ */
+function classifyReasonId(value) {
+  const text = typeof value === 'string' ? value.trim() : ''
+  return GITEA_FAILURE_REASONS.includes(text) ? text : ''
+}
+
+/**
  * The page a browser lands on when the provider REDIRECTS WITH AN OAUTH ERROR
  * instead of an authorization code (`?error=invalid_scope&error_description=…`).
  *
@@ -757,15 +932,35 @@ export function completionPage({ ok, message, redirectUri = '', errorCode = '', 
  * provider-controlled text), and prints the exact place to fix it. Nothing else
  * from the query string is echoed: no code, no state, no client id.
  *
+ * GITEA'S REDIRECT REFUSAL ARRIVES HERE TOO. A wrong `redirect_uri` can be refused
+ * at the authorize step with `error=redirect_uri_mismatch` (or Gitea's own
+ * `invalid_redirect_uri`), which never reaches the token exchange — so the same
+ * human block the completion page uses is rendered here, naming the redirect this
+ * deployment actually sends.
+ *
  * @param options - wiring.
  * @param options.provider - `cloudflare` or `gitea` (picks the fix-it steps).
  * @param options.error - the OAuth `error` code, e.g. `invalid_scope`.
  * @param options.description - the OAuth `error_description` (provider text).
+ * @param options.redirectUri - the callback URL this deployment sends (public).
  * @returns the HTML document.
  */
-export function callbackErrorPage({ provider = 'cloudflare', error = '', description = '' }) {
+export function callbackErrorPage({ provider = 'cloudflare', error = '', description = '', redirectUri = '' }) {
   const errorName = escapeHtml(String(error ?? '').slice(0, 80))
   const detail = escapeHtml(trimMessage(description))
+  const redirect = typeof redirectUri === 'string' && /^https?:\/\//u.test(redirectUri) ? redirectUri : ''
+  /**
+   * An OAuth `error` code on the redirect is a REFUSAL BEFORE any code exists, so
+   * the only ones that map onto a fix are the redirect ones (and a client one).
+   * `invalid_scope` keeps its own troubleshooting list below.
+   */
+  const lower = String(error ?? '').trim().toLowerCase()
+  const lowerDetail = String(description ?? '').toLowerCase()
+  const reason = lower === 'redirect_uri_mismatch' || lower === 'invalid_redirect_uri'
+    ? 'redirect-uri-mismatch'
+    : (lower === 'invalid_client' ? 'invalid-client'
+      : (/^invalid_request$/u.test(lower) && /redirect|callback/u.test(lowerDetail) ? 'redirect-uri-mismatch' : ''))
+  const remedy = reason === '' ? '' : remedyFor({ provider, reason, redirect })
   const steps = provider === 'cloudflare'
     ? [
       'Open dash.cloudflare.com → Manage Account → OAuth clients → your client → Select permission scopes → add the scope named in the message above (e.g. page.read) → retry Login from Connector.',
@@ -779,10 +974,12 @@ export function callbackErrorPage({ provider = 'cloudflare', error = '', descrip
   const body = [
     '<strong>Login not completed</strong>',
     `<p>The provider refused the authorization before any token was issued (${errorName}).</p>`,
+    remedy === '' ? '' : `<section data-connector-remedy="${escapeHtml(reason)}"><h2>What to do</h2><p class="kv">${escapeHtml(remedy)}</p></section>`,
     '<section data-connector-troubleshoot="true">',
     '<h2>Troubleshooting</h2>',
     `<p class="kv">Error: <code>${errorName}</code></p>`,
     detail === '' ? '' : `<p class="kv">Message: <code>${detail}</code></p>`,
+    redirect === '' ? '' : `<p class="kv">Redirect URI: <code data-connector-redirect-uri="${escapeHtml(redirect)}">${escapeHtml(redirect)}</code></p>`,
     `<ol>${steps.map(step => `<li>${step}</li>`).join('')}</ol>`,
     '</section>',
   ]

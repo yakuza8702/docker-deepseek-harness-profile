@@ -10,6 +10,9 @@
     "status.providers": "Providers",
     "status.resolved": "resolved",
     "status.unresolved": "not resolved",
+    "status.live": "live",
+    "status.dead": "EXPIRED — press Login",
+    "status.deadHint": "this token no longer authenticates: reads may fall back anonymously. Press Login to refresh it.",
     "status.noRef": "(no reference set)",
     "status.noAlias": "This provider has no alias yet.",
     "status.setRef": "Set reference",
@@ -104,7 +107,7 @@
       "Make sure the Base URL on this card is your instance origin, e.g. https://git.example.com.",
       "Open {base}/user/settings/applications — the SELF-SERVICE path on the account that will authorize. (Site Administration → Applications is the site-wide admin path; the user path is the one to use.)",
       "Press \"Create OAuth2 Application\". Fields: \"Application Name\" (e.g. DSH Connector); \"Redirect URI(s)\" — an array, each entry matched EXACTLY.",
-      "Redirect URI: {callback} — copy it exactly. Use the 127.0.0.1 form this page shows, not \"localhost\" (RFC 8252 §8.3 recommends the loopback IP; Gitea matches the string).",
+      "Redirect URI: {callback} — copy it exactly. Use the 127.0.0.1 form this page shows, not \"localhost\" (RFC 8252 §8.3 recommends the loopback IP; Gitea matches the string). If this tab is not on the origin you registered, set Callback origin below first: this line and the authorize call then use the saved origin.",
       "Tick \"Confidential client\": this plugin is a confidential client — the code exchange sends its client secret. Untick it and the exchange has no secret and will be refused.",
       "Press Create, then copy the generated Client ID and Client Secret. The secret is shown ONLY once: if you lose it, regenerate the application; this plugin stores it under GITEA_CLIENT_SECRET.",
       "Back on this card press Login: the panel shows \"Application Client ID\" and \"Application Client Secret\" — save both (the secret goes into DSH under its own reference and is never shown again).",
@@ -170,6 +173,15 @@
     "cf.startErrorTitle": "Login did not start.",
     "cf.startErrorOrigin": "This tab cannot be a Cloudflare redirect (HTTPS, or HTTP only for hosts ending in localhost). Current origin:",
     "cf.startErrorNoOrigin": "This host cannot tell which origin the page is on.",
-    "cf.startErrorOriginHint": "Nothing was opened. Set Callback origin below to your HTTPS domain (origin only, e.g. https://your-domain.example), press Save, then press Login again."
+    "cf.startErrorOriginHint": "Nothing was opened. Set Callback origin below to your HTTPS domain (origin only, e.g. https://your-domain.example), press Save, then press Login again.",
+    "gitea.redirectLabel": "Callback URI to register on the OAuth2 application",
+    "gitea.redirectFromOverride": "Built from your saved Callback origin. Gitea compares it character for character, so the OAuth2 application must list it as-is.",
+    "gitea.redirectFromTab": "Built from this tab's address bar, and this is exactly what the authorize call sends. Register this string on the OAuth2 application as-is.",
+    "gitea.callbackOriginLabel": "Callback origin",
+    "gitea.callbackOriginHint": "Origin only, no path — the plugin appends /api/connector/oauth/gitea/callback. Set it when your OAuth2 application registered a domain this tab is not on (e.g. your public HTTPS host while you are on 127.0.0.1), and every authorize call uses it. Same value as the giteaCallbackOrigin setting.",
+    "gitea.callbackOriginDerived": "(derived from this tab)",
+    "gitea.callbackOriginClearHint": "Clear the field and press Save to fall back to this tab's own origin.",
+    "gitea.callbackOriginSaved": "Callback origin saved. Press Login to authorize with it.",
+    "gitea.redirectFromHost": "Built from the origin this host derived from your request (this page has no address bar to read). Register this string on the OAuth2 application as-is."
   }
 }

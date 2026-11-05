@@ -126,6 +126,8 @@ const ROUTES = { ...READ_ROUTES, ...WRITE_ROUTES, ...MIXED_ROUTES }
  * humans and changes freely; these codes are the contract.
  *
  *   404 — the alias has no token stored (naming it is the actionable part)
+ *   401 — the stored token is DEAD (expired/revoked): the pre-flight refused the
+ *         write before anything was sent, so the page can say "press Login"
  *   400 — the caller's input or configuration is wrong (TypeError, our code)
  *   503 — this host mounted no credential store
  *   424 — the provider or its network refused; the request itself was fine
@@ -137,6 +139,7 @@ const ROUTES = { ...READ_ROUTES, ...WRITE_ROUTES, ...MIXED_ROUTES }
 function statusOf(error) {
   if (error instanceof StoreUnavailableError || error?.code === 'CONNECTOR_STORE_UNAVAILABLE') return 503
   if (error?.code === 'CONNECTOR_NO_TOKEN') return 404
+  if (error?.code === 'CONNECTOR_TOKEN_DEAD') return 401
   if (error?.code === 'CONNECTOR_BAD_REQUEST' || error instanceof TypeError) return 400
   if (error?.code === 'CONNECTOR_PROVIDER_ERROR') return 424
   return 500
@@ -283,6 +286,9 @@ export function createRoutes({ operations, logger }) {
           provider: callback.provider,
           error: oauthError,
           description: url.searchParams.get('error_description') ?? '',
+          // PUBLIC, and the one string this deployment actually sends: a refusal of
+          // `redirect_uri_mismatch` is unactionable without it.
+          redirectUri: redirectUriFor(origin, callback.path) ?? '',
         }))
       }
       const code = url.searchParams.get('code') ?? ''
@@ -331,7 +337,17 @@ export function createRoutes({ operations, logger }) {
           // actionable (424 = the provider/network refused; 400 = this request;
           // 404/503 = the local store). Neither is derived from a value.
           errorCode: typeof error?.code === 'string' ? error.code : '',
-          redirectUri: typeof error?.redirectUri === 'string' ? error.redirectUri : '',
+          // The REASON id and the provider's own bounded sentence: a class name
+          // alone cannot distinguish a redirect mismatch from a rotated secret.
+          errorReason: typeof error?.reasonKind === 'string' ? error.reasonKind : '',
+          providerMessage: typeof error?.providerMessage === 'string' ? error.providerMessage : '',
+          provider: callback.provider,
+          // Prefer the redirect the OPERATION reports (the parked / derived value
+          // it really sent). When the failure happened before that point, the
+          // request-derived callback is still the honest public value.
+          redirectUri: typeof error?.redirectUri === 'string' && error.redirectUri !== ''
+            ? error.redirectUri
+            : (redirectUriFor(origin, callback.path) ?? ''),
         }))
       }
     }

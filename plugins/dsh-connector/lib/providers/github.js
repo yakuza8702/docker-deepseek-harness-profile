@@ -262,6 +262,47 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     },
 
     /**
+     * THE LIVENESS PROBE — one `GET /user`, classified, NEVER throwing at the
+     * caller and NEVER refreshing.
+     *
+     * `resolved` (the reference exists) and `live` (the value still
+     * authenticates) are different facts, and a status that reports only the
+     * first one lies: an expired device-flow access token resolves perfectly and
+     * 401s on every write, while public reads still succeed anonymously. This is
+     * the cheap one-call answer to "does the token WORK", which is what a caller
+     * has to know before it decides to write.
+     *
+     * It deliberately does NOT use `readRepo`: that path refreshes once and then
+     * falls back anonymously. Status must tell the truth about the stored token,
+     * not silently heal it (a refresh belongs to the operation that needed it).
+     *
+     * Typed states:
+     *   * `live`        — 200 from `/user`;
+     *   * `expired`     — 401: the token itself was refused (dead credential);
+     *   * `unreachable` — a network failure or any other status. NOT dead: an
+     *                     offline host or a proxy in the way says nothing about
+     *                     the token, and guessing "dead" there would send the
+     *                     user to a Login that cannot help.
+     *
+     * @param token - the resolved token to classify.
+     * @returns `{ state, login?, status?, reason? }`.
+     */
+    async tokenState(token) {
+      let response
+      try {
+        response = await call(token, '/user')
+      } catch (error) {
+        // A network/DNS/timeout failure: unknown, not expired.
+        return { state: 'unreachable', reason: String(error?.message ?? error) }
+      }
+      if (response.ok) return { state: 'live', login: response.json?.login }
+      if (response.status === 401) return { state: 'expired', status: 401, reason: 'GitHub refused the token on /user' }
+      // 403 (SSO wall, suspended account) and 5xx say nothing definite about
+      // expiry, so they are reported as unknown rather than as a dead credential.
+      return { state: 'unreachable', status: response.status, reason: `GitHub ${response.status} on /user` }
+    },
+
+    /**
      * The token's budget, straight from the endpoint that costs nothing to ask.
      *
      * `/rate_limit` does not consume quota, which is what makes it safe to call

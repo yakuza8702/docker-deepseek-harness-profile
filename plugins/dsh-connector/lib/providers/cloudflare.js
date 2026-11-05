@@ -104,6 +104,75 @@ export const CLOUDFLARE_DDOS_SCOPES = [
 ]
 
 /**
+ * THE PUBLIC SENTENCE for a token the API refused as expired/invalid.
+ *
+ * ONE constant, because it is now produced by three call sites (REST `unwrap`,
+ * the GraphQL endpoint, and the identity probe chain) and the whole defect this
+ * replaces was a WRONG-CAUSE message: an expired OAuth access token was reported
+ * as "scope not granted … (needs zone-settings.read)", sending the user to
+ * re-consent a permission that was never the problem.
+ *
+ * It names the action ("press Login"), never a value, a length or a mask.
+ */
+export const CLOUDFLARE_TOKEN_EXPIRED_MESSAGE = 'Cloudflare access token expired/invalid — press Login on the Connector page, then retry.'
+
+/**
+ * Does this answer say THE TOKEN ITSELF is dead?
+ *
+ * THE LIVE EVIDENCE this exists for: an expired OAuth access token answered
+ *
+ *   * `POST /graphql` → **401** `{"errors":[{"code":10000,"message":"Authentication error"}]}`
+ *   * `GET /zones/{z}/settings` → **403** `{"errors":[{"code":10000,"message":"Invalid access token"}]}`
+ *
+ * The second one used to be classified as a missing SCOPE (403 ⇒ "scope not
+ * granted … (needs zone-settings.read)") even though re-consenting cannot fix an
+ * expired token. So the token signal is checked FIRST, and only after it fails can
+ * a 403 mean "this token may not do THIS".
+ *
+ * The rules are evidence-based, never "any 403 is a permission" or "code 10000 is
+ * always auth" (Cloudflare uses 10000 for ordinary permission refusals too — e.g.
+ * "This token does not have permission for dns_records" — and those MUST keep
+ * their scope guidance):
+ *
+ *   1. any **401** — the status Cloudflare uses only when the token itself is
+ *      missing/expired/revoked (this was already the refresh trigger);
+ *   2. a **403** whose message is an AUTHENTICATION phrase: `Invalid access
+ *      token` / `invalid_token` (the live /settings body), `Authentication
+ *      error`, or `Unable to authenticate request`;
+ *   3. `code 1000` (CF's "Invalid API Token" code) with token-shaped text.
+ *
+ * Everything else — `This token does not have permission …`, `not authorized`,
+ * `does not have access to the path`, `botnet feed is not available` — stays a
+ * SCOPE refusal even when it carries code 10000.
+ *
+ * @param response - `{ status }` of the answer.
+ * @param payload - the parsed `{ success, errors, result }` body.
+ * @returns whether the failure is the TOKEN's, not a scope's.
+ */
+export function isInvalidTokenResponse(response, payload) {
+  const status = Number(response?.status ?? 0)
+  if (status !== 401 && status !== 403) return false
+  // 401 IS the token's own refusal, whatever the wording rides along with it.
+  if (status === 401) return true
+  const errors = Array.isArray(payload?.errors) ? payload.errors : []
+  const messages = errors.map(error => String(error?.message ?? '')).filter(message => message !== '')
+  const codes = errors.map(error => Number(error?.code)).filter(code => Number.isFinite(code))
+  for (const message of messages) {
+    // "Invalid access token", "invalid_token" — the phrase Cloudflare used on the
+    // live /settings 403. Not "invalid_request", not "does not have access".
+    if (/^\s*invalid[\s_-]*(access[\s_-]+)?token\b/iu.test(message)) return true
+    // The 401-wording that also appears on 403s in some zones' responses, and the
+    // bare "Unable to authenticate request" body. Neither is a permission phrase.
+    if (/^\s*(authentication\s+(error|failed|required)|unable\s+to\s+authenticate)\b/iu.test(message)) return true
+  }
+  // Code 1000 is CF's "Invalid API Token"; only token-shaped text makes it one.
+  if (codes.includes(1000) && messages.some(message => (
+    /\btoken\b/iu.test(message) && /\b(invalid|expired|revoked|not valid)\b/iu.test(message)
+  ))) return true
+  return false
+}
+
+/**
  * The scope ids one API call needs, from the label the call was given.
  *
  * The labels are the short, greppable names used in `unwrap(..., what)` — e.g.
@@ -197,13 +266,34 @@ export function createCloudflare({ apiBase, request, runWrangler }) {
       .join('; ')
   }
 
+  /** The typed "the token is dead" failure. ONE shape, THREE call sites. */
+  function tokenExpiredError(status) {
+    const error = providerError(CLOUDFLARE_TOKEN_EXPIRED_MESSAGE, {
+      status,
+      // The operations layer may attempt ONE refresh + retry for this error.
+      tokenRejected: true,
+    })
+    // PUBLIC classification: a caller (and the page) can tell expiry from scope.
+    error.reason = 'token_expired'
+    error.tokenExpired = true
+    return error
+  }
+
   /** Unwrap Cloudflare's `{success, errors, result}` envelope. */
   function unwrap(response, what) {
     const payload = response.json ?? {}
     if (response.ok && payload.success !== false) return payload.result
+    /**
+     * ORDER MATTERS, AND THIS IS THE BUG THAT WAS FIXED: an expired token that
+     * arrives as a 403 ("Invalid access token") used to fall through to the
+     * permission branch and print "scope not granted … (needs zone-settings.read)".
+     * The token signal is therefore tested BEFORE any scope reasoning — a
+     * re-consent cannot revive an expired token.
+     */
+    if (isInvalidTokenResponse(response, payload)) throw tokenExpiredError(response.status)
     const errors = errorsOf(payload)
     const detail = errors === '' ? `Cloudflare ${response.status}` : `Cloudflare: ${errors}`
-    // 401 = the token itself; 403 = this token may not do THIS — reported at the
+    // 403 (with no token signal) = this token may not do THIS — reported at the
     // endpoint's own scope so the user knows what to grant, not "log in again".
     // The message NAMES the gatekeeper id(s) (e.g. zone-settings.read for
     // /zones/{id}/settings, both DDoS ids for the ddos_l7 entry point), which is
@@ -212,7 +302,7 @@ export function createCloudflare({ apiBase, request, runWrangler }) {
     const suffix = response.status === 403
       ? ` — scope not granted on this OAuth token${needed.length === 0 ? '' : ` (needs ${needed.join(', ')})`}`
       : ''
-    throw providerError(`${detail} (${what})${suffix}`, { status: response.status, tokenRejected: response.status === 401 })
+    throw providerError(`${detail} (${what})${suffix}`, { status: response.status, tokenRejected: false })
   }
 
   /**
@@ -325,7 +415,14 @@ export function createCloudflare({ apiBase, request, runWrangler }) {
           }
         }
         if (response.status === 401 || response.status === 403) {
-          rejection = { label: attempt.label, status: response.status, errors: errorsOf(payload) }
+          rejection = {
+            label: attempt.label,
+            status: response.status,
+            errors: errorsOf(payload),
+            // A 401 is the token's own refusal; a 403 is one only with an
+            // invalid-token phrase ("Invalid access token").
+            invalidToken: isInvalidTokenResponse(response, payload),
+          }
           continue
         }
         const errors = errorsOf(payload)
@@ -334,9 +431,12 @@ export function createCloudflare({ apiBase, request, runWrangler }) {
       const label = rejection?.label ?? 'user'
       const status = rejection?.status ?? 401
       const errors = rejection?.errors ?? ''
+      // EVERY step refused, and the refusal was the token's: say so with the one
+      // sentence that names the fix, instead of a chain position the user cannot use.
+      if (rejection?.invalidToken === true) throw tokenExpiredError(status)
       throw providerError(
         `token rejected at /${label} (${status})${errors === '' ? '' : `: ${errors}`}`,
-        { status, tokenRejected: status === 401 },
+        { status, tokenRejected: false },
       )
     },
 
@@ -555,6 +655,15 @@ export function createCloudflare({ apiBase, request, runWrangler }) {
       const payload = response.json ?? {}
       const errors = Array.isArray(payload.errors) ? payload.errors : []
       const first = errors.map(error => error?.message).filter(Boolean).join('; ')
+      /**
+       * THE TOKEN FIRST. The live 401 was
+       * `{"errors":[{"code":10000,"message":"Authentication error"}]}` — before this
+       * check it fell past the permission branch (the wording contains none of
+       * "permission|not authorized|analytics|access to the path") and surfaced as
+       * `Cloudflare graphql 401: Authentication error`: true, but unactionable, and
+       * it skipped the refresh-once policy.
+       */
+      if (isInvalidTokenResponse(response, payload)) throw tokenExpiredError(response.status)
       if (response.status === 403 || /(permission|not authorized|analytics|access to the path)/iu.test(first)) {
         // TWO reason classes, not one: a missing scope id (tick it on the client)
         // vs a zone-level consent refusal (re-consent with Analytics Read ticked).
