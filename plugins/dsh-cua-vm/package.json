@@ -1,0 +1,36 @@
+{
+  "name": "dsh-cua-vm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A personal Linux VM per workspace, driven by the cua-vm supervisor. Gives the model build/test/troubleshoot capability without giving its shell the KVM device, and keeps VM disks outside the workspace.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "files": [
+    "cordis.patch.yml",
+    "index.js",
+    "client.js",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22.19"
+  }
+}

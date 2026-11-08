@@ -218,13 +218,12 @@ print("wrote", ${JSON.stringify(document)})
   if (skillOffice === undefined) {
     bad('the office bundle is selected but @deepseek-ai/dsh-skill-office is not installed')
   } else if (checker === undefined || !existsSync(checker)) {
-    // Upstream retired assets/scripts/check_office.py in the 0.2.1 line
-    // (gone from 0.2.1-alpha.3 onward): the skills now validate through their
-    // documented Python workflow and no SKILL.md references the checker any
-    // more. Keep the gate honest — require the skills the bundle actually
-    // ships, not a file that no longer exists — so following upstream does not
-    // fail the build.
-    ok('this skill-office release ships no assets/scripts/check_office.py (retired upstream in the 0.2.1 line) — validating the bundled skills instead')
+    // Upstream removed check_office.py in 0.2.1-rc.2 along with the rest of the
+    // per-skill scripts: the skills now validate through their documented
+    // Python workflow, and SKILL.md no longer references the checker. Keep the
+    // gate honest — require the skills themselves, not a file that no longer
+    // exists — so following upstream does not fail the build.
+    ok('this skill-office release ships no assets/scripts/check_office.py (removed upstream in 0.2.1-rc.2) — validating the bundled skills instead')
     const skills = ['office-docx', 'office-pptx', 'office-xlsx']
     const missingSkills = skills.filter((name) => !existsSync(join(skillOffice, 'assets', name, 'SKILL.md')))
     if (missingSkills.length === 0) ok(`the three bundled skills are present (${skills.join(', ')})`)

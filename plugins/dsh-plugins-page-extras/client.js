@@ -85,11 +85,37 @@ window.__ModuleLoader__.load({
         panel: true
       },
       {
+        // The personal VM is not a browser feature, but it belongs on this list for
+        // the same reason: it is an integrated capability whose tools are context in
+        // every request, so the person paying for it must be able to release it with
+        // one switch. `row` is the loader entry the bundle patch mounts (dsh-cua-vm
+        // -> id `cua-vm`); the supervisor that owns QEMU keeps running either way, so
+        // switching it back on is instant and never loses a VM.
+        row: 'cua-vm',
+        glyph: 'desktop',
+        title: 'Personal VM (CUA)',
+        body: 'A Linux VM per workspace, on KVM, owned by a supervisor outside the agent sandbox. The model builds, tests and troubleshoots inside it and copies only the finished product back; VM disks live outside the workspace and survive until you delete them. Turn it off to release the cua_vm_* tools and their prompt section \u2014 suspending a VM is separate, and nothing is destroyed.'
+      },
+      {
+        // The connector (dsh-connector) is an integrated capability on the same
+        // terms: six native tools (connector_status, connector_repos_list,
+        // connector_repo_actions, connector_file, connector_cloudflare,
+        // connector_push) plus the /api/connector routes and one system-prompt
+        // section, all of it constant context once mounted. `row` is the loader
+        // entry the bundle patch mounts (dsh-connector -> id `connector`), sitting
+        // under the VM row; switching it off releases the tools and the routes,
+        // and touches NO stored credential.
+        row: 'connector',
+        glyph: 'puzzle',
+        title: 'Connector',
+        body: 'GitHub / Cloudflare / Gitea connector settings'
+      },
+      {
         row: 'skill-office',
         glyph: 'office',
         title: 'Office documents',
         body: 'Word, PowerPoint and Excel work for the model: the harness\u2019s own office-docx, office-pptx and office-xlsx skills, running on a pinned Python payload, with the bundled LibreOffice engine rendering and converting when a page needs to be looked at or a PDF is asked for. Turn it off to release the three skills and their instructions from every request.'
-      }
+      },
     ]
 
     /**
@@ -259,6 +285,22 @@ window.__ModuleLoader__.load({
       React.createElement('path', { d: 'M8.6 12.4l2.1-2.6 1.9 1.6 2.3-3' })
     )
 
+    /**
+     * The connector row's glyph: a jigsaw piece — one part that only works when it
+     * is slotted into something else, which is the connector's whole shape (DSH
+     * keeps the credential, the plugin keeps the reference NAME). Plug-style: a
+     * single closed outline with two tabs, drawn on the same 24-unit grid and with
+     * the same stroke as the four above.
+     */
+    const PuzzleIcon = () => React.createElement('svg', {
+      width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+      strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true
+    },
+      React.createElement('path', {
+        d: 'M9.4 3.5a2.1 2.1 0 0 1 4.2 0v.9h3.2a1.2 1.2 0 0 1 1.2 1.2v3.2h.9a2.1 2.1 0 0 1 0 4.2h-.9v5.5a1.2 1.2 0 0 1-1.2 1.2h-4.1v-.9a2.1 2.1 0 0 0-4.2 0v.9H5.4a1.2 1.2 0 0 1-1.2-1.2v-4.1h-.9a2.1 2.1 0 0 1 0-4.2h.9V5.6a1.2 1.2 0 0 1 1.2-1.2h3.9z'
+      })
+    )
+
     /** The fourth feature's glyph: a document sheet with text on it. */
     const OfficeIcon = () => React.createElement('svg', {
       width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
@@ -272,7 +314,7 @@ window.__ModuleLoader__.load({
     )
 
     /** The rows' glyphs, by the `glyph` key each FEATURE carries. */
-    const GLYPHS = { tools: ToolsIcon, devtools: DevtoolsIcon, desktop: DesktopIcon, office: OfficeIcon }
+    const GLYPHS = { tools: ToolsIcon, devtools: DevtoolsIcon, desktop: DesktopIcon, office: OfficeIcon, puzzle: PuzzleIcon }
 
     function Extras() {
       const [rows, setRows] = useState(null)
@@ -282,11 +324,6 @@ window.__ModuleLoader__.load({
       const [message, setMessage] = useState(null)
       const say = useCallback((text, tone = 'info') => setMessage({ text, tone }), [])
       const [selected, setSelected] = useState('dsh-market')
-
-      const bundle = (name) => bundles?.find((entry) => entry.name === name) ?? null
-      const row = (id) => rows?.find((entry) => entry.id === id) ?? null
-      const loaded = rows !== null && bundles !== null
-
       const call = useCallback(async (action, body) => {
         const response = await fetch(`${ROUTE}/${action}`, body === undefined
           ? { headers: { accept: 'application/json' } }
@@ -305,6 +342,11 @@ window.__ModuleLoader__.load({
           say(String(error?.message ?? error), 'error')
         }
       }, [call])
+
+      const bundle = (name) => bundles?.find((entry) => entry.name === name) ?? null
+      const row = (id) => rows?.find((entry) => entry.id === id) ?? null
+      const loaded = rows !== null && bundles !== null
+
 
       useEffect(() => { void refresh() }, [refresh])
 

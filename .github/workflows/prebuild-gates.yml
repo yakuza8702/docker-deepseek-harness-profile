@@ -1,0 +1,224 @@
+# =====================================================================
+# prebuild-gates — answer "is the wiring sound?" and "does the image
+# still build?" on every push to `rea` and every `v*` tag, BEFORE the
+# image is published.
+#
+# WHY THIS EXISTS, NEXT TO docker-build.yml
+# -----------------------------------------
+# docker-build.yml owns publishing: it resolves the upstream DSH release
+# and moves `:latest`. Its build is the first place the image's own gates
+# run — mid-Dockerfile, against the two populated node_modules roots — and
+# on a tag push that is already too late: the tag exists, the image is
+# half-built, and the failure names a stage number instead of a file.
+#
+# So this workflow splits the question in two:
+#
+#   gates  (job 1)  the SAME repository assertions, seconds after checkout,
+#                   with no image: tools/ci-gates.mjs stages `plugins/*`
+#                   into a throwaway node_modules root (the shape the image
+#                   has) and runs every gate that needs nothing else.
+#                   Gates that dereference an IMAGE ARTIFACT (the pinned
+#                   Office payload, the OCR tree, the compiled Brave MCP
+#                   wrapper, the BUILT plugin-manager client bundle) are
+#                   SKIPPED with the exact missing path printed. They are
+#                   NOT counted as passes — the runner exits 1 on a FAIL
+#                   and never fabricates green; those gates still run,
+#                   unconditionally, inside `docker build`.
+#
+#   build  (job 2)  only runs when job 1 is green. Same buildx convention
+#                   as docker-build.yml (buildx + gha cache + the same
+#                   build-args), but it does NOT publish by default: the
+#                   repo's `:latest` belongs to docker-build.yml from
+#                   `main`, and a feature-branch push must not clobber it.
+#                   Set `push_image` (workflow_dispatch) to publish
+#                   `:rea-<sha8>` for a branch build.
+#
+# VIRGL
+# -----
+# The Dockerfile already has the toggle this workflow wires:
+#
+#   ARG WITH_VIRGL_QEMU=0   (Dockerfile, "Optional: a virgl-capable QEMU")
+#   -> apt install qemu-system-x86 qemu-system-modules-opengl
+#      libvirglrenderer1 libegl1 libgl1-mesa-dri
+#
+# cua provisions its own QEMU, which is built WITHOUT virtio-gpu-gl-pci; the
+# distro build above is what makes `cua sb create --gpu virgl` real. The
+# supervisor swaps cua's wrapper to /usr/bin/qemu-system-x86_64 only when
+# the image has it, and `DSH_CUA_VM_GPU=virgl` at runtime selects the path
+# (docker/cua-vm-supervisor.mjs). Cost: ~200 MB and a host with /dev/dri.
+#
+# docker-build.yml exposes the same arg as an opt-in input. Here it defaults
+# to ON — this workflow exists to prove the GPU path is not broken, and a
+# toggle that is off by default is never exercised. Override per run with
+# the `virgl` input. The repo variable `vars.DSH_WITH_VIRGL_QEMU` is NOT read
+# here on purpose: it already exists to gate the PUBLISHED image in
+# docker-build.yml, and honouring it would let a stale `0` silently turn off the
+# path this workflow exists to exercise. An explicit run input is the only way
+# to disable it.
+#
+# TAG TRIGGER
+# -----------
+# `v*` tags (this branch's initial tag: v0.1.0) run both jobs, so a tag is
+# only "released" after the gates and a real build succeed.
+# =====================================================================
+name: prebuild-gates
+
+on:
+  push:
+    branches:
+      - rea
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      virgl:
+        description: "Build the virgl-capable QEMU (personal-VM GPU path; +~200 MB, needs /dev/dri on the host)"
+        type: boolean
+        default: true
+      push_image:
+        description: "Publish :rea-<sha8> to GHCR (off by default; :latest belongs to docker-build.yml)"
+        type: boolean
+        default: false
+      dsh_version:
+        description: "Upstream @deepseek-ai/dsh version to build (default: latest)"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+  packages: write
+
+# One build per ref: a force-push supersedes the run it replaced. Tag runs get
+# their own group, so a branch push and a tag push never cancel each other.
+concurrency:
+  group: prebuild-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # The virgl default, in one place. Every expression below reads THIS value
+  # (post-processed by the `virgl` dispatch input), so "on unless a run says
+  # otherwise" is stated once instead of copied into three expressions.
+  DSH_WITH_VIRGL_QEMU: "1"
+
+jobs:
+  # -------------------------------------------------------------------
+  # job 1 — pre-build gates, repository only. No image, no secrets.
+  # -------------------------------------------------------------------
+  gates:
+    name: Pre-build gates (repo-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # The gates are dependency-free (node: builtins only): there is no
+          # root package.json and nothing to `npm ci`. Node 22 matches the
+          # image's runtime major.
+          node-version: "22"
+
+      - name: Syntax-check the gate runner and every gate it drives
+        run: |
+          set -euo pipefail
+          node --check tools/ci-gates.mjs
+          for gate in tools/check-*.mjs; do node --check "$gate"; done
+
+      - name: Run the repository gates
+        shell: bash
+        run: |
+          set -o pipefail
+          node tools/ci-gates.mjs 2>&1 | tee gates.log
+          status=${PIPESTATUS[0]}
+          {
+            echo '## Repo-only gates'
+            echo ''
+            echo '```'
+            cat gates.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Explain what was skipped
+        if: always()
+        run: |
+          {
+            echo ''
+            echo "Skipped rows above need an image artifact and are skipped by path,"
+            echo "never counted as passes. They run unconditionally inside \`docker build\`:"
+            echo ""
+            echo "- \`check-office.mjs\` — pinned Office Python payload"
+            echo "- \`check-ocr-toolchain.mjs\` — OCR tools tree"
+            echo "- \`check-brave-mcp.mjs\` — compiled Brave MCP wrapper + built plugin-manager client bundle"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------
+  # job 2 — the image itself, with the wiring job 1 just proved.
+  # -------------------------------------------------------------------
+  build:
+    name: Build image (virgl ${{ github.event.inputs.virgl == 'false' && 'off' || 'on' }})
+    needs: [gates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: github.event.inputs.push_image == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          SHA8="$(printf '%s' "${GITHUB_SHA}" | cut -c1-8)"
+          echo "sha8=${SHA8}" >> "$GITHUB_OUTPUT"
+          echo "ref_tag=rea-${SHA8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and (optionally) push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Off by default: docker-build.yml publishes :latest from `main`. A
+          # dispatch run may publish :rea-<sha8> for a branch build.
+          push: ${{ github.event.inputs.push_image == 'true' }}
+          # DSH_VERSION: the upstream release the image installs (Dockerfile
+          # default is `latest`; docker-build.yml resolves it dynamically).
+          # WITH_VIRGL_QEMU: the Dockerfile's own GPU feature (ARG, off by
+          # default there) — distro QEMU + qemu-system-modules-opengl +
+          # virgl/Mesa. ON here (env DSH_WITH_VIRGL_QEMU=1) on every push and
+          # tag, so the GPU path is actually exercised instead of only when
+          # somebody remembers the toggle; a dispatch run may turn it off.
+          build-args: |
+            DSH_VERSION=${{ github.event.inputs.dsh_version || 'latest' }}
+            WITH_VIRGL_QEMU=${{ github.event.inputs.virgl == 'false' && '0' || env.DSH_WITH_VIRGL_QEMU }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tags.outputs.ref_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## prebuild-gates"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Ref | \`${{ github.ref }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Gates | ${{ needs.gates.result }} |"
+            echo "| Build | ${{ job.status }} |"
+            echo "| virgl QEMU | \`${{ github.event.inputs.virgl == 'false' && 'off' || 'on' }}\` |"
+            echo "| Pushed | \`${{ github.event.inputs.push_image == 'true' }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

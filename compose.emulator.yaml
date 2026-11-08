@@ -1,46 +1,50 @@
 # =====================================================================
-# Emulator override — gives the container the ONE thing it cannot carry in an
-# image: access to the host's KVM device.
+# KVM override — gives the container the ONE thing it cannot carry in an
+# image: the host's /dev/kvm, for the personal-VM supervisor.
 #
 #   docker compose -f compose.yaml -f compose.emulator.yaml up -d
+#
+# (The file keeps its old name because existing stacks still reference it. It
+# used to pass /dev/kvm to the Android emulator, which this image no longer
+# ships — see the Dockerfile. The device is now for `cua`, the Linux VM the
+# model builds and tests in.)
+#
+# WHAT IT ENABLES
+#   docker/entrypoint.sh starts `cua-vm-supervisor` outside the agent's
+#   sandbox; the supervisor owns /dev/kvm, QEMU and the /cua-vm volume. The
+#   harness itself keeps every bit of its hardening: cap_drop ALL, read-only
+#   rootfs, no-new-privileges. Nothing here adds a capability — an unprivileged
+#   QEMU only needs the device node.
 #
 # WHY THIS IS AN OVERRIDE AND NOT PART OF THE BASE FILE
 # Docker refuses to start a container whose `devices:` entry does not exist on
 # the host, so putting /dev/kvm in compose.yaml would break the harness on every
-# machine without it. The base compose stays fully locked down (cap_drop ALL,
-# read-only rootfs); this file is the explicit opt-in.
+# machine without it. Without this override the harness still boots; the VM
+# tools report that the device is missing instead.
 #
 # REQUIREMENTS
-#   * /dev/kvm on the HOST. On a host that is itself a VM, enable nested
-#     virtualisation, otherwise /dev/kvm appears but guests refuse to start.
-#   * access to the device for the non-root user. MEASURED: Docker resolves a
-#     group NAME against the IMAGE's /etc/group, not the host's — so
-#     `group_add: [kvm]` adds whatever gid this image assigned (the image
-#     creates one, docker/emulator-toolchain.sh) and that is only correct when it
-#     happens to equal the gid that owns /dev/kvm on the host. Two reliable ways:
-#
-#       (a) no gid guessing — make the device accessible on the host:
+#   * /dev/kvm on the HOST. On a host that is itself a VM, nested virtualisation
+#     must be enabled, otherwise the device appears but guests refuse to start.
+#   * access to the device for the non-root user. Docker resolves a group NAME
+#     against the IMAGE's /etc/group, not the host's, so either:
+#       (a) make the device accessible on the host:
 #             # /etc/udev/rules.d/99-kvm.rules
 #             KERNEL=="kvm", GROUP="kvm", MODE="0666"
-#
-#       (b) pin the host's gid explicitly (compose cannot run `getent`, so put it
-#           in .env):   echo "KVM_GID=$(getent group kvm | cut -d: -f3)" >> .env
-#           and use:     group_add: ["${KVM_GID}"]
-#
-#     Check what the container actually sees before trusting either:
-#       docker run --rm --device /dev/kvm alpine:3 sh -c 'ls -l /dev/kvm; id'
+#       (b) pin the host's gid explicitly (compose cannot run `getent`):
+#             echo "KVM_GID=$(getent group kvm | cut -d: -f3)" >> .env
+#           and use: group_add: ["${KVM_GID}"]
 #
 # VERIFY INSIDE THE CONTAINER
-#   emulator-tools                       # "hardware accel: /dev/kvm present and accessible"
-#   emulator-tools --up                  # boot Android
+#   ls -l /dev/kvm && id            # the user must be in the owning group
+#   cua runtime doctor              # qemu: installable/ok  (read-only)
 #
-# NO EXTRA CAPABILITIES ARE NEEDED: the emulator is an ordinary userspace QEMU
-# process. If it ever refuses with a seccomp error, prefer
-# `security_opt: [seccomp=unconfined]` over `privileged: true`.
+# The VM store is a named volume (`cua-vm`) mounted at /cua-vm. It holds the
+# base image, per-workspace deltas, the user-local QEMU and the supervisor log;
+# nothing of it is in the workspace, and `docker volume rm` reclaims it all.
 # =====================================================================
 services:
   seek-harness:
     devices:
       - /dev/kvm
     group_add:
-      - kvm
+      - "${KVM_GID:-kvm}"

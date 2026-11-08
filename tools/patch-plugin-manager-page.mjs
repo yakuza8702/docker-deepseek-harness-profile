@@ -20,13 +20,15 @@
  *
  * `dsh-plugins-page-extras` then registers the component that fills it.
  *
- * It also adds this installation's INTEGRATED bundles to the page's own
- * `BUILTIN_PROFILE_BUNDLES` set, so a feature that has moved into the top section
- * stops having a card of its own underneath: a bundle is listed only when it is a
- * profile dependency or a shipped optional bundle, and the page already excludes
- * the names in that set. Without this the same feature appears twice — as the
- * top row and again under "Installed" — which is not the layout of the Desktop
- * page this mirrors.
+ * It also keeps this installation's INTEGRATED bundles out of the page's list, so a
+ * feature that has moved into the top section stops having a card of its own
+ * underneath: a bundle is listed only when it is a profile dependency or a shipped
+ * optional bundle, and the page already excludes the names in its own exclusion set.
+ * Without this the same feature appears twice — as the top row and again under
+ * "Installed" — which is not the layout of the Desktop page this mirrors. Rather than
+ * editing that set (its name and its home have both moved upstream), the patch
+ * declares `DSH_IMAGE_HIDDEN_BUNDLES` beside the page's exclusion filter and ANDs it
+ * into the guard.
  *
  * Every anchor is asserted present and unique; the patch is idempotent and FAILS
  * THE BUILD if upstream moves one — an upstream refactor must never silently drop
@@ -65,20 +67,43 @@ const ANCHOR_RENDER_VARIANTS = [
   { since: "<= 0.2.1-alpha.1", anchor: 'renderGroup("official", t("officialTitle"), officialCards)' },
 ];
 
-// 3. The page's own exclusion list: names that stay out of it even when the
-//    profile declares them as dependencies.
-const ANCHOR_BUILTIN = /const BUILTIN_PROFILE_BUNDLES = new Set\(\[([\s\S]*?)\]\)/u;
+// 3. The page's own exclusion test: `…filter(p => !<SET>.has(p.name))`, the filter
+//    that keeps names out of the list even when the profile declares them as
+//    dependencies.
+//
+//    This anchors on the FILTER SHAPE, never on a symbol name. Upstream renamed the
+//    set from BUILTIN_PROFILE_BUNDLES to HIDDEN_BUNDLES in 0.2.2-alpha.2 and moved
+//    its declaration into @deepseek-ai/dsh-official-bundles, which is exactly what a
+//    name anchor cannot survive — it failed the feat/tool-trim build at step #39.
+//    The shape has held across every published release (0.2.1-alpha.2 .. 0.2.2-alpha.2).
+//
+//    Two idioms are anchored because the set may become an array: `.has(name)` for a
+//    Set, `.includes(name)` for an array. The first variant that appears EXACTLY ONCE
+//    wins; anything else fails the build with every count printed.
+//
+//    This patch never rewrites upstream's set. It declares its own beside the filter
+//    and ANDs one clause in, so a rename, a retype, or the declaration moving out of
+//    this file all leave it working — and upstream's own list keeps behaving as they
+//    wrote it. Mirrored by tools/probe-anchors.mjs; keep the two in step.
+const ANCHOR_LIST_FILTERS = [
+  { kind: "has", re: /\.filter\(\s*\(?(\w+)\)?\s*=>\s*!(\w+)\.has\(\1\.name\)/u },
+  { kind: "includes", re: /\.filter\(\s*\(?(\w+)\)?\s*=>\s*!(\w+)\.includes\(\1\.name\)/u },
+];
+
+/** The exclusion set this patch contributes, declared beside upstream's filter. */
+const OWN_HIDDEN = "DSH_IMAGE_HIDDEN_BUNDLES";
 
 /**
  * The bundles this installation surfaces in the top section instead of as cards:
  * the browser tooling (plugins/dsh-browser-mcp), the browser troubleshooting tools
  * (plugins/dsh-brave-devtools-mcp), the visible browser desktop with its
  * browser_open bridge (plugins/dsh-browser-desktop), the Office skills and their
- * Python payload (plugins/dsh-office) and the market the market selector installs.
+ * Python payload (plugins/dsh-office), the personal VM (plugins/dsh-cua-vm), the
+ * Connector (plugins/dsh-connector) and the market the market selector installs.
  * All of them keep their own switch up there, so nothing becomes uncontrollable —
  * they simply stop being listed twice.
  */
-const INTEGRATED_BUNDLES = ["dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-browser-desktop", "dsh-office", "dshmarket"];
+const INTEGRATED_BUNDLES = ["dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-browser-desktop", "dsh-office", "dsh-cua-vm", "dsh-connector", "dshmarket"];
 
 /** Occurrences of a literal, counted without regex escaping. */
 const count = (text, needle) => text.split(needle).length - 1;
@@ -197,25 +222,35 @@ for (const root of roots) {
   }
 
   if (!builtinDone) {
-    const found = ANCHOR_BUILTIN.exec(after);
-    if (found === null) {
+    const candidates = ANCHOR_LIST_FILTERS.map((variant) => ({
+      variant,
+      hits: [...after.matchAll(new RegExp(variant.re.source, "gu"))],
+    }));
+    const chosen = candidates.find((candidate) => candidate.hits.length === 1);
+    if (chosen === undefined) {
+      const seen = candidates.map((candidate) => `${candidate.variant.kind} ${candidate.hits.length}x`).join(", ");
       console.error(
-        `[plugins-page] ERROR: the exclusion list anchor is gone from ${file} (BUILTIN_PROFILE_BUNDLES not found).\n` +
-          `  ${INTEGRATED_BUNDLES.join(", ")} would come back as duplicate cards, so the image refuses to build. Re-anchor this script against the new upstream code.`,
+        `[plugins-page] ERROR: the exclusion-list filter anchor is gone from ${file} (${seen}; expected exactly one match).\n` +
+          `  Looked for \`.filter(p => !<SET>.has(p.name))\` and \`.filter(p => !<SET>.includes(p.name))\` —\n` +
+          `  ${INTEGRATED_BUNDLES.join(", ")} would come back as duplicate cards, so the image refuses to build.\n` +
+          `  Re-anchor ANCHOR_LIST_FILTERS against the new upstream code (tools/probe-anchors.mjs reports the same shape).`,
       );
       process.exit(1);
     }
-    const body = found[1];
-    const indent = (body.match(/\n([^\S\n]+)["']/u) ?? [null, "  "])[1];
-    const missing = INTEGRATED_BUNDLES.filter((name) => !body.includes(`"${name}"`) && !body.includes(`'${name}'`));
-    // Keep the original trailing whitespace so the closing bracket lands on its
-    // own indentation, and supply the separator: upstream's last entry carries no
-    // trailing comma (the built bundle and the source agree).
-    const tail = /\s*$/u.exec(body)[0];
-    const head = body.slice(0, body.length - tail.length);
-    const separator = /,[ \t]*$/u.test(head) ? "" : ",";
-    const grown = `${head}${separator}${missing.map((name) => `\n${indent}"${name}",`).join("")}${tail}`;
-    after = after.replace(found[0], `const BUILTIN_PROFILE_BUNDLES = new Set([${grown}])`);
+    const [whole, param, upstreamId] = chosen.hits[0];
+    const guard = `!${upstreamId}.${chosen.variant.kind}(${param}.name)`;
+    const at = after.indexOf(guard, chosen.hits[0].index);
+    const declared = `const ${OWN_HIDDEN} = new Set([${INTEGRATED_BUNDLES.map((name) => `"${name}"`).join(", ")}]);`;
+    // 1. Widen the guard in place: upstream's own test keeps running, ours is ANDed
+    //    in beside it. Upstream's set is never rewritten, so a rename or a retype of
+    //    that set cannot break this, and their exclusion behaviour is preserved.
+    after = after.slice(0, at) + `${guard} && !${OWN_HIDDEN}.has(${param}.name)` + after.slice(at + guard.length);
+    // 2. Declare our set on its own line above the statement holding the filter,
+    //    reusing that statement's indentation so the file stays readable.
+    const lineStart = after.lastIndexOf("\n", at) + 1;
+    const indent = /^[ \t]*/u.exec(after.slice(lineStart, at))[0];
+    after = after.slice(0, lineStart) + `${indent}${declared}\n` + after.slice(lineStart);
+    console.log(`[plugins-page] exclusion list: injected ${OWN_HIDDEN} beside upstream's ${upstreamId} (${chosen.variant.kind})`);
   }
 
   fs.writeFileSync(file, after);

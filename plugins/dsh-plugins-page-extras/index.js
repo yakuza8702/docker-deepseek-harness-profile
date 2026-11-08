@@ -24,6 +24,8 @@
  * `browser_open` tool and its prompt section, independently.
  */
 
+import { createConnection } from 'node:net'
+
 export const name = 'plugins-page-extras'
 export const inject = ['pluginManager', 'webServer']
 
@@ -66,7 +68,25 @@ const ROWS = [
    * `load_workspace_dependencies` tool, is left mounted because it answers one
    * question and does nothing on its own.
    */
-  { id: 'skill-office', bundle: 'dsh-office' }
+  { id: 'skill-office', bundle: 'dsh-office' },
+  /**
+   * The personal VM, from plugins/dsh-cua-vm. Nine tools (`cua_vm_*`) plus one
+   * system-prompt section: context in every request, so it gets a switch like the
+   * rest. The supervisor that owns QEMU is a container process, not this row, so
+   * switching the row off releases the tools and leaves every VM intact; switching
+   * it back on re-mounts them against the same socket.
+   */
+  { id: 'cua-vm', bundle: 'dsh-cua-vm' },
+  /**
+   * The connector (GitHub / Cloudflare / Gitea tokens + repo verbs), from
+   * plugins/dsh-connector. Six `connector_*` native tools, the `/api/connector`
+   * Host routes and a `tool:connector` system-prompt section — context in every
+   * request, so it gets its own switch like the other integrated features. The
+   * row id is `connector` (the patch row in the bundle); the bundle is what
+   * carries it, and the credential REFERENCE names it configures are untouched by
+   * switching — only the tools, routes and prompt section are released.
+   */
+  { id: 'connector', bundle: 'dsh-connector' }
 ]
 
 /**
@@ -92,6 +112,37 @@ const MARKETS = [
 ]
 
 const MANAGED_MARKETS = MARKETS.map((market) => market.name)
+
+/** Talk to the cua-vm supervisor over its unix socket, one JSON line each way. */
+function supervisorCall(payload, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(process.env.CUA_SUPERVISOR_SOCK || '/tmp/cua-vm/supervisor.sock')
+    let buffer = ''
+    let settled = false
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      try { socket.destroy() } catch {}
+      fn(value)
+    }
+    socket.setEncoding('utf8')
+    socket.setTimeout(timeoutMs)
+    socket.on('connect', () => socket.write(`${JSON.stringify(payload)}\n`))
+    socket.on('data', (chunk) => {
+      buffer += chunk
+      if (!buffer.includes('\n')) return
+      try {
+        const answer = JSON.parse(buffer.slice(0, buffer.indexOf('\n')))
+        if (answer.ok === true) finish(resolve, answer)
+        else finish(reject, new Error(answer.error || 'the VM supervisor refused the request'))
+      } catch (error) {
+        finish(reject, error)
+      }
+    })
+    socket.on('timeout', () => finish(reject, new Error('the VM supervisor did not answer')))
+    socket.on('error', (error) => finish(reject, error))
+  })
+}
 
 async function readBody(req) {
   if (req.method !== 'POST') return {}
@@ -189,6 +240,40 @@ export function apply(ctx) {
                 .filter((bundle) => MANAGED_MARKETS.includes(bundle.name))
                 .map((bundle) => ({ name: bundle.name, enabled: bundle.enabled === true, installed: bundle.installed === true }))
             })
+          }
+          case 'cua-vms':
+          case 'cua-create':
+          case 'cua-start':
+          case 'cua-delete':
+          case 'cua-exec':
+          case 'cua-metrics':
+          case 'cua-port': {
+            const VM_OPS = {
+              'cua-vms': 'vmList', 'cua-create': 'vmCreate', 'cua-start': 'vmStart',
+              'cua-delete': 'vmDelete', 'cua-exec': 'exec', 'cua-metrics': 'vmMetrics', 'cua-port': 'port'
+            }
+            try {
+              const body = req.method === 'POST' ? await readBody(req) : {}
+              const answer = await supervisorCall({ op: VM_OPS[action], ...body }, 900000)
+              return send(res, 200, { ok: true, ...answer })
+            } catch (error) {
+              return send(res, 503, { ok: false, error: String(error?.message ?? error) })
+            }
+          }
+          case 'cua-config': {
+            // The VM policy lives in the supervisor's store (config.json), not in
+            // this image and not in a constant: the page reads and writes it here.
+            try {
+              if (req.method === 'POST') {
+                const body = await readBody(req)
+                const answer = await supervisorCall({ op: 'configSet', config: body })
+                return send(res, 200, { ok: true, ...answer })
+              }
+              const answer = await supervisorCall({ op: 'configGet' })
+              return send(res, 200, { ok: true, ...answer })
+            } catch (error) {
+              return send(res, 503, { ok: false, error: String(error?.message ?? error) })
+            }
           }
           case 'row': {
             const body = await readBody(req)

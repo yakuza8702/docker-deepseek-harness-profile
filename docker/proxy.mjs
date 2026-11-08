@@ -23,7 +23,7 @@
 import http from "node:http";
 import net from "node:net";
 import fs from "node:fs";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 // Recovery surface: when the harness cannot boot, no plugin inside it can render
 // anything — this proxy is the process that survives, so it serves the failure,
 // the profile list and the two fixes (switch profile / Safe Mode).
@@ -48,6 +48,33 @@ const DESKTOP_ENABLED = (process.env.DSH_DESKTOP_ENABLED ?? "1") !== "0";
 const DESKTOP_PREFIX = `/${(process.env.DSH_DESKTOP_PREFIX || "desktop").replace(/^\/+|\/+$/g, "")}`;
 const DESKTOP_PORT = parseInt(process.env.DSH_NOVNC_PORT || "6080", 10);
 const DESKTOP_WS_PATH = "/websockify";
+// ---------------------------------------------------------------------
+// Personal VM port previews: /vm/port/<name>/... -> 127.0.0.1:<localPort>
+// The supervisor opens a real `cua sb port-forward` and records it in
+// ports.json (outside the image), so a preview survives a harness restart
+// for as long as the VM does. The route inherits the proxy's auth and is
+// same-origin with the harness page, which is what a build previewing an
+// app on :3000 actually needs.
+// ---------------------------------------------------------------------
+const VM_PORT_PREFIX = "/vm/port";
+const VM_PORTS_FILE = process.env.CUA_PORTS_FILE || `${process.env.CUA_VM_STORE || "/cua-vm"}/ports.json`;
+// The shared desktop viewer (human takeover). `cua sb view --no-open --json`
+// mints a loopback URL with a ticket in the FRAGMENT; the supervisor records
+// host port + path, the browser keeps the ticket, and this proxy only moves
+// bytes. Same auth as the harness because it is the same origin.
+const VM_VIEW_PREFIX = "/vm/view";
+const VM_VIEWS_FILE = process.env.CUA_VIEWS_FILE || `${process.env.CUA_VM_STORE || "/cua-vm"}/views.json`;
+// ---------------------------------------------------------------------
+// VM gate: the shared desktop and the port previews get their own layer even
+// when the resource itself is protected by an SSO proxy that cannot carry an
+// auth redirect through a WebSocket upgrade. The proxy sets this cookie on any
+// page it serves (so the visitor has already passed whatever guards the app),
+// and refuses the VM surfaces without it. Set VM_GATE_SECRET to keep it stable
+// across restarts; otherwise it is minted per boot and a reload re-issues it.
+// ---------------------------------------------------------------------
+const VM_GATE_SECRET = process.env.VM_GATE_SECRET || randomBytes(24).toString("hex");
+const VM_GATE_COOKIE = "dsh_vm_gate";
+
 const AUTH_USER = process.env.PROXY_USERNAME || "";
 const AUTH_PASS = process.env.PROXY_PASSWORD || "";
 const AUTH_ENABLED = AUTH_USER !== "" && AUTH_PASS !== "";
@@ -115,6 +142,83 @@ function checkAuth(req) {
     safeEqual(decoded.slice(0, idx), AUTH_USER) &&
     safeEqual(decoded.slice(idx + 1), AUTH_PASS)
   );
+}
+
+function vmGateCookie(req) {
+  const raw = String(req.headers.cookie || "");
+  const match = /(?:^|;\s*)dsh_vm_gate=([^;]+)/u.exec(raw);
+  return match === null ? null : decodeURIComponent(match[1]);
+}
+
+/** True when a request is part of the VM desktop or a port preview. */
+function isVmSurface(req) {
+  const url = String(req.url || "/");
+  if (url.startsWith("/vm/view/") || url.startsWith("/vm/port/")) return true;
+  return vmViewReferer(req.headers.referer) !== null;
+}
+
+/**
+ * The viewer's gRPC client does NOT send cookies (connect-es omits credentials
+ * for these calls), so it authenticates with the ticket instead. That ticket
+ * was minted by /cua/view, which sits behind the app's own auth, and the
+ * supervisor recorded its hash when the link was issued — comparing the hash is
+ * what makes this proof, not merely a header that looks right.
+ */
+function vmGateTicketProof(req) {
+  const auth = String(req.headers["x-cua-env-authorization"] || "");
+  const bearer = /^Bearer\s+(.+)$/iu.exec(auth.trim());
+  const url = String(req.url || "/");
+  const query = url.includes("?") ? new URLSearchParams(url.slice(url.indexOf("?") + 1)).get("ticket") : null;
+  const ticket = (bearer === null ? null : bearer[1]) || query;
+  if (ticket === null || ticket === "") return false;
+  const hash = createHash("sha256").update(ticket).digest("hex");
+  try {
+    const table = JSON.parse(fs.readFileSync(VM_VIEWS_FILE, "utf8"));
+    return Object.values(table).some((entry) => entry && entry.ticketHash === hash
+      && (Number(entry.expiresAt) === 0 || Number(entry.expiresAt) > Date.now()));
+  } catch {
+    return false;
+  }
+}
+
+/** The ways in: cookie (pages), gate header/query (scripts), or a viewer ticket. */
+function vmGateAllows(req) {
+  if (vmGateTicketProof(req)) return true;
+  const cookie = vmGateCookie(req);
+  if (cookie !== null && safeEqual(cookie, VM_GATE_SECRET)) return true;
+  const header = String(req.headers["x-dsh-vm-gate"] || "");
+  if (header !== "" && safeEqual(header, VM_GATE_SECRET)) return true;
+  const url = String(req.url || "/");
+  const query = url.includes("?") ? new URLSearchParams(url.slice(url.indexOf("?") + 1)).get("gate") : null;
+  return query !== null && safeEqual(query, VM_GATE_SECRET);
+}
+
+function issueVmGate(req, res, force = false) {
+  if (!force && vmGateCookie(req) !== null) return;
+  const secure = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
+  res.setHeader("set-cookie", [
+    `${VM_GATE_COOKIE}=${encodeURIComponent(VM_GATE_SECRET)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${secure ? "; Secure" : ""}`
+  ]);
+}
+
+function denyVmGate(res, upgrade) {
+  const body = [
+    "403 — the personal VM needs the harness session first.",
+    "",
+    "Open the harness page in this browser, then press Show VM again. If you are",
+    "a script, send `x-dsh-vm-gate: <VM_GATE_SECRET>` or append `?gate=<secret>`.",
+  ].join("\n");
+  if (upgrade) {
+    res.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    res.destroy();
+    return;
+  }
+  res.writeHead(403, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
 }
 
 function deny(res, upgrade) {
@@ -233,6 +337,218 @@ function tunnelToDesktop(req, socket, head, upstreamPath) {
   upstream.on("error", () => desktopUnavailable(socket, true));
 }
 
+/** Map /vm/port/<name>/<rest>?<query> onto { name, path }. */
+function vmPortRoute(rawUrl) {
+  const raw = String(rawUrl || "/");
+  const path = raw.split("?")[0];
+  if (!path.startsWith(`${VM_PORT_PREFIX}/`)) return null;
+  const rest = path.slice(VM_PORT_PREFIX.length + 1);
+  if (rest === "") return null;
+  const slash = rest.indexOf("/");
+  const name = slash === -1 ? rest : rest.slice(0, slash);
+  const suffix = slash === -1 ? "/" : rest.slice(slash);
+  const query = raw.includes("?") ? raw.slice(raw.indexOf("?")) : "";
+  return { name, path: `${suffix}${query}` };
+}
+
+/** The loopback port the supervisor recorded for this VM, or null. */
+function vmPortTarget(name) {
+  try {
+    const table = JSON.parse(fs.readFileSync(VM_PORTS_FILE, "utf8"));
+    const entry = table[name];
+    return entry && Number(entry.localPort) > 0 ? Number(entry.localPort) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Map /vm/view/<name>/<rest> onto { name, rest } (query preserved separately). */
+function vmViewRoute(rawUrl) {
+  const raw = String(rawUrl || "/");
+  const path = raw.split("?")[0];
+  if (!path.startsWith(`${VM_VIEW_PREFIX}/`)) return null;
+  const rest = path.slice(VM_VIEW_PREFIX.length + 1);
+  if (rest === "") return null;
+  const slash = rest.indexOf("/");
+  const name = slash === -1 ? rest : rest.slice(0, slash);
+  const suffix = slash === -1 ? "" : rest.slice(slash + 1);
+  const query = raw.includes("?") ? raw.slice(raw.indexOf("?")) : "";
+  return { name, suffix, query };
+}
+
+function vmViewTarget(name) {
+  try {
+    const table = JSON.parse(fs.readFileSync(VM_VIEWS_FILE, "utf8"));
+    const entry = table[name];
+    if (!entry || !(Number(entry.port) > 0)) return null;
+    if (Number(entry.expiresAt) > 0 && Number(entry.expiresAt) < Date.now()) return null;
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+function vmViewUnavailable(res, upgrade, name) {
+  const body = [
+    `no desktop viewer is open for VM "${name}"`,
+    "",
+    "Press Show VM on the Personal VM page first: it mints a viewer link and",
+    "records it in " + VM_VIEWS_FILE + ".",
+  ].join("\n");
+  if (upgrade) {
+    res.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    res.destroy();
+    return;
+  }
+  res.writeHead(502, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function forwardToVmView(req, res, entry, upstreamPath, name) {
+  const headers = { ...req.headers };
+  headers.host = `127.0.0.1:${entry.port}`;
+  const upstream = http.request(
+    { host: "127.0.0.1", port: entry.port, method: req.method, path: upstreamPath, headers },
+    (upRes) => {
+      // The viewer ships `frame-ancestors 'none'` because it expects to be
+      // opened as a top-level page. It is served from the harness origin here,
+      // so allowing only that origin is the correct, narrower rewrite.
+      const headers = { ...upRes.headers };
+      if (typeof headers["content-security-policy"] === "string") {
+        headers["content-security-policy"] = headers["content-security-policy"].replace(/frame-ancestors[^;]*/i, "frame-ancestors 'self'");
+      }
+      if (headers["x-frame-options"] !== undefined) headers["x-frame-options"] = "SAMEORIGIN";
+      res.writeHead(upRes.statusCode, headers);
+      upRes.pipe(res);
+    }
+  );
+  upstream.on("error", () => vmViewUnavailable(res, false, name));
+  req.pipe(upstream);
+}
+
+function tunnelToVmView(req, socket, head, entry, upstreamPath, name) {
+  const upstream = net.connect(entry.port, "127.0.0.1", () => {
+    const lines = [`${req.method} ${upstreamPath} HTTP/1.1`];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const lower = req.rawHeaders[i].toLowerCase();
+      let value = req.rawHeaders[i + 1];
+      if (lower === "host") value = `127.0.0.1:${entry.port}`;
+      lines.push(`${req.rawHeaders[i]}: ${value}`);
+    }
+    upstream.write(lines.join("\r\n") + "\r\n\r\n");
+    pipeSockets(socket, upstream, head);
+  });
+  upstream.on("error", () => vmViewUnavailable(socket, true, name));
+}
+
+/**
+ * The viewer talks gRPC-web to ROOT paths (`/cua.env.v1.SystemService/...`),
+ * not to paths under its own prefix. A request whose Referer is the viewer is
+ * therefore the viewer's, and goes to the same upstream with its path intact.
+ * Nothing else in this proxy is reachable from that Referer, so DSH's own
+ * `/api/*` cannot be captured by it.
+ */
+function vmViewReferer(referer) {
+  if (typeof referer !== "string" || referer === "") return null;
+  try {
+    const url = new URL(referer);
+    const match = url.pathname.match(/^\/vm\/view\/([^/]+)\//u);
+    return match === null ? null : { name: decodeURIComponent(match[1]) };
+  } catch {
+    return null;
+  }
+}
+
+/** The most recently opened viewer, for requests that carry no referer. */
+function newestViewEntry() {
+  try {
+    const table = JSON.parse(fs.readFileSync(VM_VIEWS_FILE, "utf8"));
+    const entries = Object.values(table)
+      .filter((entry) => entry && Number(entry.port) > 0)
+      .sort((a, b) => String(b.openedAt || "").localeCompare(String(a.openedAt || "")));
+    return entries[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Segments the viewer asks for at the top level of its own origin. spacesd
+ * serves `/media` (the media socket) and friends next to `/viewer/`, while the
+ * browser resolves them against `/vm/view/`, so they arrive as
+ * `/vm/view/media?ticket=…` — a path that must NOT be mistaken for a VM name.
+ */
+const VM_VIEW_SERVICE_SEGMENTS = new Set(["media", "ws", "api", "session"]);
+
+function isViewerService(segment) {
+  return segment.includes(".") || VM_VIEW_SERVICE_SEGMENTS.has(segment);
+}
+
+/** `/vm/view/<service>/<rest>` -> `/<service>/<rest>` on the viewer upstream. */
+function vmServiceUpstream(segment, suffix, query) {
+  return suffix === "" ? `/${segment}${query}` : `/${segment}/${suffix}${query}`;
+}
+
+function vmViewUpstream(entry, suffix, query) {
+  const base = entry.path.endsWith("/") ? entry.path : `${entry.path}/`;
+  return suffix === "" ? `${base}${query}` : `${base}${suffix}${query}`;
+}
+
+function vmPortUnavailable(res, upgrade, name) {
+  const body = [
+    `no preview is open for VM "${name}"`,
+    "",
+    "Open one from the model (cua_vm_port) — it starts a port forward and",
+    "records it in " + VM_PORTS_FILE + ".",
+    "",
+    "Check:  docker exec <container> cat " + VM_PORTS_FILE,
+  ].join("\n");
+  if (upgrade) {
+    res.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    res.destroy();
+    return;
+  }
+  res.writeHead(502, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function forwardToVmPort(req, res, port, upstreamPath, name) {
+  const headers = { ...req.headers };
+  headers.host = `127.0.0.1:${port}`;
+  const upstream = http.request(
+    { host: "127.0.0.1", port, method: req.method, path: upstreamPath, headers },
+    (upRes) => {
+      res.writeHead(upRes.statusCode, upRes.headers);
+      upRes.pipe(res);
+    }
+  );
+  upstream.on("error", () => vmPortUnavailable(res, false, name));
+  req.pipe(upstream);
+}
+
+function tunnelToVmPort(req, socket, head, port, upstreamPath, name) {
+  const upstream = net.connect(port, "127.0.0.1", () => {
+    const lines = [`${req.method} ${upstreamPath} HTTP/1.1`];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const lower = req.rawHeaders[i].toLowerCase();
+      let value = req.rawHeaders[i + 1];
+      if (lower === "host") value = `127.0.0.1:${port}`;
+      lines.push(`${req.rawHeaders[i]}: ${value}`);
+    }
+    upstream.write(lines.join("\r\n") + "\r\n\r\n");
+    pipeSockets(socket, upstream, head);
+  });
+  upstream.on("error", () => vmPortUnavailable(socket, true, name));
+}
+
 function upstreamUnavailable(res, upgrade, req) {
   // A browser asking for a page while the harness is down gets the recovery
   // screen (boot failure + profile switch + Safe Mode) instead of a bare 502 —
@@ -308,7 +624,11 @@ const BOOT_WATCHDOG = `<script>(function(){
   function booted() {
     if (document.querySelector('[class*="footArea"]')) return true;
     if (document.querySelector('[class*="sidebarCol"] button')) return true;
-    return document.querySelectorAll("button").length >= 5;
+    if (document.querySelectorAll("button").length >= 5) return true;
+    // A shell that has rendered anything into the root is not "timed out",
+    // even if its chrome is still catching up.
+    var root = document.getElementById("root") || document.body;
+    return Boolean(root && root.children.length > 0 && document.body.innerText.trim() !== "");
   }
   function handoff(why) {
     if (fired || failed() === false && booted()) return;
@@ -319,7 +639,9 @@ const BOOT_WATCHDOG = `<script>(function(){
   var observer = new MutationObserver(function(){ if (failed()) handoff("client-failed"); });
   try { observer.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
   // Give a healthy shell real time to mount before the timeout path can fire.
-  setTimeout(function(){ observer.disconnect(); handoff("client-timeout"); }, 12000);
+  // 25 s: a busy browser (many tabs, a cold profile) legitimately needs more
+  // than the old 12 s, and a false "recovery" is worse than a later one.
+  setTimeout(function(){ observer.disconnect(); handoff("client-timeout"); }, 25000);
 })();</script>`;
 
 function injectPolyfill(html) {
@@ -348,6 +670,51 @@ function pipeSockets(client, upstream, head) {
 }
 
 // Buffer a text response, run `fn`, and send the (possibly rewritten) body.
+/**
+ * The MCP manager lists every loader-owned MCP row read-only. `browser-mcp` and
+ * `brave-devtools-mcp` are owned by this image's bundles and switched on the
+ * Plugins page, so listing them again is a second, inert control for the same
+ * thing.
+ *
+ * This filter lives in the proxy instead of a patch on the plugin's own file
+ * because the plugin is a profile dependency: `pnpm add`/`update` rewrites
+ * `lib/index.js`, and a boot-time patch is only re-applied on the next
+ * container start — measured: the manager's file was rewritten at 14:17 by a
+ * plugin install and both rows came back until the container restarted.
+ * Filtering the response needs no restart and survives any version of the
+ * plugin, as long as a row still carries `readOnlyReason: 'loader'`.
+ *
+ * DSH_MCP_MANAGER_HIDDEN="" shows everything again.
+ */
+const MANAGER_API_PREFIX = "/dsh-mcp-manager/api";
+const HIDDEN_MCP_ROWS = new Set(
+  (process.env.DSH_MCP_MANAGER_HIDDEN ?? "browser-mcp,brave-devtools-mcp")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
+function isMcpManagerApi(url) {
+  return typeof url === "string" && url.startsWith(MANAGER_API_PREFIX);
+}
+
+/** Drop the loader-owned rows that the Plugins page owns; anything else passes. */
+function filterManagerRows(body) {
+  let payload;
+  try {
+    payload = JSON.parse(body.toString("utf8"));
+  } catch {
+    return body; // not JSON (or not the list action): pass through untouched
+  }
+  const rows = payload?.rows ?? payload?.result?.rows;
+  if (!Array.isArray(rows)) return body;
+  const kept = rows.filter((row) => !(row && HIDDEN_MCP_ROWS.has(row.id) && row.readOnlyReason === "loader"));
+  if (kept.length === rows.length) return body;
+  if (Array.isArray(payload.rows)) payload.rows = kept;
+  else payload.result.rows = kept;
+  return Buffer.from(JSON.stringify(payload));
+}
+
 function bufferAndRewrite(upRes, res, fn) {
   const parts = [];
   let size = 0;
@@ -453,6 +820,10 @@ function forwardToUpstream(req, res, autoAuthTried) {
           }
         });
         authed.end();
+        return;
+      }
+      if (!upRes.headers["content-encoding"] && isMcpManagerApi(req.url)) {
+        bufferAndRewrite(upRes, res, filterManagerRows);
         return;
       }
       const ctype = String(upRes.headers["content-type"] || "");
@@ -561,10 +932,56 @@ function forwardToUpstream(req, res, autoAuthTried) {
 
 const server = http.createServer((req, res) => {
   if (!checkAuth(req, false)) return deny(res, false);
+  // A page loaded before a restart holds a cookie minted with the previous
+  // per-boot secret, and a SPA does not refetch its document — so the page asks
+  // for a fresh cookie explicitly instead of failing on the first Show VM.
+  if (String(req.url || "").split("?")[0] === "/vm/gate") {
+    const secure = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
+    const cookie = `${VM_GATE_COOKIE}=${encodeURIComponent(VM_GATE_SECRET)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${secure ? "; Secure" : ""}`;
+    res.writeHead(204, { "set-cookie": cookie, "cache-control": "no-store" });
+    res.end();
+    return;
+  }
+  if (isVmSurface(req) && !vmGateAllows(req)) return denyVmGate(res, false);
+  // Any page served here means the visitor already passed the app's own guard,
+  // so this is where the VM gate cookie is handed out.
+  issueVmGate(req, res);
   // The browser desktop is a separate loopback service. It is routed before
   // everything else because it must NOT be touched by the DSH-specific HTML/JS
   // rewriting below (noVNC is a static client and the harness recovery surface
   // and API have nothing to say about it).
+  // The viewer's own root-path calls (gRPC-web, favicon, …) — identified by the
+  // viewer being the referrer, never by the path, so DSH's /api is untouched.
+  const fromViewer = vmViewReferer(req.headers.referer);
+  if (fromViewer !== null) {
+    const entry = vmViewTarget(fromViewer.name);
+    if (entry !== null) return forwardToVmView(req, res, entry, req.url, fromViewer.name);
+  }
+  // The shared VM desktop: a loopback viewer with its ticket kept in the
+  // fragment, so this route only forwards paths.
+  const view = vmViewRoute(req.url);
+  if (view !== null) {
+    let entry = vmViewTarget(view.name);
+    let upstreamPath = entry === null ? null : vmViewUpstream(entry, view.suffix, view.query);
+    if (entry === null && isViewerService(view.name)) {
+      // The viewer resolves spacesd's ROOT services against `/vm/view/`, so
+      // they arrive as `/vm/view/cua.env.v1.SystemService/<Method>` or
+      // `/vm/view/media?ticket=…`. A service segment is not a VM name: send it
+      // to the newest viewer with its own path intact.
+      entry = newestViewEntry();
+      if (entry !== null) upstreamPath = vmServiceUpstream(view.name, view.suffix, view.query);
+    }
+    if (entry === null || upstreamPath === null) return vmViewUnavailable(res, false, view.name);
+    return forwardToVmView(req, res, entry, upstreamPath, view.name);
+  }
+  // VM port previews come before the desktop and before the harness: they are a
+  // plain loopback upstream with no rewriting.
+  const preview = vmPortRoute(req.url);
+  if (preview !== null) {
+    const port = vmPortTarget(preview.name);
+    if (port === null) return vmPortUnavailable(res, false, preview.name);
+    return forwardToVmPort(req, res, port, preview.path, preview.name);
+  }
   const desktop = desktopRoute(req.url);
   if (desktop !== null) {
     if (desktop.redirect) {
@@ -592,6 +1009,32 @@ const server = http.createServer((req, res) => {
 // incl. the Authorization header already validated above).
 server.on("upgrade", (req, socket, head) => {
   if (!checkAuth(req, true)) return deny(socket, true);
+  if (isVmSurface(req) && !vmGateAllows(req)) return denyVmGate(socket, true);
+  // Same discriminator for the viewer's websocket traffic.
+  const viewerUpgradeRef = vmViewReferer(req.headers.referer);
+  if (viewerUpgradeRef !== null) {
+    const entry = vmViewTarget(viewerUpgradeRef.name);
+    if (entry !== null) return tunnelToVmView(req, socket, head, entry, req.url, viewerUpgradeRef.name);
+  }
+  // The viewer's own websocket (media/input) uses the same route.
+  const viewUpgrade = vmViewRoute(req.url);
+  if (viewUpgrade !== null) {
+    let entry = vmViewTarget(viewUpgrade.name);
+    let upstreamPath = entry === null ? null : vmViewUpstream(entry, viewUpgrade.suffix, viewUpgrade.query);
+    if (entry === null && isViewerService(viewUpgrade.name)) {
+      entry = newestViewEntry();
+      if (entry !== null) upstreamPath = vmServiceUpstream(viewUpgrade.name, viewUpgrade.suffix, viewUpgrade.query);
+    }
+    if (entry === null || upstreamPath === null) return vmViewUnavailable(socket, true, viewUpgrade.name);
+    return tunnelToVmView(req, socket, head, entry, upstreamPath, viewUpgrade.name);
+  }
+  // A preview's own websocket (HMR, dev servers) stays same-origin too.
+  const preview = vmPortRoute(req.url);
+  if (preview !== null) {
+    const port = vmPortTarget(preview.name);
+    if (port === null) return vmPortUnavailable(socket, true, preview.name);
+    return tunnelToVmPort(req, socket, head, port, preview.path, preview.name);
+  }
   // noVNC's websocket goes to the desktop service, not to the harness.
   const desktop = desktopRoute(req.url);
   if (desktop !== null && desktop.path !== undefined) {

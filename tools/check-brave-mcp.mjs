@@ -13,9 +13,10 @@
  *   2. the row — the bundle patch that mounts `@deepseek-ai/dsh-mcp-client`;
  *   3. the SWITCH — the Plugins-page host table (which row id it may toggle) and
  *      its client half (which title it renders);
- *   4. the duplicate-card suppression — the name must stay in the page's
- *      `BUILTIN_PROFILE_BUNDLES` set, or the integrated feature reappears as a
- *      second, ordinary card underneath.
+ *   4. the duplicate-card suppression — the name must stay in an exclusion set the
+ *      page filters with (upstream's `BUILTIN_PROFILE_BUNDLES`/`HIDDEN_BUNDLES`, or
+ *      the `DSH_IMAGE_HIDDEN_BUNDLES` this image injects beside that filter), or the
+ *      integrated feature reappears as a second, ordinary card underneath.
  *
  * A green image with any ONE of those missing looks exactly like success until the
  * user opens the page. So this gate EXECUTES the server (a real MCP handshake, no
@@ -316,14 +317,25 @@ expect(
 );
 for (const page of pageFiles) {
   const source = fs.readFileSync(page, "utf8");
-  const set = /const BUILTIN_PROFILE_BUNDLES = new Set\(\[([\s\S]*?)\]\)/u.exec(source);
-  expect(set !== null, `the exclusion set is still where the patch expects it (${path.dirname(page)})`);
-  if (set !== null) {
-    expect(
-      set[1].includes(`"${BUNDLE}"`) || set[1].includes(`'${BUNDLE}'`),
-      `${BUNDLE} is excluded from the ordinary list (no second card under "Installed")`
-    );
-    expect(set[1].includes('"dsh-browser-mcp"'), "the sibling bundles are still excluded too");
+  // The exclusion may live in upstream's own set (BUILTIN_PROFILE_BUNDLES before
+  // 0.2.2-alpha.2, HIDDEN_BUNDLES after) or in the set this image injects beside the
+  // page's own exclusion filter (DSH_IMAGE_HIDDEN_BUNDLES). All three are legitimate:
+  // what the gate is for is that the name cannot appear twice, not which set holds
+  // it. tools/patch-plugin-manager-page.mjs anchors on the filter shape for exactly
+  // this reason, so this gate must not re-introduce a name dependency.
+  const sets = [
+    /const BUILTIN_PROFILE_BUNDLES = new Set\(\[([\s\S]*?)\]\)/u,
+    /const HIDDEN_BUNDLES = new Set\(\[([\s\S]*?)\]\)/u,
+    /const DSH_IMAGE_HIDDEN_BUNDLES = new Set\(\[([\s\S]*?)\]\)/u,
+  ]
+    .map((pattern) => pattern.exec(source))
+    .filter((match) => match !== null)
+    .map((match) => match[1]);
+  const holds = (name) => sets.some((body) => body.includes(`"${name}"`) || body.includes(`'${name}'`));
+  expect(sets.length > 0, `an exclusion set is present (${path.dirname(page)})`);
+  if (sets.length > 0) {
+    expect(holds(BUNDLE), `${BUNDLE} is excluded from the ordinary list (no second card under "Installed")`);
+    expect(holds("dsh-browser-mcp"), "the sibling bundles are still excluded too");
   }
   expect(source.includes("plugins.page.top"), "the top slot the rows render into is present");
 }

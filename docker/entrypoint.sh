@@ -124,30 +124,6 @@ ensure_home_alias() {
   fi
 }
 
-# ---------------------------------------------------------------------
-# Android emulator: make the AVD EXIST before the first session.
-#
-# `emulator-tools --up` is all an agent should need, so the AVD is written here
-# instead (cheap, and offline: the system image ships inside the image, so
-# nothing is downloaded). The rootfs is read-only, hence $ANDROID_AVD_HOME on
-# the workspace volume — see docker/emulator.md.
-#
-# Skipped silently when the emulator is not installed (arm64 builds install
-# none, because Google publishes no linux_aarch64 emulator). Booting still
-# needs /dev/kvm, which compose.emulator.yaml passes in; this step only removes
-# the "create an AVD first" friction.
-# ---------------------------------------------------------------------
-provision_emulator_avd() {
-  [[ "${DSH_EMULATOR:-1}" == "0" ]] && { log "emulator: skipped (DSH_EMULATOR=0)"; return 0; }
-  local sdk="${ANDROID_SDK_ROOT:-/opt/android-sdk}"
-  [[ -x "$sdk/emulator/emulator" ]] || return 0
-  if emulator-tools --avd >/dev/null 2>&1; then
-    log "emulator: AVD ready (${ANDROID_AVD_HOME:-/workspace/.android/avd}) — 'emulator-tools --up' boots it, needs /dev/kvm"
-  else
-    log "WARN: emulator: could not write the AVD — run 'emulator-tools --avd' to see why"
-  fi
-  return 0
-}
 
 # ---------------------------------------------------------------------
 # Fresh start: materialize the profile selection.
@@ -617,6 +593,161 @@ seed_office_bundle() {
   esac
 }
 
+# The personal VM as a switchable BUNDLE (see plugins/dsh-cua-vm).
+#
+# Same contract as the four above: its row lives in the bundle's own patch, so
+# the Plugins page switch is what mounts it, and a profile-level `disabled:`
+# override wins. Selecting it once on a fresh home only makes the tools exist
+# by default; DSH_CUA_VM=0 removes the row entirely.
+CUA_VM_BUNDLE="dsh-cua-vm"
+
+seed_cua_vm_bundle() {
+  [[ "${SAFE_MODE:-0}" == "1" ]] && { log "cua vm: Safe Mode — the real profile is left untouched"; return 0; }
+  [[ "${DSH_CUA_VM:-1}" == "0" ]] && { log "cua vm: not selected (DSH_CUA_VM=0)"; return 0; }
+
+  local dir="$DSH_REAL_HOME/profiles/$PROFILE"
+  local manifest="$dir/package.json"
+  [[ -f "$manifest" ]] || { log "cua vm: profile \"$PROFILE\" does not exist yet — it will be selected on the next boot"; return 0; }
+
+  local bundle_dir=""
+  for root in /opt/dsh /opt/dsh-src; do
+    if [[ -d "$root/node_modules/$CUA_VM_BUNDLE" ]]; then bundle_dir="$root/node_modules/$CUA_VM_BUNDLE"; break; fi
+  done
+  [[ -n "$bundle_dir" ]] || { log "WARN: $CUA_VM_BUNDLE is not in this image's node_modules — the VM tools will not be offered"; return 0; }
+
+  local marker="$DSH_REAL_HOME/.cua-vm-bundle-seeded"
+  local seeded=0
+  [[ -f "$marker" ]] && seeded=1
+
+  local how
+  how="$(node -e '
+    const fs = require("fs");
+    const [manifest, name, seeded] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const profile = parsed?.dsh?.profile;
+    if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
+    const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
+    if (seeded === "1") { process.stdout.write("existing-home"); process.exit(0); }
+    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("selected");
+  ' "$manifest" "$CUA_VM_BUNDLE" "$seeded" 2>/dev/null || true)"
+
+  case "$how" in
+    selected|already-selected)
+      printf '%s\n' "$how" > "$marker" 2>/dev/null || true
+      log "cua vm: \"$CUA_VM_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page to release the VM tools"
+      ;;
+    existing-home) ;;
+    unreadable|no-profile-block) log "WARN: could not select \"$CUA_VM_BUNDLE\" ($how) — enable it by hand in the Plugins page" ;;
+    *) log "WARN: could not select \"$CUA_VM_BUNDLE\" — enable it by hand in the Plugins page" ;;
+  esac
+}
+
+# The Connector as a switchable BUNDLE (see plugins/dsh-connector).
+#
+# Same contract as the five above: the row lives in the bundle's own patch
+# (`id: connector`), the Plugins page's top row (next to Personal VM (CUA)) is
+# what mounts it, and a profile-level `disabled:` override wins. DSH_CONNECTOR=0
+# removes the row entirely, exactly like DSH_CUA_VM=0 removes the VM tools.
+#
+# One thing the five do NOT need: a MIGRATION. An earlier iteration of this
+# feature was shipped by pinning the plugin into the profile manifest as
+# `"@local/connector": "link:/workspace/plugin/connector"`. That predates the
+# rename and the built-in recipe, so on a home seeded by it the plugin would show
+# up TWICE (once under "Installed plugins" as a profile dependency, once as the
+# new built-in bundle) and its old patch row (`name: '@local/connector'`) would
+# no longer resolve at all. Only OUR link is dropped — a user who pinned the
+# package themselves (any other spec, or a different path) keeps their pin — and
+# it runs on every boot so pre-rename homes are repaired the first time they
+# start on this image, whether or not the feature stays selected afterwards.
+CONNECTOR_BUNDLE="dsh-connector"
+
+drop_connector_profile_link() {
+  [[ "${SAFE_MODE:-0}" == "1" ]] && return 0
+  local manifest="$DSH_REAL_HOME/profiles/$PROFILE/package.json"
+  [[ -f "$manifest" ]] || return 0
+  local dropped
+  dropped="$(node -e '
+    const fs = require("fs");
+    const [manifest, name, suffix] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const dependencies = parsed.dependencies;
+    if (dependencies === null || typeof dependencies !== "object" || !Object.hasOwn(dependencies, name)) { process.stdout.write("absent"); process.exit(0); }
+    const spec = dependencies[name];
+    // Ours is a `link:` whose PATH SUFFIX is /plugin/connector (the source
+    // checkout the old image pinned, wherever the checkout was mounted): a
+    // link: into node_modules or any other path is the user\u0027s own pin.
+    const ours = typeof spec === "string" && spec.startsWith("link:") && spec.replace(/\/+$/, "").endsWith(suffix);
+    if (!ours) { process.stdout.write("foreign:" + String(spec)); process.exit(0); }
+    delete dependencies[name];
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("dropped");
+  ' "$manifest" "@local/connector" "/plugin/connector" 2>/dev/null || true)"
+  case "$dropped" in
+    dropped) log "connector: dropped the pre-rename \"@local/connector\" profile link — the name is dsh-connector now, installed as a built-in bundle" ;;
+    foreign:*) log "connector: the profile pins \"@local/connector\" itself (${dropped#foreign:}) — left exactly as the user set it" ;;
+  esac
+}
+
+seed_connector_bundle() {
+  [[ "${SAFE_MODE:-0}" == "1" ]] && { log "connector: Safe Mode — the real profile is left untouched"; return 0; }
+
+  # Repair any pre-rename profile pin FIRST, i.e. before this boot decides whether
+  # the bundle stays selected: a home the old image seeded must not keep a
+  # dependency whose patch row name no longer exists, whether or not the feature
+  # is on. Same ordering as seed_browser_mcp_bundle's drop block.
+  drop_connector_profile_link
+
+  [[ "${DSH_CONNECTOR:-1}" == "0" ]] && { log "connector: not selected (DSH_CONNECTOR=0)"; return 0; }
+
+  local dir="$DSH_REAL_HOME/profiles/$PROFILE"
+  local manifest="$dir/package.json"
+  [[ -f "$manifest" ]] || { log "connector: profile \"$PROFILE\" does not exist yet — it will be selected on the next boot"; return 0; }
+
+  local bundle_dir=""
+  for root in /opt/dsh /opt/dsh-src; do
+    if [[ -d "$root/node_modules/$CONNECTOR_BUNDLE" ]]; then bundle_dir="$root/node_modules/$CONNECTOR_BUNDLE"; break; fi
+  done
+  [[ -n "$bundle_dir" ]] || { log "WARN: $CONNECTOR_BUNDLE is not in this image's node_modules — the connector tools will not be offered"; return 0; }
+
+  local marker="$DSH_REAL_HOME/.connector-bundle-seeded"
+  local seeded=0
+  [[ -f "$marker" ]] && seeded=1
+
+  local how
+  how="$(node -e '
+    const fs = require("fs");
+    const [manifest, name, seeded] = process.argv.slice(1);
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(manifest, "utf8")); } catch { process.stdout.write("unreadable"); process.exit(0); }
+    const profile = parsed?.dsh?.profile;
+    if (profile === null || typeof profile !== "object") { process.stdout.write("no-profile-block"); process.exit(0); }
+    const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
+    if (seeded === "1") { process.stdout.write("existing-home"); process.exit(0); }
+    if (bundles.includes(name)) { process.stdout.write("already-selected"); process.exit(0); }
+    parsed.dsh = { ...parsed.dsh, profile: { ...profile, bundles: [...bundles, name] } };
+    fs.writeFileSync(manifest + ".tmp", JSON.stringify(parsed, null, 2) + "\n");
+    fs.renameSync(manifest + ".tmp", manifest);
+    process.stdout.write("selected");
+  ' "$manifest" "$CONNECTOR_BUNDLE" "$seeded" 2>/dev/null || true)"
+
+  case "$how" in
+    selected|already-selected)
+      printf '%s\n' "$how" > "$marker" 2>/dev/null || true
+      log "connector: \"$CONNECTOR_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page to release the connector_* tools"
+      ;;
+    existing-home) ;;
+    unreadable|no-profile-block) log "WARN: could not select \"$CONNECTOR_BUNDLE\" ($how) — enable it by hand in the Plugins page" ;;
+    *) log "WARN: could not select \"$CONNECTOR_BUNDLE\" — enable it by hand in the Plugins page" ;;
+  esac
+}
+
 fatal() {
   echo "[seek-harness] FATAL: $*" >&2
   write_boot_state failed "$*" "the harness process exited during startup"
@@ -756,18 +887,6 @@ fi
 # `~/.dsh` and `$DSH_HOME` to the same directory.
 ensure_home_alias || true
 
-# The image no longer sets ANDROID_PREFS_ROOT at all: it is the legacy alias of
-# ANDROID_USER_HOME, and AGP fails to configure a project when BOTH are present, even when they
-# hold the same path (measured — see the note in the Dockerfile). A user or an older compose file
-# may still export it, so it is dropped whenever the modern name is in play rather than leaving a
-# build to die with "different paths to the Android Preferences folder".
-if [ -n "${ANDROID_USER_HOME:-}" ] && [ -n "${ANDROID_PREFS_ROOT:-}" ]; then
-  echo "entrypoint: ignoring ANDROID_PREFS_ROOT (legacy alias of ANDROID_USER_HOME; both together break AGP)"
-  unset ANDROID_PREFS_ROOT
-fi
-
-# The emulator's AVD, so a session can boot Android without preparing anything.
-provision_emulator_avd || true
 
 # Make the boot-time selection explicit on a fresh volume (see
 # seed_profile_selection). Safe Mode runs on a throwaway home and must never
@@ -797,6 +916,23 @@ else
   # with one card in the Plugins page. Same reason as the others — the skills are
   # catalog context in every request, so the switch that releases them is the point.
   seed_office_bundle
+  # …and the personal VM as a FIFTH (see plugins/dsh-cua-vm): build/test inside
+  # a Linux VM whose disk lives outside the workspace, with the shell staying
+  # confined to workspace-write.
+  seed_cua_vm_bundle
+  # …and the Connector as a SIXTH (see plugins/dsh-connector): GitHub /
+  # Cloudflare / Gitea tokens and repo verbs, with the row id `connector`
+  # mounted by the bundle patch and switched by the Extras row next to
+  # Personal VM (CUA). Same contract as the five above.
+  seed_connector_bundle
+fi
+
+# Hide the image's integrated MCP rows from a user-installed MCP manager:
+# browser-mcp / brave-devtools-mcp are switched on the Plugins page, and a
+# read-only duplicate in the MCP list is a second control that does nothing.
+# Best effort, idempotent, and it never blocks the boot.
+if [[ -f /opt/seek-harness/patch-mcp-manager.mjs ]]; then
+  node /opt/seek-harness/patch-mcp-manager.mjs "$DSH_REAL_HOME" 2>&1 | sed 's/^/entrypoint: /' || true
 fi
 
 # ---------------------------------------------------------------------
@@ -994,6 +1130,46 @@ start_desktop() {
   return 0
 }
 
+
+# ---------------------------------------------------------------------
+# The personal VM supervisor (see docker/cua-vm-supervisor.mjs).
+#
+# It starts BEFORE any Session and outside the agent's sandbox, because that is
+# the only way a workspace-write session can have a VM at all: the sandbox
+# grants /dev/null + /tmp + the workspace root, and QEMU needs /dev/kvm O_RDWR
+# while the disks must stay outside the workspace. The tools talk to this
+# process over the socket; nothing else opens the device.
+#
+# A boot here without /dev/kvm (compose.emulator.yaml not applied) is not fatal:
+# the supervisor still starts, and vm_ensure reports the device error.
+# ---------------------------------------------------------------------
+start_cua_supervisor() {
+  [[ "${DSH_CUA_VM:-1}" == "0" ]] && { log "cua vm: disabled (DSH_CUA_VM=0)"; return 0; }
+  if [[ ! -r /usr/local/bin/cua-vm-supervisor ]]; then
+    log "WARN: cua vm: supervisor is not installed — VM tools will report the failure"
+    return 0
+  fi
+  local store="${CUA_VM_STORE:-/cua-vm}"
+  local sock="${CUA_SUPERVISOR_SOCK:-/tmp/cua-vm/supervisor.sock}"
+  mkdir -p "$store/home" "$(dirname "$sock")" 2>/dev/null || true
+  if [[ ! -w "$store" ]]; then
+    log "WARN: cua vm: $store is not writable — mount the cua-vm volume at /cua-vm"
+    return 0
+  fi
+  CUA_VM_STORE="$store" CUA_VM_HOME="$store/home" CUA_SUPERVISOR_SOCK="$sock" \
+    CUA_WORKSPACE_ROOT="${CUA_WORKSPACE_ROOT:-/workspace}" CUA_BIN="${CUA_BIN:-/usr/local/bin/cua}" \
+    node /usr/local/bin/cua-vm-supervisor >>"$store/supervisor.log" 2>&1 &
+  CUA_SUPERVISOR_PID=$!
+  local i
+  for i in $(seq 1 50); do [[ -S "$sock" ]] && break; sleep 0.1; done
+  if [[ -S "$sock" ]]; then
+    log "cua vm: supervisor ready on $sock (store $store, ONE VM per workspace)"
+  else
+    log "WARN: cua vm: supervisor did not create $sock — see $store/supervisor.log"
+  fi
+}
+
+
 # Reached only for the `web` command: every other form exec'd above.
 DESKTOP_ACTIVE=0
 if [[ "$DESKTOP_ENABLED" != "0" ]]; then
@@ -1011,6 +1187,8 @@ fi
 
 # The harness child gets the (possibly temporary) DSH_HOME; every other process
 # — the proxy, the recovery surface, the entrypoint — keeps the real home.
+start_cua_supervisor || true
+
 DSH_HOME="$HARNESS_HOME" node "${node_flags[@]}" "$DSH_BIN" --profile "${PROFILE}" \
   ${overlay_args[@]+"${overlay_args[@]}"} \
   --no-open --host 127.0.0.1 --port "$DSH_PORT" \
@@ -1026,7 +1204,8 @@ PROXY_PID=$!
 terminate() {
   log "signal received — stopping DSH (${DSH_PID}), proxy (${PROXY_PID}) and the desktop"
   : > /tmp/dsh-stopping
-  kill -TERM "$DSH_PID" "$PROXY_PID" ${TAIL_PID:+"$TAIL_PID"} ${WATCHDOG_PID:+"$WATCHDOG_PID"} 2>/dev/null || true
+  kill -TERM "$DSH_PID" "$PROXY_PID" ${TAIL_PID:+"$TAIL_PID"} ${WATCHDOG_PID:+"$WATCHDOG_PID"} \
+    ${CUA_SUPERVISOR_PID:+"$CUA_SUPERVISOR_PID"} 2>/dev/null || true
   # The browser lives under a restart supervisor: stop the supervisor first,
   # otherwise it simply brings the browser back while we are tearing down.
   for pid in ${desktop_pids[@]+"${desktop_pids[@]}"}; do

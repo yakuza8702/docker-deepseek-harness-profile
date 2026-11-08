@@ -119,6 +119,22 @@ RUN set -eux; \
       fonts-liberation fonts-noto-cjk; \
     rm -rf /var/lib/apt/lists/*
 
+# Optional: a virgl-capable QEMU. cua provisions its own QEMU, but that build
+# has no virtio-gpu-gl-pci (verified: "This QEMU was built without
+# virglrenderer"), so the personal VM is limited to software GL. Installing the
+# distro build lets `cua sb create --gpu virgl` hand the guest a virgl context;
+# the supervisor points cua's wrapper at this binary when DSH_CUA_VM_GPU=virgl.
+# Off by default: it costs ~200 MB and needs /dev/dri (or the NVIDIA toolkit)
+# on the host to be worth anything.
+ARG WITH_VIRGL_QEMU=0
+RUN set -eux; \
+    if [ "$WITH_VIRGL_QEMU" = "1" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends \
+        qemu-system-x86 qemu-system-modules-opengl libvirglrenderer1 libegl1 libgl1-mesa-dri; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Brave — the browser the desktop runs (user's choice; it is also the browser
 # they use locally). Installed from Brave's official APT repository, added here
 # explicitly with its keyring rather than via a curl|bash installer.
@@ -311,6 +327,20 @@ RUN printf '%s\n' \
 # integrity unless the URL is git-hosted, so one Market install of a curated
 # release-archive plugin bricks every install in that profile.
 COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs docker/lockfile-integrity.mjs /opt/seek-harness/
+# The MCP tool-catalogue trimmer (see docker/mcp-slim.mjs): one proxy in front of
+# the two browser MCP servers, dropping the verbs the other one already offers and
+# compressing what is left. Its gate runs here so a policy that drops a tool the
+# catalog does not have, or leaks a long description, fails the build.
+COPY --chmod=0644 docker/mcp-slim.mjs docker/mcp-slim.browser.json docker/mcp-slim.brave.json /opt/seek-harness/
+COPY --chmod=0644 tools/check-tool-trim.mjs /opt/seek-harness/check-tool-trim.mjs
+RUN DSH_SLIM_BIN=/opt/seek-harness/mcp-slim.mjs DSH_SLIM_POLICIES=/opt/seek-harness \
+    node /opt/seek-harness/check-tool-trim.mjs
+# The REA wiring gate (see tools/check-cua-rea.mjs). Collected here; run at the
+# bottom of this stage, after the plugin exists, because it asserts the plugin
+# surface as well as the guest script and the supervisor.
+COPY --chmod=0644 tools/check-cua-rea.mjs /opt/seek-harness/check-cua-rea.mjs
+# Hide the image-owned MCP rows from a user-installed MCP manager (see the file).
+COPY --chmod=0644 tools/patch-mcp-manager.mjs /opt/seek-harness/patch-mcp-manager.mjs
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
  && ln -sfn /opt/seek-harness/entrypoint.sh /usr/local/bin/entrypoint.sh
 
@@ -388,6 +418,7 @@ COPY plugins/dsh-browser-mcp /opt/dsh-browser-mcp
 COPY plugins/dsh-brave-devtools-mcp /opt/dsh-brave-devtools-mcp
 COPY plugins/dsh-plugins-page-extras /opt/dsh-plugins-page-extras
 COPY plugins/dsh-office /opt/dsh-office-bundle
+COPY plugins/dsh-connector /opt/dsh-connector
 RUN set -eux; \
     installed=0; \
     for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
@@ -399,14 +430,15 @@ RUN set -eux; \
         cp -a /opt/dsh-brave-devtools-mcp "$target/dsh-brave-devtools-mcp"; \
         cp -a /opt/dsh-plugins-page-extras "$target/dsh-plugins-page-extras"; \
         cp -a /opt/dsh-office-bundle "$target/dsh-office"; \
+        cp -a /opt/dsh-connector "$target/dsh-connector"; \
         installed=1; \
       fi; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
-    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras /opt/dsh-office-bundle; \
+    rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras /opt/dsh-office-bundle /opt/dsh-connector; \
     chmod -R a+rX \
-      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras /opt/dsh/node_modules/dsh-office \
-      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras /opt/dsh-src/node_modules/dsh-office 2>/dev/null || true
+      /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras /opt/dsh/node_modules/dsh-office /opt/dsh/node_modules/dsh-connector \
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras /opt/dsh-src/node_modules/dsh-office /opt/dsh-src/node_modules/dsh-connector 2>/dev/null || true
 # The workspace plugin's own suite, kept in the image so the ported host logic can
 # be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
 
@@ -428,7 +460,7 @@ RUN set -eux; \
       anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
       [ -d "$root/dsh-browser-desktop" ] || continue; \
-      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "dsh-office", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "dsh-office", "dsh-connector", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
@@ -474,7 +506,10 @@ RUN set -eux; \
       '# source channel (/opt/dsh-src).' \
       'for root in /opt/dsh /opt/dsh-src; do' \
       '  cli="$root/node_modules/@playwright/mcp/cli.js"' \
-      '  if [ -f "$cli" ]; then exec node "$cli" "$@"; fi' \
+      '  if [ -f "$cli" ]; then' \
+      '    [ "${MCP_SLIM:-1}" = "0" ] && exec node "$cli" "$@"' \
+      '    exec node /opt/seek-harness/mcp-slim.mjs --policy /opt/seek-harness/mcp-slim.browser.json -- node "$cli" "$@"' \
+      '  fi' \
       'done' \
       'echo "dsh-playwright-mcp: @playwright/mcp is not installed in this image" >&2' \
       'exit 127' \
@@ -526,20 +561,26 @@ RUN set -eux; \
       '# ships inside the image, started in attach mode against the visible Brave' \
       '# desktop over loopback CDP. A stable path, so the row never has to know' \
       '# where the package lives — and never runs npx.' \
-      'exec node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
+      '[ "${MCP_SLIM:-1}" = "0" ] && exec node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
+      'exec node /opt/seek-harness/mcp-slim.mjs --policy /opt/seek-harness/mcp-slim.brave.json -- node /opt/brave-mcp/node_modules/brave-mcp/build/src/bin/brave-devtools-mcp.js "$@"' \
       > /usr/local/bin/dsh-brave-devtools-mcp; \
     chmod 0755 /usr/local/bin/dsh-brave-devtools-mcp; \
     echo "browser DevTools: brave-mcp ${installed} behind /usr/local/bin/dsh-brave-devtools-mcp"
 
 # The row works only while FOUR pieces agree — the server above, the bundle patch
 # that mounts the row, the Plugins-page switch (host table + client row) and the
-# page's duplicate-card suppression. One of them missing still produces a healthy
+# page's duplicate-card suppression.
+#
+# The gate below runs with MCP_SLIM=0: it asks whether the WRAPPER reaches a
+# working server, i.e. the upstream surface. What the model actually sees is the
+# trimmed catalogue, and that is checked separately (tools/check-tool-trim.mjs
+# for the policy, and the measured 30 -> 12 tools / -66% in the commit). One of them missing still produces a healthy
 # image and a dead switch, so this gate EXECUTES the server through the wrapper
 # (a real MCP handshake — brave-mcp connects to the browser lazily, so no browser
 # is needed at build time) and reads the other three out of the installed files.
 # See tools/check-brave-mcp.mjs.
 COPY --chmod=0644 tools/check-brave-mcp.mjs /tmp/check-brave-mcp.mjs
-RUN node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
+RUN MCP_SLIM=0 node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-mcp "${BRAVE_MCP_VERSION}" /opt/dsh/node_modules /opt/dsh-src/node_modules \
  && rm -f /tmp/check-brave-mcp.mjs
 
 # ---------------------------------------------------------------------
@@ -602,6 +643,33 @@ RUN node /tmp/check-office.mjs \
       --entrypoint /tmp/office-repo/entrypoint.sh \
       --install /opt/dsh/node_modules --install /opt/dsh-src/node_modules \
  && rm -rf /tmp/check-office.mjs /tmp/office-repo
+
+# ---------------------------------------------------------------------
+# CONNECTOR GATE — the row the Plugins page shows under "Personal VM (CUA)".
+#
+# Seven hops, none of them type-checked: the installed bundle in EVERY channel's
+# node_modules, the bundle patch's `id: connector` + `name: dsh-connector` row,
+# the Plugins-page host pair and its client row (ORDER matters: it renders
+# between "Personal VM (CUA)" and "Office documents"), the duplicate-card
+# suppression list, the entrypoint's seeder plus its `@local/connector` link
+# migration, and this Dockerfile's own COPY/staging lines. Any one of them
+# missing builds a green image whose Plugins page simply never shows the
+# connector — or shows it twice, under "Installed". See tools/check-connector.mjs.
+#
+# Placed after the Office gate because both read the same repository
+# declarations (extras index/client, the page patcher, the entrypoint), so a
+# failure here is reported against files the previous gate has already proven
+# present.
+# ---------------------------------------------------------------------
+COPY --chmod=0644 plugins/dsh-connector/cordis.patch.yml /tmp/connector-repo/dsh-connector.cordis.patch.yml
+COPY --chmod=0644 plugins/dsh-plugins-page-extras/index.js /tmp/connector-repo/plugins-page-extras.index.js
+COPY --chmod=0644 plugins/dsh-plugins-page-extras/client.js /tmp/connector-repo/plugins-page-extras.client.js
+COPY --chmod=0644 tools/patch-plugin-manager-page.mjs /tmp/connector-repo/patch-plugin-manager-page.mjs
+COPY --chmod=0644 docker/entrypoint.sh /tmp/connector-repo/entrypoint.sh
+COPY --chmod=0644 Dockerfile /tmp/connector-repo/Dockerfile
+COPY --chmod=0644 tools/check-connector.mjs /tmp/check-connector.mjs
+RUN node /tmp/check-connector.mjs --repo /tmp/connector-repo /opt/dsh/node_modules /opt/dsh-src/node_modules \
+ && rm -rf /tmp/check-connector.mjs /tmp/connector-repo
 
 # ---------------------------------------------------------------------
 # Native LibreOffice layout — soffice --headless + system-python docx/xlsx.
@@ -689,85 +757,6 @@ RUN set -eux; \
       > /usr/local/bin/office-swap-pages; \
     chmod 0755 /usr/local/bin/office-swap-pages
 
-# ---------------------------------------------------------------------
-# APK / Android reverse-engineering toolchain.
-#
-# WHY IT IS IN THE IMAGE
-# The harness gets pointed at an .apk ("what does this app actually do, and
-# where does my data go?") and the honest answer without this layer is
-# `unzip` + `strings`: enough for the DEX string table, useless for the real
-# logic — which for a React-Native app is not in the DEX at all, it is a
-# Hermes BYTECODE bundle that neither jadx nor strings can read.
-#
-# WHAT EACH PIECE BUYS
-#   JDK                 jadx, apktool, apksigner, sdkmanager and
-#                       apkanalyzer are all JVM programs
-#   jadx                DEX -> Java source: the readable half of an APK
-#   apktool             binary AndroidManifest + resources.arsc -> real XML,
-#                       plus smali decode/rebuild — the only sane repack path
-#                       (a decompiler cannot produce an APK; this can)
-#   hbctool, hermes-dec Hermes HBC bytecode -> disassembly/decompilation,
-#                       covering different HBC revisions so both ship
-#   frida-tools,        dynamic instrumentation on a target device, dexdump
-#   frida-dexdump,      from memory, and objection's wrapper on top
-#   objection
-#   androguard, apkid   scriptable APK/DEX/AXML analysis WITHOUT a JVM, and
-#                       packer/obfuscator detection
-#   Android SDK         apksigner + zipalign + aapt2 + apkanalyzer: sign,
-#                       align and inspect a rebuilt APK
-#   adb                 talks to a device/emulator when there is one. Taken
-#                       from Debian on purpose: Google's platform-tools zip
-#                       has no aarch64 build, and this image builds for arm64
-#                       too.
-#
-# Nothing here runs at container start and nothing needs a phone, an account
-# or a network call at runtime — it is static-analysis capability for the
-# agent's shell. `apk-tools` prints the inventory from inside a running
-# container; `apk-unpack` is the one-shot entry point.
-#
-# Versions are pinned in docker/apk-toolchain.sh (and every download is
-# checksum-verified against the vendor's own digest), because a silent
-# upstream change would make yesterday's analysis unreproducible. The build
-# then EXECUTES all of it — tools/check-apk-toolchain.mjs fails the build if
-# a tool cannot run, so a broken toolchain cannot ship as a working one.
-#
-# SIZE WARNING: this section adds roughly 0.7 GB to the image (mostly the
-# JDK and the Android SDK). It is the price of being able to answer the
-# question offline instead of downloading a toolchain per session.
-# ---------------------------------------------------------------------
-ARG JADX_VERSION=1.5.6
-ARG APKTOOL_VERSION=3.0.3
-ARG ANDROID_CMDLINE_TOOLS_BUILD=16111833
-ARG ANDROID_BUILD_TOOLS=36.1.0
-ARG ANDROID_PLATFORM=android-36
-
-COPY --chmod=0755 docker/apk-toolchain.sh /tmp/apk-toolchain.sh
-COPY --chmod=0755 docker/apk-tools.sh /usr/local/bin/apk-tools
-COPY --chmod=0755 docker/apk-unpack.sh /usr/local/bin/apk-unpack
-RUN set -eux; \
-    APK_JADX_VERSION="${JADX_VERSION}" \
-    APK_APKTOOL_VERSION="${APKTOOL_VERSION}" \
-    APK_CMDLINE_TOOLS_BUILD="${ANDROID_CMDLINE_TOOLS_BUILD}" \
-    APK_BUILD_TOOLS="${ANDROID_BUILD_TOOLS}" \
-    APK_PLATFORM="${ANDROID_PLATFORM}" \
-      /tmp/apk-toolchain.sh; \
-    rm -f /tmp/apk-toolchain.sh
-
-# JAVA_HOME is /opt/java because the real JDK path carries the architecture
-# (java-21-openjdk-amd64 / -arm64) and tools like Gradle and sdkmanager
-# refuse to guess; the installer points that symlink at whatever apt
-# installed. The tool venv comes FIRST on PATH so `python3` and `pip` stay
-# the same interpreter — `pip install X` then `python3 -c "import X"` must
-# not disagree with itself.
-ENV JAVA_HOME=/opt/java \
-    ANDROID_HOME=/opt/android-sdk \
-    ANDROID_SDK_ROOT=/opt/android-sdk \
-    PATH=/opt/apk-tools/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-# The build-time proof (also runnable in a live container: `apk-tools --check`).
-COPY --chmod=0644 docker/apk-tools.md /opt/apk-tools/README.md
-COPY --chmod=0644 tools/check-apk-toolchain.mjs /opt/apk-tools/check.mjs
-RUN node /opt/apk-tools/check.mjs
 
 # ---------------------------------------------------------------------
 # OCR for image-only PDFs — the other half of "read this PDF".
@@ -839,93 +828,92 @@ RUN set -eux; \
 # The build-time proof (also runnable in a live container: `ocr-tools --check`).
 RUN node /opt/ocr-tools/check.mjs
 
+
+
 # ---------------------------------------------------------------------
-# Android EMULATOR — the "what does this app DO" half of APK analysis.
+# CUA — the model's own computer, as a VM, OUTSIDE the workspace.
 #
-# WHY IT IS IN THE IMAGE
-# The APK toolchain above answers "what is in this app" from a file. It cannot
-# answer "what does this app DO when it runs": permission prompts, camera
-# capture, WebView rendering, insets on a device with a camera cutout. Those
-# need a booted Android system, and without this layer the only honest answer
-# is "install an emulator first" — a ~2.4 GB download and a long detour in the
-# middle of a task the user asked for now.
+# THE PROBLEM THIS SOLVES
+# The harness runs in `workspace-write`, where the sandbox grants read-write
+# only to /dev/null, /tmp and the workspace root (see
+# packages/sandbox/sandbox-local/src/profiles.ts). QEMU opens /dev/kvm O_RDWR,
+# so a VM cannot be started from the agent's shell — and it should not be:
+# a 1.3 GB base disk plus per-workspace deltas do not belong in the user's
+# project directory.
 #
-# WHAT EACH PIECE BUYS
-#   emulator          the QEMU-based Android emulator (Linux x86_64 only)
-#   system image      a bootable Android (API) google_apis x86_64, no Play
-#                     account needed and nothing licensed to accept
-#   libpulse0         the emulator binary links libpulse.so.0 DIRECTLY — without
-#                     it the process dies before printing its version
-#   libxdamage1       X11 damage extension, used by the emulator's Qt window
-#   kvm group         so a compose `group_add: [kvm]` resolves by name
+# THE SPLIT
+#   /usr/local/bin/cua-vm-supervisor   started by docker/entrypoint.sh BEFORE
+#                                      any Session, owns /dev/kvm, QEMU, the
+#                                      cua daemon and the /cua-vm volume
+#   dsh-cua-vm (the plugin below)      tools that only write JSON to a unix
+#                                      socket under /tmp, which the sandbox
+#                                      already allows
 #
-# HARDWARE ACCELERATION IS A RUNTIME DEVICE, NOT A PACKAGE: /dev/kvm is passed
-# to the container by compose.emulator.yaml (or `--device /dev/kvm --group-add
-# kvm`). Without it the emulator REFUSES to start; with `-accel off` it boots
-# but Android's watchdog kills system_server within minutes (measured), so API
-# 34+ is effectively untestable. That is also why the build-time check treats a
-# missing /dev/kvm as a warning: the build has no device, the container does.
+# The CLI is not the daemon: it is the client the supervisor drives. QEMU
+# itself is installed into the volume on first use (`cua runtime setup qemu`,
+# user-local, no apt, no root) so it never lands in an image layer.
 #
-# ARCHITECTURE: Google publishes the Linux emulator for x86_64 ONLY (linux_x64,
-# darwin_x64, darwin_aarch64, windows_x64 — there is no linux_aarch64). On
-# arm64 docker/emulator-toolchain.sh installs nothing and says so, the same way
-# the APK toolchain takes adb from Debian because platform-tools has no aarch64
-# build either. The check is skipped rather than failed there.
-#
-# The AVD is NOT created here: the rootfs is read-only at run time, so
-# docker/entrypoint.sh writes it into $ANDROID_AVD_HOME on the workspace volume
-# (see provision_emulator_avd) and `emulator-tools` owns it from then on.
-#
-# SIZE WARNING: this section adds roughly 2.4 GB (emulator ~1.0 GB, system image
-# ~1.3 GB). It is the price of being able to RUN an APK offline instead of only
-# reading it. Set DSH_EMULATOR=0 at boot to skip AVD provisioning; the packages
-# stay in the image either way.
+# SIZE: ~45 MB compressed for the CLI binary; QEMU ~200 MB in the volume, once.
 # ---------------------------------------------------------------------
-ARG EMU_API=android-36
-ARG EMU_TAG=google_apis
-ARG EMU_ABI=x86_64
-# The gid that owns /dev/kvm on the host this image is built for (Debian/OMV:
-# kvm:x:104:). It goes into the image so the runtime user can open the device
-# without a compose `group_add` line — see docker/emulator-toolchain.sh.
-ARG KVM_GID=104
-# Escape hatch for lean builds: `--build-arg WITH_EMULATOR=0` skips the ~2.4 GB
-# and leaves `emulator-tools` reporting the capability as not installed. Useful
-# when the CI disk or the buildx gha cache (10 GB per repo) is the constraint —
-# the capability is then built on demand instead of on every push.
-ARG WITH_EMULATOR=1
-
-COPY --chmod=0755 docker/emulator-toolchain.sh /tmp/emulator-toolchain.sh
-COPY --chmod=0755 docker/emulator-tools.sh /usr/local/bin/emulator-tools
+ARG CUA_CLI_VERSION=0.7.0
 RUN set -eux; \
-    if [ "${WITH_EMULATOR}" = "1" ]; then \
-      EMU_API="${EMU_API}" EMU_TAG="${EMU_TAG}" EMU_ABI="${EMU_ABI}" KVM_GID="${KVM_GID}" \
-        /tmp/emulator-toolchain.sh; \
-    else \
-      echo "emulator: skipped (WITH_EMULATOR=0)"; \
-    fi; \
-    rm -f /tmp/emulator-toolchain.sh
-
-# The AVD and the Gradle cache must live on the writable workspace: the rootfs is
-# read-only at run time, and a JVM tool resolving user.home = /home/node (which
-# is read-only here) fails with "Read-only file system" rather than a clear error.
-# ANDROID_PREFS_ROOT is deliberately NOT set. It is the legacy alias of
-# ANDROID_USER_HOME, and AGP refuses to configure a project when both are present
-# ("Several environment variables and/or system properties contain different paths to
-# the Android Preferences folder") — measured, and it is not about the values being
-# different: setting both to the SAME path still fails. Anyone overriding one of them
-# — the natural thing to do when giving the AVD its own volume — would otherwise turn
-# every Gradle build into that error. One variable, one meaning.
-ENV ANDROID_AVD_HOME=/workspace/.android/avd \
-    ANDROID_USER_HOME=/workspace/.android \
-    GRADLE_USER_HOME=/workspace/.gradle
-
-# The build-time proof (also runnable in a live container: `emulator-tools --check`).
-COPY --chown=node:node --chmod=0644 docker/emulator.md /opt/emulator-tools/README.md
-COPY --chown=node:node --chmod=0644 tools/check-emulator-toolchain.mjs /opt/emulator-tools/check.mjs
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) cua_asset="x64" ;; \
+      arm64) cua_asset="arm64" ;; \
+      *) echo "cua: unsupported architecture $arch"; exit 1 ;; \
+    esac; \
+    url="https://github.com/trycua/cua/releases/download/cua-sdk-v${CUA_CLI_VERSION}/cua-cli-${CUA_CLI_VERSION}-linux-${cua_asset}.tar.gz"; \
+    curl -fsSL --retry 3 -o /tmp/cua.tgz "$url"; \
+    tar -xzf /tmp/cua.tgz -C /usr/local/bin cua; \
+    chmod 0755 /usr/local/bin/cua; \
+    rm -f /tmp/cua.tgz; \
+    # The harness shell runs with HOME=/workspace (the dir-selector fix), while
+    # cua keeps its sandboxes under the VM store. Without this wrapper every
+    # `cua sb ...` typed in a shell — by the model or a human — looks at
+    # /workspace/.cua, finds nothing and answers "not found: sandbox <name>".
+    # CUA_CLI_HOME overrides it for a different store.
+    mv /usr/local/bin/cua /usr/local/bin/cua.real; \
+    printf '%s\n' '#!/bin/sh' 'exec env HOME="${CUA_CLI_HOME:-/cua-vm/home}" /usr/local/bin/cua.real "$@"' > /usr/local/bin/cua; \
+    chmod 0755 /usr/local/bin/cua; \
+    /usr/local/bin/cua.real --version
+COPY --chmod=0755 docker/cua-vm-supervisor.mjs /usr/local/bin/cua-vm-supervisor
+# Guest provisioning runs INSIDE the VM, piped through `sudo bash` by the
+# supervisor. Kept as real files (not a base64 blob in the supervisor) so
+# they can be read, diffed and run by hand to debug a guest. rea is its own
+# layer with its own marker, so a computer without `rea: true` never runs it.
+COPY --chmod=0644 docker/cua-guest-provision.sh docker/cua-guest-android.sh docker/cua-guest-rea.sh /usr/local/bin/
+COPY plugins/dsh-cua-vm /opt/dsh-cua-vm
 RUN set -eux; \
-    chmod 0755 /opt/emulator-tools; \
-    if [ "${WITH_EMULATOR}" = "1" ]; then node /opt/emulator-tools/check.mjs; \
-    else echo "emulator check: skipped (WITH_EMULATOR=0)"; fi
+    installed=0; \
+    for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
+      if [ -d "$target" ]; then \
+        cp -a /opt/dsh-cua-vm "$target/dsh-cua-vm"; \
+        installed=1; \
+      fi; \
+    done; \
+    [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
+    rm -rf /opt/dsh-cua-vm; \
+    chmod -R a+rX /opt/dsh/node_modules/dsh-cua-vm /opt/dsh-src/node_modules/dsh-cua-vm 2>/dev/null || true; \
+    for spec in "/opt/dsh/node_modules/@deepseek-ai/dsh/package.json:/opt/dsh/node_modules" "/opt/dsh-src/apps/cli/package.json:/opt/dsh-src/node_modules"; do \
+      anchor="${spec%%:*}"; root="${spec##*:}"; \
+      [ -f "$anchor" ] || continue; \
+      [ -d "$root/dsh-cua-vm" ] || continue; \
+      node -e 'const fs=require("node:fs");const a=process.argv[1];const r=process.argv[2];const m=JSON.parse(fs.readFileSync(a,"utf8"));const v=JSON.parse(fs.readFileSync(r+"/dsh-cua-vm/package.json","utf8")).version;m.dependencies={...(m.dependencies??{}),"dsh-cua-vm":v};fs.writeFileSync(a,JSON.stringify(m,null,2)+"\n");console.log("declared dsh-cua-vm",v,"in",a)' "$anchor" "$root"; \
+    done
+
+# ---------------------------------------------------------------------
+# REA GATE. The kit is five files joined only by strings: the shell script the
+# supervisor looks up by name, the supervisor's call sites, this Dockerfile's
+# COPY, and the plugin's `rea: true`. None of that is type-checked, so a rename
+# or a dropped field ships a plain desktop that reads like a RE workstation.
+# The copies below are flat (pick() in the checker handles both layouts) and
+# the Dockerfile is copied only for the length of this RUN.
+# ---------------------------------------------------------------------
+COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-vm-supervisor.mjs Dockerfile /opt/seek-harness/cua-check/
+COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js /opt/seek-harness/cua-check/
+RUN node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check \
+ && rm -f /opt/seek-harness/cua-check/Dockerfile
 
 ENV NODE_ENV=production \
     DSH_HOME=/home/node/.dsh \

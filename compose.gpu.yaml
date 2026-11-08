@@ -1,0 +1,47 @@
+# =====================================================================
+# GPU override — hand the personal VM a real GL context (virgl), sharing
+# the host GPU with the rest of the container instead of passing it through.
+#
+#   docker compose -f compose.yaml -f compose.gpu.yaml up -d
+#
+# Build the image with the virgl QEMU (the default one cannot do it):
+#   docker build --build-arg WITH_VIRGL_QEMU=1 ...
+#
+# WHAT IT NEEDS ON THE HOST
+#   * /dev/dri/renderD128 + /dev/dri/card0 (Intel/AMD, or NVIDIA with
+#     nvidia-drm loaded). virgl refuses to start without a render node.
+#   * For NVIDIA: the NVIDIA Container Toolkit, and the `graphics` capability
+#     below so the EGL/GL libs are mounted (compute alone is not enough).
+#   * The GPU stays usable by the host (llama-server keeps working); this is a
+#     paravirtual GL device, not VFIO passthrough, and it is NOT CUDA.
+#
+# WHAT THE GUEST GETS
+#   virtio-gpu-gl with Mesa virgl → accelerated OpenGL/GLES for the desktop,
+#   browsers, Blender's viewport/EEVEE and the Android emulator's GLES path.
+#   Vulkan (Venus) additionally needs host kernel >= 6.13, guest Mesa >= 24.2
+#   and NVIDIA driver >= 570.86.
+# =====================================================================
+services:
+  seek-harness:
+    devices:
+      - /dev/kvm
+      - /dev/dri
+    group_add:
+      # Numeric GIDs: names are resolved inside the image, not on the host.
+      #   getent group render | cut -d: -f3
+      #   getent group video  | cut -d: -f3
+      - "${RENDER_GID:-993}"
+      - "${VIDEO_GID:-44}"
+    environment:
+      # Supervisor: point cua at the system QEMU and pass --gpu virgl.
+      DSH_CUA_VM_GPU: "virgl"
+      # NVIDIA toolkit: mount every driver capability, GL included.
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility, graphics, video, compute]
