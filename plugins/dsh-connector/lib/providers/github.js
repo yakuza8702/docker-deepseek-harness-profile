@@ -29,6 +29,14 @@ const DIFF_ACCEPT = 'application/vnd.github.diff'
 const API_VERSION = '2022-11-28'
 const PER_PAGE = 100
 const MAX_PAGES = 5
+/**
+ * How many jobs one run-log read fetches before it says so out loud.
+ *
+ * A matrix run can have dozens of jobs; reading them all multiplies the exit
+ * cost of one list call. The cap is reported in `refused` when it bites, so a
+ * short log is never mistaken for a complete one.
+ */
+const MAX_LOG_JOBS = 10
 /** Where public GitHub clones from when nothing better is known. */
 const PUBLIC_WEB_ORIGIN = 'https://github.com'
 /** A full commit sha — the only ref shape the git data API needs no lookup for. */
@@ -92,6 +100,22 @@ export function decodeTextBase64(base64) {
   const buffer = Buffer.from(encoded, 'base64')
   if (buffer.length === 0 || buffer.includes(0)) return undefined
   return buffer.toString('utf8')
+}
+
+/**
+ * Does this payload look like a ZIP archive rather than text?
+ *
+ * The run-level log route answers with a ZIP of per-job logs on many builds, and
+ * the request helper hands back a UTF-8 decode of those bytes — which renders as
+ * mojibake that reads like a corrupt log. The local file header (`PK\x03\x04`)
+ * is ASCII, so it survives the decode and is a reliable signal that the body
+ * must not be shown as text.
+ *
+ * @param text - the body handed back by the request helper.
+ * @returns true when the body starts with a ZIP header.
+ */
+function looksLikeZip(text) {
+  return typeof text === 'string' && (text.startsWith('PK\u0003\u0004') || text.startsWith('PK\u0005\u0006'))
 }
 
 /**
@@ -470,22 +494,46 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     },
 
     /**
-     * One run's log tail. GitHub answers 302 to a short-lived archive URL, which
-     * the request helper follows; the body is plain text.
+     * One run's log text, per job.
+     *
+     * The API REQUEST has to accept JSON: `call` keeps the module default ACCEPT
+     * (`application/vnd.github+json`). Only the 302 redirect TARGET serves
+     * `text/plain`, and the request helper follows it; sending `Accept:
+     * text/plain` on the request itself makes GitHub answer 415 Unsupported
+     * 'Accept' header instead of a body.
+     *
+     * Nothing is read silently: a job whose log cannot be shown is named in
+     * `refused`, and when no job produced text the reason comes back as the
+     * text itself rather than an empty string.
      */
     async runLog(token, owner, repo, runId) {
       const detail = await call(token, `${repoPath(owner, repo)}/actions/runs/${encodeURIComponent(runId)}`)
       if (!detail.ok) throw new Error(`GitHub ${detail.status} on actions/runs/${runId}`)
       const jobs = await call(token, `${repoPath(owner, repo)}/actions/runs/${encodeURIComponent(runId)}/jobs`)
       if (!jobs.ok) throw new Error(`GitHub ${jobs.status} on actions/runs/${runId}/jobs`)
+      const rows = Array.isArray(jobs.json?.jobs) ? jobs.json.jobs : []
       const texts = []
-      for (const job of (jobs.json?.jobs ?? []).slice(0, 3)) {
-        const log = await call(token, `${repoPath(owner, repo)}/actions/jobs/${job.id}/logs`, { accept: 'text/plain' })
-        if (log.ok && typeof log.text === 'string' && log.text !== '') {
-          texts.push(`--- job ${job.name} (${job.conclusion ?? job.status}) ---\n${log.text}`)
+      const refused = []
+      for (const job of rows.slice(0, MAX_LOG_JOBS)) {
+        const name = job?.name ?? 'job'
+        const log = await call(token, `${repoPath(owner, repo)}/actions/jobs/${encodeURIComponent(job?.id)}/logs`)
+        if (looksLikeZip(log.text)) {
+          refused.push(`${name}: log archive is a ZIP, not text`)
+          continue
         }
+        if (log.ok && typeof log.text === 'string' && log.text !== '') {
+          texts.push(`--- job ${name} (${job.conclusion ?? job.status}) ---\n${log.text}`)
+          continue
+        }
+        refused.push(`${name}: HTTP ${log.status}${log.json?.message === undefined ? '' : ` — ${log.json.message}`}`)
       }
-      return { run: detail.json ?? {}, text: texts.join('\n\n') }
+      if (rows.length > MAX_LOG_JOBS) {
+        refused.push(`+${rows.length - MAX_LOG_JOBS} more jobs beyond MAX_LOG_JOBS, truncated`)
+      }
+      const text = texts.length > 0
+        ? texts.join('\n\n')
+        : (refused.length > 0 ? `no job logs retrieved from run ${runId}:\n${refused.join('\n')}` : '')
+      return { run: detail.json ?? {}, text, refused }
     },
 
     /**
