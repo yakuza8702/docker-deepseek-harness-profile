@@ -3,7 +3,7 @@
 # OCR toolchain — route A only: tesseract for image-only PDFs.
 #
 # Called once by the Dockerfile (as root, before the image drops to uid
-# 1000). Like docker/apk-toolchain.sh it is deliberately a standalone
+# 1000). It is deliberately a standalone
 # script rather than an inlined RUN block, so it can be executed VERBATIM
 # against a stock base image and proved on its own:
 #

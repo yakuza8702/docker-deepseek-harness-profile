@@ -756,7 +756,7 @@ Inside the container: `docker ps`, `docker compose version`, `docker build ...` 
 
 ## What's inside (smanx devtools-latest set)
 
-`git` `curl` `wget` `nano` `jq` `less` `ripgrep` `rsync` `procps` `ca-certificates` `unzip` `vim` `zip` `htop` `tmux` `tree` `openssl` `python3` `bash-completion` `build-essential` (via base image) · npm globals: **pnpm** (pinned) · **uv** (`uvx` for MCP servers) · **docker CLI + compose plugin** · `tini` · `bubblewrap` (DSH Linux sandbox backend) · **APK/Android reverse-engineering toolchain** (JDK, jadx, apktool, Hermes, frida, androguard, Android SDK — see the section below)
+`git` `curl` `wget` `nano` `jq` `less` `ripgrep` `rsync` `procps` `ca-certificates` `unzip` `vim` `zip` `htop` `tmux` `tree` `openssl` `python3` `bash-completion` `build-essential` (via base image) · npm globals: **pnpm** (pinned) · **uv** (`uvx` for MCP servers) · **docker CLI + compose plugin** · `tini` · `bubblewrap` (DSH Linux sandbox backend)
 
 No browser is *forced* on you: the desktop is started only for a `web` boot
 (`DSH_DESKTOP_ENABLED=0` turns it off entirely) and DSH still runs with `--no-open`
@@ -764,118 +764,16 @@ so it never tries to open a host browser. The image does ship the browser stack 
 **Brave**, Xvfb, openbox, x11vnc, websockify and noVNC — because that is what Browser
 Use and human takeover run on.
 
-## APK / Android reverse-engineering toolchain
+## Personal VM (`cua`) and `/dev/kvm`
 
-The image answers "what does this .apk actually do?" offline — no toolchain to
-download at runtime, no phone, no account. This is what the agent reaches for when
-it is handed an APK (or an `.apks`/`.xapk` split bundle), and it is the difference
-between reading a DEX string table and reading the app's actual logic.
-
-```bash
-docker run --rm --entrypoint apk-tools ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest   # inventory + versions
-docker exec seek-harness apk-tools --check        # re-run the build-time probe of every tool
-docker exec seek-harness apk-unpack /workspace/app.apk          # -> /workspace/app-unpacked/
-docker exec seek-harness apk-unpack /workspace/app.apks ./out   # split bundle: analyses base.apk
-```
-
-| Tool | Version | What it answers |
-|---|---|---|
-| JDK | 21 (Debian) | jadx, apktool, apksigner, sdkmanager and apkanalyzer are all JVM programs |
-| `jadx` | 1.5.6 | DEX → Java source (`jadx/sources/`) — the readable half of an APK |
-| `apktool` | 3.0.3 | binary `AndroidManifest.xml` + `resources.arsc` → real XML, smali decode, **and rebuild** (a decompiler cannot produce an APK) |
-| `hbctool`, `hermes-dec` | 0.1.5 / 0.1.7 | React-Native `assets/index.android.bundle` is Hermes **bytecode**, invisible to jadx and to `strings` |
-| `androguard`, `apkid` | 4.1.4 / 3.1.0 | scriptable APK/DEX/AXML analysis without a JVM, and packer/obfuscator detection |
-| `frida`, `frida-dexdump`, `objection` | 17.20.0 / 2.0.1 / 1.12.5 | dynamic instrumentation (needs a device — the container has no USB) |
-| Android SDK | cmdline-tools `16111833`, build-tools `36.1.0`, `android-36` | `apksigner`, `zipalign`, `aapt2`, `apkanalyzer`, `sdkmanager` — sign and inspect a rebuilt APK |
-| `adb` | Debian package | talks to a device/emulator over TCP. Debian's on purpose: Google's platform-tools zip has no aarch64 build |
-
-`apk-unpack` produces a layout meant to be read, not re-derived:
-`raw/` (the archive as-is), `base/` (the inner `base.apk` of a split bundle, unpacked),
-`apktool/` (decoded resources + smali), `jadx/` (Java sources), `AndroidManifest.xml`
-(apkanalyzer's print), `apk-summary.txt`, `SUMMARY.txt` (dex count, native libs,
-Hermes/Flutter/Unity hints) and `logs/` — every step's failure is kept in a log instead
-of being thrown away, because `jadx` reports errors on almost every obfuscated app and
-that must not stop you from reading the manifest.
-
-Three things worth knowing before trusting a result:
-
-- **Hermes revisions differ.** `hbctool` refuses bytecode revisions it does not know
-  (v98, which current React Native/Expo apps ship, is one of them); `hermes-dec`
-  (`hbc-disassembler`, `hbc-decompiler`) handles those with a warning. Try both, and
-  report which one worked instead of guessing at the bytecode.
-- **The rootfs is read-only** (`read_only: true` in the compose file), so
-  `sdkmanager --install "platforms;android-35"` cannot write into `$ANDROID_HOME`.
-  Android *projects* usually only need their own `./gradlew` (it downloads its Gradle
-  into `$HOME`); for extra SDK packages, use a `compose.override.yaml` with
-  `read_only: false` or point `ANDROID_HOME` at a writable path.
-- **Static by default.** Nothing here calls out, and no device is touched unless you
-  connect one (`adb connect host:port` + `frida-server` on the target).
-
-Cost, stated plainly: this section adds roughly **0.7 GB** to the image (mostly the JDK
-and the Android SDK). Versions are pinned in [`docker/apk-toolchain.sh`](docker/apk-toolchain.sh)
-and every download is checksum-verified against the vendor's own digest, so an analysis
-can be reproduced later; [`tools/check-apk-toolchain.mjs`](tools/check-apk-toolchain.mjs)
-**executes** all 27 checks at build time and fails the build if any tool cannot run —
-a container that boots is a container whose toolchain works. The in-image guide
-(`/opt/apk-tools/README.md`, also in the repo as [`docker/apk-tools.md`](docker/apk-tools.md))
-carries the full workflow: Hermes bundles, repack/sign, native libs, and the limits.
-
-## Android emulator — running the app, not just reading it
-
-The APK toolchain above is *static*: it tells you what is inside an APK. It cannot tell
-you what the app **does** — the permission prompts, the camera flow, whether the layout
-survives a device with a camera cutout. That needs a booted Android system, and the image
-ships one (Android API 36, `google_apis`, x86_64) rather than making the agent fetch a
-1.3 GB image in the middle of a task:
-
-```bash
-emulator-tools              # inventory: what is installed, what is missing, what to run
-emulator-tools --up         # write the AVD, boot Android, wait for boot_completed
-emulator-tools --apk app-debug.apk --pkg com.example.app
-emulator-tools --down
-```
-
-**KVM is a host device, not a package.** It is deliberately *not* in the base compose
-(which keeps `cap_drop ALL` + a read-only rootfs), because Docker refuses to start a
-container whose `devices:` entry does not exist on the host. It ships as an opt-in
-override, exactly like the docker-access one:
+The image ships `cua`, the Linux VM the agent builds and tests in. It needs the host's
+`/dev/kvm`, which an image cannot carry; `compose.emulator.yaml` is the override that
+passes the device through — the filename is historical, it used to feed the Android
+emulator, which this image no longer ships:
 
 ```bash
 docker compose -f compose.yaml -f compose.emulator.yaml up -d
-#   …or: docker run --device /dev/kvm --group-add kvm ...
 ```
-
-Without `/dev/kvm` the emulator refuses to start; with `-accel off` it boots but Android's
-watchdog kills `system_server` within minutes (measured on this image, at load ~20), so
-API 34+ is effectively untestable without hardware acceleration. `emulator-tools` reports
-the KVM state plainly and refuses to start unless you insist.
-
-**The APK must carry x86_64 native code.** The emulator image has no ARM translation, so
-an `arm64-v8a`-only APK cannot run there. For a Gradle project:
-`./gradlew assembleDebug -PforEmulator`. Check with `unzip -l app-debug.apk | grep lib/x86_64`.
-
-Traps the tooling already handles (all measured): `avdmanager create avd` is broken in the
-current cmdline-tools and its replacement downloads images — so the AVD is **written by
-hand** against the image that ships; the AVD lives in `$ANDROID_AVD_HOME` on the workspace
-volume because the rootfs is read-only; `adb install` of a large APK fails *silently* on a
-slow guest, so the tool pushes to `/data/local/tmp` and verifies with `pm path`;
-`sys.boot_completed` flips before the launcher is usable, so boot waiting adds a settle
-delay; and `libpulse0` is a hard dependency of the emulator binary (installed here).
-
-What it is **not** good for: real inference latency, camera image quality (the back camera
-is a virtual scene), Play Services or a Google account, and anything user-facing that
-depends on real hardware behaviour. Emulated numbers are not device numbers.
-
-`emulator-tools --check` re-runs the build-time proof (the binary executes, the image
-metadata is complete, a hand-written AVD is discovered *and* resolved to its system image,
-KVM state reported). Full guide: [`docker/emulator.md`](docker/emulator.md) — also in the
-image at `/opt/emulator-tools/README.md`.
-
-Cost, stated plainly: roughly **2.4 GB** (emulator ~1.0 GB, system image ~1.3 GB), on top
-of the APK toolchain's 0.7 GB — and CI pays it twice, because `cache-to: type=gha,mode=max`
-stores the layers too. `--build-arg WITH_EMULATOR=0` builds the image without it (the
-tooling stays wired and reports itself as not installed); `DSH_EMULATOR=0` at boot skips
-only AVD provisioning.
 
 ## Auto-update workflow
 
@@ -934,8 +832,6 @@ services:
 docker run --rm --entrypoint dsh ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest --version   # prints pinned DSH version
 docker run --rm --entrypoint bash ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest -c \
   'docker --version && docker compose version && pnpm --version && uv --version && bwrap --version'
-docker run --rm --entrypoint bash ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest -c \
-  'apk-tools --check'                       # APK toolchain: 27/27 checks passed
 docker compose up -d && curl -fsS http://127.0.0.1:3080/ && docker compose ps   # healthy
 ```
 
