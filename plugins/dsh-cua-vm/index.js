@@ -762,11 +762,13 @@ export function apply(ctx, config = {}) {
     async execute(args = {}) {
       const result = await call({ op: 'destroy', name: args.name })
       if (result.complete === false) {
-        // A PARTIAL manifest is not a deletion: the sandbox may still be there
-        // and the row is kept (and marked orphaned) so the name stays visible.
-        const failed = (result.failed ?? []).map((item) => `- ${item.target}: ${item.detail}`).join('\n')
-        return { text: `${result.name} was NOT fully deleted. ${result.detail ?? ''}
-${failed}` }
+        // A PARTIAL manifest is not a deletion, and a KEPT item is the usual
+        // case: a disk whose QEMU is still running is deliberately left alone,
+        // so the row stays (orphaned) and cua_vm_gc reclaims it once the process
+        // is gone. Print both lists: what failed and what was kept on purpose.
+        const failed = (result.failed ?? []).map((item) => `- FAILED ${item.target}: ${item.detail}`).join('\n')
+        const kept = (result.kept ?? []).map((item) => `- KEPT ${item.target}: ${item.reason}`).join('\n')
+        return { text: `${result.name} was NOT fully deleted. ${result.detail ?? ''}\n${[kept, failed].filter(Boolean).join('\n')}` }
       }
       return { text: `${result.name} destroyed (${result.items?.length ?? 0} store item(s) removed). The next ensure starts from the base image.` }
     }

@@ -323,9 +323,9 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **207** assertions across 12 files |
+| `node tools/check-cua-vm.mjs` | **216** assertions across 12 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
-| Supervisor smoke against a **throwaway store + stub `cua`** (71 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
+| Supervisor smoke against a **throwaway store + stub `cua`** (82 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
 | ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
 | `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
@@ -351,7 +351,7 @@ regression tests where the bug was testable without a VM.
 | D4 | `space.capture` captured whatever `cua do` was last pointed at | it now runs `do switch local:<name>` before the screenshot (and drops the cached space + prime flag on a switch), exactly like the gui path |
 | D5 | registry read-modify-write across `await`s: a finishing `exec` could write a pre-shutdown snapshot back and resurrect `state: "ready"` | every mutation goes through `mutateRegistry()` — a tiny critical section under `withLock('@registry')` that **re-reads** inside the lock |
 | D6 | a failure between container-create and start left an orphan container holding the name, with no registry row | both failure paths `DELETE` the container before the error travels |
-| D7 | docs claimed 117 assertions and "21/21" needles | gates now print their own totals (**207** assertions, **67** needles) and the docs quote those; the Windows 64 GB quota requirement is stated in README §Personal VM and here |
+| D7 | docs claimed 117 assertions and "21/21" needles | gates now print their own totals (**216** assertions, **67** needles) and the docs quote those; the Windows 64 GB quota requirement is stated in README §Personal VM and here |
 
 A residual from that round: the `stale` flag was read by `startFromCheckpoint` but
 **written nowhere** (the first fix aborted the shutdown before touching the row),
@@ -393,6 +393,14 @@ are covered in the smoke suite.
 | S13 | previews were closed before the outcome and never restored on the abandoned path | the preview is snapshotted and reopened when the shutdown aborts |
 | S14 | one unguarded step (`writeViews`) could throw out of the delete manifest and skip the rest | every manifest step is its own try/catch and reports `failed` |
 | S15 | `vmDelete` reported success even when items failed | the result carries `complete`, `deleted` (false on a partial), and the `failed` list; the tool and the panel print it |
+
+**Round 3 residuals** (a second pass over the same defects):
+
+| # | Defect | Fix |
+|---|---|---|
+| R1 | the delete verdict counted a `skipped` item as complete: deleting a computer with a live QEMU returned `deleted:true` while `vmm/qemu/<name>` was deliberately kept, so the panel said "destroyed" about a disk that was still on the volume and no longer reachable (the row had been dropped) | `complete` requires every item **removed**; a kept item makes the delete partial, the row is kept and marked orphaned (so the disk stays reachable), and `cua_vm_gc` reclaims it once cua drops the sandbox **and** the QEMU pid is gone — the panel says "partially deleted — disk kept, run Clean up" |
+| R2 | the registry step was outside `step()`, so an unreadable registry threw out of `destroyVm` after the checkpoints/shots/vmm were already unlinked, and the caller got a bare error with no `items`/`failed`/`complete` | the row write is a manifest step like every other one: it reports `failed` and the structured result still comes back |
+| R3 | a corrupt registry killed the supervisor at boot: the listen callback read it unguarded for the Windows-resume loop, so the socket existed and then the process exited 1 | both boot-time reads are guarded (listen callback, idle timer): the failure is logged, the Windows watches are skipped for this boot, and every tool still answers |
 
 **Windows (checked against `dockurr/windows:4.35` and its `qemux/qemu:7.12` base)**
 

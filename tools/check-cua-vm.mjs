@@ -208,7 +208,18 @@ const NEEDLES = {
     ["abandonedBecause = 'survived the QMP quit'", 1],
     ['restorePorts(name, previews)', 1],
     // S2: mayBeTorn is READ on the start path, not just written.
-    ['meta.mayBeTorn === true', 1]
+    ['meta.mayBeTorn === true', 1],
+    // R1: a KEPT item (the disk of a live QEMU) is not a completed delete, and
+    // the row keeps it reachable until GC can reclaim it.
+    ["const skipped = items.filter((item) => item.status === 'skipped')", 1],
+    ['skipped.length === 0 && sandboxGone', 1],
+    ['kept: skipped.map', 1],
+    ['would reclaim the kept disk', 1],
+    // R2: the registry write is a manifest step, so it cannot throw out of it.
+    ["await step('registry.json'", 1],
+    // R3: the boot/timer paths cannot die on a corrupt registry.
+    ['windows: install watches were NOT resumed', 1],
+    ['idle: registry unreadable', 1]
   ],
   space: [
     ['export const CAPTURE_MAX_PIXELS = 900_000', 1],
@@ -325,6 +336,9 @@ const NEEDLES = {
     ["op: 'vmWindowsCreate'", 1],
     ["op: 'vmGc'", 1],
     ["op: 'vmDoctor'", 1],
+    // R1: a partial delete prints what failed AND what was kept on purpose.
+    ['- KEPT ${item.target}: ${item.reason}', 1],
+    ['- FAILED ${item.target}: ${item.detail}', 1],
     // the port answer is url + localPort; `target` was never in the payload
     ['result.url', 1],
     ['result.localPort', 1],

@@ -661,7 +661,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **207 assertions** across 12 files (the gate prints
+* `tools/check-cua-vm.mjs` — **216 assertions** across 12 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -679,9 +679,9 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (207 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
+green (216 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
-(71 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
+(82 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
 must not be touched, target switching, a concurrent exec burst), a real `qemu-system-x86_64 -S` shutdown
 (timeout → quit → `mayBeTorn`), an ACPI-refusal fallback against a
@@ -705,6 +705,15 @@ uncompensated container on a failed registration, W5 no Windows suspend, W6
 silently ignored `save`, W10 overstated docs). The per-defect table is
 REPORT.md §9.5; the gate gained a needle or a FORBIDDEN rule for every mapping
 change (notably: VRAM_SIZE, SHUTDOWN and ISO are now forbidden strings).
+
+Three residuals from that round: R1 the delete verdict counted a `skipped` item
+as complete (a disk kept under a live QEMU was reported "destroyed" and became
+unreachable) — `complete` now requires every item removed, the row stays orphaned
+while the disk does, and `cua_vm_gc` reclaims it once cua and the pid agree it is
+safe; R2 the registry write moved inside the manifest's step wrapper, so a corrupt
+registry yields a structured partial result instead of a bare throw; R3 the
+boot-time and timer-time registry reads are guarded, so a corrupt file logs and
+skips the Windows watches instead of killing the process after the socket exists.
 
 ### 15.8 Review round 2
 

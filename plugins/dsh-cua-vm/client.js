@@ -343,8 +343,9 @@ window.__ModuleLoader__.load({
         try {
           const payload = await api('gc', {})
           await load()
-          setNote(clean(payload.bytesFreed > 0
-            ? `Cleaned ${(payload.bytesFreed / 1024 ** 2).toFixed(1)} MB: ${payload.checkpoints.length} checkpoint(s), ${payload.shots.length} screenshot(s), ${payload.views.length} viewer row(s), ${payload.ports.length} port row(s).`
+          const reclaimed = (payload.orphans ?? []).filter((row) => row.action.startsWith('reclaim'))
+          setNote(clean(payload.bytesFreed > 0 || reclaimed.length > 0
+            ? `Cleaned ${(payload.bytesFreed / 1024 ** 2).toFixed(1)} MB: ${payload.checkpoints.length} checkpoint(s), ${payload.shots.length} screenshot(s), ${payload.views.length} viewer row(s), ${payload.ports.length} port row(s)${reclaimed.length > 0 ? `, ${reclaimed.length} orphaned computer(s) reclaimed` : ''}.`
             : 'Nothing to clean.'))
         } catch (error) {
           setNote(clean(error?.message ?? error))
@@ -634,8 +635,17 @@ window.__ModuleLoader__.load({
                           await load()
                           // A partial manifest is not a deletion: say which
                           // items survived instead of reporting success.
+                          // A partial manifest is not a deletion: say which
+                          // items survived (usually a disk kept because QEMU
+                          // still holds it) instead of reporting success.
+                          const kept = (payload.kept ?? []).map((item) => item.target)
+                          const failed = (payload.failed ?? []).map((item) => item.target)
                           setNote(payload.complete === false
-                            ? clean(`${name} was NOT fully deleted: ${(payload.failed ?? []).map((item) => item.target).join(', ') || payload.detail || 'see the supervisor log'}`)
+                            ? clean(`Partially deleted ${name} — ${[
+                                kept.length > 0 ? `disk kept: ${kept.join(', ')} (run Clean up to reclaim once the process is gone)` : '',
+                                failed.length > 0 ? `failed: ${failed.join(', ')}` : '',
+                                kept.length === 0 && failed.length === 0 ? (payload.detail ?? 'see the supervisor log') : ''
+                              ].filter(Boolean).join('; ')}`)
                             : `Deleted ${name}.`)
                         } catch (error) {
                           setNote(clean(error?.message ?? error))

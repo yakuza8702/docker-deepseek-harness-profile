@@ -1642,27 +1642,42 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
   //    becomes permanently unusable (create refuses "already exists") with
   //    nothing in the UI to delete. Keep the row and mark it orphaned instead;
   //    cua_vm_gc reconciles it against `sb ls` once the sandbox is really gone.
-  const failureCount = items.filter((item) => item.status === 'failed').length
-  const hadRow = Boolean(readRegistry().vms[name])
-  if (hadRow && !sandboxGone) {
-    await mutateRegistry((registry) => {
-      const row = registry.vms[name]
-      if (!row) return
-      row.orphaned = true
-      row.orphanReason = 'sb rm failed during delete; the sandbox may still exist'
-      row.orphanedAt = new Date().toISOString()
-    })
-    record('registry.json', 'kept', 'the sandbox could not be removed, so the row is marked orphaned (cua_vm_gc reconciles it)')
-  } else if (hadRow) {
-    await mutateRegistry((registry) => { delete registry.vms[name] })
-    record('registry.json', 'removed')
-  } else {
-    record('registry.json', 'absent')
-  }
+  // R2: THE ROW WRITE IS A MANIFEST STEP TOO. `mutateRegistry` throws when the
+  // registry cannot be read, and before this wrapper that throw escaped
+  // `destroyVm` AFTER the checkpoints, shots and QEMU directory were already
+  // unlinked: the caller got a bare error with no `items`, no `failed`, no
+  // `complete`, and no way to tell what had happened.
+  await step('registry.json', async () => {
+    const diskKept = items.some((item) => item.status === 'skipped')
+    const hadRow = Boolean(readRegistry().vms[name])
+    if (hadRow && (!sandboxGone || diskKept)) {
+      await mutateRegistry((registry) => {
+        const row = registry.vms[name]
+        if (!row) return
+        row.orphaned = true
+        row.orphanReason = diskKept
+          ? 'the QEMU directory was kept because the process is still running; cua_vm_gc reclaims it once QEMU is gone'
+          : 'sb rm failed during delete; the sandbox may still exist'
+        row.orphanedAt = new Date().toISOString()
+      })
+      record('registry.json', 'kept', 'the row is marked orphaned (cua_vm_gc reconciles it)')
+    } else if (hadRow) {
+      await mutateRegistry((registry) => { delete registry.vms[name] })
+      record('registry.json', 'removed')
+    } else {
+      record('registry.json', 'absent')
+    }
+  })
 
   const failures = items.filter((item) => item.status === 'failed')
-  const complete = failures.length === 0 && sandboxGone
-  log(`destroy ${name} (${reason}): ${items.length - failures.length}/${items.length} item(s) cleaned${failures.length ? `, ${failures.length} failed` : ''}${complete ? '' : ' (INCOMPLETE)'}`)
+  // A `skipped` item is a DELIBERATE leftover, not a success: the QEMU directory
+  // of a computer whose process is still running is skipped so the disk is not
+  // deleted under a live guest. Counting it as completion is how the panel came
+  // to say "destroyed" about a computer whose 6 GB disk was still on the volume
+  // and unreachable (the row had been dropped).
+  const skipped = items.filter((item) => item.status === 'skipped')
+  const complete = failures.length === 0 && skipped.length === 0 && sandboxGone
+  log(`destroy ${name} (${reason}): ${items.filter((item) => item.status === 'removed').length}/${items.length} item(s) removed${failures.length ? `, ${failures.length} failed` : ''}${skipped.length ? `, ${skipped.length} kept` : ''}${complete ? '' : ' (INCOMPLETE)'}`)
   return {
     name,
     // `deleted` stays truthful: a partial manifest is not a deletion.
@@ -1671,10 +1686,13 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
     items,
     failures: failures.length,
     failed: failures.map((item) => ({ target: item.target, detail: item.detail ?? '' })),
+    kept: skipped.map((item) => ({ target: item.target, reason: item.detail ?? '' })),
     ...(complete ? {} : {
-      detail: sandboxGone
-        ? `${failures.length} item(s) could not be removed; the registry row was kept`
-        : 'the sandbox could not be removed, so the registry row is kept and marked orphaned; run cua_vm_gc after the sandbox is gone'
+      detail: skipped.length > 0
+        ? 'partially deleted — the disk was kept (QEMU still holds it); it stays reachable through the orphaned row. Run cua_vm_gc after the process is gone to reclaim it.'
+        : sandboxGone
+          ? `${failures.length} item(s) could not be removed; the registry row was kept`
+          : 'the sandbox could not be removed, so the registry row is kept and marked orphaned; run cua_vm_gc after the sandbox is gone'
     })
   }
 }
@@ -1726,14 +1744,51 @@ async function collectGarbage({ dryRun = false } = {}) {
     if (orphans.length > 0) {
       const { parsed } = await listSandboxes()
       const listed = new Set((Array.isArray(parsed) ? parsed : []).map((row) => row?.name ?? row?.id ?? ''))
-      for (const [name, row] of orphans) {
-        const stillThere = listed.has(name)
-        report.orphans.push({ name, sandbox: stillThere ? 'still listed by cua' : 'gone from cua', action: stillThere ? 'kept' : (dryRun ? 'would drop the row' : 'row dropped') })
-        if (stillThere) continue
-        if (!dryRun) {
-          await mutateRegistry((fresh) => { delete fresh.vms[name] })
+      for (const [name] of orphans) {
+        await withVmLock(name, async () => {
+          const stillThere = listed.has(name)
+          if (stillThere) {
+            report.orphans.push({ name, sandbox: 'still listed by cua', action: 'kept' })
+            return
+          }
+          // The sandbox is gone, but the DISK may still be held by a live QEMU:
+          // that is exactly why it was kept at delete time. Reclaiming it now
+          // would delete the file out from under the process.
+          const pid = qemuPid(name)
+          if (pidAlive(pid)) {
+            report.orphans.push({ name, sandbox: 'gone from cua', action: `kept: QEMU (pid ${pid}) still running` })
+            return
+          }
+          // SAFE TO RECLAIM: cua no longer knows the sandbox and no process holds
+          // the directory, so the leftover disk, its checkpoints, screenshots and
+          // rows go, and then the row that made them reachable.
+          const reclaimed = []
+          if (dryRun) {
+            report.orphans.push({ name, sandbox: 'gone from cua', action: 'would reclaim the kept disk and drop the row' })
+            return
+          }
+          await withVmLock(name, async () => {
+            const vmDir = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name)
+            if (existsSync(vmDir)) {
+              try { rmSync(vmDir, { recursive: true, force: true }); reclaimed.push(vmDir) } catch (error) { report.errors.push(`${vmDir}: ${error.message}`) }
+            }
+            for (const file of checkpointFilesFor(name)) {
+              try { unlinkSync(file); reclaimed.push(file) } catch (error) { report.errors.push(`${file}: ${error.message}`) }
+            }
+            for (const file of shotFilesFor(name)) {
+              try { unlinkSync(file); reclaimed.push(file) } catch (error) { report.errors.push(`${file}: ${error.message}`) }
+            }
+            const views = readViews()
+            if (views[name]) {
+              delete views[name]
+              try { writeViews(views) } catch (error) { report.errors.push(`views.json: ${error.message}`) }
+            }
+            closePorts(name)
+            await mutateRegistry((fresh) => { delete fresh.vms[name] })
+          })
+          report.orphans.push({ name, sandbox: 'gone from cua', action: 'reclaimed the kept disk and dropped the row', reclaimed })
           registry = readRegistry()
-        }
+        })
       }
       // A sandbox cua lists with NO row is not ours to delete (it may belong to
       // another workspace or a previous install); report it so the cause is
@@ -4026,7 +4081,16 @@ server.on('error', (error) => {
 setInterval(() => {
   const config = readConfig()
   if (config.autoSuspend !== true || config.idleSuspendMinutes <= 0) return
-  const registry = readRegistry()
+  // A THROW IN A TIMER IS FATAL. `readRegistry` throws on a corrupt file, and an
+  // uncaught throw from a `setInterval` callback ends the process — the same
+  // failure as the listen path, one minute later.
+  let registry
+  try {
+    registry = readRegistry()
+  } catch (error) {
+    log(`idle: registry unreadable (${error?.message ?? error}); the idle timer skips this minute`)
+    return
+  }
   const now = Date.now()
   for (const [name, meta] of Object.entries(registry.vms)) {
     if (meta.state !== 'ready') continue
@@ -4059,11 +4123,21 @@ server.listen(SOCK, () => {
   void reconcilePorts().catch((error) => log(`ports: boot reconciliation failed (${error?.message ?? error})`))
   // A Windows computer that was `installing` when the process stopped has no
   // watcher any more; resume watching the rows that are still in flight.
-  for (const [name, meta] of Object.entries(readRegistry().vms)) {
-    if (meta?.kind === 'windows' && meta.state === 'installing') {
-      log(`windows: resuming the install watch for ${name}`)
-      watchWindowsInstall(name)
+  //
+  // GUARDED, because `readRegistry` throws on a corrupt file — and this callback
+  // runs AFTER the socket exists but INSIDE the listen event: an uncaught throw
+  // here took the whole process down (exit 1) with the cause only in the
+  // container log, i.e. every VM tool dead because one JSON file was truncated.
+  // A boot that cannot read the registry still has to serve `cua_vm_doctor`.
+  try {
+    for (const [name, meta] of Object.entries(readRegistry().vms)) {
+      if (meta?.kind === 'windows' && meta.state === 'installing') {
+        log(`windows: resuming the install watch for ${name}`)
+        watchWindowsInstall(name)
+      }
     }
+  } catch (error) {
+    log(`windows: install watches were NOT resumed (${error?.message ?? error}); fix registry.json and restart to pick them up`)
   }
 })
 
