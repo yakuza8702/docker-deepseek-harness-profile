@@ -464,10 +464,10 @@ export function apply(ctx, config = {}) {
         memory: { type: 'number', description: 'RAM in GB (default 4; Windows floors at 6).' },
         image: { type: 'string', description: 'Image reference. Default "linux" (Ubuntu 24.04 slim Cua disk). Linux only.' },
         gpu: { type: 'boolean', description: 'virgl GPU for 3D/Android/Blender (Windows: GPU=Y + the render node).' },
-        diskGb: { type: 'number', description: 'Disk size in GB (Android and REA: 40; Windows floors at 64).' },
+        diskGb: { type: 'number', description: 'Disk size in GB. Omitted: 20 for Linux, 64 for Windows. Below a Windows floor (64 GB disk / 6 GB RAM / 2 vCPU) the computer is still created and the result carries a warning.' },
         android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating (Linux only).' },
         rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true. Linux only.' },
-        windowsVersion: { type: 'string', enum: ['11', '10', 'ltsc10', '2022', '2025'], description: 'Windows version. Only "2025" has a pinned public ISO; the others require windowsIso (their evaluation media is behind a session-token page). Windows only.' },
+        windowsVersion: { type: 'string', enum: ['11', '11ltsc', '10', 'ltsc10', '2022', '2025'], description: 'Windows version. "2025" and "11ltsc" (Windows 11 IoT Enterprise LTSC 2024, alias "ltsc11") have pinned, probed public ISOs; 11/10/ltsc10/2022 require windowsIso (their evaluation media is behind a session-token page). Windows only.' },
         windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL (downloaded once into $STORE/iso/) or a file path inside the VM store or the workspace (attached directly as a QEMU drive). Windows only; mutually exclusive with windowsVersion.' }
       }
     },
@@ -483,8 +483,10 @@ export function apply(ctx, config = {}) {
         const parts = [`${answer.name} is ${answer.state} (Windows).`]
         if (answer.console) parts.push(`Live view: ${answer.console} (noVNC over QEMU VNC, never published raw).`)
         parts.push(answer.passwordHint)
-        if (answer.diskGbRaised !== undefined) parts.push(`Disk raised to ${answer.diskGbRaised} GB: Windows does not install below 64 GB.`)
-        if (answer.memoryRaised !== undefined) parts.push(`RAM raised to ${answer.memory} GB: Windows does not install below 6 GB.`)
+        // The floors are DEFAULTS now: a below-floor request is created and the
+        // warnings come from the supervisor, so the sentence describes what
+        // actually happened instead of a silent raise.
+        for (const warning of answer.warnings ?? []) parts.push(`WARNING: ${warning.message}`)
         parts.push('Once it is ready, `cua_vm_exec` runs commands over SSH in cmd.exe, `cua_vm_put`/`cua_vm_get` copy files over scp, and `cua_vm_gui` drives the screen over QMP — `cua_vm_disk`, Android and REA are the Linux-only ones.')
         if (answer.detail) parts.push(answer.detail)
         return { text: parts.join(' ') }

@@ -799,7 +799,9 @@ Linux guest (`cap_drop ALL`, read-only rootfs, `no-new-privileges`).
 
 **What a Windows computer is.** OVMF firmware with a per-computer NVRAM and a
 swtpm TPM2, a plain qcow2 disk under `/cua-vm/windows/<name>/`, a pinned
-Microsoft evaluation ISO (downloaded once into `/cua-vm/iso/`, or `windowsIso`),
+Microsoft evaluation ISO — Server 2025, or Windows 11 IoT Enterprise LTSC 2024
+(`windowsVersion: "11ltsc"`, alias `ltsc11`), both probed live — downloaded once
+into `/cua-vm/iso/`, or `windowsIso`,
 and an unattended answer file that installs OpenSSH, Python and dsh-cua. The
 guest's only network is QEMU user-mode (SLIRP): outbound internet, host services
 at `10.0.2.2`, SSH forwarded to loopback. A bridge/tap is possible but not

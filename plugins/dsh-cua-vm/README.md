@@ -203,13 +203,21 @@ context of the display device, **not** acceleration inside the guest.
 ### Install media
 
 **An operator-supplied ISO is the primary path, and that is deliberate.** Of the
-five Microsoft evaluation URLs this module used to pin, only **Server 2025**
-still answers (probed 2026-11-15: HTTP 206; the other four return HTTP 400 — those
-editions are behind a session-token download page). So:
+five Microsoft evaluation URLs this module originally pinned, only **Server 2025**
+still answered (probed 2026-11-15: HTTP 206; the other four return HTTP 400 —
+those editions are behind a session-token download page). A sixth, **Windows 11
+IoT Enterprise LTSC 2024**, was added from Microsoft's own Evaluation Center
+(`microsoft.com/en-us/evalcenter/download-windows-11-iot-enterprise-ltsc-eval`):
+its x64 button is `go.microsoft.com/fwlink/?linkid=2270353`, which resolves to a
+static `software-static.download.prss.microsoft.com` object that answered
+**HTTP 206** with 5,060,020,224 bytes — so it is pinned and installs without an
+operator ISO. So:
 
-* `windowsVersion` lists all five, but only `2025` has a pinned URL. Selecting
-  another one **refuses immediately**, naming the version and both remediations —
-  it does not fail inside a 5.5 GB download.
+* `windowsVersion` lists six, but only **`2025`** and **`11ltsc`** (Windows 11 IoT
+  Enterprise LTSC 2024, alias `ltsc11`) have pinned URLs — both were probed with a
+  live ranged GET (HTTP 206). Selecting another one **refuses immediately**,
+  naming the version and both remediations — it does not fail inside a 5.5 GB
+  download.
 * `windowsIso` is how you install 11/10/ltsc10/2022: an `http(s)` URL (downloaded
   into `$STORE/iso/` with progress and a timeout, `DSH_CUA_WINDOWS_ISO_TIMEOUT_MS`
   default 1 h) or a local `.iso` inside `$STORE` or the workspace, attached

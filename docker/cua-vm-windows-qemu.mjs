@@ -78,6 +78,15 @@ export const WINDOWS_ISO_SOURCES = {
     url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso',
     probed: '2026-11-15: HTTP 206 (ranged GET)'
   },
+  '11ltsc': {
+    label: 'Windows 11 IoT Enterprise LTSC 2024 (evaluation)',
+    // PROBED 2026-11-15 with a ranged GET: HTTP 206, 5,060,020,224 bytes. This is
+    // the URL the Evaluation Center's own x64 button resolves to
+    // (go.microsoft.com/fwlink/?linkid=2270353 → this static prss.microsoft.com
+    // object), so it is an official Microsoft host, not a mirror.
+    url: 'https://software-static.download.prss.microsoft.com/dbazure/998969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso',
+    probed: '2026-11-15: HTTP 206 (ranged GET), 5,060,020,224 bytes'
+  },
   '11': {
     label: 'Windows 11 (evaluation)',
     url: null,
@@ -109,7 +118,8 @@ export const WINDOWS_ISO_SOURCES = {
  * none. Called BEFORE any download so the refusal is cheap and actionable.
  */
 export function resolveWindowsIso(version) {
-  const entry = WINDOWS_ISO_SOURCES[version]
+  const canonical = canonicalWindowsVersion(version)
+  const entry = WINDOWS_ISO_SOURCES[canonical]
   if (entry === undefined) {
     throw new Error(`windowsVersion must be one of ${WINDOWS_VERSIONS.join(', ')} (or give windowsIso instead)`)
   }
@@ -121,7 +131,19 @@ export function resolveWindowsIso(version) {
   return { entry, url: entry.url }
 }
 
-export const WINDOWS_VERSIONS = ['11', '10', 'ltsc10', '2022', '2025']
+export const WINDOWS_VERSIONS = ['11', '11ltsc', '10', 'ltsc10', '2022', '2025']
+
+/**
+ * Aliases people type. `ltsc11` is the obvious one for Windows 11 LTSC (the
+ * Windows 10 one is `ltsc10`), so it is accepted everywhere a version is.
+ */
+export const WINDOWS_VERSION_ALIASES = { ltsc11: '11ltsc' }
+
+/** The canonical version for a user-supplied string (alias-aware). */
+export function canonicalWindowsVersion(version) {
+  const text = String(version ?? '')
+  return WINDOWS_VERSION_ALIASES[text] ?? text
+}
 
 /** Floors a Windows install does not survive below (same as the old backend). */
 export const WINDOWS_MIN_MEMORY_GB = 6
@@ -147,10 +169,48 @@ export function windowsEnabled() {
   return String(process.env.DSH_CUA_VM_WINDOWS ?? '1') !== '0'
 }
 
+/**
+ * The capacity advice for a Windows computer.
+ *
+ * The three numbers below are RECOMMENDATIONS (the defaults), not gates: a
+ * smaller computer is created when it is asked for, and this function produces
+ * the warnings that travel with the result and the panel. It is pure so the
+ * decision can be tested without a hypervisor.
+ */
+export function windowsCapacityWarnings({ diskGb, memory, cpu }) {
+  const warnings = []
+  if (Number(diskGb) < WINDOWS_MIN_DISK_GB) {
+    warnings.push({
+      code: 'disk-below-floor',
+      message: `disk ${diskGb} GB is below the recommended ${WINDOWS_MIN_DISK_GB} GB floor; a Windows install needs roughly 52 GB after updates, so Windows Update will run out of space and the install may fail. Created anyway on request (the quota still counts the real bytes).`
+    })
+  }
+  if (Number(memory) < WINDOWS_MIN_MEMORY_GB) {
+    warnings.push({
+      code: 'memory-below-floor',
+      message: `RAM ${memory} GB is below the recommended ${WINDOWS_MIN_MEMORY_GB} GB floor; Setup and the first logon will be very slow and may fail. Created anyway on request.`
+    })
+  }
+  if (Number(cpu) < WINDOWS_MIN_CPU) {
+    warnings.push({
+      code: 'cpu-below-floor',
+      message: `${cpu} vCPU is below the recommended ${WINDOWS_MIN_CPU}; Windows Setup will be slow. Created anyway on request.`
+    })
+  }
+  return warnings
+}
+
 /** Is this host able to boot a Windows computer at all? */
 export function windowsHostCaps() {
   const exists = (file) => {
     try { return statSync(file).isFile() } catch { return false }
+  }
+  // SELF-TEST HOOK. The create path (quota → ports → ISO → OEM payload → boot) is
+  // the part worth testing, and it cannot run on a host without qemu/OVMF/swtpm.
+  // This makes the capability check report "present" so the smoke suite can drive
+  // the real code. It is never set in compose/.env, and a gate forbids that.
+  if (String(process.env.DSH_CUA_WINDOWS_FAKE_HOST_CAPS ?? '') === '1') {
+    return { qemu: true, ovmfCode: true, ovmfVars: true, swtpm: true, virtioWin: false, kvm: true, render: true, faked: true }
   }
   return {
     qemu: exists(WINDOWS_QEMU),
@@ -602,6 +662,13 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
       })
       const child = spawn(WINDOWS_QEMU, argv, { stdio: 'ignore', detached: true })
       children.set(`qemu:${spec.name}`, child)
+      // A SPAWN ERROR IS AN EVENT, NOT A THROW: without this listener, a missing
+      // qemu binary (or E2BIG on a bad argv) raises an unhandled 'error' and takes
+      // the whole supervisor down — every computer with it.
+      child.on('error', (error) => {
+        log(`windows: ${spec.name} qemu failed to start: ${error?.message ?? error}`)
+        stopSwtpm(spec.name)
+      })
       child.unref()
       log(`windows: ${spec.name} qemu started (pid ${child.pid}${installPending ? ', installing' : ''})`)
       return { pid: child.pid, installPending }

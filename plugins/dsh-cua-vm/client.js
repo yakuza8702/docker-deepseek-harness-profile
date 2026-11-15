@@ -425,8 +425,13 @@ window.__ModuleLoader__.load({
       // 40 the moment the box is ticked — before the supervisor's own clamp has
       // to save the create.
       // The floor is a property of the workload: the REA kit needs 40 GB, a
-      // Windows install needs 64 GB, a plain desktop is fine on 20.
-      const diskFloorGb = draft.kind === 'windows' ? 64 : draft.rea === true ? 40 : 20
+      // Windows install RECOMMENDS 64 GB, a plain desktop is fine on 20.
+      //
+      // Windows is different on purpose: 64 GB is a recommendation, not a gate.
+      // The input accepts less and the create carries a warning ("Windows Update
+      // will run out of space"), because refusing a size the user typed is worse
+      // than doing what they asked and saying what will happen.
+      const diskFloorGb = draft.rea === true && draft.kind !== 'windows' ? 40 : 20
 
       return h('div', { style: S.page },
         h('div', { style: S.head },
@@ -495,12 +500,20 @@ window.__ModuleLoader__.load({
                       onChange: (event) => setDraft({ ...draft, windowsVersion: event.target.value })
                     },
                       h('option', { value: '11' }, 'Windows 11'),
+                      // Pinned, probed public ISO (Microsoft's own Evaluation Center
+                      // link resolves to it) — the only 11-family image that installs
+                      // without an operator-supplied ISO.
+                      h('option', { value: '11ltsc' }, 'Windows 11 IoT Enterprise LTSC 2024 (pinned ISO)'),
                       h('option', { value: '10' }, 'Windows 10'),
                       h('option', { value: 'ltsc10' }, 'Windows 10 LTSC'),
                       h('option', { value: '2022' }, 'Server 2022'),
-                      h('option', { value: '2025' }, 'Server 2025')
+                      h('option', { value: '2025' }, 'Server 2025 (pinned ISO)')
                     ))
             ),
+            // The recommendation, stated where the number is typed — the create
+            // itself no longer refuses a smaller disk.
+            draft.kind === 'windows' && h('div', { style: { ...S.muted, fontSize: 12 } },
+              `Recommended: 64 GB disk / 6 GB RAM / 2 vCPU. Below that the computer is still created, with a warning that Windows Update will run out of space.`),
             draft.kind === 'windows' && h('input', {
               placeholder: 'ISO: http(s) URL, or a path under the VM store (e.g. windows/11.iso) — optional',
               value: draft.windowsIso, style: S.input,
@@ -544,7 +557,7 @@ window.__ModuleLoader__.load({
             ),
             draft.kind === 'linux'
               ? h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Enable REA adds Node 22, rea-agents, a JDK 21, Ghidra 12.1.4 and JADX to the computer, roughly 3.5 GB installed, and lifts the disk to at least a 40 GB one. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field. Leaving Enable GPU unticked uses the host default (virgl when this host can do it).')
-              : h('div', { style: S.muted }, 'Windows is a DIRECT QEMU computer (OVMF firmware, a swtpm TPM2, a qcow2 disk under the VM store) — there is no container runtime. It needs /dev/kvm and compose.windows.yaml for the devices (DSH_CUA_VM_WINDOWS=1). Disk floors at 64 GB and RAM at 6 GB. The install takes tens of minutes and lists as installing until SSH answers AND QMP says running. Once ready: exec/put/get work over SSH, the desktop is cua_vm_gui over QMP, and the live view at /vm/port/<name>/ is a noVNC stream a human can drive. It cannot take REA or Android, and the disk does not grow. Its password is generated and shown with Reveal — stored 0600 in the VM store, never in the registry.'),
+              : h('div', { style: S.muted }, 'Windows is a DIRECT QEMU computer (OVMF firmware, a swtpm TPM2, a qcow2 disk under the VM store) — there is no container runtime. It needs /dev/kvm and compose.windows.yaml for the devices (DSH_CUA_VM_WINDOWS=1). The recommended floor is 64 GB disk and 6 GB RAM: create below it anyway, and the computer carries a warning that Windows Update will run out of space. The install takes tens of minutes and lists as installing until SSH answers AND QMP says running. Once ready: exec/put/get work over SSH, the desktop is cua_vm_gui over QMP, and the live view at /vm/port/<name>/ is a noVNC stream a human can drive. It cannot take REA or Android, and the disk does not grow. Its password is generated and shown with Reveal — stored 0600 in the VM store, never in the registry.'),
             draft.rea === true && (form.diskQuotaGb < 40 || form.diskQuotaGb - (state.usedBytes ?? 0) / 1024 ** 3 < draft.diskGb) && h('div', { style: { ...S.muted, color: T.error } },
               `The VM store quota is ${form.diskQuotaGb} GB, so a 40 GB or larger REA disk cannot be created. Raise Disk Size in the Policy tab first.`),
             h('div', { style: S.row },

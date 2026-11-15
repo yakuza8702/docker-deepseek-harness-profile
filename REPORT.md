@@ -323,10 +323,10 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **304** assertions across 16 files |
+| `node tools/check-cua-vm.mjs` | **315** assertions across 16 files (314 in the flat `cua-check` replay) |
 | `node tools/check-anchors.mjs` | **14** assertions — both directions, offline |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
-| `node tests/supervisor-smoke.mjs` — throwaway store + stub `cua` (92 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
+| `node tests/supervisor-smoke.mjs` — throwaway store + stub `cua` (98 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
 | ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
 | `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
@@ -606,6 +606,51 @@ Re-verified in three layouts — repo (invoked from the repo **and** from `/`), 
 flat `/opt/seek-harness/tools/` layout from `/`, and the negative case in both
 (a renamed fixture anchor gives exit 1 with 6 failures) — plus a simulation of the
 full Dockerfile sequence (383 → 405 → 418) against the real 0.2.2-rc.3 bundles.
+
+### 9.6.7 Change of policy: Windows floors are defaults, not refusals
+
+The three Windows numbers were hard minimums: a create with `diskGb < 64`, RAM
+`< 6` or CPU `< 2` was clamped or refused. They are now **defaults and
+recommendations**:
+
+| Request | Result |
+|---|---|
+| `diskGb` omitted | 64 GB |
+| `diskGb: 8` | 8 GB, created, with `warnings[code: disk-below-floor]` |
+| `memory: 2` | 2 GB, created, with `warnings[code: memory-below-floor]` |
+| `cpu: 1` | 1 vCPU, created, with `warnings[code: cpu-below-floor]` |
+| the quota | unchanged: real bytes, and a disk that does not fit is still refused |
+
+`warnings` is the one shape (`[{ code, message }]`) and it appears in the create
+result, in the registry row (so the panel shows it after a reload) and in the
+human-facing text. The warning says what will actually go wrong — a sub-52 GB
+disk runs out of space during Windows Update and the install may fail.
+
+Mechanically: `windowsCapacityWarnings({diskGb, memory, cpu})` in
+`docker/cua-vm-windows-qemu.mjs` is pure and unit-testable; `normaliseSpec` fills
+the **Linux** defaults, so the create path carries `diskGiven`/`memoryGiven`/
+`cpuGiven` to tell "omitted" from "chosen". Linux behaviour, the REA 40 GB clamp
+and the Windows REA/Android refusals are untouched.
+
+Smoke: a below-floor create returns `ok:true`, the requested sizes
+(`8 / 2 / 1`), all three warning codes and the disk warning text; an omitted
+create returns `64 / 6 / 2` with `warnings: []`.
+
+### 9.6.8 Windows 11 IoT Enterprise LTSC 2024 as a pinned source
+
+Research (2026-11-15): the Microsoft Evaluation Center page
+`https://www.microsoft.com/en-us/evalcenter/download-windows-11-iot-enterprise-ltsc-eval`
+offers the x64 ISO behind `https://go.microsoft.com/fwlink/?linkid=2270353`.
+
+| Probe | Result |
+|---|---|
+| `curl -IL` the fwlink | redirects to `software-static.download.prss.microsoft.com/dbazure/998969d5-…/26100.1742.240906-0331.ge_release_svc_refresh_CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso`, HTTP 200 |
+| ranged `GET 0-1` on that URL | **HTTP 206**, `Content-Range: bytes 0-1/5060020224` (5.06 GB, ~4.71 GiB) |
+
+Because it answers directly it is **pinned** (`windowsVersion: "11ltsc"`,
+alias **`ltsc11`**), unlike 11/10/ltsc10/2022 (which return 400 and refuse with a
+remediation). The vhdx/ARM64 media on the same page is a separate link and is not
+pinned.
 
 ### 9.7 What is still open (TBC)
 

@@ -276,6 +276,10 @@ const NEEDLES = {
     ['reserveStoreBytes(`${spec.name}/iso`, expectedBytes)', 1],
     // X7: resume rebuilds the preview.
     ["await ensureWindowsConsoleRelay(name)\n    return ok({ name, state: 'ready', kind: 'windows' })", 1],
+    // The floors produce warnings, and the requested sizes are not clamped.
+    ['const warnings = windowsCapacityWarnings({ diskGb, memory, cpu })', 1],
+    ['warnings,', 2],
+    ['const diskGb = given.disk ? spec.diskGb : WINDOWS_DEFAULT_DISK_GB', 1],
     // Y1: the virgl decision is made once and stored on the row.
     ["const virgl = spec.gpu === true && systemQemuSupportsVirgl() && existsSync('/dev/dri/renderD128')", 1],
     ['      virgl,', 1],
@@ -360,12 +364,22 @@ const NEEDLES = {
     ['stopSwtpm(spec.name)', 2],
     // the ISO sources are pinned and documented
     ['export const WINDOWS_ISO_SOURCES = {', 1],
-    // K2: exactly ONE probed public URL is pinned (Server 2025). The other four
-    // versions answer 400 and require `windowsIso`; `resolveWindowsIso` names the
-    // version and both remediations before any bytes move.
-    ['software-static.download.prss.microsoft.com', 1],
+    // K2: TWO probed public URLs are pinned now — Server 2025 and Windows 11 IoT
+    // Enterprise LTSC 2024 (both answered 206 to a live ranged GET); the rest
+    // answer 400 and require `windowsIso`.
+    ['software-static.download.prss.microsoft.com', 2],
     ['export function resolveWindowsIso(version)', 1],
     ['has no public direct ISO link', 1],
+    // The LTSC source, its alias, and the fact that the alias is canonicalised.
+    ["'11ltsc': {", 1],
+    ['CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso', 1],
+    ['export const WINDOWS_VERSION_ALIASES = { ltsc11: \'11ltsc\' }', 1],
+    ['export function canonicalWindowsVersion(version)', 1],
+    // FLOORS ARE WARNINGS. The create must produce advice, never a clamp.
+    ['export function windowsCapacityWarnings({ diskGb, memory, cpu })', 1],
+    ['disk-below-floor', 1],
+    ['memory-below-floor', 1],
+    ['Created anyway on request', 3],
     ['export async function ensureIso(', 1],
     ['export function writeOemPayload(', 1],
     // frames and input over QMP

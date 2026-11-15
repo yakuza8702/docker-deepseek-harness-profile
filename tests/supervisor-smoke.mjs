@@ -134,6 +134,41 @@ writeFileSync(path.join(STORE, 'views.json'), JSON.stringify({ [NAME]: { port: 5
 mkdirSync(path.join(HOME, '.cua', 'trajectories', `local_${NAME}`, '20260101-000000'), { recursive: true })
 writeFileSync(path.join(HOME, '.cua', 'trajectories', `local_${NAME}`, '20260101-000000', 'x.json'), '{}')
 
+const QEMU_IMG_STUB = path.join(HOME, '.cua', 'bin', 'qemu-img')
+mkdirSync(path.dirname(QEMU_IMG_STUB), { recursive: true })
+// `convert -O qcow2 SRC DST` copies; `create -f qcow2 FILE SIZE` writes a small
+// file (the smoke never boots it — it only has to exist and be non-empty).
+writeFileSync(QEMU_IMG_STUB, [
+  '#!/bin/sh',
+  'if [ "$1" = "create" ]; then',
+  '  shift',
+  '  while [ "$#" -gt 0 ]; do',
+  '    case "$1" in -f|-b) shift 2;; -F) shift 2;; *) FILE="$1"; shift;; esac',
+  '  done',
+  '  printf "stub qcow2" > "$FILE"',
+  '  exit 0',
+  'fi',
+  'cp "$4" "$5"',
+  ''
+].join('\n'))
+chmodSync(QEMU_IMG_STUB, 0o755)
+// ssh-keygen writes the pair the create expects.
+const SSH_KEYGEN_STUB = path.join(HOME, '.cua', 'bin', 'ssh-keygen')
+writeFileSync(SSH_KEYGEN_STUB, [
+  '#!/bin/sh',
+  'while [ "$#" -gt 0 ]; do case "$1" in -f) KEY="$2"; shift 2;; *) shift;; esac; done',
+  'printf "PRIVATE" > "$KEY"',
+  'printf "ssh-ed25519 AAAA stub\n" > "$KEY.pub"',
+  ''
+].join('\n'))
+chmodSync(SSH_KEYGEN_STUB, 0o755)
+const STUB_BIN = path.dirname(QEMU_IMG_STUB)
+// The supervisor spawns this and only needs a pid; it exits at once, which is
+// exactly the "install died" case the state machine has to survive.
+const FAKE_QEMU = path.join(STUB_BIN, 'qemu-system-x86_64')
+writeFileSync(FAKE_QEMU, '#!/bin/sh\nexit 0\n')
+chmodSync(FAKE_QEMU, 0o755)
+
 const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')], {
   env: {
     ...process.env,
@@ -142,6 +177,15 @@ const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervi
     CUA_SUPERVISOR_SOCK: SOCK,
     CUA_BIN: STUB,
     CUA_WORKSPACE_ROOT: '/workspace',
+    // The Windows create path runs on this host (no qemu/OVMF/swtpm), so the
+    // documented self-test hook reports the capabilities present and the stub
+    // binaries stand in for qemu-img/ssh-keygen.
+    DSH_CUA_WINDOWS_FAKE_HOST_CAPS: '1',
+    // The OEM payload ships in the image at /usr/local/share/cua-vm/windows-oem;
+    // in a checkout it is right there in the repository.
+    DSH_CUA_WINDOWS_OEM_DIR: path.join(REPO, 'docker', 'windows-oem'),
+    DSH_CUA_WINDOWS_QEMU: path.join(STUB_BIN, 'qemu-system-x86_64'),
+    PATH: `${STUB_BIN}:${process.env.PATH ?? ''}`,
     DSH_CUA_VM_WINDOWS: '1',
     PNG_SOURCE
   },
@@ -174,10 +218,6 @@ const call = (payload) => new Promise((resolve, reject) => {
 // F1: `checkpointDiskFile` shells out to qemu-img. This host has none, so the
 // stub flattens by copying — the CALL SITE and the restore bookkeeping are what
 // the tests are about, not qemu's converter.
-const QEMU_IMG_STUB = path.join(HOME, '.cua', 'bin', 'qemu-img')
-mkdirSync(path.dirname(QEMU_IMG_STUB), { recursive: true })
-writeFileSync(QEMU_IMG_STUB, '#!/bin/sh\n# args: convert -O qcow2 SRC DST\ncp "$4" "$5"\n')
-chmodSync(QEMU_IMG_STUB, 0o755)
 
 try {
   const up = await waitFor(() => existsSync(SOCK))
@@ -437,6 +477,37 @@ try {
     })())
   }
 
+  // ---- FLOORS ARE WARNINGS: a below-floor Windows create succeeds and warns ----
+  {
+    // A tiny local ISO: `windowsIso` inside the store is used directly, so the
+    // create never reaches the download.
+    mkdirSync(path.join(STORE, 'iso'), { recursive: true })
+    writeFileSync(path.join(STORE, 'iso', 'tiny.iso'), 'not a real iso')
+    const low = await call({
+      op: 'vmWindowsCreate', name: 'ws-win-low', kind: 'windows',
+      diskGb: 8, memory: 2, cpu: 1, windowsIso: 'iso/tiny.iso'
+    })
+    check('a below-floor Windows create succeeds', low.ok === true, JSON.stringify(low).slice(0, 200))
+    check('the requested sizes are used, not clamped', low.diskGb === 8 && low.memory === 2 && low.cpu === 1,
+      `disk=${low.diskGb} mem=${low.memory} cpu=${low.cpu}`)
+    const codes = (low.warnings ?? []).map((warning) => warning.code).sort()
+    check('the payload carries all three floor warnings', codes.join(',') === 'cpu-below-floor,disk-below-floor,memory-below-floor', codes.join(','))
+    check('the disk warning says updates will fail', (low.warnings ?? []).some((warning) => /Windows Update will run out of space/u.test(warning.message)))
+    const lowRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms['ws-win-low']
+    check('the row keeps the warnings for the panel', Array.isArray(lowRow?.warnings) && lowRow.warnings.length === 3)
+    await call({ op: 'vmDelete', name: 'ws-win-low' })
+
+    // The default path is unchanged: omit everything → 64 GB / 6 GB / 2 vCPU,
+    // no warnings.
+    // The default 64 GB needs head-room in the quota this suite runs with.
+    await call({ op: 'configSet', config: { diskQuotaGb: 120 } })
+    const standard = await call({ op: 'vmWindowsCreate', name: 'ws-win-def', kind: 'windows', windowsIso: 'iso/tiny.iso' })
+    check('omitting the sizes still gives the Windows defaults', standard.ok === true
+      && standard.diskGb === 64 && standard.memory === 6 && standard.cpu === 2
+      && (standard.warnings ?? []).length === 0, JSON.stringify(standard).slice(0, 200))
+    await call({ op: 'vmDelete', name: 'ws-win-def' })
+  }
+
   // ---- Z1/Z2: a cold start keeps a free port triple, and the claim is released ----
   {
     const stable = 'ws-win-stable'
@@ -451,7 +522,7 @@ try {
     // QEMU is not installed in this container, so the boot fails — but the port
     // decision happens first, and that is what this asserts.
     check('a cold start with free ports does not re-allocate them', started.portsChanged === false
-      && started.ports?.qmp === 46996 && started.ports?.ssh === 47995 && started.ports?.vnc === 5994, JSON.stringify(started.ports))
+      && started.ports?.qmp === 46996 && started.ports?.ssh === 47995 && started.ports?.vnc === 5994, JSON.stringify(started).slice(0, 200))
     const afterRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[stable]
     check('the row keeps its port triple', afterRow?.ports?.qmp === 46996 && afterRow?.ports?.ssh === 47995 && afterRow?.ports?.vnc === 5994)
     // The claim set must not still own them: a second computer must be able to

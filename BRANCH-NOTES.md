@@ -663,7 +663,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 * `tools/check-anchors.mjs` — **14 assertions**, offline: both build-time bundle
   patches apply to minified fixtures and still refuse a moved anchor.
-* `tools/check-cua-vm.mjs` — **304 assertions** across 16 files (the gate prints
+* `tools/check-cua-vm.mjs` — **315 assertions** across 16 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -681,7 +681,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (304 assertions / 67 needles), `ci-gates` 7/0/3, and the runtime suite in `tests/`
+green (315 assertions / 67 needles), `ci-gates` 7/0/3, and the runtime suite in `tests/`
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
 (82 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
@@ -824,6 +824,22 @@ New: `tools/check-anchors.mjs` with minified fixtures under `tools/fixtures/`
 — it applies both patches, re-runs them (idempotent), and proves the refusal
 still fires when an anchor is renamed. Hard gate in `ci-gates`, and a `RUN` step
 before the real patches in the Dockerfile.
+
+### 15.8.7 Policy change: Windows floors are warnings
+
+`windowsCreateManaged` no longer clamps or refuses a below-floor Windows computer.
+64 GB / 6 GB / 2 vCPU are the **defaults**; asking for less creates it anyway and
+carries `warnings[]` (`disk-below-floor` / `memory-below-floor` /
+`cpu-below-floor`) in the result and in the registry row. The quota still refuses
+a disk that does not fit, Linux is untouched, and the REA 40 GB clamp and the
+Windows REA/Android refusals are unchanged. The advice is one pure function
+(`windowsCapacityWarnings`), and the smoke covers both directions (below-floor
+create warns; omitted create returns the defaults with no warnings).
+
+Also added: **Windows 11 IoT Enterprise LTSC 2024** as `windowsVersion: "11ltsc"`
+(alias `ltsc11`), pinned from Microsoft's Evaluation Center link and probed live
+(HTTP 206, 5,060,020,224 bytes). The other four versions still refuse with a
+remediation because their evaluation media answers 400.
 
 ### 15.9 Review round 2
 

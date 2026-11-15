@@ -56,7 +56,8 @@ import { createSpace, formatSpace, formatSpaceWarning, pngSize, relativeToPixels
 import {
   createWindowsBackend, windowsEnabled, windowsHostCaps,
   WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
-  WINDOWS_MIN_CPU, WINDOWS_USERNAME, WINDOWS_QEMU,
+  WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
+  WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso
 } from './cua-vm-windows-qemu.mjs'
 
@@ -2923,6 +2924,8 @@ function watchWindowsInstall(name) {
  */
 async function windowsCreateManaged(spec) {
   if (windowsEnabled() === false) throw new Error('the Windows backend is disabled (DSH_CUA_VM_WINDOWS=0)')
+  // `ltsc11` is an accepted spelling of the Windows 11 IoT LTSC version.
+  spec.windowsVersion = canonicalWindowsVersion(spec.windowsVersion)
   if (spec.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer (create the Windows computer without it, or use a Linux computer)')
   if (spec.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest')
   const caps = windowsHostCaps()
@@ -2952,11 +2955,22 @@ async function windowsCreateManaged(spec) {
   if (running >= config.maxRunning) {
     return fail(`VM limit reached (${running}/${config.maxRunning} running). Shutdown one, or raise the limit above.`)
   }
-  const diskGb = Math.max(spec.diskGb > 0 ? spec.diskGb : WINDOWS_MIN_DISK_GB, WINDOWS_MIN_DISK_GB)
-  const memory = Math.max(spec.memory, WINDOWS_MIN_MEMORY_GB)
-  const cpu = Math.max(spec.cpu, WINDOWS_MIN_CPU)
+  // THE FLOORS ARE DEFAULTS, NOT MINIMUMS. A smaller computer is created when it
+  // is asked for — the user may be testing an install failure, or running a tiny
+  // workload — and the result carries a WARNING instead of a refusal. What is
+  // still refused is anything that cannot exist: a zero disk, or a disk that does
+  // not fit the store quota.
+  // `normaliseSpec` fills the LINUX defaults (memory 4), so "omitted" has to be
+  // carried explicitly — otherwise an omitted memory would become 4 GB + a
+  // warning instead of the Windows default of 6.
+  const given = { disk: spec.diskGiven === true, memory: spec.memoryGiven === true, cpu: spec.cpuGiven === true }
+  const diskGb = given.disk ? spec.diskGb : WINDOWS_DEFAULT_DISK_GB
+  const memory = given.memory ? spec.memory : WINDOWS_DEFAULT_MEMORY_GB
+  const cpu = given.cpu ? spec.cpu : WINDOWS_DEFAULT_CPU
+  // One pure builder, so the same advice reaches the result, the row and the panel.
+  const warnings = windowsCapacityWarnings({ diskGb, memory, cpu })
   if (config.diskQuotaGb < diskGb) {
-    return fail(`a Windows computer needs a ${diskGb} GB disk (it does not install below 64 GB), but the VM store quota is ${config.diskQuotaGb} GB. Raise Disk Size under Plugins → Personal VM (CUA) → Policy to at least ${diskGb} GB first.`)
+    return fail(`a ${diskGb} GB disk does not fit the VM store quota (${config.diskQuotaGb} GB). Raise Disk Size under Plugins → Personal VM (CUA) → Policy, or create the computer with a smaller disk.`)
   }
   const over = await reserveStoreBytes(spec.name, diskGb * 1024 ** 3)
   if (over !== null) return fail(over)
@@ -3075,6 +3089,7 @@ async function windowsCreateManaged(spec) {
       diskGb,
       cpu,
       memory,
+      warnings,
       credentials: true,
       installTimeoutMinutes: readConfig().windowsInstallTimeoutMinutes,
       createdAt: new Date().toISOString(),
@@ -3108,8 +3123,9 @@ async function windowsCreateManaged(spec) {
     created: true,
     backend: 'qemu',
     diskGb,
-    diskGbRaised: diskGb > spec.diskGb ? diskGb : undefined,
-    memoryRaised: memory > spec.memory ? memory : undefined,
+    cpu,
+    memory,
+    warnings,
     gpu: spec.gpu,
     passwordHint: 'the generated password is in the computer list (Reveal) — user "cua"',
     console: `/vm/port/${spec.name}/`,
@@ -3498,7 +3514,11 @@ async function windowsStart(name, meta) {
         row.error = 'QEMU started but did not reach `running` (see its serial log)'
       }
     })
-    if (!running) return fail(`${name} did not start: QEMU exited or never answered QMP. The restore point was kept.`)
+    if (!running) {
+      // The same port diagnostics as the spawn-failure path: a start that failed
+      // after moving the ports is a different bug from one that kept them.
+      return fail(`${name} did not start: QEMU exited or never answered QMP. The restore point was kept.`, { ports: reconciled.ports, portsChanged: reconciled.changed })
+    }
     watchWindowsInstall(name)
     await ensureWindowsConsoleRelay(name)
     return ok({
@@ -4106,7 +4126,14 @@ const handlers = {
     if (!/^[a-z0-9][a-z0-9-]{1,30}$/.test(String(spec.name || ''))) {
       throw new Error('name must be 2-31 chars: lowercase letters, digits and dashes')
     }
-    spec.memory = Math.max(spec.memory, WINDOWS_MIN_MEMORY_GB)
+    // No floor clamp: `windowsCreateManaged` decides the effective values and
+    // reports a warning when one is below the recommended default.
+    spec.windowsVersion = canonicalWindowsVersion(spec.windowsVersion)
+    // Which numbers did the caller actually choose? A default is not a request,
+    // so an omitted memory must not read as "4 GB on purpose".
+    spec.diskGiven = Number(input.diskGb) > 0
+    spec.memoryGiven = Number(input.memory) > 0
+    spec.cpuGiven = Number(input.cpu) > 0
     return withLock(spec.name, () => windowsCreateManaged(spec))
   },
 

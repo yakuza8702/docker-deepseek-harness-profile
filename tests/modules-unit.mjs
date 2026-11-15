@@ -11,7 +11,8 @@ import {
   pngSize, formatSpace, formatSpaceWarning, spaceLine, relativeToPixels, toDisplayPixels, resolutionProblem, createSpace
 } from '../docker/cua-vm-space.mjs'
 import {
-  WINDOWS_VERSIONS, WINDOWS_ISO_SOURCES, resolveWindowsIso, charToKey, parseKeySpec, generatePassword, windowsEnabled,
+  WINDOWS_VERSIONS, WINDOWS_ISO_SOURCES, resolveWindowsIso, canonicalWindowsVersion, windowsCapacityWarnings,
+  charToKey, parseKeySpec, generatePassword, windowsEnabled,
   buildQemuArgs, vncDisplayFor, vncPortFor, windowsPaths, frameSpace
 } from '../docker/cua-vm-windows-qemu.mjs'
 
@@ -102,7 +103,7 @@ await space.measure('vm')
 check('invalidate() forces a fresh measurement (resume/restart/zoom)', displayCalls === 3)
 
 // ---- windows: the spec contract ----
-check('the five Windows versions are the pinned ones', WINDOWS_VERSIONS.join(',') === '11,10,ltsc10,2022,2025', WINDOWS_VERSIONS.join(','))
+check('the six Windows versions are the pinned ones', WINDOWS_VERSIONS.join(',') === '11,11ltsc,10,ltsc10,2022,2025', WINDOWS_VERSIONS.join(','))
 check('charToKey maps ASCII to physical qcodes', charToKey('a')?.qcode === 'a' && charToKey('A')?.shift === true && charToKey('!')?.qcode === '1' && charToKey(' ')?.qcode === 'spc' && charToKey('.')?.qcode === 'dot')
 check('charToKey refuses non-ASCII (no clipboard)', charToKey('é') === null && charToKey('中') === null)
 check('parseKeySpec handles named keys and modifiers', parseKeySpec('enter').qcode === 'ret' && parseKeySpec('ctrl+c').ctrl === true && parseKeySpec('shift+tab').shiftModifier === true)
@@ -161,8 +162,8 @@ check('the VNC display number is port - 5900', vncDisplayFor(5931) === 31 && vnc
 check('a frame IS the display for the QMP path', frameSpace(png).scale === 1 && frameSpace(png).source === 'qmp')
 // K2: exactly one source has a probed public URL; the others refuse by name
 // instead of 400ing mid-download.
-check('exactly one pinned ISO source has a public URL', Object.keys(WINDOWS_ISO_SOURCES).length === 5
-  && Object.values(WINDOWS_ISO_SOURCES).filter((entry) => typeof entry.url === 'string').length === 1)
+check('exactly two pinned ISO sources have a public URL', Object.keys(WINDOWS_ISO_SOURCES).length === 6
+  && Object.values(WINDOWS_ISO_SOURCES).filter((entry) => typeof entry.url === 'string').length === 2)
 check('the pinned URL is the probed Microsoft one', WINDOWS_ISO_SOURCES['2025'].url.startsWith('https://software-static.download.prss.microsoft.com/'))
 check('a version without a public link refuses with its name and the remediation', (() => {
   try { resolveWindowsIso('11'); return false } catch (error) {
@@ -170,6 +171,20 @@ check('a version without a public link refuses with its name and the remediation
   }
 })())
 check('the probed version resolves', resolveWindowsIso('2025').url.startsWith('https://'))
+// LTSC: pinned from Microsoft's Evaluation Center link, probed 206.
+check('Windows 11 IoT LTSC 2024 is a pinned, probed source', WINDOWS_ISO_SOURCES['11ltsc'].url.includes('CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso')
+  && /2026-11-15: HTTP 206/u.test(WINDOWS_ISO_SOURCES['11ltsc'].probed))
+check('the ltsc11 alias resolves to 11ltsc', canonicalWindowsVersion('ltsc11') === '11ltsc'
+  && resolveWindowsIso('ltsc11').url === WINDOWS_ISO_SOURCES['11ltsc'].url)
+check('exactly two versions have a probed public URL', WINDOWS_VERSIONS.filter((v) => WINDOWS_ISO_SOURCES[v].url !== null).join(',') === '11ltsc,2025')
+
+// Floors are warnings, not clamps.
+check('the Windows defaults produce no warnings', windowsCapacityWarnings({ diskGb: 64, memory: 6, cpu: 2 }).length === 0)
+check('a below-floor disk warns and is not refused', (() => {
+  const warnings = windowsCapacityWarnings({ diskGb: 8, memory: 6, cpu: 2 })
+  return warnings.length === 1 && warnings[0].code === 'disk-below-floor' && /Windows Update will run out of space/u.test(warnings[0].message)
+})())
+check('a below-floor RAM and CPU warn too', windowsCapacityWarnings({ diskGb: 64, memory: 2, cpu: 1 }).map((w) => w.code).join(',') === 'memory-below-floor,cpu-below-floor')
 check('the Windows store paths are all under $STORE', Object.values(paths).every((value) => String(value).startsWith('/cua-vm/')))
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)
