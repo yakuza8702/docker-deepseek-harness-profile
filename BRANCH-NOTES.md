@@ -661,7 +661,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **299 assertions** across 16 files (the gate prints
+* `tools/check-cua-vm.mjs` — **304 assertions** across 16 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -679,7 +679,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (299 assertions / 67 needles), `ci-gates` 7/0/3, and the runtime suite in `tests/`
+green (304 assertions / 67 needles), `ci-gates` 7/0/3, and the runtime suite in `tests/`
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
 (82 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
@@ -784,6 +784,17 @@ unreserved, resume never rebuilt the preview, the status page timed from
 `createdAt`, the migration comment lied about the backend value, and the virgl
 branch was unreachable because nothing ever set the flag — it is now decided once
 at create (capability probe + render node), stored on the row and reused.
+
+### 15.8.5 Final-acceptance round
+
+Z1 was a real regression with a subtle cause: rows carry no `name` field, so the
+"skip the subject" comparison in the port reconciliation never matched and every
+Windows cold start re-allocated all three ports. The name is now passed in and
+the subject's own ports are subtracted, which the smoke proves (`portsChanged:
+false`, same triple on two consecutive starts). Z2 releases the create's port
+claim when the row is written (the row is the source of truth), Z3 derives the
+ISO allowlist through the same name normalisation the download uses, and Z4
+treats an existing raw relay as the live view when websockify is absent.
 
 ### 15.9 Review round 2
 

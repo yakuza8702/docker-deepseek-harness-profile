@@ -437,6 +437,33 @@ try {
     })())
   }
 
+  // ---- Z1/Z2: a cold start keeps a free port triple, and the claim is released ----
+  {
+    const stable = 'ws-win-stable'
+    const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    reg.vms[stable] = {
+      workspace: '/workspace', kind: 'windows', backend: 'qemu', state: 'powered-off',
+      ports: { qmp: 46996, ssh: 47995, vnc: 5994 }, diskGb: 64, cpu: 2, memory: 6,
+      installComplete: true, createdAt: new Date().toISOString()
+    }
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(reg, null, 2)}\n`)
+    const started = await call({ op: 'vmStart', name: stable })
+    // QEMU is not installed in this container, so the boot fails — but the port
+    // decision happens first, and that is what this asserts.
+    check('a cold start with free ports does not re-allocate them', started.portsChanged === false
+      && started.ports?.qmp === 46996 && started.ports?.ssh === 47995 && started.ports?.vnc === 5994, JSON.stringify(started.ports))
+    const afterRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[stable]
+    check('the row keeps its port triple', afterRow?.ports?.qmp === 46996 && afterRow?.ports?.ssh === 47995 && afterRow?.ports?.vnc === 5994)
+    // The claim set must not still own them: a second computer must be able to
+    // allocate around this one (asserted by the absence of a "ports re-allocated"
+    // decision on the *next* start).
+    const again = await call({ op: 'vmStart', name: stable })
+    check('a second start also keeps the triple', again.portsChanged === false, JSON.stringify(again.ports))
+    const regAfter = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    delete regAfter.vms[stable]
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(regAfter, null, 2)}\n`)
+  }
+
   // ---- X1: asking for the live view twice must not kill it ----
   {
     const viewName = 'ws-win-view'

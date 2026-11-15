@@ -323,9 +323,9 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **299** assertions across 16 files |
+| `node tools/check-cua-vm.mjs` | **304** assertions across 16 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
-| `node tests/supervisor-smoke.mjs` — throwaway store + stub `cua` (89 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
+| `node tests/supervisor-smoke.mjs` — throwaway store + stub `cua` (92 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
 | ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
 | `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
@@ -522,6 +522,15 @@ to it, and an `nvidia-smi` EGL handle is the host-side QEMU context.
 | X8 | `vmWindowsStatus` measured elapsed time from `createdAt` | per-attempt `startedAt`, falling back to `createdAt` for legacy rows |
 | X9 | the migration header still claimed `backend: 'windows'` is kept | the comment now states the canonical `qemu` normalisation |
 | Y1 | the virgl branch was unreachable: the install spec omitted `virgl` and the row had no field, so the post-install boot always passed `false` | the flag is computed once at create (`gpu` **and** `systemQemuSupportsVirgl()` **and** a render node), stored on the row, and reused; the docs now scope each branch |
+
+### 9.6.5 Final-acceptance round (Z1–Z4)
+
+| # | Defect | Fix |
+|---|---|---|
+| Z1 | `reconcileWindowsPorts` compared `otherName === meta.name`, but a row carries **no `name` field** — so the subject's own qmp/ssh/vnc landed in `reserved` and every cold start re-allocated the whole triple | the subject name is passed in (`reconcileWindowsPorts(name, meta)`), excluded from the reserved set, and its own ports are subtracted; the smoke asserts a cold start reports `portsChanged: false` and keeps `46996/47995/5994` |
+| Z2 | create-time claims were released only on error and on delete, never after the row was written — the comment says claims are for "rows not yet written", so they leaked | the claim triple is released in the same flow as the row write; a second start proves nothing lingers (`portsChanged: false`) |
+| Z3 | the always-keep allowlist built names with a raw `basename` while the download writes them through `isoFileName` (sanitise + digest) | the allowlist goes through `isoTargetPath`, so both sides agree by construction |
+| Z4 | with no websockify no child ever exists in `LIVE_VIEWS`, so every `view`/status tick rebuilt the relay instead of reusing it | a raw relay row that still targets this computer's VNC port **and** is listening is treated as the view (no kill, no rebuild) |
 
 ### 9.7 What is still open (TBC)
 

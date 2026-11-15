@@ -785,8 +785,12 @@ function ok(result) {
   return { ok: true, ...result }
 }
 
-function fail(error) {
-  return { ok: false, error: error instanceof Error ? error.message : String(error) }
+function fail(error, extra = null) {
+  const message = error instanceof Error ? error.message : String(error)
+  // `extra` carries diagnostics (a partial result, a changed port triple) on an
+  // answer that is otherwise a plain refusal; every existing caller passes one
+  // argument, so nothing else changes.
+  return { ok: false, error: message, ...(extra ?? {}) }
 }
 
 /**
@@ -1878,9 +1882,12 @@ async function collectGarbage({ dryRun = false } = {}) {
     const alwaysKeep = new Set([
       path.join(ISO_DIR, 'virtio-win.iso'),
       ...(process.env.DSH_CUA_WINDOWS_VIRTIO_ISO ? [path.resolve(process.env.DSH_CUA_WINDOWS_VIRTIO_ISO)] : []),
+      // Z3: through isoTargetPath, so the name is the one ensureIso actually
+      // writes (sanitised + digested); a raw basename would stop matching as
+      // soon as a URL carries a character the sanitiser rewrites.
       ...Object.values(WINDOWS_ISO_SOURCES)
         .filter((entry) => typeof entry.url === 'string')
-        .map((entry) => path.join(ISO_DIR, path.basename(decodeURIComponent(entry.url.split('/').pop()))))
+        .map((entry) => isoTargetPath(ISO_DIR, entry.url))
     ])
     const keepMs = config.shotsKeepDays * 24 * 60 * 60 * 1000
     let isos = []
@@ -2712,7 +2719,13 @@ async function ensureWindowsConsoleRelay(name) {
   if (existing !== undefined) {
     const child = LIVE_VIEWS.get(name)
     const alive = child !== undefined && child.exitCode === null && child.signalCode === null
-    if (alive) return existing
+    // Z4: without websockify no child ever exists, so "alive" could never be
+    // true and every tick rebuilt the relay. A relay row that still points at
+    // this computer's VNC port and is listening IS the view.
+    const rawRelay = existing.backend === 'relay'
+      && Number(existing.target?.port) === Number(meta.ports.vnc)
+      && existing.alive?.() === true
+    if (alive || rawRelay) return existing
     stopLiveView(name)
     closePorts(name)
   } else {
@@ -3071,6 +3084,10 @@ async function windowsCreateManaged(spec) {
       installDetail: 'Windows Setup is running (the answer file installs OpenSSH, python and dsh-cua; then the first logon provisions them)'
     }
     await mutateRegistry((fresh) => { fresh.vms[spec.name] = row })
+    // Z2: THE ROW NOW OWNS THESE PORTS. The claim existed only for the window
+    // between allocation and the row write; keeping it made every later
+    // reconcile (and every other create) see them as taken.
+    for (const port of Object.values(portTriple)) CLAIMED_WINDOWS_PORTS.delete(Number(port))
   } catch (error) {
     // Nothing half-created survives: kill the QEMU we started, stop its TPM (a
     // leaked swtpm holds the TPM state directory) and release the port claim.
@@ -3334,17 +3351,21 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
  * pressed Start) — so each port is probed and, when taken, re-allocated under
  * the same global lock the create uses.
  */
-async function reconcileWindowsPorts(meta) {
+async function reconcileWindowsPorts(name, meta) {
   const ports = { ...(meta.ports ?? {}) }
   // X5: a FREE port may still belong to another computer — a powered-off one
   // keeps its row, and a create in flight keeps an in-memory claim. Asking only
   // the OS could hand out a port another row reserves, which is exactly the
   // hostfwd collision this function exists to prevent.
+  // Z1: THE SUBJECT IS EXCLUDED BY NAME, passed in — rows carry no `name` field,
+  // so `otherName === meta.name` never matched and the computer's own triple
+  // landed in `reserved`: every cold start re-allocated all three ports.
   const reserved = new Set(CLAIMED_WINDOWS_PORTS)
   for (const [otherName, row] of Object.entries(readRegistry().vms)) {
-    if (otherName === meta.name) continue
+    if (otherName === name) continue
     for (const port of Object.values(row?.ports ?? {})) reserved.add(Number(port))
   }
+  for (const port of Object.values(ports)) reserved.delete(Number(port))
   const mine = new Set(Object.values(ports).map(Number))
   let changed = false
   for (const [key, range] of [['qmp', WINDOWS_QMP_RANGE], ['ssh', WINDOWS_SSH_RANGE], ['vnc', WINDOWS_VNC_RANGE]]) {
@@ -3408,7 +3429,7 @@ async function windowsStart(name, meta) {
     }
 
     // ---- the process is gone: reconcile ports, restore a checkpoint, boot ----
-    const reconciled = await withLock('@ports', () => reconcileWindowsPorts(current))
+    const reconciled = await withLock('@ports', () => reconcileWindowsPorts(name, current))
     const restore = current.restoreFrom
     const distrust = restore?.stale === true || current.mayBeTorn === true
     if (reconciled.changed) log(`windows: ${name} ports re-allocated (${JSON.stringify(current.ports)} → ${JSON.stringify(reconciled.ports)})`)
@@ -3447,7 +3468,9 @@ async function windowsStart(name, meta) {
         row.state = 'error'
         row.error = `could not start the Windows computer: ${error?.message ?? error}`
       })
-      return fail(`could not start ${name}: ${error?.message ?? error}`)
+      // `portsChanged` is diagnostic gold: a failed boot that also moved the
+      // port triple is a different bug from one that kept it.
+      return fail(`could not start ${name}: ${error?.message ?? error}`, { ports: reconciled.ports, portsChanged: reconciled.changed })
     }
     // H5: PROVE IT IS RUNNING BEFORE TRUSTING IT. The old code deleted
     // `restoreFrom` and reported a state captured BEFORE the boot, so a QEMU

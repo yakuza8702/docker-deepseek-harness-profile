@@ -244,7 +244,7 @@ const NEEDLES = {
     ['let running = false', 1],
     // H1/H7: per-attempt deadline, port reconciliation.
     ['row.startedAt = new Date().toISOString()', 1],
-    ['async function reconcileWindowsPorts(meta)', 1],
+    ['async function reconcileWindowsPorts(name, meta)', 1],
     // M1: the ISO cache is accounted for and GC'd.
     ['ISO_DIR', 3],
     ['report.isos.push', 1],
@@ -260,8 +260,18 @@ const NEEDLES = {
     ['windowsGui({ name, action, x, y, x2, y2, text, key, save, app, window: windowName, path: target, relative, region, scale })', 1],
     // X4: shared media is never pruned (the virtio ISO is referenced by no row).
     ['const alwaysKeep = new Set([', 1],
-    // X5: reconciliation respects other rows and in-flight claims.
+    // Z3: the allowlist uses the SAME name normalisation as the download.
+    ['isoTargetPath(ISO_DIR, entry.url)', 1],
+    // X5/Z1: reconciliation respects other rows and in-flight claims, and
+    // excludes the SUBJECT by name (rows carry no `name` field, so comparing
+    // against `meta.name` never matched and every start re-allocated).
     ['const reserved = new Set(CLAIMED_WINDOWS_PORTS)', 1],
+    ['if (otherName === name) continue', 1],
+    ['for (const port of Object.values(ports)) reserved.delete(Number(port))', 1],
+    // Z2: the row owns its ports once written; the claim is released there.
+    ['for (const port of Object.values(portTriple)) CLAIMED_WINDOWS_PORTS.delete(Number(port))', 1],
+    // Z4: without websockify an existing raw relay IS the view.
+    ["const rawRelay = existing.backend === 'relay'", 1],
     // X6: the download reserves before it writes.
     ['reserveStoreBytes(`${spec.name}/iso`, expectedBytes)', 1],
     // X7: resume rebuilds the preview.
