@@ -13,7 +13,7 @@
 #     volume as everything else.
 #
 # WHAT IT DELIBERATELY DOES NOT ADD
-#   No DinD service, no privileged sidecar, no second engine. A Windows computer
+#   No second container engine, no privileged sidecar, no extra runtime. A Windows computer
 #   is `qemu-system-x86_64` started by the SAME supervisor that runs the Linux
 #   guest: OVMF + swtpm + a qcow2 disk under /cua-vm, QMP and VNC on loopback,
 #   and SLIRP networking. The harness keeps cap_drop ALL, read-only rootfs and

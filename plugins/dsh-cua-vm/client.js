@@ -275,7 +275,7 @@ window.__ModuleLoader__.load({
         const windows = draft.kind === 'windows'
         setPending({ name: draft.name, action: 'create' })
         setNote(windows
-          ? `Creating ${draft.name} (Windows ${draft.windowsVersion})… the container starts installing at once and the first boot re-partitions a 64 GB disk, so this is tens of minutes. The computer lists as installing; the panel follows the log.`
+          ? `Creating ${draft.name} (Windows ${draft.windowsVersion})… QEMU starts the install at once and the first boot re-partitions a 64 GB disk, so this is tens of minutes. The computer lists as installing until SSH answers; the panel follows the serial log.`
           : `Creating ${draft.name}${draft.gpu === true ? ' with GPU' : ''}${draft.android ? ' + Android SDK' : ''}${draft.rea ? ' + REA' : ''}… the first start also provisions the guest (a minute or two).${draft.rea ? ' The REA kit adds several minutes for Node 22, rea-agents, a JDK, Ghidra and JADX.' : ''}`)
         try {
           await api('create', windows
@@ -592,7 +592,7 @@ window.__ModuleLoader__.load({
                   // SHUTDOWN and SUSPEND are different promises. Shutdown is the
                   // real ACPI power-off (checkpoint, sandbox removed, Start cold
                   // boots); suspend keeps the sandbox and resumes instantly. A
-                  // Windows container only has the first.
+                  // A Windows computer only has the live view.
                   ready && h('button', {
                     type: 'button', style: S.button, disabled: busy,
                     onClick: () => {
@@ -601,7 +601,7 @@ window.__ModuleLoader__.load({
                     }
                   }, busy && busyLabel !== null ? busyLabel : 'Shutdown'),
                   // Both kinds can be suspended: `cua sb suspend` on Linux,
-                  // `docker pause` on Windows (the tool says which).
+                  // QMP stop on Windows (the tool says which).
                   ready && h('button', {
                     type: 'button', style: S.button, disabled: busy,
                     onClick: () => void act(name, `Suspending ${name}…`, 'suspend', { name })
@@ -686,7 +686,7 @@ window.__ModuleLoader__.load({
             'Suspend idle computers automatically'
           ),
           field('idleSuspendMinutes', 'Idle timeout (minutes)', '0 disables. Checked every minute; a running command postpones it.'),
-          field('diskQuotaGb', 'Disk Size (GB)', 'Base image + QEMU + every disk, checkpoint, screenshot and Windows container in the store. A create that would exceed it is refused before it starts.'),
+          field('diskQuotaGb', 'Disk Size (GB)', 'Base image + QEMU + every disk, checkpoint, screenshot and the shared ISO cache in the store. A create that would exceed it is refused before it starts.'),
           field('maxRunning', 'Max running computers', 'Shutdown frees a slot, disks are untouched.'),
           field('shutdownTimeoutSec', 'Shutdown timeout (seconds)', 'How long an ACPI powerdown may take before the QMP quit forces it. 120 is right for a slow init.'),
           h('label', { style: { display: 'grid', gap: 4, fontSize: 13 } },

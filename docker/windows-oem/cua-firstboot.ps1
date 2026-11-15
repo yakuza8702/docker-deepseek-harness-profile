@@ -22,7 +22,7 @@
   NOT derived from it — `vmWindowsStatus` waits for the SSH banner, which only
   exists once the `openssh` step has run.
 #>
-param([string]$Mode = 'Setup')
+param([switch]$Force)
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
@@ -32,8 +32,26 @@ $log = Join-Path $logDir 'cua-firstboot.log'
 function Say([string]$m) { "$(Get-Date -Format o) $m" | Tee-Object -FilePath $log -Append }
 
 $marker = 'C:\cua-provision.json'
+
+# THIS SCRIPT RUNS TWICE: once as SYSTEM from setupcomplete.cmd (the end of
+# Setup) and once as `cua` from FirstLogonCommands. Installing OpenSSH, python
+# and the scheduled task twice is wasteful at best and fights itself at worst
+# (a second `pip install` while the first holds the wheel cache, a second
+# Register-ScheduledTask on a running one). The marker makes it idempotent: a
+# stage that already succeeded is SKIPPED, and -Force re-runs everything.
 $state = @{ started = (Get-Date).ToString('o'); steps = @() }
+if (Test-Path $marker) {
+  try {
+    $previous = Get-Content $marker -Raw | ConvertFrom-Json
+    if ($previous -and $previous.steps) { $state.steps = @($previous.steps) }
+  } catch { Say "marker unreadable, starting fresh: $($_.Exception.Message)" }
+}
+$done = @{}
+foreach ($step in $state.steps) { if ($step.ok -eq $true) { $done[$step.step] = $true } }
+if ($Force) { $done = @{}; $state.steps = @() }
+
 function Step([string]$name, [scriptblock]$body) {
+  if ($done.ContainsKey($name)) { Say "== $name (already done, skipped)"; return }
   Say "== $name"
   try {
     & $body
@@ -43,6 +61,17 @@ function Step([string]$name, [scriptblock]$body) {
     $state.steps += @{ step = $name; ok = $false; error = $_.Exception.Message }
   }
   $state | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $marker
+}
+
+# M2: `Get-Command python` on Windows 11 happily returns the WindowsApps
+# App Execution Alias — a 0-byte stub that opens the Store instead of running
+# Python. Installing "succeeded", pip then failed, and the whole dsh-cua step
+# died. Only a real interpreter (outside \WindowsApps) counts.
+function Get-RealPython {
+  foreach ($candidate in @(Get-Command python -All -ErrorAction SilentlyContinue)) {
+    if ($candidate.Source -and $candidate.Source -notmatch '\\WindowsApps\\') { return $candidate.Source }
+  }
+  return $null
 }
 
 Step 'openssh' {
@@ -80,18 +109,21 @@ Step 'openssh' {
 }
 
 Step 'python' {
-  if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+  $py = Get-RealPython
+  if (-not $py) {
     $installer = Join-Path $env:TEMP 'python-setup.exe'
     Invoke-WebRequest -Uri '{{PYTHON_URL}}' -OutFile $installer -UseBasicParsing
     Start-Process -FilePath $installer -ArgumentList '/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1 Include_test=0' -Wait
     $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    $py = Get-RealPython
   }
-  $py = (Get-Command python -ErrorAction Stop).Source
+  if (-not $py) { throw 'no real python after install (only the WindowsApps App Execution Alias?)' }
   Say "python: $py"
 }
 
 Step 'dsh-cua' {
-  $py = (Get-Command python -ErrorAction Stop).Source
+  $py = Get-RealPython
+  if (-not $py) { throw 'python is missing: the python step did not produce a real interpreter' }
   & $py -m pip install --disable-pip-version-check --no-input '{{DSH_CUA_PIP}}'
   $mod = & $py -c "import importlib.util,sys; print('yes' if importlib.util.find_spec('dsh_cua') else 'no')"
   if ($mod.Trim() -ne 'yes') { throw 'dsh-cua did not import after pip install' }
@@ -101,7 +133,8 @@ Step 'autostart-task' {
   # THE INTERACTIVE SESSION. `dsh-cua-server` opens a local named pipe; the SSH
   # side (Session 0, no desktop) proxies stdio to it. A task that runs "at
   # logon" of the cua user is the only way to guarantee the desktop session.
-  $py = (Get-Command python -ErrorAction Stop).Source
+  $py = Get-RealPython
+  if (-not $py) { throw 'python is missing: cannot register the dsh-cua task' }
   $action = New-ScheduledTaskAction -Execute $py -Argument '-m dsh_cua.server --pipe \\.\pipe\dsh-cua'
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User 'cua'
   $principal = New-ScheduledTaskPrincipal -UserId 'cua' -LogonType Interactive -RunLevel Highest

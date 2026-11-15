@@ -57,7 +57,7 @@ import {
   createWindowsBackend, windowsEnabled, windowsHostCaps,
   WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
   WINDOWS_MIN_CPU, WINDOWS_USERNAME, WINDOWS_QEMU,
-  windowsPaths, ensureIso, writeOemPayload, generatePassword, frameSpace
+  windowsPaths, ensureIso, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso
 } from './cua-vm-windows-qemu.mjs'
 
 const SOCK = process.env.CUA_SUPERVISOR_SOCK || '/tmp/cua-vm/supervisor.sock'
@@ -183,7 +183,11 @@ const ACCOUNTED_PATHS = () => [
   path.join(CUA_HOME, '.cua'),
   CHECKPOINT_DIR,
   path.join(STORE, 'shots'),
-  WINDOWS_DIR
+  WINDOWS_DIR,
+  // M1: the ISO cache is the LARGEST thing in a Windows store (5.5 GB per
+  // version + the optional virtio-win ISO). It used to be invisible to the
+  // quota: ~25 GB could sit there while the panel showed "0 used".
+  ISO_DIR
 ]
 
 /** Bytes under one path, via du (fast, sparse-aware) or 0 when it is absent. */
@@ -524,12 +528,16 @@ const VM_KINDS = new Set(['linux', 'windows'])
  */
 function migrateRegistryRow(row) {
   const record = row && typeof row === 'object' ? row : {}
-  const windows = record.kind === 'windows' || record.backend === 'windows'
+  const windows = record.kind === 'windows' || record.backend === 'windows' || record.backend === 'qemu'
   const kind = windows ? 'windows' : (VM_KINDS.has(record.kind) ? record.kind : 'linux')
   return {
     ...record,
     kind,
-    backend: windows ? 'windows' : 'linux',
+    // L2: ONE canonical value per kind. A created row writes `qemu`; a migrated
+    // v1 row used to keep `windows`, so `vmList` and the doctor could disagree
+    // about what backend a computer had. `qemu` is canonical for Windows (it is
+    // what the code drives), `linux` for the cua guest.
+    backend: windows ? 'qemu' : 'linux',
     ...(windows
       ? { windowsVersion: String(record.windowsVersion || '11'), windowsIso: String(record.windowsIso || '') }
       : { image: String(record.image || 'linux'), tier: String(record.tier || 'slim') })
@@ -643,6 +651,8 @@ async function migrateRegistryFile() {
  * supervisor, which is the one process that has to read it anyway.
  */
 const WINDOWS_DIR = path.join(STORE, 'windows')
+/** Downloaded install media hold: shared by every computer, counted by the quota. */
+const ISO_DIR = path.join(STORE, 'iso')
 
 function windowsCredentialsPath(name) {
   return path.join(WINDOWS_DIR, assertVmName(name), 'credentials.json')
@@ -1654,10 +1664,18 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
     const already = readRegistry().vms[name]
     const windowsStore = path.join(WINDOWS_DIR, name)
     if (already?.kind !== 'windows' && !existsSync(windowsStore)) return
+    // H6: CHECK LIVENESS BEFORE ANYTHING IS KILLED OR UNLINKED. The first
+    // version killed the process and THEN asked whether it was alive, which is
+    // always false — so the guard never fired.
+    const windowsPid = windowsBackend.qemuPid(name)
+    if (windowsBackend.pidAlive(windowsPid)) {
+      record(windowsStore, 'skipped', `QEMU (pid ${windowsPid}) is still running; its disk is not deleted under it — stop it with cua_vm_shutdown and delete again`)
+      return
+    }
     if (deleteContainer) {
       try {
         windowsBackend.kill(name)
-        record('windows qemu', 'stopped', 'process and swtpm stopped')
+        record('windows qemu', 'stopped', 'no live qemu; swtpm stopped')
       } catch (error) {
         record('windows qemu', 'failed', error?.message ?? String(error))
       }
@@ -1768,7 +1786,7 @@ async function collectGarbage({ dryRun = false } = {}) {
   return withLock('@gc', async () => {
     const config = readConfig()
     let registry = readRegistry()
-    const report = { checkpoints: [], shots: [], views: [], ports: [], orphans: [], sandboxes: [], bytesFreed: 0, errors: [] }
+    const report = { checkpoints: [], shots: [], views: [], ports: [], orphans: [], isos: [], sandboxes: [], bytesFreed: 0, errors: [] }
     const remove = (file, bytes) => {
       if (!dryRun) {
         try { unlinkSync(file) } catch (error) { report.errors.push(`${file}: ${error.message}`); return }
@@ -1842,6 +1860,42 @@ async function collectGarbage({ dryRun = false } = {}) {
         report.sandboxes.push({ name: vmName, status: String(row?.status ?? row?.phase ?? 'unknown') })
       }
     }
+
+  // 2b. M1: the ISO cache. It is counted by the quota now, but nothing ever
+  // removed from it: five versions plus virtio-win is ~25 GB that survives every
+  // delete. An ISO no row references and that is older than the retention
+  // policy is reported (and removed unless this is a dry run).
+  {
+    const referenced = new Set(Object.values(readRegistry().vms)
+      .map((row) => row?.isoPath)
+      .filter((value) => typeof value === 'string' && value !== ''))
+    const keepMs = config.shotsKeepDays * 24 * 60 * 60 * 1000
+    let isos = []
+    try { isos = readdirSync(ISO_DIR).filter((file) => file.endsWith('.iso') || file.endsWith('.iso.part')) } catch {}
+    for (const file of isos) {
+      const absolute = path.join(ISO_DIR, file)
+      if (referenced.has(absolute)) continue
+      let ageMs = 0
+      let bytes = 0
+      try {
+        const info = statSync(absolute)
+        ageMs = Date.now() - info.mtimeMs
+        bytes = info.size
+      } catch {
+        continue
+      }
+      if (ageMs < keepMs) continue
+      report.isos.push({ file: absolute, bytes, ageDays: Math.round(ageMs / 86400000) })
+      if (!dryRun) {
+        try {
+          unlinkSync(absolute)
+          report.bytesFreed += bytes
+        } catch (error) {
+          report.errors.push(`${absolute}: ${error.message}`)
+        }
+      }
+    }
+  }
 
     // Every entry in the checkpoint directory, grouped by the computer name.
     let entries = []
@@ -2594,6 +2648,26 @@ async function startFromCheckpoint(name, meta) {
  * websockify child, so the relay would be reopened to a port nobody listens on
  * and every request would 502 while the message said "reopened".
  */
+/**
+ * Mark the Windows restore point unusable after a shutdown that left QEMU
+ * running — the same semantics as the Linux abandoned branch: `stale` +
+ * `staleReason` + `mayBeTorn` + a `lastShutdown` record, in ONE write.
+ */
+async function markWindowsShutdownAbandoned(name, because) {
+  let marked = false
+  await mutateRegistry((fresh) => {
+    const row = fresh.vms[name]
+    if (!row) return
+    row.lastShutdown = { at: new Date().toISOString(), method: 'abandoned', reason: 'shutdown', error: because }
+    row.mayBeTorn = true
+    if (row.restoreFrom?.kind === 'checkpoint') {
+      row.restoreFrom = { ...row.restoreFrom, stale: true, staleReason: `shutdown abandoned while QEMU held the disk (${because})` }
+      marked = true
+    }
+  })
+  return marked
+}
+
 async function replaceLiveView(name, preview) {
   try {
     const relay = await ensureWindowsConsoleRelay(name)
@@ -2606,6 +2680,14 @@ async function replaceLiveView(name, preview) {
 }
 
 async function ensureWindowsConsoleRelay(name) {
+  // A live view that is already up is reused; a STALE child (or one from a
+  // previous boot) is killed before a new one is spawned, otherwise the old
+  // websockify keeps the port and LIVE_VIEWS silently forgets it.
+  if (LIVE_VIEWS.has(name)) {
+    const previous = LIVE_VIEWS.get(name)
+    try { previous?.kill('SIGTERM') } catch {}
+    LIVE_VIEWS.delete(name)
+  }
   const registry = readRegistry()
   const meta = registry.vms[name]
   if (!meta?.ports?.vnc) return null
@@ -2650,6 +2732,11 @@ async function ensureWindowsConsoleRelay(name) {
 /** websockify children, one per computer, killed with it. */
 const LIVE_VIEWS = new Map()
 
+/**
+ * Close the live view: the relay AND the websockify behind it. A preview that
+ * "closed" while its child kept the VNC port busy blocks the next open with
+ * EADDRINUSE (and the port would answer with a stale framebuffer).
+ */
 function stopLiveView(name) {
   const child = LIVE_VIEWS.get(name)
   LIVE_VIEWS.delete(name)
@@ -2719,54 +2806,65 @@ function watchWindowsInstall(name) {
     try {
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 15000))
-        const registry = readRegistry()
-        const meta = registry.vms[name]
-        if (!meta || meta.kind !== 'windows') return
-        const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
-        const started = Date.parse(meta.createdAt || '') || Date.now()
-        const elapsedMinutes = Math.round((Date.now() - started) / 60000)
-        let verdict
-        try {
-          verdict = await windowsBackend.ready(meta, { ssh: meta.ssh !== false })
-        } catch (error) {
-          verdict = { ready: false, error: error?.message ?? String(error) }
-        }
-        if (verdict.ready) {
+        // THE TICK BELONGS INSIDE THE LOCK. This loop used to write the row from
+        // outside it, so a tick that started before a shutdown could land after
+        // it and clobber `powered-off` with `installing` (and the same for
+        // suspend). Inside the lock, and guarded on the CURRENT state, a tick can
+        // only touch a computer that is still installing.
+        const decision = await withVmLock(name, async () => {
+          const meta = readRegistry().vms[name]
+          if (!meta || meta.kind !== 'windows') return { stop: true }
+          if (meta.state !== 'installing' && meta.state !== 'booting') return { stop: true, reason: `state is ${meta.state}` }
+          // H1: the deadline is per START ATTEMPT. Using createdAt made every
+          // restart of an old computer "timed out" on the first tick.
+          const started = Date.parse(meta.startedAt || meta.createdAt || '') || Date.now()
+          const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
+          const elapsedMinutes = Math.round((Date.now() - started) / 60000)
+          let verdict
+          try {
+            verdict = await windowsBackend.ready(meta, { ssh: meta.ssh !== false, phase: 'install' })
+          } catch (error) {
+            verdict = { ready: false, error: error?.message ?? String(error) }
+          }
+          if (verdict.ready) {
+            await mutateRegistry((fresh) => {
+              const row = fresh.vms[name]
+              if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
+              row.state = 'ready'
+              row.endpoint = verdict.endpoint
+              row.installComplete = true
+              row.installDetail = `ready (${verdict.endpoint} accepting, QMP running)`
+              delete row.error
+              delete row.errorLog
+              delete row.startedAt
+            })
+            return { stop: true, ready: true }
+          }
+          if (elapsedMinutes > timeoutMinutes) {
+            const tail = windowsLogTail(name, 40)
+            await mutateRegistry((fresh) => {
+              const row = fresh.vms[name]
+              if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
+              row.state = 'error'
+              row.error = `the Windows install did not become ready within ${timeoutMinutes} minutes (${verdict.error ?? 'SSH did not answer'})`
+              row.errorLog = tail.slice(-4000)
+            })
+            return { stop: true, timedOut: true }
+          }
           await mutateRegistry((fresh) => {
             const row = fresh.vms[name]
-            if (!row) return
-            row.state = 'ready'
-            row.endpoint = verdict.endpoint
-            // THE INSTALL IS OVER. Without this, `windowsStart` recomputes
-            // installPending from a flag that never became true and re-attaches
-            // the install ISO on every later start.
-            row.installComplete = true
-            row.installDetail = `ready (${verdict.endpoint} accepting, QMP running)`
-            delete row.error
-            delete row.errorLog
+            if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
+            row.state = 'installing'
+            row.installDetail = `installing (${elapsedMinutes} min): ${verdict.endpoint === 'none' ? 'no SSH yet' : `${verdict.endpoint} answering`}, QMP ${verdict.status || 'not running'}`
           })
-          await ensureWindowsConsoleRelay(name)
-          log(`windows: ${name} ready via ${verdict.endpoint}`)
-          return
-        }
-        if (elapsedMinutes > timeoutMinutes) {
-          const tail = windowsLogTail(name, 40)
-          await mutateRegistry((fresh) => {
-            const row = fresh.vms[name]
-            if (!row) return
-            row.state = 'error'
-            row.error = `the Windows install did not become ready within ${timeoutMinutes} minutes (${verdict.error ?? verdict.endpoint ?? 'no endpoint answered'})`
-            row.errorLog = tail.slice(-4000)
-          })
-          log(`windows: ${name} install timed out after ${timeoutMinutes} min`)
-          return
-        }
-        await mutateRegistry((fresh) => {
-          const row = fresh.vms[name]
-          if (!row) return
-          row.state = 'installing'
-          row.installDetail = `installing (${elapsedMinutes} min): ${verdict.endpoint === 'none' ? 'no endpoint yet' : `${verdict.endpoint} answering`}, QMP ${verdict.status || 'not running'}`
+          return { stop: false }
         })
+        if (decision.stop) {
+          if (decision.ready) await ensureWindowsConsoleRelay(name)
+          if (decision.reason !== undefined) log(`windows: install watch for ${name} stopped (${decision.reason})`)
+          if (decision.ready) log(`windows: ${name} ready`)
+          return
+        }
       }
     } catch (error) {
       log(`windows: install watch for ${name} stopped (${error?.message ?? error})`)
@@ -2846,7 +2944,10 @@ async function windowsCreateManaged(spec) {
     if (spec.windowsIso !== '' && !/^https?:\/\//iu.test(spec.windowsIso)) {
       isoPath = path.isAbsolute(spec.windowsIso) ? spec.windowsIso : path.resolve(STORE, spec.windowsIso)
     } else {
-      const url = spec.windowsIso !== '' ? spec.windowsIso : WINDOWS_ISO_SOURCES[spec.windowsVersion].url
+      // K2: a version without a probed public link refuses HERE, with the
+      // version named and both remediations, instead of 400ing inside the
+      // download after the quota was reserved.
+      const url = spec.windowsIso !== '' ? spec.windowsIso : resolveWindowsIso(spec.windowsVersion).url
       const downloaded = await ensureIso({
         url,
         isoDir: paths.isoDir,
@@ -2976,6 +3077,19 @@ function sshBaseArgs(meta) {
 }
 
 /** Quote for cmd.exe (double quotes; no single-quote convention). */
+/**
+ * A Windows guest path that reaches `scp` must not contain cmd.exe
+ * metacharacters: the remote side is `cmd.exe /c scp`-ish, and a path with `&`
+ * or `"` re-parses as a second command. Absolute drive paths only (C:\…).
+ */
+function assertWindowsGuestPath(guest) {
+  const text = String(guest ?? '')
+  if (text === '') throw new Error('guest path is required')
+  if (/["&|<>^]/u.test(text)) throw new Error(`guest path contains a shell metacharacter: ${guest} (quotes, &, |, <, >, ^ are refused on a Windows computer)`)
+  if (!/^[A-Za-z]:[\\/]/u.test(text)) throw new Error(`guest path must be an absolute Windows path such as C:\\Users\\cua\\file.txt (got ${guest})`)
+  return text
+}
+
 function quoteForWindows(value) {
   const text = String(value)
   return /\s/u.test(text) ? `"${text.replace(/"/gu, '""')}"` : text
@@ -3019,9 +3133,16 @@ function scpRun(meta, localPath, guestPath, { direction }) {
     ]
     const child = spawn('/usr/bin/scp', args, { stdio: ['ignore', 'ignore', 'pipe'] })
     let stderr = ''
+    let timedOut = false
+    // M5: scp had NO timeout, so an unresponsive guest hung cua_vm_put/get
+    // forever (the Linux path caps at 600 s).
+    const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL') } catch {} }, Number(process.env.DSH_CUA_WIN_SCP_TIMEOUT_MS || 300000))
     child.stderr.on('data', (chunk) => { stderr += chunk })
-    child.on('error', (error) => resolve({ code: -1, stderr: `${error?.message ?? error}` }))
-    child.on('close', (code) => resolve({ code: code ?? -1, stderr }))
+    child.on('error', (error) => { clearTimeout(timer); resolve({ code: -1, stderr: `${error?.message ?? error}` }) })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      resolve({ code: timedOut ? 124 : (code ?? -1), stderr: timedOut ? `${stderr}\nscp timed out` : stderr })
+    })
   })
 }
 
@@ -3036,7 +3157,7 @@ const WINDOWS_NO_AGENT = (tool) => `cua_vm_${tool} needs the guest SSH server, w
  * guest draws, and nothing equivalent exists on Windows — the real pointer is
  * what the frame shows (and what VNC draws for a human).
  */
-async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relative }) {
+async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relative, region = null, scale = 1 }) {
   if (typeof save === 'string' && save !== '') {
     return fail('`save` is not available for Windows computers: the frame is written into the workspace, and there is no guest filesystem to save a path into. Use the returned workspace path or the live view.')
   }
@@ -3053,12 +3174,35 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
       const hostFile = path.join(SHOTS_DIR, `${name}-${stamp}.png`)
       const artifact = path.join(WINDOWS_ARTIFACT_DIR, `${name}-${stamp}.png`)
       writeFileSync(hostFile, frame.png)
+      // M7: the region crop the Linux path has. The model should not have to
+      // crop a 1024x768 frame by hand (and lose the coordinate mapping doing it).
+      let pngOut = frame.png
+      let mapping = ''
+      const area = region === null || region === undefined ? null : region
+      if (area !== null) {
+        const rx = Math.max(0, Math.round(Number(area.x) || 0))
+        const ry = Math.max(0, Math.round(Number(area.y) || 0))
+        const rw = Math.max(16, Math.min(4096, Math.round(Number(area.width ?? area.w) || 320)))
+        const rh = Math.max(16, Math.min(4096, Math.round(Number(area.height ?? area.h) || 200)))
+        const zoom = Math.max(1, Math.min(4, Number(area.scale ?? scale ?? 1) || 1))
+        const cropped = path.join(SHOTS_DIR, `${name}-${stamp}-crop.png`)
+        try {
+          execFileSync('/usr/bin/convert', [hostFile, '-crop', `${rw}x${rh}+${rx}+${ry}`, '+repage', '-resize', `${Math.round(zoom * 100)}%`, cropped], { timeout: 30000 })
+          pngOut = readFileSync(cropped)
+          mapping = `crop ${rw}x${rh} at frame (${rx},${ry}) magnified ${zoom}x → this image is only for reading: to click, divide by ${zoom} and add the origin, i.e. click at (${rx} + px/${zoom}, ${ry} + py/${zoom}).\n`
+        } catch (error) {
+          // No ImageMagick in the image is a real possibility: say so instead of
+          // silently returning the full frame as if it were the crop.
+          mapping = `crop unavailable (${error?.message ?? error}); the FULL frame is below, so click using display coordinates.\n`
+        }
+      }
       copyFileSync(hostFile, artifact)
       return ok({
         name,
         action,
-        png: frame.png.toString('base64'),
+        png: pngOut.toString('base64'),
         output: `${formatSpace(measured)} (QMP screendump: the PNG IS the display, no capture budget)\n`
+          + mapping
           + `the frame is in the workspace at ${artifact} — image px = display px, and clicks take the same pixels.\n`
           + 'Windows limits: no clipboard, no accessibility tree, no window list, no cursor overlay (the real pointer is in the frame). For element-level actions use the dsh-cua tools once the guest is ready.'
       })
@@ -3132,17 +3276,80 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
  *   installing    nothing to do but keep watching
  * A computer whose process died is re-booted from its own disk, never rebuilt.
  */
+/**
+ * Ports that a previous run left behind, or that something else grabbed while
+ * this computer was off. A stale row must not boot QEMU onto an occupied socket
+ * (it fails with "Could not set up host forwarding rule", long after the user
+ * pressed Start) — so each port is probed and, when taken, re-allocated under
+ * the same global lock the create uses.
+ */
+async function reconcileWindowsPorts(meta) {
+  const ports = { ...(meta.ports ?? {}) }
+  let changed = false
+  for (const [key, range] of [['qmp', WINDOWS_QMP_RANGE], ['ssh', WINDOWS_SSH_RANGE], ['vnc', WINDOWS_VNC_RANGE]]) {
+    const value = Number(ports[key])
+    if (Number.isFinite(value) && value > 0 && await portIsFree(value)) continue
+    ports[key] = await (async () => {
+      for (let port = range[0]; port < range[1]; port += 1) {
+        if (await portIsFree(port)) return port
+      }
+      throw new Error(`no free port in ${range[0]}-${range[1]} for the Windows computer`)
+    })()
+    changed = true
+  }
+  return { ports, changed }
+}
+
 async function windowsStart(name, meta) {
   assertVmName(name)
-  const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
-  const verdict = await windowsBackend.probe(meta)
-  const registry = readRegistry()
-  if (!verdict.alive) {
-    // A checkpoint is only a restore point if Start USES it. For Windows that
-    // means converting it back over `disk.qcow2` before boot; a stale or torn
-    // one is not trusted, exactly like the Linux path.
-    const restore = meta.restoreFrom
-    const distrust = restore?.stale === true || meta.mayBeTorn === true
+  // THE SAME LOCK AS EVERY OTHER LIFECYCLE OP. Without it two concurrent Starts
+  // both saw a dead QEMU, both spawned one, and the second `-pidfile` write left
+  // the first process unkillable by name.
+  return withVmLock(name, async () => {
+    const current = readRegistry().vms[name]
+    if (!current) return fail(`no computer named "${name}"`)
+    const verdict = await windowsBackend.probe(current)
+
+    if (verdict.alive) {
+      // A live process is never started twice.
+      if (verdict.status === 'paused' || verdict.status === 'suspended' || current.state === 'suspended') {
+        await windowsBackend.unpause(current)
+        await mutateRegistry((fresh) => {
+          const row = fresh.vms[name]
+          if (!row) return
+          row.state = 'ready'
+          row.lastUsed = new Date().toISOString()
+          delete row.startedAt
+        })
+        // M6: a suspended computer lost its live view with the relay; rebuild it.
+        await ensureWindowsConsoleRelay(name)
+        return ok({ name, state: 'ready', kind: 'windows', detail: 'unpaused (suspend kept the guest exactly as it was)' })
+      }
+      const ready = await windowsBackend.ready(current, { ssh: current.ssh !== false })
+      if (ready.ready) {
+        await mutateRegistry((fresh) => {
+          const row = fresh.vms[name]
+          if (!row) return
+          row.state = 'ready'
+          row.endpoint = ready.endpoint
+          row.installComplete = true
+          row.lastUsed = new Date().toISOString()
+          delete row.error
+          row.installDetail = `ready (${ready.endpoint} accepting, QMP running)`
+        })
+        await ensureWindowsConsoleRelay(name)
+        return ok({ name, state: 'ready', kind: 'windows', console: `/vm/port/${name}/`, detail: ready.endpoint })
+      }
+      watchWindowsInstall(name)
+      await ensureWindowsConsoleRelay(name)
+      return ok({ name, state: 'booting', kind: 'windows', detail: `QMP running, ${ready.endpoint === 'none' ? 'no endpoint answers yet' : `${ready.endpoint} answering`}` })
+    }
+
+    // ---- the process is gone: reconcile ports, restore a checkpoint, boot ----
+    const reconciled = await withLock('@ports', () => reconcileWindowsPorts(current))
+    const restore = current.restoreFrom
+    const distrust = restore?.stale === true || current.mayBeTorn === true
+    if (reconciled.changed) log(`windows: ${name} ports re-allocated (${JSON.stringify(current.ports)} → ${JSON.stringify(reconciled.ports)})`)
     if (restore?.kind === 'checkpoint' && distrust !== true && existsSync(restore.file)) {
       const target = windowsPaths(STORE, name).disk
       const staged = `${target}.restore.qcow2`
@@ -3157,19 +3364,19 @@ async function windowsStart(name, meta) {
     } else if (restore?.kind === 'checkpoint' && distrust) {
       log(`start: ${name} refuses its ${restore.stale === true ? 'stale' : 'torn'} checkpoint; booting the existing disk`)
     }
-    const installPending = !existsSync(windowsPaths(STORE, name).disk)
-      || meta.installComplete !== true
+    const installPending = !existsSync(windowsPaths(STORE, name).disk) || current.installComplete !== true
     try {
       await windowsBackend.boot({
         name,
-        cpu: meta.cpu,
-        memory: meta.memory,
-        gpu: meta.gpu === true,
+        cpu: current.cpu,
+        memory: current.memory,
+        gpu: current.gpu === true,
+        virgl: current.virgl === true,
         paths: windowsPaths(STORE, name),
-        isoPath: meta.isoPath,
-        qmpPort: meta.ports.qmp,
-        vncPort: meta.ports.vnc,
-        sshPort: meta.ports.ssh
+        isoPath: current.isoPath,
+        qmpPort: reconciled.ports.qmp,
+        vncPort: reconciled.ports.vnc,
+        sshPort: reconciled.ports.ssh
       }, { installPending })
     } catch (error) {
       await mutateRegistry((fresh) => {
@@ -3180,52 +3387,43 @@ async function windowsStart(name, meta) {
       })
       return fail(`could not start ${name}: ${error?.message ?? error}`)
     }
-    await mutateRegistry((fresh) => {
-      const row = fresh.vms[name]
-      if (!row) return
-      row.state = installPending ? 'installing' : 'booting'
-      row.installDetail = installPending ? 'Windows Setup is running' : 'the guest is booting'
-      row.lastUsed = new Date().toISOString()
-      delete row.restoreFrom
-      delete row.mayBeTorn
-    })
-    watchWindowsInstall(name)
-    await ensureWindowsConsoleRelay(name)
-    return ok({ name, state: registry.vms[name]?.state ?? 'booting', kind: 'windows', detail: installPending ? 'Windows Setup is running again' : 'the guest is booting from its disk' })
-  }
-  if (verdict.status === 'paused' || verdict.status === 'suspended' || meta.state === 'suspended') {
-    await windowsBackend.unpause(meta)
-    await mutateRegistry((fresh) => {
-      const row = fresh.vms[name]
-      if (!row) return
-      row.state = 'ready'
-      row.lastUsed = new Date().toISOString()
-    })
-    await ensureWindowsConsoleRelay(name)
-    return ok({ name, state: 'ready', kind: 'windows', detail: 'unpaused (suspend kept the guest exactly as it was)' })
-  }
-  if (verdict.status === 'running') {
-    const ready = await windowsBackend.ready(meta, { ssh: meta.ssh !== false })
-    if (ready.ready) {
-      await mutateRegistry((fresh) => {
-        const row = fresh.vms[name]
-        if (!row) return
-        row.state = 'ready'
-        row.endpoint = ready.endpoint
-        row.installComplete = true
-        row.lastUsed = new Date().toISOString()
-        delete row.error
-        row.installDetail = `ready (${ready.endpoint} accepting, QMP running)`
-      })
-      await ensureWindowsConsoleRelay(name)
-      return ok({ name, state: 'ready', kind: 'windows', console: `/vm/port/${name}/`, detail: ready.endpoint })
+    // H5: PROVE IT IS RUNNING BEFORE TRUSTING IT. The old code deleted
+    // `restoreFrom` and reported a state captured BEFORE the boot, so a QEMU
+    // that died on a bad argv looked started and lost its restore point.
+    let running = false
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const state = await windowsBackend.probe({ ...current, ports: reconciled.ports })
+      if (state.alive && state.status === 'running') { running = true; break }
+      if (!state.alive && attempt > 2) break
+      await new Promise((resolve) => setTimeout(resolve, 500))
     }
+    const bootState = !running ? 'error' : (installPending ? 'installing' : 'booting')
+    await mutateRegistry((fresh) => {
+      const row = fresh.vms[name]
+      if (!row) return
+      row.ports = reconciled.ports
+      row.state = bootState
+      row.startedAt = new Date().toISOString()
+      row.lastUsed = new Date().toISOString()
+      if (running) {
+        delete row.restoreFrom
+        delete row.mayBeTorn
+        row.installDetail = installPending ? 'Windows Setup is running' : 'the guest is booting'
+      } else {
+        row.error = 'QEMU started but did not reach `running` (see its serial log)'
+      }
+    })
+    if (!running) return fail(`${name} did not start: QEMU exited or never answered QMP. The restore point was kept.`)
     watchWindowsInstall(name)
     await ensureWindowsConsoleRelay(name)
-    return ok({ name, state: 'booting', kind: 'windows', detail: `QMP running, ${ready.endpoint === 'none' ? 'no endpoint answers yet' : `${ready.endpoint} answering`}` })
-  }
-  watchWindowsInstall(name)
-  return ok({ name, state: 'installing', kind: 'windows', detail: `QMP ${verdict.status || 'not answering'}` })
+    return ok({
+      name,
+      state: bootState,
+      kind: 'windows',
+      console: `/vm/port/${name}/`,
+      detail: installPending ? 'Windows Setup is running again' : 'the guest is booting from its disk'
+    })
+  })
 }
 
 async function windowsEnsure(name, meta) {
@@ -3250,17 +3448,21 @@ async function windowsShutdown(name, meta) {
   try {
     outcome = await windowsBackend.shutdown(meta, { timeoutMs: config.shutdownTimeoutSec * 1000 })
   } catch (error) {
-    // `stopLiveView` killed websockify, so reopening the relay alone would point
-    // at a dead target. Rebuild the whole view, and only CLAIM it worked when it
-    // did.
+    // H4: THE ABANDONED BRANCH MUST MARK THE RESTORE POINT, like Linux does.
+    // A shutdown that throws because the monitor never answered leaves the disk
+    // open; a restore point from before that is not trustworthy, and the next
+    // Start must not silently boot it.
+    const marked = await markWindowsShutdownAbandoned(name, 'its monitor did not answer')
     const reopened = await replaceLiveView(name, preview)
-    return fail(`could not power ${name} off: ${error?.message ?? error}. Nothing was removed${reopened ? '' : '; the live view could NOT be reopened'}.`)
+    log(`shutdown ${name}: abandoned — nothing was removed${marked ? ', restore point marked stale' : ''}${reopened ? '' : ', live view NOT reopened'}`)
+    return fail(`could not power ${name} off: ${error?.message ?? error}. Nothing was removed${marked ? '; its restore point is now marked stale (Start will boot the existing disk instead of trusting it)' : ''}${reopened ? '' : '; the live view could NOT be reopened'}.`)
   }
   if (!outcome.exited) {
     // It survived ACPI and `quit`: the disk is still open, so it is NOT
     // checkpointed and the computer is still running.
+    const marked = await markWindowsShutdownAbandoned(name, 'it survived the QMP quit')
     const reopened = await replaceLiveView(name, preview)
-    return fail(`could not power ${name} off: QEMU is still running after a forced quit, so the disk is open and no checkpoint was taken.${reopened ? ' The live view was reopened.' : ' The live view could NOT be reopened.'} Use cua_vm_destroy to remove it.`)
+    return fail(`could not power ${name} off: QEMU is still running after a forced quit, so the disk is open and no checkpoint was taken.${marked ? ' Its restore point is now marked stale.' : ''}${reopened ? ' The live view was reopened.' : ' The live view could NOT be reopened.'} Use cua_vm_destroy to remove it.`)
   }
   let checkpoint = null
   let checkpointSkipped = ''
@@ -3648,7 +3850,7 @@ const handlers = {
       const source = workspacePath(local, { mustExist: true })
       // scp speaks POSIX paths; Windows OpenSSH accepts forward slashes and
       // `/c/...`-style is NOT valid, so a drive path is normalised here.
-      const result = await scpRun(putMeta, source, guest, { direction: 'to-guest' })
+      const result = await scpRun(putMeta, source, assertWindowsGuestPath(guest), { direction: 'to-guest' })
       if (result.code !== 0) return fail(`vm_put failed over SSH: ${result.stderr.trim().slice(-600)}`)
       return ok({ local: source, guest })
     }
@@ -3668,7 +3870,7 @@ const handlers = {
       const absolute = path.isAbsolute(local) ? path.normalize(local) : path.join(root, local)
       if (absolute !== root && !absolute.startsWith(root + path.sep)) throw new Error(`path escapes the workspace: ${local}`)
       mkdirSync(path.dirname(absolute), { recursive: true })
-      const result = await scpRun(getMeta, absolute, guest, { direction: 'from-guest' })
+      const result = await scpRun(getMeta, absolute, assertWindowsGuestPath(guest), { direction: 'from-guest' })
       if (result.code !== 0) return fail(`vm_get failed over SSH: ${result.stderr.trim().slice(-600)}`)
       return ok({ guest, local: absolute, bytes: statSync(absolute).size })
     }
@@ -3689,7 +3891,7 @@ const handlers = {
    * Open a real forward for one guest port and publish it as /vm/port/<name>/.
    * The forward lives until portClose, shutdown or destroy — the proxy reads
    * ports.json, so a page survives a harness restart as long as the VM does.
-   * A Windows computer's console (8006) is already a relay; asking for it again
+   * A Windows computer's live view is already a relay; asking for it again
    * returns the same row instead of a second listener.
    */
   async port({ name, guestPort = 8080 }) {
@@ -4414,7 +4616,7 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
    * Mint the shared viewer link and publish it at /vm/view/<name>/.
    *
    * A Windows computer has no cua viewer (there is no spacesd to talk to): its
-   * console is the relayed 8006 page at /vm/port/<name>/, so that is what the
+   * live view is the noVNC page relayed at /vm/port/<name>/, so that is what the
    * panel opens. Answering with a /vm/view link there would be a 502 with no
    * explanation.
    */
@@ -4422,7 +4624,7 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
     if (!name) throw new Error('name is required')
     if (readRegistry().vms[name]?.kind === 'windows') {
       const relayed = await ensureWindowsConsoleRelay(name)
-      if (relayed === null) return fail('the Windows console is not up yet: the container has not published 8006 (it is still installing?)')
+      if (relayed === null) return fail('the live view is not up yet: the display has not started, or websockify is missing from the image')
       return ok({ name, kind: 'windows', url: `/vm/port/${name}/`, hash: '', console: true })
     }
     const result = await runCua(['sb', 'view', '--no-open', '--json', '--local', name], { timeoutMs: 60000 })

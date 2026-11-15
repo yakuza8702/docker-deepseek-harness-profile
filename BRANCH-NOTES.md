@@ -661,7 +661,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **272 assertions** across 16 files (the gate prints
+* `tools/check-cua-vm.mjs` — **291 assertions** across 16 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -679,7 +679,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (272 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
+green (291 assertions / 67 needles), `ci-gates` 7/0/3, and the runtime suite in `tests/`
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
 (82 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
@@ -757,6 +757,22 @@ container copy (plugin README kinds + env table, the panel's kind picker and
 provisioning blurb). F3 fixed the failed-create port release — `Object.values` of
 a `Set` is `[]`, so it had been a no-op; it now releases exactly the three ports
 that create claimed.
+
+### 15.8.3 Jury round
+
+Thirteen defects from the three-juror pass: the xhci arg order (QEMU parses argv
+left to right — a semantic gate assertion now pins it), the four dead ISO URLs
+(only Server 2025 is pinned; the rest refuse by name and require `windowsIso`),
+the VNC-banner readiness lie during Setup (SSH-only until post-install), the
+watcher's timestamps/locking/state guard, the unlocked Start (double boot on one
+pidfile), the missing `stale`/`mayBeTorn` producer, no post-boot verification,
+the unguarded Windows unlink in destroy, port reconciliation on start, ISO
+download integrity (short-read abort, atomic rename, no stale `.part`), ISO
+accounting + GC, `python.exe` alias detection, double provisioning (idempotent
+marker), the MCP in-flight guard, scp path/timeout hardening, the live view on
+resume, region crops, virgl honesty, read-only vvfat, the container-string sweep,
+case-insensitive FORBIDDEN, canonical `backend: 'qemu'`, and the tests committed
+under `tests/`.
 
 ### 15.9 Review round 2
 

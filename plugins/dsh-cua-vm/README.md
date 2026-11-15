@@ -187,26 +187,39 @@ $STORE/windows/<name>/serial.log          the console — the install progress
 | disk | qcow2, AHCI by default; **virtio-blk** when a virtio-win ISO is provided |
 | NIC | SLIRP user-mode networking, `e1000e` by default; virtio-net with the driver ISO |
 | input | `usb-tablet` (absolute pointer — what QMP `input-send-event` needs) + `usb-kbd` |
-| display | `VGA` by default; `virtio-gpu-pci` with Enable GPU |
+| display | `VGA` by default; with Enable GPU a `virtio-gpu-gl-pci` + `egl-headless` (render node) when the image's QEMU advertises it, else a plain `virtio-gpu-pci` |
 | control | QMP on loopback; VNC on loopback for the live view |
 
-**Windows has no accelerated 3D here.** The GPU option gives a virtio-gpu device
-backed by the host's `/dev/dri/renderD128` (the same virgl wiring the Linux guest
-uses), but Windows has no accelerated driver for it in this image: Direct3D falls
-back to **WARP (CPU)** and OpenGL is not hardware-accelerated. Expect desktop
-composition and 2D to be fine and anything 3D to be slow. On NVIDIA hosts the
+**Windows has no accelerated 3D here, and the GPU option does not change that.**
+With Enable GPU the display is `virtio-gpu-gl-pci` + `egl-headless` on the host
+render node **when the image's QEMU advertises it** (the same capability probe the
+Linux guest uses); otherwise it falls back to a plain `virtio-gpu-pci`
+framebuffer. Either way Windows has no accelerated driver for it in this image:
+Direct3D runs on **WARP (CPU)** and OpenGL is not hardware-accelerated. Expect 2D
+and desktop composition to be fine and anything 3D to be slow. On NVIDIA hosts the
 QEMU process may show an EGL handle in `nvidia-smi` — that is the host-side
-context of the virtio-gpu device, **not** acceleration inside the guest.
+context of the display device, **not** acceleration inside the guest.
 
 ### Install media
 
-`windowsVersion` picks a pinned Microsoft evaluation ISO
-(`docker/cua-vm-windows-qemu.mjs` → `WINDOWS_ISO_SOURCES`: 11, 10, ltsc10, 2022,
-2025). The first create downloads it **once** into `$STORE/iso/` with progress in
-the supervisor log and a timeout (`DSH_CUA_WINDOWS_ISO_TIMEOUT_MS`, default 1 h).
+**An operator-supplied ISO is the primary path, and that is deliberate.** Of the
+five Microsoft evaluation URLs this module used to pin, only **Server 2025**
+still answers (probed 2026-11-15: HTTP 206; the other four return HTTP 400 — those
+editions are behind a session-token download page). So:
 
-`windowsIso` overrides it: an `http(s)` URL (downloaded the same way) or a file
-path — inside `$STORE` or inside the workspace — used directly as a QEMU drive.
+* `windowsVersion` lists all five, but only `2025` has a pinned URL. Selecting
+  another one **refuses immediately**, naming the version and both remediations —
+  it does not fail inside a 5.5 GB download.
+* `windowsIso` is how you install 11/10/ltsc10/2022: an `http(s)` URL (downloaded
+  into `$STORE/iso/` with progress and a timeout, `DSH_CUA_WINDOWS_ISO_TIMEOUT_MS`
+  default 1 h) or a local `.iso` inside `$STORE` or the workspace, attached
+  directly as a QEMU drive.
+* The download is verified: a short read aborts and removes the `.part` file, the
+  rename into place is atomic, and a stale `.part` is cleared first — so a
+  truncated ISO can never be reused as "cached".
+* The cache is **shared** by every computer and **counted by the store quota**
+  (`$STORE/iso/` is part of the accounted store). `cua_vm_gc` prunes ISOs no row
+  references once they are older than the screenshot retention policy.
 
 An optional `virtio-win.iso` (`$STORE/iso/virtio-win.iso` or
 `DSH_CUA_WINDOWS_VIRTIO_ISO`) switches the disk and NIC to virtio; without it

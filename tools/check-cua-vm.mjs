@@ -234,6 +234,26 @@ const NEEDLES = {
     ['restored from its checkpoint', 1],
     // D4: the watcher records that the install finished.
     ['row.installComplete = true', 3],
+    // K3: during Setup only SSH gates `ready` (QEMU's VNC socket answers from
+    // the first second of setup.exe and used to mark a half-install ready).
+    ["phase: 'install'", 1],
+    // H4: the abandoned Windows shutdown marks its restore point, like Linux.
+    ['async function markWindowsShutdownAbandoned(name, because)', 1],
+    ['windowsBackend.pidAlive(windowsPid)', 1],
+    // H5: the start verifies QEMU reached `running` before trusting it.
+    ['let running = false', 1],
+    // H1/H7: per-attempt deadline, port reconciliation.
+    ['row.startedAt = new Date().toISOString()', 1],
+    ['async function reconcileWindowsPorts(meta)', 1],
+    // M1: the ISO cache is accounted for and GC'd.
+    ['ISO_DIR', 3],
+    ['report.isos.push', 1],
+    // M6: a resume rebuilds the live view; a new relay kills the old child.
+    ['if (LIVE_VIEWS.has(name))', 1],
+    // M5: Windows guest paths are validated before they reach scp.
+    ['function assertWindowsGuestPath(guest)', 1],
+    // L2: one canonical backend value, also in the migration.
+    ["backend: windows ? 'qemu' : 'linux'", 1],
     // D5: an aborted shutdown rebuilds the live view instead of relaying to a
     // dead websockify.
     ['async function replaceLiveView(name, preview)', 1],
@@ -296,7 +316,8 @@ const NEEDLES = {
     ['file=${p.disk},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap', 1],
     // install medium while installing, drivers ISO when present, OEM payload
     ['if=none,id=cd0', 1],
-    ['file=fat:rw:${p.oemDir},format=raw,if=none,id=oem0', 1],
+    // M9: read-only vvfat — nothing in the guest writes this staging directory.
+    ['file=fat:ro:${p.oemDir},format=raw,if=none,id=oem0', 1],
     ['usb-storage,drive=oem0,bus=xhci.0', 1],
     // networking: SLIRP + the SSH forward (no bridge, no tap)
     ['user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22', 1],
@@ -314,7 +335,12 @@ const NEEDLES = {
     ['stopSwtpm(spec.name)', 2],
     // the ISO sources are pinned and documented
     ['export const WINDOWS_ISO_SOURCES = {', 1],
-    ['software-static.download.prss.microsoft.com', 5],
+    // K2: exactly ONE probed public URL is pinned (Server 2025). The other four
+    // versions answer 400 and require `windowsIso`; `resolveWindowsIso` names the
+    // version and both remediations before any bytes move.
+    ['software-static.download.prss.microsoft.com', 1],
+    ['export function resolveWindowsIso(version)', 1],
+    ['has no public direct ISO link', 1],
     ['export async function ensureIso(', 1],
     ['export function writeOemPayload(', 1],
     // frames and input over QMP
@@ -325,7 +351,13 @@ const NEEDLES = {
     ['export function charToKey(char)', 1],
     ['export function generatePassword()', 1],
     ['export function frameSpace(png)', 1],
-    ['export function windowsEnabled()', 1]
+    ['export function windowsEnabled()', 1],
+    // M8: virgl when the build has it, plain virtio-gpu otherwise.
+    ['virtio-gpu-gl-pci', 1],
+    ['egl-headless,rendernode=', 1],
+    // K1: the controller appears in the argv list before the device that uses it
+    // (the ORDER is asserted separately, below).
+    ["'-device', 'qemu-xhci,id=xhci'", 1]
   ],
   winMcp: [
     ['export function windowsMcpEnabled()', 1],
@@ -472,7 +504,7 @@ const NEEDLES = {
     ['10.0.2.2', 2],
     ['/cua-vm/windows/<name>/', 1],
     ['/cua-vm/iso/', 1],
-    ['No DinD service', 1]
+    ['No second container engine', 1]
   ],
   env: [
     ['DSH_CUA_VM_WINDOWS=0', 1],
@@ -564,7 +596,9 @@ for (const [key, spec] of Object.entries(FILES)) {
   for (const rule of FORBIDDEN.filter((entry) => entry.key === key)) {
     checked += 1
     total += 1
-    if (text.includes(rule.pattern)) {
+    // L1: CASE-INSENSITIVE. `dind`, `DinD` and `DIND` are the same regression,
+    // and the first version only caught the lowercase spelling.
+    if (text.toLowerCase().includes(rule.pattern.toLowerCase())) {
       bad += 1
       failures += 1
       missing.push(`${spec.label}: forbidden "${rule.pattern}" — ${rule.reason}`)
@@ -574,6 +608,46 @@ for (const [key, spec] of Object.entries(FILES)) {
     if (!values.quiet) console.log(`  ok   ${spec.label} — ${checked} assertion(s)`)
   } else {
     console.log(`  FAIL ${spec.label} — ${bad}/${checked} assertion(s) failed`)
+  }
+}
+
+/** Semantic assertions the needle list cannot express (order, not presence). */
+{
+  const quietMode = process.argv.includes('--quiet')
+  const windowsSource = readFileSync(path.join(ROOT, 'docker', 'cua-vm-windows-qemu.mjs'), 'utf8')
+  const controller = windowsSource.indexOf("'-device', 'qemu-xhci,id=xhci'")
+  const usbStorage = windowsSource.indexOf('usb-storage,drive=oem0,bus=xhci.0')
+  total += 1
+  if (controller !== -1 && usbStorage !== -1 && controller < usbStorage) {
+    if (!quietMode) console.log('  ok   K1 the USB controller precedes the device that names bus xhci.0')
+  } else {
+    failures += 1
+    missing.push('docker/cua-vm-windows-qemu.mjs: the xhci controller must come BEFORE usb-storage,bus=xhci.0 (QEMU parses argv in order: "Bus \'xhci.0\' not found")')
+    console.log('  FAIL K1 xhci ordering')
+  }
+  // L5: the runtime suite ships IN the repository (it used to live outside it,
+  // so every "pinned by a test" claim pointed at something a reviewer could not
+  // open).
+  total += 1
+  const suite = ['supervisor-smoke.mjs', 'modules-unit.mjs', 'qmp-shutdown.mjs']
+    .every((file) => existsSync(path.join(ROOT, 'tests', file)))
+  if (suite) {
+    if (!quietMode) console.log('  ok   L5 the runtime suite is committed under tests/')
+  } else {
+    failures += 1
+    missing.push('tests/: supervisor-smoke.mjs, modules-unit.mjs and qmp-shutdown.mjs must be committed')
+    console.log('  FAIL L5 runtime suite')
+  }
+
+  const supervisorSource = readFileSync(path.join(ROOT, 'docker', 'cua-vm-supervisor.mjs'), 'utf8')
+  total += 1
+  const isoInAccounted = /const ACCOUNTED_PATHS = \(\) => \[[^\]]*ISO_DIR/su.test(supervisorSource)
+  if (isoInAccounted) {
+    if (!quietMode) console.log('  ok   M1 the ISO cache is part of the accounted store')
+  } else {
+    failures += 1
+    missing.push('docker/cua-vm-supervisor.mjs: ISO_DIR must be in ACCOUNTED_PATHS (the ISO cache is the largest thing in a Windows store)')
+    console.log('  FAIL M1 ISO accounting')
   }
 }
 

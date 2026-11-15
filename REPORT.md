@@ -323,9 +323,9 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **272** assertions across 16 files |
+| `node tools/check-cua-vm.mjs` | **291** assertions across 16 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
-| Supervisor smoke against a **throwaway store + stub `cua`** (85 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
+| `node tests/supervisor-smoke.mjs` — throwaway store + stub `cua` (87 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
 | ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
 | `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
@@ -478,6 +478,35 @@ to it, and an `nvidia-smi` EGL handle is the host-side QEMU context.
 | F1 | the c467edb hunk swapped the checkpoint call sites: the Linux shutdown ran `checkpointDiskFile(…windowsPaths…)` (a path that does not exist for Linux → **no Linux checkpoint at all**) while `windowsShutdown` still called the Linux-only `checkpointSandbox` (→ no Windows checkpoint) | each shutdown is back on its own disk: `checkpointSandbox(name)` for Linux, `checkpointDiskFile(name, windowsPaths(STORE, name).disk)` for Windows. Two gate needles pin the pair, and the smoke now asserts BOTH: a Linux shutdown writes `checkpoints/<name>.qcow2` from the vmm disk and records `restoreFrom.kind === 'checkpoint'`, and a Windows shutdown does the same from `$STORE/windows/<name>/disk.qcow2`. `windowsStart` restores from the same file with the stale/torn gates unchanged |
 | F2 | user-visible copy still described the container backend | plugin README (§kinds + env table: `DSH_CUA_WINDOWS_IMAGE`/`DSH_CUA_WINDOWS_NETWORK` replaced by the QEMU/OVMF/swtpm/virtio vars) and the panel (`Windows (direct QEMU)`, and the provisioning blurb now says SSH exec/put/get + noVNC live view) |
 | F3 | the failed-create port release iterated a `Set` with `Object.values` (always `[]`), so claims leaked; a naive fix would have cleared other creates' claims | `portTriple` is declared before the `try` and the catch releases exactly those three ports |
+
+### 9.6.3 Jury round (K1–K3, H1–H8, M1–M10, L1–L6)
+
+| # | Defect | Fix |
+|---|---|---|
+| K1 | `usb-storage,bus=xhci.0` appeared **before** `-device qemu-xhci,id=xhci`; QEMU parses argv in order and dies "Bus 'xhci.0' not found" | the controller is emitted first; a **semantic** gate assertion (not a needle) pins the order, and a unit test asserts the indices |
+| K2 | 4 of 5 pinned ISO URLs answer HTTP 400 (probed live: only Server 2025 gives 206) | the pinned list is now honest: exactly one URL, the rest `url: null` with the reason; `resolveWindowsIso()` refuses **before** any download, naming the version and both remediations (`windowsIso` URL or local file) |
+| K3 | the VNC-banner fallback marked a half-installed Windows `ready` and set `installComplete` | during install `ready()` accepts **SSH only**; the VNC fallback applies to a running, post-install computer |
+| H1 | the watcher timed from `createdAt`, so every Start of an old computer went `error` on the first tick | `startedAt` is written at each boot and used for the deadline |
+| H2 | the watcher ran outside the lock and clobbered `powered-off`/`suspended` | each tick runs inside `withVmLock(name)` and returns unless the state is `installing`/`booting` |
+| H3 | `vmWindowsStart` bypassed the lock; two Starts both booted (`-pidfile` collision, unkillable first QEMU) | the whole start runs under `withVmLock`; a live pid/QMP short-circuits to "already running" |
+| H4 | no Windows producer of `restoreFrom.stale`/`mayBeTorn` | `markWindowsShutdownAbandoned()` mirrors the Linux semantics (stale + reason + mayBeTorn + lastShutdown, one write) |
+| H5 | `restoreFrom` was deleted before the guest was known to run, and the returned state predated the boot | the start polls for `pidAlive` + QMP `running` before clearing `restoreFrom`, and returns the post-boot state (or a clear failure) |
+| H6 | destroy unlinked the Windows tree with no liveness guard | the same `pidAlive` guard as the Linux branch → a `skipped` item (so the delete is correctly "partial"), never an unlink under a live guest |
+| H7 | Start reused `meta.ports` unchecked | `reconcileWindowsPorts()` probes all three under `withLock('@ports')`, re-allocates what is taken, and rewrites the row before boot |
+| H8 | the ISO download copied 5.5 GB instead of renaming, left the `.part` behind, never checked length | atomic `renameSync` in the same directory, stream destroyed on every exit, `.part` cleared and removed on failure, **short read aborts**, redirects bounded |
+| M1 | `$STORE/iso` was invisible to accounting | in `ACCOUNTED_PATHS` (and a semantic gate assertion), reserved on download, and `cua_vm_gc` prunes unreferenced ISOs past the retention policy |
+| M2 | `Get-Command python` matched the WindowsApps alias stub | `Get-RealPython` rejects anything under `\WindowsApps\` and fails loudly if no real interpreter exists |
+| M3 | provisioning ran twice (SYSTEM + first logon) | the script is idempotent through `C:\cua-provision.json` (completed stages skipped; `-Force` re-runs), and the dead `-Mode` parameter is gone |
+| M4 | the 5 s MCP beat could double-connect (45 s connect) | an in-flight promise guards the attach; the beat returns it instead of starting another |
+| M5 | Windows `put`/`get` paths went into `scp` unvalidated, and `scp` had no timeout | `assertWindowsGuestPath()` requires an absolute drive path and refuses quotes/`&|<>^`; scp has a timeout + kill (300 s, `DSH_CUA_WIN_SCP_TIMEOUT_MS`) |
+| M6 | resume never rebuilt the live view; a new relay overwrote `LIVE_VIEWS` without killing the old websockify | resume calls `ensureWindowsConsoleRelay`; `stopLiveView` is called for an existing child before spawning; `portClose` stops it |
+| M7 | `region` was silently dropped on Windows | implemented with ImageMagick (same crop math as Linux) and an explicit "crop unavailable, this is the full frame" message when convert is missing |
+| M8 | docs claimed virgl but the argv used a non-GL device with `-display none` | `virtio-gpu-gl-pci` + `egl-headless,rendernode=/dev/dri/renderD128` when the build advertises it, plain `virtio-gpu-pci` otherwise; the WARP/no-acceleration note stands either way |
+| M9 | the OEM payload was a **read-write** vvfat share | `fat:ro:` (nothing in the guest writes it) |
+| M10 | user-visible container-era strings (`docker pause`, 8006, "container", engine reachability) | swept from the panel, the tool descriptions, the view refusal and the docs; the doctor now prints the real host capabilities |
+| L1 | FORBIDDEN matched case-sensitively (`DinD` slipped through) | the haystack is lower-cased |
+| L2 | `backend` was `windows` after migration and `qemu` after create | one canonical value: `qemu` for Windows (migration included) |
+| L5 | the docs claimed committed tests that lived outside the repo | the suite moved to `tests/{supervisor-smoke,modules-unit,qmp-shutdown}.mjs` with repo-relative paths |
 
 ### 9.7 What is still open (TBC)
 

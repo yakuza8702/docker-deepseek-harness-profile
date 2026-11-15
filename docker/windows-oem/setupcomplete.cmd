@@ -9,6 +9,8 @@ REM nobody sees.
 REM =====================================================================
 set LOG=C:\Windows\Setup\Scripts\cua-setup.log
 echo === setupcomplete %DATE% %TIME% === >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& 'C:\Windows\Setup\Scripts\cua-firstboot.ps1' -Mode Setup *>> '%LOG%'"
+REM No arguments: the script is idempotent through C:\cua-provision.json, so the
+REM run at first logon skips whatever this SYSTEM pass already finished.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& 'C:\Windows\Setup\Scripts\cua-firstboot.ps1' *>> '%LOG%'"
 echo === setupcomplete exit %ERRORLEVEL% === >> "%LOG%"
 exit /b 0

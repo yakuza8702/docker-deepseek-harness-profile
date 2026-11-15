@@ -3,7 +3,7 @@
  *
  * WHY THIS EXISTS (and what it replaced)
  * --------------------------------------
- * Windows used to be a third-party Windows container image on a Docker Engine sidecar (DinD).
+ * Windows used to be a third-party Windows container image on a Docker Engine sidecar.
  * That architecture had three problems that could not be fixed from inside it:
  *
  *   1. it needed a second container runtime (privileged DinD) just to hold a
@@ -39,7 +39,7 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process'
-import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
 import path from 'node:path'
@@ -51,43 +51,76 @@ import { pngSize } from './cua-vm-space.mjs'
  * ------------------------------------------------------------------ */
 
 /**
- * Windows versions and the ISO each one installs from.
+ * Windows versions and where their install media comes from.
  *
- * These are Microsoft's OWN download URLs, not a third-party mirror: the
- * evaluation ISOs are stable for years and are the only ones that can be pinned
- * honestly. `windowsIso` overrides any of them (local file or URL).
+ * PROBED LIVE (ranged GET, 2 bytes, 2026-11-15): of the five URLs this module
+ * used to pin, four answer **HTTP 400** and one answers **206** — Microsoft
+ * moved the older evaluation media behind a session-token download page. A
+ * pinned URL that 400s is worse than no pin at all: the first create of every
+ * default version died inside the download with a generic error.
  *
- * A pinned URL is still a remote dependency: the first create downloads ~5.5 GB
- * into `$STORE/iso/`, once, with progress in the supervisor log and a timeout.
+ * So the contract is now explicit:
+ *
+ *   * `url` is non-null ONLY when it was probed and answered (today: Server
+ *     2025).
+ *   * `url: null` means "no public direct link": the version is still listed
+ *     (the answer file and the floors are version-independent), but a create
+ *     must be given `windowsIso` — a direct URL or a local ISO. The refusal
+ *     names the version and the two remediations, before any bytes move.
+ *
+ * An operator-supplied ISO is therefore the PRIMARY path, and the pinned list is
+ * a convenience where one exists — which is also the honest shape, because
+ * Microsoft's own download pages are session-token protected.
  */
 export const WINDOWS_ISO_SOURCES = {
+  '2025': {
+    label: 'Windows Server 2025 (evaluation)',
+    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso',
+    probed: '2026-11-15: HTTP 206 (ranged GET)'
+  },
   '11': {
     label: 'Windows 11 (evaluation)',
-    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/22631.2861.231204-0538.23H2_NI_RELEASE_SVC_REFRESH_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso'
+    url: null,
+    note: 'Microsoft publishes the 11 evaluation ISO through the Evaluation Center page, which is session-token protected',
+    probed: '2026-11-15: the previously pinned URL answers HTTP 400'
   },
   '10': {
     label: 'Windows 10 (evaluation)',
-    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/19045.2965.230505-1209.22H2_RELEASE_SVC_PROD1_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso'
+    url: null,
+    note: 'the same: a session-token download page, no stable direct link',
+    probed: '2026-11-15: the previously pinned URL answers HTTP 400'
   },
   ltsc10: {
     label: 'Windows 10 LTSC (evaluation)',
-    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/19044.1288.211006-0501.21H2_RELEASE_SVC_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso'
+    url: null,
+    note: 'LTSC evaluation media is served from the Evaluation Center only',
+    probed: '2026-11-15: the previously pinned URL answers HTTP 400'
   },
   '2022': {
     label: 'Windows Server 2022 (evaluation)',
-    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/20348.169.210806-2348.fe_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso'
-  },
-  '2025': {
-    label: 'Windows Server 2025 (evaluation)',
-    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso'
+    url: null,
+    note: 'the 2022 evaluation link was retired; 2025 is the pinned Server image',
+    probed: '2026-11-15: the previously pinned URL answers HTTP 400'
   }
 }
 
 /**
- * The ORDER the panel offers, written out: `Object.keys` would put the
- * integer-like keys first (10, 11, 2022, 2025) and leave ltsc10 last, which
- * reads like a mistake in a dropdown.
+ * Resolve a version to a downloadable URL, or explain precisely why there is
+ * none. Called BEFORE any download so the refusal is cheap and actionable.
  */
+export function resolveWindowsIso(version) {
+  const entry = WINDOWS_ISO_SOURCES[version]
+  if (entry === undefined) {
+    throw new Error(`windowsVersion must be one of ${WINDOWS_VERSIONS.join(', ')} (or give windowsIso instead)`)
+  }
+  if (entry.url === null) {
+    throw new Error(`windowsVersion "${version}" has no public direct ISO link (${entry.note}). `
+      + 'Pass windowsIso instead: either a direct https URL, or a local .iso file inside the VM store or the workspace. '
+      + `Versions with a pinned, probed link: ${WINDOWS_VERSIONS.filter((key) => WINDOWS_ISO_SOURCES[key].url !== null).join(', ') || 'none'}.`)
+  }
+  return { entry, url: entry.url }
+}
+
 export const WINDOWS_VERSIONS = ['11', '10', 'ltsc10', '2022', '2025']
 
 /** Floors a Windows install does not survive below (same as the old backend). */
@@ -224,25 +257,36 @@ export function buildQemuArgs(spec) {
       ? ['-drive', `file=${spec.driverIso},media=cdrom,readonly=on,if=none,id=cd1`,
         '-device', 'ide-cd,drive=cd1,bus=ide.2']
       : []),
-    // the OEM payload: a vvfat directory presented as a USB stick
-    '-drive', `file=fat:rw:${p.oemDir},format=raw,if=none,id=oem0`,
+    // THE USB CONTROLLER COMES FIRST. QEMU parses argv in order, so a device
+    // that names `bus=xhci.0` before `-device qemu-xhci,id=xhci` dies with
+    // "Bus 'xhci.0' not found" (verified on QEMU 10). Order is asserted by a
+    // gate needle, because it is invisible in a diff.
+    '-device', 'qemu-xhci,id=xhci',
+    // the OEM payload: a READ-ONLY vvfat directory presented as a USB stick
+    // (nothing in the guest writes to it; `rw` only gives Setup a chance to
+    // corrupt the staging directory until the host copy breaks)
+    '-drive', `file=fat:ro:${p.oemDir},format=raw,if=none,id=oem0`,
     '-device', 'usb-storage,drive=oem0,bus=xhci.0',
     // networking: SLIRP + the SSH forward
     '-netdev', `user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22`,
     '-device', spec.virtio ? 'virtio-net-pci,netdev=net0' : 'e1000e,netdev=net0',
     // input: absolute pointer (QMP input-send-event) + keyboard
-    '-device', 'qemu-xhci,id=xhci',
     '-device', 'usb-kbd',
     '-device', 'usb-tablet',
     // display: the panel's live view and the agent's frames
-    '-display', 'none',
+    '-display', spec.gpu && spec.virgl ? 'egl-headless,rendernode=/dev/dri/renderD128' : 'none',
     // QEMU READS THIS AS A DISPLAY NUMBER, NOT A PORT: `-vnc host:31` binds
     // 5900+31. Passing the raw port (5931) binds 11831 — the relay, the banner
     // probe and websockify all point at 5931, so the live view never connects
     // and the non-SSH readiness probe never answers. The conversion lives in one
     // function so it cannot drift again.
     '-vnc', `127.0.0.1:${vncDisplayFor(spec.vncPort)}`,
-    '-device', spec.gpu ? 'virtio-gpu-pci' : 'VGA,vgamem_mb=32',
+    // GPU: virgl only when the distro QEMU advertises virtio-gpu-gl-pci AND a
+    // render node exists — otherwise a plain virtio-gpu framebuffer. Windows has
+    // no accelerated driver either way (Direct3D is WARP); the difference is that
+    // virgl routes the guest's GL through the host render node, which is what the
+    // Linux guest does.
+    '-device', spec.gpu ? (spec.virgl ? 'virtio-gpu-gl-pci' : 'virtio-gpu-pci') : 'VGA,vgamem_mb=32',
     // control + observability
     '-qmp', `tcp:127.0.0.1:${spec.qmpPort},server=on,wait=off`,
     '-monitor', 'none',
@@ -290,61 +334,98 @@ export async function ensureIso({ url, isoDir, timeoutMs = 60 * 60 * 1000, onPro
   const target = path.join(isoDir, isoFileName(url))
   if (existsSync(target) && statSync(target).size > 1024 * 1024) return { path: target, downloaded: false }
   const partial = `${target}.part`
+  // A killed download leaves a `.part` behind; the next attempt must not append
+  // to it (which is how a truncated ISO ends up "complete").
+  try { unlinkSync(partial) } catch {}
+
   const started = Date.now()
   let received = 0
+  let expected = 0
   let lastReport = 0
-  await new Promise((resolve, reject) => {
-    const client = String(url).startsWith('https:') ? https : http
-    const request = client.get(url, { timeout: 60000 }, (response) => {
+
+  const fetchTo = (from) => new Promise((resolve, reject) => {
+    const client = String(from).startsWith('https:') ? https : http
+    let settled = false
+    let stream = null
+    const fail = (error) => {
+      if (settled) return
+      settled = true
+      try { stream?.destroy() } catch {}
+      try { request.destroy() } catch {}
+      try { unlinkSync(partial) } catch {}
+      reject(error)
+    }
+    const request = client.get(from, { timeout: 60000 }, (response) => {
       // Redirects are normal for Microsoft's CDN.
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
         response.resume()
-        ensureIso({ url: new URL(response.headers.location, url).toString(), isoDir, timeoutMs, onProgress, log })
-          .then(resolve, reject)
+        settled = true
+        resolve({ redirect: new URL(response.headers.location, from).toString() })
         return
       }
       if (response.statusCode !== 200) {
         response.resume()
-        reject(new Error(`ISO download failed: HTTP ${response.statusCode} for ${url}`))
+        fail(new Error(`ISO download failed: HTTP ${response.statusCode} for ${from}`))
         return
       }
-      const total = Number(response.headers['content-length'] || 0)
-      const out = createWriteStream(partial)
+      expected = Number(response.headers['content-length'] || 0)
+      stream = createWriteStream(partial)
       response.on('data', (chunk) => {
         received += chunk.length
         if (Date.now() - started > timeoutMs) {
-          request.destroy(new Error(`ISO download timed out after ${Math.round(timeoutMs / 1000)} s`))
+          fail(new Error(`ISO download timed out after ${Math.round(timeoutMs / 1000)} s (${(received / 1024 ** 3).toFixed(2)} GB received)`))
           return
         }
         if (Date.now() - lastReport > 5000) {
           lastReport = Date.now()
-          onProgress(total > 0 ? received / total : null, received)
+          onProgress(expected > 0 ? received / expected : null, received)
         }
       })
-      response.pipe(out)
-      out.on('finish', () => {
-        out.close(() => {
+      response.on('aborted', () => fail(new Error('the ISO connection was aborted')))
+      response.on('error', fail)
+      stream.on('error', fail)
+      response.pipe(stream)
+      stream.on('finish', () => {
+        if (settled) return
+        // SHORT READ = A BROKEN ISO. Content-Length is authoritative; without
+        // this check a connection that drops at 80% leaves a 4 GB file that
+        // `existsSync && size > 1 MB` would happily reuse forever.
+        if (expected > 0 && received !== expected) {
+          fail(new Error(`ISO download was truncated: ${received} of ${expected} bytes`))
+          return
+        }
+        stream.close(() => {
+          if (settled) return
+          settled = true
           try {
-            renameSyncSafe(partial, target)
+            // SAME DIRECTORY → a real atomic rename. `copyFileSync` here meant
+            // another 5.5 GB write and a window where a kill left a half-copied
+            // file wearing the final name.
+            renameSync(partial, target)
             log(`iso: ${path.basename(target)} (${(statSync(target).size / 1024 ** 3).toFixed(2)} GB)`)
-            resolve()
+            resolve({ path: target })
           } catch (error) {
-            reject(error)
+            fail(error)
           }
         })
       })
-      out.on('error', reject)
     })
-    request.on('timeout', () => request.destroy(new Error('ISO download socket timed out')))
-    request.on('error', reject)
+    request.on('timeout', () => fail(new Error('ISO download socket timed out')))
+    request.on('error', fail)
   })
-  return { path: target, downloaded: true, bytes: statSync(target).size }
-}
 
-function renameSyncSafe(from, to) {
-  try { unlinkSync(to) } catch {}
-  copyFileSync(from, to)
-  try { unlinkSync(from) } catch {}
+  let current = url
+  for (let hop = 0; hop < 5; hop += 1) {
+    const result = await fetchTo(current)
+    if (result.redirect !== undefined) {
+      current = result.redirect
+      received = 0
+      expected = 0
+      continue
+    }
+    return { path: result.path, downloaded: true, bytes: statSync(result.path).size }
+  }
+  throw new Error(`ISO download followed too many redirects (>5) starting at ${url}`)
 }
 
 /* ------------------------------------------------------------------ *
@@ -553,16 +634,25 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    * `ssh: false` or one whose first boot is still finishing. `paused` is NOT
    * ready — a paused guest keeps its VNC port open and used to read as running.
    */
-  async function ready(spec, { ssh = true } = {}) {
+  async function ready(spec, { ssh = true, phase = 'running' } = {}) {
     const state = await probe(spec)
-    if (!state.alive || state.status !== 'running') return { ready: false, ...state }
+    if (!state.alive || state.status !== 'running') return { ready: false, phase, ...state }
+    if (phase === 'install') {
+      // DURING SETUP only SSH counts. QEMU's VNC socket answers from the first
+      // second of setup.exe, so a VNC probe called a half-installed Windows
+      // "ready", set installComplete, and the next Start booted the half-written
+      // disk. SSH exists only after the answer file has run.
+      const banner = await bannerProbe('127.0.0.1', spec.sshPort, { timeoutMs: 3000 })
+      if (banner !== null) return { ready: true, endpoint: 'ssh', banner: banner.slice(0, 24), phase, ...state }
+      return { ready: false, endpoint: 'none', phase, ...state }
+    }
     if (ssh) {
       const banner = await bannerProbe('127.0.0.1', spec.sshPort)
-      if (banner !== null) return { ready: true, endpoint: 'ssh', banner: banner.slice(0, 24), ...state }
+      if (banner !== null) return { ready: true, endpoint: 'ssh', banner: banner.slice(0, 24), phase, ...state }
     }
     const vnc = await bannerProbe('127.0.0.1', spec.vncPort)
-    if (vnc !== null) return { ready: true, endpoint: 'vnc', ...state }
-    return { ready: false, endpoint: 'none', ...state }
+    if (vnc !== null) return { ready: true, endpoint: 'vnc', phase, ...state }
+    return { ready: false, endpoint: 'none', phase, ...state }
   }
 
   /** A PNG frame of the guest's framebuffer (QMP screendump). */

@@ -186,7 +186,10 @@ export function apply(ctx, config = {}) {
    * COST: the guest's schema is ~3-8k tokens while it is attached, which is why
    * it is not attached to a Linux-only workspace at all.
    */
-  const WIN_MCP = { name: '', client: null, disposers: [], at: 0, reason: 'not attempted' }
+  // `inflight` is the guard, not `at`: a connect can take up to 45 s while the
+  // beat is 5 s, so without it two ticks race into two SSH sessions and register
+  // every tool twice (the second registration throws, the first leaks).
+  const WIN_MCP = { name: '', client: null, disposers: [], inflight: null, reason: 'not attempted' }
 
   function detachWindowsMcp(reason) {
     for (const dispose of WIN_MCP.disposers.splice(0)) {
@@ -200,10 +203,12 @@ export function apply(ctx, config = {}) {
   }
 
   async function attachWindowsMcp() {
-    if (!windowsMcpEnabled()) {
-      detachWindowsMcp('disabled (DSH_CUA_VM_WIN_MCP=0)')
-      return
-    }
+    if (WIN_MCP.inflight !== null) return WIN_MCP.inflight
+    WIN_MCP.inflight = (async () => {
+      if (!windowsMcpEnabled()) {
+        detachWindowsMcp('disabled (DSH_CUA_VM_WIN_MCP=0)')
+        return
+      }
     let target = null
     try {
       const answer = await call({ op: 'vmWindowsMcp', name: '' })
@@ -250,6 +255,8 @@ export function apply(ctx, config = {}) {
       WIN_MCP.reason = `attach failed: ${error?.message ?? error}`
       console.log(`[cua-vm] windows MCP NOT attached: ${error?.message ?? error}`)
     }
+    })().finally(() => { WIN_MCP.inflight = null })
+    return WIN_MCP.inflight
   }
 
   /**
@@ -460,7 +467,7 @@ export function apply(ctx, config = {}) {
         diskGb: { type: 'number', description: 'Disk size in GB (Android and REA: 40; Windows floors at 64).' },
         android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating (Linux only).' },
         rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true. Linux only.' },
-        windowsVersion: { type: 'string', enum: ['11', '10', 'ltsc10', '2022', '2025'], description: 'Windows version (VERSION in the container spec). Windows only.' },
+        windowsVersion: { type: 'string', enum: ['11', '10', 'ltsc10', '2022', '2025'], description: 'Windows version. Only "2025" has a pinned public ISO; the others require windowsIso (their evaluation media is behind a session-token page). Windows only.' },
         windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL (downloaded once into $STORE/iso/) or a file path inside the VM store or the workspace (attached directly as a QEMU drive). Windows only; mutually exclusive with windowsVersion.' }
       }
     },
@@ -837,7 +844,9 @@ export function apply(ctx, config = {}) {
           `desktop: ${caps.desktop}${caps.resolutionAllowed ? '' : ' (refused: above cua\'s capture budget — set DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=1 to accept a scaled capture)'}`,
           `workspace share: ${caps.share}`,
           `docker engine: ${caps.docker}`,
-          `windows: ${windows.enabled ? `enabled (${windows.image}, engine ${windows.engineReachable ? 'reachable' : 'NOT reachable'})` : `disabled (${windows.reason})`}`,
+          `windows: ${windows.enabled
+            ? `enabled (direct qemu: ${windows.hostCaps?.qemu ? 'present' : 'MISSING'}, OVMF ${windows.hostCaps?.ovmfCode ? 'present' : 'MISSING'}, swtpm ${windows.hostCaps?.swtpm ? 'present' : 'MISSING'}, KVM ${windows.hostCaps?.kvm ? 'present' : 'MISSING'})`
+            : `disabled (${windows.reason})`}`,
           `store: ${(store.usedBytes / 1024 ** 3).toFixed(1)} GB of ${(store.quotaBytes / 1024 ** 3).toFixed(0)} GB`,
           `policy: shutdownTimeoutSec=${answer.shutdownTimeoutSec} checkpointPolicy=${answer.checkpointPolicy} computers=${answer.vms}`
         ].join('\n')
@@ -847,12 +856,12 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_suspend',
-    description: 'Pause the computer and keep its disk (resume is instant). Linux: cua sb suspend. Windows: docker pause. For a real power-off use cua_vm_shutdown.',
+    description: 'Pause the computer and keep its disk (resume is instant). Linux: cua sb suspend. Windows: QMP stop. For a real power-off use cua_vm_shutdown.',
     parameters: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] },
     output: textOutput('Suspend result.'),
     async execute(args = {}) {
       const result = await call({ op: 'suspend', name: args.name })
-      if (result.kind === 'windows') return { text: `${result.name} is suspended (the Windows container is paused; Start resumes it).` }
+      if (result.kind === 'windows') return { text: `${result.name} is suspended (the VM is paused with QMP stop; Start continues it).` }
       return { text: `${result.name} suspended; its disk stays in the VM store.` }
     }
   })
