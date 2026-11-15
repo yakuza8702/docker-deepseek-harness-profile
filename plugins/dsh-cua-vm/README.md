@@ -187,7 +187,7 @@ $STORE/windows/<name>/serial.log          the console — the install progress
 | disk | qcow2, AHCI by default; **virtio-blk** when a virtio-win ISO is provided |
 | NIC | SLIRP user-mode networking, `e1000e` by default; virtio-net with the driver ISO |
 | input | `usb-tablet` (absolute pointer — what QMP `input-send-event` needs) + `usb-kbd` |
-| display | `VGA` by default; with Enable GPU a `virtio-gpu-gl-pci` + `egl-headless` (render node) when the image's QEMU advertises it, else a plain `virtio-gpu-pci` |
+| display | `VGA` by default. With Enable GPU: `virtio-gpu-gl-pci` + `egl-headless` on the render node **when `qemu -device help` lists `virtio-gpu-gl-pci` and `/dev/dri/renderD128` exists** (the same probe the Linux guest uses); otherwise a plain `virtio-gpu-pci`. The choice is made once at create, stored on the row, and reused by every later boot |
 | control | QMP on loopback; VNC on loopback for the live view |
 
 **Windows has no accelerated 3D here, and the GPU option does not change that.**

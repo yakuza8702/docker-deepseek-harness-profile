@@ -661,7 +661,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **291 assertions** across 16 files (the gate prints
+* `tools/check-cua-vm.mjs` — **299 assertions** across 16 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -679,7 +679,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (291 assertions / 67 needles), `ci-gates` 7/0/3, and the runtime suite in `tests/`
+green (299 assertions / 67 needles), `ci-gates` 7/0/3, and the runtime suite in `tests/`
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
 (82 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
@@ -773,6 +773,17 @@ marker), the MCP in-flight guard, scp path/timeout hardening, the live view on
 resume, region crops, virgl honesty, read-only vvfat, the container-string sweep,
 case-insensitive FORBIDDEN, canonical `backend: 'qemu'`, and the tests committed
 under `tests/`.
+
+### 15.8.4 Re-jury round
+
+Ten residuals: the live view was killed on every second call (reuse-first now),
+`region`/`scale` never reached the Windows branch, the ISO prune ignored the
+"keep for ever" policy and would have deleted the shared virtio-win ISO, port
+reconciliation ignored other rows' reservations, the ISO download was
+unreserved, resume never rebuilt the preview, the status page timed from
+`createdAt`, the migration comment lied about the backend value, and the virgl
+branch was unreachable because nothing ever set the flag — it is now decided once
+at create (capability probe + render node), stored on the row and reused.
 
 ### 15.9 Review round 2
 

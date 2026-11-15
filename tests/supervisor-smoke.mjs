@@ -437,6 +437,28 @@ try {
     })())
   }
 
+  // ---- X1: asking for the live view twice must not kill it ----
+  {
+    const viewName = 'ws-win-view'
+    const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    reg.vms[viewName] = { workspace: '/workspace', kind: 'windows', backend: 'qemu', state: 'ready', ports: { qmp: 46997, ssh: 47996, vnc: 5995 }, diskGb: 64, cpu: 2, memory: 6 }
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(reg, null, 2)}\n`)
+    const first = await call({ op: 'view', name: viewName })
+    const second = await call({ op: 'view', name: viewName })
+    check('the live view answers twice with the same URL', first.ok === true && second.ok === true
+      && first.url === second.url && first.console === true, `${first.url} / ${second.url}`)
+    // ports.json is keyed by computer name.
+    check('the second call did not drop the relay row', (() => {
+      try {
+        const rows = JSON.parse(readFileSync(path.join(STORE, 'ports.json'), 'utf8'))
+        return rows[viewName]?.url === `/vm/port/${viewName}/` && Number(rows[viewName]?.localPort) > 0
+      } catch { return false }
+    })())
+    const regAfter = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    delete regAfter.vms[viewName]
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(regAfter, null, 2)}\n`)
+  }
+
   // ---- H6: a Windows delete must not unlink a disk QEMU still holds ----
   {
     const liveWin = 'ws-win-live'

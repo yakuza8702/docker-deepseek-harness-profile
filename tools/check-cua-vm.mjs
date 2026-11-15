@@ -248,12 +248,27 @@ const NEEDLES = {
     // M1: the ISO cache is accounted for and GC'd.
     ['ISO_DIR', 3],
     ['report.isos.push', 1],
-    // M6: a resume rebuilds the live view; a new relay kills the old child.
-    ['if (LIVE_VIEWS.has(name))', 1],
+    // M6/X1: a genuine rebuild stops the old child; a live one is reused.
+    ['stopLiveView(name)', 4],
     // M5: Windows guest paths are validated before they reach scp.
     ['function assertWindowsGuestPath(guest)', 1],
     // L2: one canonical backend value, also in the migration.
     ["backend: windows ? 'qemu' : 'linux'", 1],
+    // X1: reuse the live view instead of killing it on every call.
+    ['const alive = child !== undefined && child.exitCode === null && child.signalCode === null', 1],
+    // X2: region/scale reach the Windows branch.
+    ['windowsGui({ name, action, x, y, x2, y2, text, key, save, app, window: windowName, path: target, relative, region, scale })', 1],
+    // X4: shared media is never pruned (the virtio ISO is referenced by no row).
+    ['const alwaysKeep = new Set([', 1],
+    // X5: reconciliation respects other rows and in-flight claims.
+    ['const reserved = new Set(CLAIMED_WINDOWS_PORTS)', 1],
+    // X6: the download reserves before it writes.
+    ['reserveStoreBytes(`${spec.name}/iso`, expectedBytes)', 1],
+    // X7: resume rebuilds the preview.
+    ["await ensureWindowsConsoleRelay(name)\n    return ok({ name, state: 'ready', kind: 'windows' })", 1],
+    // Y1: the virgl decision is made once and stored on the row.
+    ["const virgl = spec.gpu === true && systemQemuSupportsVirgl() && existsSync('/dev/dri/renderD128')", 1],
+    ['      virgl,', 1],
     // D5: an aborted shutdown rebuilds the live view instead of relaying to a
     // dead websockify.
     ['async function replaceLiveView(name, preview)', 1],

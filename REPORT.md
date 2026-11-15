@@ -323,9 +323,9 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **291** assertions across 16 files |
+| `node tools/check-cua-vm.mjs` | **299** assertions across 16 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
-| `node tests/supervisor-smoke.mjs` — throwaway store + stub `cua` (87 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
+| `node tests/supervisor-smoke.mjs` — throwaway store + stub `cua` (89 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
 | ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
 | `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
@@ -507,6 +507,21 @@ to it, and an `nvidia-smi` EGL handle is the host-side QEMU context.
 | L1 | FORBIDDEN matched case-sensitively (`DinD` slipped through) | the haystack is lower-cased |
 | L2 | `backend` was `windows` after migration and `qemu` after create | one canonical value: `qemu` for Windows (migration included) |
 | L5 | the docs claimed committed tests that lived outside the repo | the suite moved to `tests/{supervisor-smoke,modules-unit,qmp-shutdown}.mjs` with repo-relative paths |
+
+### 9.6.4 Re-jury round (X1–X9, Y1)
+
+| # | Defect | Fix |
+|---|---|---|
+| X1 | `ensureWindowsConsoleRelay` killed the websockify child **before** looking at the relay row, so the second call (Start end, watcher tick, `view`, `vmWindowsStatus`) left a relay pointing at a dead port — a permanent 502 | reuse-first: a live child + an existing row is returned as-is; only a dead child or a missing row rebuilds, and a genuine rebuild still kills the old child |
+| X2 | `handlers.gui` accepted `region`/`scale` but the Windows branch dropped them, so the M7 crop was unreachable | both are forwarded to `windowsGui` |
+| X3 | the ISO prune ignored `shotsKeepDays=0` ("keep for ever") | the sweep is inside `if (config.shotsKeepDays > 0)` |
+| X4 | the shared virtio-win ISO (referenced by no row) and the pinned fallback ISO were pruned | an always-keep allowlist: `$STORE/iso/virtio-win.iso`, `DSH_CUA_WINDOWS_VIRTIO_ISO`, and every pinned source's filename |
+| X5 | `reconcileWindowsPorts` asked only the OS about a port, so it could hand out one that another row or an in-flight create reserves | the reserved set is the union of `CLAIMED_WINDOWS_PORTS` and every other row's ports |
+| X6 | the ISO download wrote ~5.5 GB with no reservation | `reserveStoreBytes` around the download (skipped when the ISO is already cached, since it is already counted), released in `finally` |
+| X7 | resume unpaused but never rebuilt the preview that suspend closed | `resumeVmLocked` calls `ensureWindowsConsoleRelay` before answering |
+| X8 | `vmWindowsStatus` measured elapsed time from `createdAt` | per-attempt `startedAt`, falling back to `createdAt` for legacy rows |
+| X9 | the migration header still claimed `backend: 'windows'` is kept | the comment now states the canonical `qemu` normalisation |
+| Y1 | the virgl branch was unreachable: the install spec omitted `virgl` and the row had no field, so the post-install boot always passed `false` | the flag is computed once at create (`gpu` **and** `systemQemuSupportsVirgl()` **and** a render node), stored on the row, and reused; the docs now scope each branch |
 
 ### 9.7 What is still open (TBC)
 

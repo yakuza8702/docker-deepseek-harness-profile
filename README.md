@@ -807,7 +807,16 @@ default — it needs `CAP_NET_ADMIN`.
 
 **The live view** is QEMU VNC on loopback behind websockify+noVNC, relayed at
 `/vm/port/<name>/`: *Show VM* streams the same screen the model drives and a human
-can take over.
+can take over. The relay is built once and REUSED — asking for the view again (a
+status poll, a second Start) returns the same row instead of restarting
+websockify.
+
+**The GPU branch, precisely.** With Enable GPU, a Windows computer gets
+`virtio-gpu-gl-pci` + `egl-headless` on `/dev/dri/renderD128` **if** the image's
+QEMU lists `virtio-gpu-gl-pci` in `qemu -device help` and the render node exists
+(the same capability probe the Linux guest uses); otherwise it gets a plain
+`virtio-gpu-pci` framebuffer. The decision is made at create and stored on the
+row. Neither branch gives Windows accelerated 3D — see the ceilings below.
 
 **Honest ceilings:** the GPU option is a virtio-gpu backed by the host render
 node, but Windows has **no accelerated 3D driver** here — Direct3D falls back to

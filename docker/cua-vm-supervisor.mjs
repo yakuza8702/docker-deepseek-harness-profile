@@ -57,7 +57,7 @@ import {
   createWindowsBackend, windowsEnabled, windowsHostCaps,
   WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
   WINDOWS_MIN_CPU, WINDOWS_USERNAME, WINDOWS_QEMU,
-  windowsPaths, ensureIso, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso
+  windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso
 } from './cua-vm-windows-qemu.mjs'
 
 const SOCK = process.env.CUA_SUPERVISOR_SOCK || '/tmp/cua-vm/supervisor.sock'
@@ -506,9 +506,11 @@ function log(...parts) {
  * it silently lost any field a reader did not know about.
  *
  * v2 is `{ "version": 2, "vms": { … } }` and every row carries `kind`
- * ('linux' | 'windows') and `backend` ('linux' | 'windows'). The READ PATH
+ * ('linux' | 'windows') and `backend` ('linux' | 'qemu': `qemu` is canonical for
+ * Windows, because that is what the code drives — there is no container). The READ PATH
  * migrates: a v1 file is turned into v2 rows (kind/backend default to linux,
- * and a row that already said `backend: 'windows'` keeps it), the migrated
+ * and a row that already said `backend: 'windows'` is normalised to `'qemu'`,
+ * the one canonical value — see migrateRegistryRow), the migrated
  * content is written back, and the caller never sees the difference. That is
  * what makes this safe to land on a store with a running computer: no rename
  * of the file, no "please delete registry.json".
@@ -1865,16 +1867,28 @@ async function collectGarbage({ dryRun = false } = {}) {
   // removed from it: five versions plus virtio-win is ~25 GB that survives every
   // delete. An ISO no row references and that is older than the retention
   // policy is reported (and removed unless this is a dry run).
-  {
+  if (config.shotsKeepDays > 0) {
     const referenced = new Set(Object.values(readRegistry().vms)
       .map((row) => row?.isoPath)
       .filter((value) => typeof value === 'string' && value !== ''))
+    // X4: SHARED MEDIA IS NOT AN ORPHAN. The virtio-win drivers ISO is configured
+    // by env and referenced by no row, and the one pinned evaluation ISO is the
+    // fallback for every new computer — pruning either silently downgrades the
+    // next boot (no virtio-blk/NIC) or forces a 5.5 GB re-download.
+    const alwaysKeep = new Set([
+      path.join(ISO_DIR, 'virtio-win.iso'),
+      ...(process.env.DSH_CUA_WINDOWS_VIRTIO_ISO ? [path.resolve(process.env.DSH_CUA_WINDOWS_VIRTIO_ISO)] : []),
+      ...Object.values(WINDOWS_ISO_SOURCES)
+        .filter((entry) => typeof entry.url === 'string')
+        .map((entry) => path.join(ISO_DIR, path.basename(decodeURIComponent(entry.url.split('/').pop()))))
+    ])
     const keepMs = config.shotsKeepDays * 24 * 60 * 60 * 1000
     let isos = []
     try { isos = readdirSync(ISO_DIR).filter((file) => file.endsWith('.iso') || file.endsWith('.iso.part')) } catch {}
     for (const file of isos) {
       const absolute = path.join(ISO_DIR, file)
       if (referenced.has(absolute)) continue
+      if (alwaysKeep.has(absolute) || alwaysKeep.has(path.join(ISO_DIR, file.replace(/\.part$/u, '')))) continue
       let ageMs = 0
       let bytes = 0
       try {
@@ -2291,6 +2305,9 @@ async function resumeVmLocked(name) {
       row.state = 'ready'
       row.lastUsed = new Date().toISOString()
     })
+    // X7: suspend closed the preview; resume rebuilds it HERE, not on the next
+    // status/view call (the panel showed a dead tab until then).
+    await ensureWindowsConsoleRelay(name)
     return ok({ name, state: 'ready', kind: 'windows' })
   }
   const result = await runCua(['sb', 'resume', '--local', name], { timeoutMs: 180000 })
@@ -2683,16 +2700,25 @@ async function ensureWindowsConsoleRelay(name) {
   // A live view that is already up is reused; a STALE child (or one from a
   // previous boot) is killed before a new one is spawned, otherwise the old
   // websockify keeps the port and LIVE_VIEWS silently forgets it.
-  if (LIVE_VIEWS.has(name)) {
-    const previous = LIVE_VIEWS.get(name)
-    try { previous?.kill('SIGTERM') } catch {}
-    LIVE_VIEWS.delete(name)
-  }
   const registry = readRegistry()
   const meta = registry.vms[name]
   if (!meta?.ports?.vnc) return null
   const existing = ports.get(name)
-  if (existing !== undefined) return existing
+  // REUSE FIRST. This function is called at the end of Start, on every watcher
+  // tick, from `view` and from `vmWindowsStatus`; killing the child before
+  // looking at the row made the SECOND call leave a relay pointing at a dead
+  // websockify — a permanent 502 on /vm/port/<name>/. Rebuild only when the
+  // child is gone or the row is missing.
+  if (existing !== undefined) {
+    const child = LIVE_VIEWS.get(name)
+    const alive = child !== undefined && child.exitCode === null && child.signalCode === null
+    if (alive) return existing
+    stopLiveView(name)
+    closePorts(name)
+  } else {
+    // A child without a row is a leftover from a crash: it holds the port.
+    stopLiveView(name)
+  }
   try {
     const websockify = '/usr/bin/websockify'
     let targetPort = meta.ports.vnc
@@ -2948,14 +2974,31 @@ async function windowsCreateManaged(spec) {
       // version named and both remediations, instead of 400ing inside the
       // download after the quota was reserved.
       const url = spec.windowsIso !== '' ? spec.windowsIso : resolveWindowsIso(spec.windowsVersion).url
-      const downloaded = await ensureIso({
-        url,
-        isoDir: paths.isoDir,
-        timeoutMs: Number(process.env.DSH_CUA_WINDOWS_ISO_TIMEOUT_MS || 60 * 60 * 1000),
-        log,
-        onProgress: (fraction, bytes) => log(`iso: ${(bytes / 1024 ** 3).toFixed(2)} GB${fraction === null ? '' : ` (${Math.round(fraction * 100)}%)`}`)
-      })
-      isoPath = downloaded.path
+      // X6: A DOWNLOAD IS A WRITE. The quota used to be checked for the disk
+      // only, and the ISO then dropped ~5.5 GB into the store unchecked — one
+      // create could exceed the quota on its own. Reserve the expected size,
+      // but ONLY when the file is not already cached (a cached ISO is already
+      // counted by `used`; reserving again would refuse a create that fits).
+      const cached = existsSync(isoTargetPath(paths.isoDir, url))
+      const expectedBytes = Number(process.env.DSH_CUA_WINDOWS_ISO_BYTES || 6 * 1024 ** 3)
+      if (!cached) {
+        const isoOver = await reserveStoreBytes(`${spec.name}/iso`, expectedBytes)
+        if (isoOver !== null) {
+          throw new Error(`the Windows ISO needs about ${(expectedBytes / 1024 ** 3).toFixed(1)} GB, which does not fit the store quota: ${isoOver}`)
+        }
+      }
+      try {
+        const downloaded = await ensureIso({
+          url,
+          isoDir: paths.isoDir,
+          timeoutMs: Number(process.env.DSH_CUA_WINDOWS_ISO_TIMEOUT_MS || 60 * 60 * 1000),
+          log,
+          onProgress: (fraction, bytes) => log(`iso: ${(bytes / 1024 ** 3).toFixed(2)} GB${fraction === null ? '' : ` (${Math.round(fraction * 100)}%)`}`)
+        })
+        isoPath = downloaded.path
+      } finally {
+        if (!cached) releaseStoreBytes(`${spec.name}/iso`)
+      }
     }
 
     // SSH keypair: the agent surface authenticates with it, the password is the
@@ -2994,6 +3037,13 @@ async function windowsCreateManaged(spec) {
       vncPort: portTriple.vnc,
       sshPort: portTriple.ssh
     }
+    // Y1: THE GPU DECISION IS MADE ONCE, HERE. `buildQemuArgs` switches on
+    // `spec.virgl`, and the install-time spec used to omit it while the row had
+    // no field at all — so the post-install boot (`virgl: current.virgl === true`)
+    // was always false and the virgl branch was unreachable. Gate it on the same
+    // capability probe the Linux guest uses, plus a render node.
+    const virgl = spec.gpu === true && systemQemuSupportsVirgl() && existsSync('/dev/dri/renderD128')
+    qemuSpec.virgl = virgl
     booted = await windowsBackend.boot(qemuSpec, { installPending: true })
     const row = {
       workspace: spec.workspace,
@@ -3006,6 +3056,7 @@ async function windowsCreateManaged(spec) {
       ssh: true,
       qemu: WINDOWS_QEMU,
       gpu: spec.gpu,
+      virgl,
       android: false,
       rea: false,
       diskGb,
@@ -3285,13 +3336,24 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
  */
 async function reconcileWindowsPorts(meta) {
   const ports = { ...(meta.ports ?? {}) }
+  // X5: a FREE port may still belong to another computer — a powered-off one
+  // keeps its row, and a create in flight keeps an in-memory claim. Asking only
+  // the OS could hand out a port another row reserves, which is exactly the
+  // hostfwd collision this function exists to prevent.
+  const reserved = new Set(CLAIMED_WINDOWS_PORTS)
+  for (const [otherName, row] of Object.entries(readRegistry().vms)) {
+    if (otherName === meta.name) continue
+    for (const port of Object.values(row?.ports ?? {})) reserved.add(Number(port))
+  }
+  const mine = new Set(Object.values(ports).map(Number))
   let changed = false
   for (const [key, range] of [['qmp', WINDOWS_QMP_RANGE], ['ssh', WINDOWS_SSH_RANGE], ['vnc', WINDOWS_VNC_RANGE]]) {
     const value = Number(ports[key])
-    if (Number.isFinite(value) && value > 0 && await portIsFree(value)) continue
+    if (Number.isFinite(value) && value > 0 && !reserved.has(value) && await portIsFree(value)) continue
     ports[key] = await (async () => {
       for (let port = range[0]; port < range[1]; port += 1) {
-        if (await portIsFree(port)) return port
+        if (mine.has(port) || reserved.has(port)) continue
+        if (await portIsFree(port)) { reserved.add(port); return port }
       }
       throw new Error(`no free port in ${range[0]}-${range[1]} for the Windows computer`)
     })()
@@ -4054,7 +4116,9 @@ const handlers = {
       })
     }
     if (state === 'ready') await ensureWindowsConsoleRelay(name)
-    const elapsedMinutes = Math.round((Date.now() - (Date.parse(meta.createdAt || '') || Date.now())) / 60000)
+    // X8: per START ATTEMPT, the same clock the watcher's deadline uses; a
+    // legacy row without startedAt still falls back to createdAt.
+    const elapsedMinutes = Math.round((Date.now() - (Date.parse(meta.startedAt || meta.createdAt || '') || Date.now())) / 60000)
     return ok({
       name,
       kind: 'windows',
@@ -4251,7 +4315,7 @@ const handlers = {
     }
     const pointer = ['click', 'dclick', 'move', 'drag'].includes(action)
     const registry = readRegistry()
-    if (registry.vms[name]?.kind === 'windows') return windowsGui({ name, action, x, y, x2, y2, text, key, save, app, window: windowName, path: target, relative })
+    if (registry.vms[name]?.kind === 'windows') return windowsGui({ name, action, x, y, x2, y2, text, key, save, app, window: windowName, path: target, relative, region, scale })
     // A powered-off computer has no sandbox to drive: `sb resume` would answer
     // "not found" for two minutes and then the action would be applied to
     // nothing. Say what to do instead.

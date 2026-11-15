@@ -313,6 +313,12 @@ export function vncPortFor(display) {
  * ISO handling
  * ------------------------------------------------------------------ */
 
+/** Where an ISO URL will land. Exported so the caller can tell "cached" from
+ *  "about to download 5.5 GB" BEFORE calling ensureIso (and reserve for it). */
+export function isoTargetPath(isoDir, url) {
+  return path.join(isoDir, isoFileName(url))
+}
+
 /** A short, stable file name for a URL (the hash keeps two dates apart). */
 function isoFileName(url) {
   const base = decodeURIComponent(String(url).split('/').pop() || 'windows.iso').replace(/[^\w.-]+/gu, '-')
