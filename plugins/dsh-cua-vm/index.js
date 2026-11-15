@@ -96,7 +96,10 @@ const CUA_PROMPT_LINES = [
   'Before creating a computer, ask with `ask_user_question` for name, vCPU/RAM and image unless the user said so — never invent a spec silently — and say Debian and Arch need a built Cua disk, not a substitute image.',
   'For Android, Blender, WebGL or 3D work create it with `gpu: true` unless told otherwise (say so if the image or host cannot); an Android app is `cua_vm_create` with gpu, cpu 4, memory 8, diskGb 40, then `cua_vm_android` once (SDK + AVD), `cua-emulator` (`-no-window` for adb tests), `adb devices` before the APK, `cua_vm_exec` → `ls -l /dev/kvm` for nested KVM.',
   'On a GPU computer Xorg runs on virgl and reports OpenGL 4.3 (Mesa under-reports 4.2; the session lifts it); if an app refuses, check `cua_vm_gui geometry` or `glxinfo -B`, and use `LIBGL_ALWAYS_SOFTWARE=1` (llvmpipe, slower) only as a genuine, stated fallback.',
-  'The VM persists across turns and stops only when the user asks; if a tool reports no VM, call `cua_vm_ensure` once, then `cua_vm_exec`.',
+  'SPACE: the screenshot and the click share ONE space, and the tool measures it — every desktop result prints `screenshot WxH · display WxH · scale N`. When scale is 1 (a 1200x750 desktop) image pixels are display pixels; when it is not, the result says `image px = 0.9375 × display px; cua maps it — do not rescale`, and that is literal: click the pixel you see, never multiply it.',
+  'SHUTDOWN vs SUSPEND: `cua_vm_shutdown` is a real ACPI powerdown, then a checkpoint, then the sandbox is removed (`state: powered-off`); `cua_vm_start` cold-boots from that checkpoint — do NOT expect `sb resume` to work on a powered-off computer, that is the trap the split exists for. `cua_vm_suspend` keeps the sandbox and resumes instantly. Neither happens on its own: the computer runs until the user asks.',
+  'WINDOWS (`kind: "windows"`, via the Docker/DinD backend): a Windows computer has the desktop (`cua_vm_gui` over QMP, plus the console at /vm/port/<name>/) but NO exec, NO put/get, NO disk growth, no clipboard, no accessibility tree and no window list — those answer "not available for Windows" on purpose. It cannot take `rea: true` or `android: true`, and its generated password is per computer (the panel reveals it); RDP on 3389 exists only if the operator opted in.',
+  'If a tool reports no VM, call `cua_vm_ensure` once, then `cua_vm_exec`.',
   'For reverse-engineering work — a feature to reimplement, a suspicious binary, an APK, an Electron app, a model file — create the computer with `rea: true` (and let the disk be at least 40 GB); REA is not installed on a computer created without it, and installing it by hand inside a 20 GB disk is the wrong fix.'
 ]
 
@@ -192,7 +195,15 @@ export function apply(ctx, config = {}) {
             // The page polls this every few seconds while a machine starts, so
             // it is also the cheapest place to keep the REA cache warm.
             rememberRea(list.registry)
-            return send(200, { ok: true, config: config.config, usedBytes: config.usedBytes, vms: list.registry })
+            return send(200, {
+              ok: true,
+              config: config.config,
+              usedBytes: config.usedBytes,
+              vms: list.registry,
+              // The panel hides the Windows kind when the backend is off, so the
+              // option never becomes a button that answers "disabled".
+              windows: list.windows ?? { ok: false, reason: 'the supervisor is older than this plugin' }
+            })
           }
           case 'config': return send(200, { ok: true, ...(await call({ op: 'configSet', config: await body() })) })
           case 'create': {
@@ -208,6 +219,17 @@ export function apply(ctx, config = {}) {
             void refreshReaCache()
             return send(200, { ok: true, ...answer })
           }
+          case 'shutdown': {
+            const answer = await call({ op: 'vmShutdown', ...(await body()) })
+            return send(200, { ok: true, ...answer })
+          }
+          case 'gc': return send(200, { ok: true, ...(await call({ op: 'vmGc', ...(await body()) })) })
+          case 'doctor': return send(200, { ok: true, ...(await call({ op: 'vmDoctor' })) })
+          case 'space': return send(200, { ok: true, ...(await call({ op: 'vmSpace', ...(await body()) })) })
+          case 'windowsStatus': return send(200, { ok: true, ...(await call({ op: 'vmWindowsStatus', ...(await body()) })) })
+          // The generated Windows password, on demand only: the row carries a
+          // `credentials: true` flag, the secret stays in the 0600 file.
+          case 'windowsPassword': return send(200, { ok: true, ...(await call({ op: 'vmWindowsPassword', ...(await body()) })) })
           case 'stop': return send(200, { ok: true, ...(await call({ op: 'stop', ...(await body()) })) })
           case 'delete': {
             const answer = await call({ op: 'vmDelete', ...(await body()) })
@@ -287,7 +309,15 @@ export function apply(ctx, config = {}) {
         tier: { type: 'string', enum: ['slim', 'full'], description: 'slim (default) or full.' },
         cpu: { type: 'integer', minimum: 1, maximum: 16 },
         memory: { type: 'integer', minimum: 1, maximum: 64, description: 'Guest memory in GB.' },
-        waitForDesktop: { type: 'boolean', description: 'Wait for the desktop, not just the daemon.' }
+        waitForDesktop: { type: 'boolean', description: 'Wait for the desktop, not just the daemon.' },
+        // The whole spec travels, not just tier/cpu/memory: a computer born
+        // from "the first cua_vm_exec" used to record no image and no gpu, and
+        // a rebuild then brought it back without them.
+        image: { type: 'string', description: 'Image reference for a NEW computer (default "linux").' },
+        gpu: { type: 'boolean', description: 'virgl GPU. Omit to take the host default (virgl when DSH_CUA_VM_GPU enables it); false forces llvmpipe.' },
+        diskGb: { type: 'number', description: 'Disk size in GB for a new computer (Android and REA: 40).' },
+        android: { type: 'boolean', description: 'Install the Android SDK + AVD on a new computer.' },
+        rea: { type: 'boolean', description: 'Install the REA kit on a new computer (needs a 40 GB disk).' }
       }
     },
     output: textOutput('Creation result and the VM name to use in later calls.'),
@@ -298,32 +328,57 @@ export function apply(ctx, config = {}) {
         tier: args.tier ?? defaultTier,
         cpu: args.cpu ?? defaultCpu,
         memory: args.memory ?? defaultMemory,
-        waitDesktop: args.waitForDesktop === true
+        waitDesktop: args.waitForDesktop === true,
+        image: args.image,
+        gpu: args.gpu,
+        diskGb: args.diskGb,
+        android: args.android === true,
+        rea: args.rea === true
       })
-      return { text: `${result.created ? 'Created' : 'Resumed'} ${result.name} (tier=${result.tier}, state=${result.state}). Use this name with cua_vm_exec.` }
+      const gpuNote = result.gpu === true ? ' with a GPU (virgl)' : ''
+      return { text: `${result.created ? 'Created' : 'Resumed'} ${result.name} (tier=${result.tier}, state=${result.state}${gpuNote}). Use this name with cua_vm_exec.` }
     }
   })
 
   ctx.tools.register({
     name: 'cua_vm_create',
-    description: 'New computer: name, vCPU, RAM, image, gpu, diskGb, android, rea. Ask the user for the spec first.',
+    description: 'New computer: name, kind, vCPU, RAM, image, gpu, diskGb, android, rea (Windows: windowsVersion/windowsIso). Ask the user for the spec first.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['name'],
       properties: {
         name: { type: 'string', description: 'Computer name: lowercase letters, digits and dashes.' },
-        cpu: { type: 'number', description: 'vCPUs (default 2).' },
-        memory: { type: 'number', description: 'RAM in GB (default 4).' },
-        image: { type: 'string', description: 'Image reference. Default "linux" (Ubuntu 24.04 slim Cua disk).' },
-        gpu: { type: 'boolean', description: 'virgl GPU for 3D/Android/Blender.' },
-        diskGb: { type: 'number', description: 'Disk size in GB (Android and REA: 40).' },
-        android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating.' },
-        rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true.' }
+        kind: { type: 'string', enum: ['linux', 'windows'], description: 'linux (default, the Cua guest) or windows (Docker/DinD backend; desktop only, no exec/put/get).' },
+        cpu: { type: 'number', description: 'vCPUs (default 2; Windows floors at 2).' },
+        memory: { type: 'number', description: 'RAM in GB (default 4; Windows floors at 6).' },
+        image: { type: 'string', description: 'Image reference. Default "linux" (Ubuntu 24.04 slim Cua disk). Linux only.' },
+        gpu: { type: 'boolean', description: 'virgl GPU for 3D/Android/Blender (Windows: GPU=Y + the render node).' },
+        diskGb: { type: 'number', description: 'Disk size in GB (Android and REA: 40; Windows floors at 64).' },
+        android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating (Linux only).' },
+        rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true. Linux only.' },
+        windowsVersion: { type: 'string', enum: ['11', '10', 'ltsc10', '2022', '2025'], description: 'Windows version (VERSION in the container spec). Windows only.' },
+        windowsIso: { type: 'string', description: 'Windows ISO URL or file name instead of a version (ISO). Windows only; mutually exclusive with windowsVersion.' }
       }
     },
     output: textOutput('The computer, its renderer, disk, Android and REA status.'),
     async execute(input) {
+      if (input.kind === 'windows') {
+        // Refused HERE as well as in the supervisor: a tool that sends a
+        // combination the backend will reject costs a round trip and reads like
+        // a backend bug instead of a spec mistake.
+        if (input.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer. Create the Windows computer without it, or use a Linux computer.')
+        if (input.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest.')
+        const answer = await call({ op: 'vmWindowsCreate', ...input })
+        const parts = [`${answer.name} is ${answer.state} (Windows).`]
+        if (answer.console) parts.push(`Console: ${answer.console} (relayed from the container's 8006, never published raw).`)
+        parts.push(answer.passwordHint)
+        if (answer.diskGbRaised !== undefined) parts.push(`Disk raised to ${answer.diskGbRaised} GB: Windows does not install below 64 GB.`)
+        if (answer.memoryRaised !== undefined) parts.push(`RAM raised to ${answer.memory} GB: Windows does not install below 6 GB.`)
+        parts.push('`cua_vm_exec`, `cua_vm_put`, `cua_vm_get` and `cua_vm_disk` answer "not available" for this computer — drive it with `cua_vm_gui` or the console.')
+        if (answer.detail) parts.push(answer.detail)
+        return { text: parts.join(' ') }
+      }
       const answer = await call({ op: 'vmCreate', ...input })
       const parts = [`${answer.name} is ${answer.state}${input.gpu === true ? ' with a GPU (virgl)' : ''}.`]
       if (answer.renderer) parts.push(`Renderer: ${answer.renderer}.`)
@@ -408,6 +463,7 @@ export function apply(ctx, config = {}) {
     output: textOutput('The new size and the guest filesystem after the grow.'),
     async execute({ name, sizeGb }) {
       const answer = await call({ op: 'vmDisk', name, sizeGb })
+      if (answer.available === false) return { text: answer.message }
       if (answer.changed === false) return { text: `${name} is already ${answer.sizeGb} GB; nothing to do.` }
       return { text: `${name} disk is now ${answer.sizeGb} GB. Guest: ${answer.guest || 'unknown'}` }
     }
@@ -468,6 +524,12 @@ export function apply(ctx, config = {}) {
     },
     async execute(args = {}) {
       const result = await call({ op: 'exec', name: args.name, cmd: args.cmd, cwd: args.cwd, timeout: args.timeout ?? 300 })
+      if (result.available === false) {
+        // A Windows computer has no guest agent. The schema still has to answer,
+        // so the refusal travels in stderr with exit 126 — the shape a shell
+        // command that cannot run uses.
+        return { exit: result.exit ?? 126, stdout: '', stderr: result.stderr ?? 'not available for Windows computers', ms: 0 }
+      }
       return {
         exit: result.exit,
         stdout: clamp(result.stdout, maxOutputChars),
@@ -493,6 +555,7 @@ export function apply(ctx, config = {}) {
     output: textOutput('Copy result.'),
     async execute(args = {}) {
       const result = await call({ op: 'put', name: args.name, local: args.local, guest: args.guest })
+      if (result.available === false) return { text: result.message }
       return { text: `Copied ${result.local} → ${args.name}:${result.guest}` }
     }
   })
@@ -513,6 +576,7 @@ export function apply(ctx, config = {}) {
     output: textOutput('Copy result with byte count.'),
     async execute(args = {}) {
       const result = await call({ op: 'get', name: args.name, guest: args.guest, local: args.local })
+      if (result.available === false) return { text: result.message }
       return { text: `Copied ${args.name}:${result.guest} → ${result.local} (${result.bytes} bytes)` }
     }
   })
@@ -530,16 +594,149 @@ export function apply(ctx, config = {}) {
       },
       required: ['name', 'guestPort']
     },
-    output: textOutput('Local address that reaches the guest port.'),
+    output: textOutput('The proxy path and the loopback port that reaches the guest port.'),
     async execute(args = {}) {
       const result = await call({ op: 'port', name: args.name, guestPort: args.guestPort, localPort: args.localPort })
-      return { text: `Guest port ${args.guestPort} is reachable at ${result.target}` }
+      // The supervisor answers {url, localPort, guestPort, backend} — and used
+      // to be read as `result.target`, which is undefined: every call printed
+      // "reachable at undefined". Print BOTH: the url is what the user can open,
+      // the loopback port is what a curl from the harness shell can reach.
+      const via = result.backend === 'relay' ? ' (relayed from the container)' : ''
+      return { text: `Guest port ${result.guestPort ?? args.guestPort} on ${result.name ?? args.name} is reachable at ${result.url}${via} — from the harness shell: http://127.0.0.1:${result.localPort}/` }
+    }
+  })
+
+  /**
+   * START is its own tool because a powered-off computer does NOT resume.
+   *
+   * `cua sb resume` only works while cua still knows the sandbox; a shutdown
+   * removes it on purpose (that is what makes the powerdown real), so the
+   * natural-looking call fails for ever. `cua_vm_start` cold-boots from the
+   * checkpoint — the model does not need to know why, only that this is the
+   * button.
+   */
+  ctx.tools.register({
+    name: 'cua_vm_start',
+    description: 'Start a computer: resumes a suspended one, cold-boots a powered-off one from its checkpoint. Not for a Windows install in progress.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['name'],
+      properties: {
+        name: { type: 'string', description: 'Computer name from cua_vm_status.' }
+      }
+    },
+    output: textOutput('Start result, the boot source, and the provisioning outcome.'),
+    async execute(args = {}) {
+      const answer = await call({ op: 'vmStart', name: args.name })
+      const parts = [`${answer.name} is ${answer.state}.`]
+      if (answer.coldBoot === true) parts.push(answer.detail || 'cold-booted from its checkpoint.')
+      if (answer.bootedFrom === 'image') parts.push('No checkpoint was available, so it booted the base image: the previous disk is gone.')
+      if (answer.provisioned === false) parts.push(`Guest provisioning did not finish:\n${(answer.output || '').slice(-1200)}`)
+      if (answer.rea === false) parts.push('REA did not finish provisioning; call cua_vm_start again (it is idempotent).')
+      if (answer.detail && answer.coldBoot !== true) parts.push(answer.detail)
+      if (answer.console) parts.push(`Console: ${answer.console}`)
+      return { text: parts.join(' ') }
+    }
+  })
+
+  /**
+   * SHUTDOWN is a real power-off: ACPI `system_powerdown`, wait for the process
+   * to exit (or `query-status` to say shutdown), flatten the disk into a
+   * checkpoint, remove the sandbox, and record `powered-off` + `restoreFrom`.
+   * The alternative (`cua_vm_suspend`) keeps the sandbox and resumes instantly;
+   * the difference matters because a suspended computer still holds its RAM and
+   * its QEMU process.
+   */
+  ctx.tools.register({
+    name: 'cua_vm_shutdown',
+    description: 'Power the computer off: ACPI powerdown, checkpoint, sandbox removed, state powered-off. Start cold-boots it. Only when the user asks.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        name: { type: 'string', description: 'Computer name from cua_vm_status.' }
+      },
+      required: ['name']
+    },
+    output: textOutput('The method used, the checkpoint, and any warning.'),
+    async execute(args = {}) {
+      const answer = await call({ op: 'vmShutdown', name: args.name })
+      const parts = [`${answer.name} is ${answer.state} (${answer.method}).`]
+      if (answer.fallback === 'acpi-unsupported') parts.push(answer.detail)
+      else {
+        if (answer.checkpoint) parts.push(`Checkpoint: ${answer.checkpoint}.`)
+        if (answer.restoreFrom?.kind === 'image') parts.push('No checkpoint was written, so Start boots the base image.')
+        if (answer.mayBeTorn) parts.push('The guest did not power down in time, so the image is marked mayBeTorn: the disk was captured after a forced quit.')
+        if (Array.isArray(answer.notes) && answer.notes.length > 0) parts.push(`Notes: ${answer.notes.join('; ')}`)
+      }
+      parts.push('`cua_vm_start` boots it again; `cua_vm_resume` will NOT (a powered-off computer has no sandbox to resume).')
+      return { text: parts.join(' ') }
+    }
+  })
+
+  /** Garbage collection, so a store does not fill with dead 6 GB files. */
+  ctx.tools.register({
+    name: 'cua_vm_gc',
+    description: 'Clean the VM store: orphan checkpoints (newest kept), restore temps, screenshots older than the retention, stale viewer rows, dead port rows.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        dryRun: { type: 'boolean', description: 'Report what would go, delete nothing.' }
+      }
+    },
+    output: textOutput('What was (or would be) removed, and the bytes freed.'),
+    async execute(args = {}) {
+      const answer = await call({ op: 'vmGc', dryRun: args.dryRun === true })
+      const lines = []
+      const list = (label, rows) => {
+        if (!Array.isArray(rows) || rows.length === 0) return
+        lines.push(`${label} (${rows.length}):`)
+        for (const row of rows.slice(0, 12)) lines.push(`- ${row.file ?? row.name} — ${row.reason}`)
+      }
+      list('checkpoints', answer.checkpoints)
+      list('screenshots', answer.shots)
+      list('viewer rows', answer.views)
+      list('port rows', answer.ports)
+      if (lines.length === 0) lines.push('Nothing to clean: no orphan checkpoint, no expired screenshot, no stale row.')
+      lines.push(`${answer.dryRun === true ? 'Would free' : 'Freed'} ${(answer.bytesFreed / 1024 ** 2).toFixed(1)} MB; store now ${(answer.usedBytes / 1024 ** 3).toFixed(1)} GB.`)
+      if (Array.isArray(answer.errors) && answer.errors.length > 0) lines.push(`Errors: ${answer.errors.slice(0, 5).join('; ')}`)
+      return { text: lines.join('\n') }
+    }
+  })
+
+  /** Host capabilities, from the one process that can actually see them. */
+  ctx.tools.register({
+    name: 'cua_vm_doctor',
+    description: 'Diagnose the host: /dev/kvm, render node, QEMU virgl support, Docker engine reachability, store accounting, policy.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: textOutput('Host capabilities and the store policy, one line per fact.'),
+    async execute() {
+      const answer = await call({ op: 'vmDoctor' })
+      const caps = answer.hostCaps ?? {}
+      const windows = answer.windows ?? {}
+      const store = answer.store ?? {}
+      return {
+        text: [
+          `kvm: ${caps.kvm}${caps.kvmUsable ? '' : ' (NOT usable — the computer cannot start)'}`,
+          `render node: ${caps.renderNode}`,
+          `system qemu: ${caps.systemQemu}`,
+          `virtio-gpu-gl-pci: ${caps.virtioGpuGl ? 'yes' : 'no'} (DSH_CUA_VM_GPU=${caps.gpuMode}; default gpu=${caps.gpuDefault})`,
+          `desktop: ${caps.desktop}${caps.resolutionAllowed ? '' : ' (refused: above cua\'s capture budget — set DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=1 to accept a scaled capture)'}`,
+          `workspace share: ${caps.share}`,
+          `docker engine: ${caps.docker}`,
+          `windows: ${windows.enabled ? `enabled (${windows.image}, engine ${windows.engineReachable ? 'reachable' : 'NOT reachable'})` : `disabled (${windows.reason})`}`,
+          `store: ${(store.usedBytes / 1024 ** 3).toFixed(1)} GB of ${(store.quotaBytes / 1024 ** 3).toFixed(0)} GB`,
+          `policy: shutdownTimeoutSec=${answer.shutdownTimeoutSec} checkpointPolicy=${answer.checkpointPolicy} computers=${answer.vms}`
+        ].join('\n')
+      }
     }
   })
 
   ctx.tools.register({
     name: 'cua_vm_suspend',
-    description: 'Stop the VM, keep its disk. Start/ensure resumes it.',
+    description: 'Pause the VM and keep its disk (resume is instant). For a real power-off use cua_vm_shutdown.',
     parameters: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] },
     output: textOutput('Suspend result.'),
     async execute(args = {}) {

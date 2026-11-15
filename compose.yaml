@@ -117,6 +117,23 @@ services:
       CUA_VM_STORE: "${CUA_VM_STORE:-/cua-vm}"
       CUA_WORKSPACE_ROOT: "/workspace"
       CUA_VM_TIER: "${CUA_VM_TIER:-slim}"
+      # GPU: "virgl" makes virgl the DEFAULT for a create that does not say
+      # otherwise (an explicit gpu:false still wins), and is what
+      # compose.gpu.yaml sets. Empty = a create gets no GPU unless it asks.
+      DSH_CUA_VM_GPU: "${DSH_CUA_VM_GPU:-}"
+      # Desktop geometry. 1200x750 is exactly cua's ~900k px capture budget, so
+      # image pixels are display pixels; a larger one is refused unless
+      # DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=1 accepts a scaled capture.
+      DSH_CUA_VM_RESOLUTION: "${DSH_CUA_VM_RESOLUTION:-1200x750}"
+      DSH_CUA_VM_RESOLUTION_ALLOW_SCALE: "${DSH_CUA_VM_RESOLUTION_ALLOW_SCALE:-}"
+      # The 9p share of /workspace into the guest (0 turns it off; put/get stay).
+      DSH_CUA_VM_SHARE_WORKSPACE: "${DSH_CUA_VM_SHARE_WORKSPACE:-1}"
+      # 1 = `stop` means suspend again (the pre-2026-11 alias). 0 (default) =
+      # `stop` is a real ACPI shutdown + checkpoint.
+      DSH_CUA_VM_LEGACY_STOP: "${DSH_CUA_VM_LEGACY_STOP:-}"
+      # Windows computers: 0 removes the option entirely. They need the DinD
+      # overlay (compose.windows.yaml), which also sets DOCKER_HOST.
+      DSH_CUA_VM_WINDOWS: "${DSH_CUA_VM_WINDOWS:-0}"
       # Shared-desktop gate. The proxy hands this cookie to any browser that can
       # load the harness page, and refuses /vm/view/* and /vm/port/* without it —
       # so an SSO/passkey in front of the app also protects the VM surfaces that
