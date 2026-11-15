@@ -167,7 +167,13 @@ const NEEDLES = {
     // `powered-off` lie that would make Start build a second QEMU on the disk.
     ['could not power ${name} off: QEMU (pid ${qemuPid(name)}) is still running', 1],
     ['nothing was removed', 1],
+    // D3 (round 2): the stale marking has a PRODUCER, in the same write as
+    // lastShutdown=abandoned — without it Start's refusal was dead code.
     ['const stale = meta.restoreFrom?.stale === true', 1],
+    ["row.restoreFrom?.kind !== 'checkpoint'", 1],
+    ['staleReason:', 1],
+    ['shutdown abandoned while QEMU held the disk', 1],
+    ['Its existing restore point is now marked stale', 1],
     // D4: measuring must point cua at the computer being measured first.
     ['if (DO_TARGET !== name)', 2],
     ['space.clear()', 2],

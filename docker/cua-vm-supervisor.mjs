@@ -2170,7 +2170,7 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
         // A forced kill would tear a disk we cannot checkpoint anyway. Leave it
         // running, say so, and make Start refuse the stale restore point.
         timedOut = true
-        notes.push('the disk is still open, so NO checkpoint was taken and any existing one is marked stale')
+        notes.push('the disk is still open, so NO checkpoint was taken; an existing restore point is marked stale')
       }
     }
     if (powerdown?.[0]?.error) {
@@ -2222,25 +2222,42 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
   // 4b. AN ABANDONED COMPUTER IS LEFT ALONE.
   //
   // QEMU is running and its monitor does not answer: we cannot power it down,
-  // the disk is open, and every remaining step would make it worse. Removed the
+  // the disk is open, and every remaining step would make it worse. Removing the
   // sandbox and Start would build a second QEMU on the same qcow2; converting it
   // would publish a possibly-inconsistent image as a restore point; claiming
   // `powered-off` would be a lie the panel then acts on. So: record that the
   // attempt failed, change nothing else, and say exactly what is true.
+  //
+  // ONE THING IS STILL MUTATED, IN THE SAME WRITE: a restore point this computer
+  // already had is marked stale, because we have just proved we cannot vouch for
+  // the disk any more (the machine is up and writing to it while its monitor is
+  // gone). That marking is what makes Start's stale-refusal branch reachable —
+  // `startFromCheckpoint` reads `restoreFrom.stale` and, without a producer, the
+  // guard was dead code guarding nothing.
   if (qemuMayBeAlive) {
-    await mutateRegistry((fresh) => {
-      if (!fresh.vms[name]) return
-      fresh.vms[name].lastShutdown = {
+    const markedStale = await mutateRegistry((fresh) => {
+      const row = fresh.vms[name]
+      if (!row) return false
+      row.lastShutdown = {
         at: new Date().toISOString(),
         method: 'abandoned',
         reason,
         error: 'QEMU is still running and its QMP monitor does not answer'
       }
+      if (row.restoreFrom?.kind !== 'checkpoint') return false
+      row.restoreFrom = {
+        ...row.restoreFrom,
+        stale: true,
+        staleReason: 'shutdown abandoned while QEMU held the disk (its monitor never answered)'
+      }
+      return true
     })
-    log(`shutdown ${name}: abandoned — QEMU (pid ${qemuPid(name)}) is alive with no monitor; nothing was removed`)
+    log(`shutdown ${name}: abandoned — QEMU (pid ${qemuPid(name)}) is alive with no monitor; nothing was removed${markedStale ? ', restore point marked stale' : ''}`)
     return fail(
       `could not power ${name} off: QEMU (pid ${qemuPid(name)}) is still running and its monitor does not answer, so the disk is open. `
-      + 'No checkpoint was taken and nothing was removed — the computer is still running. Retry in a moment, or use cua_vm_destroy to remove it.'
+      + `No checkpoint was taken and nothing was removed — the computer is still running. `
+      + `${markedStale ? 'Its existing restore point is now marked stale, so Start will boot the base image instead of trusting it. ' : ''}`
+      + 'Retry in a moment, or use cua_vm_destroy to remove it.'
     )
   }
 
@@ -2266,6 +2283,8 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
     fresh.vms[name].state = 'powered-off'
     fresh.vms[name].lastUsed = new Date().toISOString()
     fresh.vms[name].lastShutdown = { at: new Date().toISOString(), method, reason }
+    // A CLEAN shutdown always writes a restore point from scratch, so a stale
+    // marking from an earlier abandoned attempt cannot survive it.
     fresh.vms[name].restoreFrom = checkpoint !== null
       ? { kind: 'checkpoint', file: checkpoint }
       : { kind: 'image', image: fresh.vms[name].image || 'linux' }

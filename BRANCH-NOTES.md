@@ -657,7 +657,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **176 assertions** across 12 files (the gate prints
+* `tools/check-cua-vm.mjs` — **180 assertions** across 12 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -675,9 +675,9 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (176 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
+green (180 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
-(61 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
+(64 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
 must not be touched, target switching, a concurrent exec burst), a real `qemu-system-x86_64 -S` shutdown
 (timeout → quit → `mayBeTorn`), an ACPI-refusal fallback against a
@@ -690,7 +690,12 @@ both are listed as TBC in REPORT.md §9.5.
 
 Seven defects fixed on this branch (D1 spawn crash, D2 path traversal through
 `name`, D3 unproven-dead checkpoint, D4 capture on the wrong target, D5 registry
-write races, D6 orphan container, D7 doc counts), with the reasoning in
-REPORT.md §9.4 and five of them covered by new assertions — `runCua` and
+write races, D6 orphan container, D7 doc counts), plus the residual that the D3
+fix left behind: the `stale` flag was READ by `startFromCheckpoint` and written
+nowhere, so the refusal was dead code. The abandoned branch now marks an existing
+restore point `{stale: true, staleReason}` in the same write as
+`lastShutdown.method: "abandoned"`, a clean shutdown overwrites `restoreFrom`
+wholesale, and the gate asserts both the producer and the reader. The reasoning is
+in REPORT.md §9.4 and five of the seven are covered by new assertions — `runCua` and
 `assertVmName` and `mutateRegistry` and the abandoned-shutdown branch are now
 gate needles, so none of them can be refactored away silently.
