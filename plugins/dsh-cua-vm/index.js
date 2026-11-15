@@ -358,7 +358,7 @@ export function apply(ctx, config = {}) {
         android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating (Linux only).' },
         rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true. Linux only.' },
         windowsVersion: { type: 'string', enum: ['11', '10', 'ltsc10', '2022', '2025'], description: 'Windows version (VERSION in the container spec). Windows only.' },
-        windowsIso: { type: 'string', description: 'Windows ISO URL or file name instead of a version (ISO). Windows only; mutually exclusive with windowsVersion.' }
+        windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL, or a path relative to the VM store (the ISO must be under $STORE; it is bind-mounted at /boot.iso). Windows only; mutually exclusive with windowsVersion.' }
       }
     },
     output: textOutput('The computer, its renderer, disk, Android and REA status.'),
@@ -699,6 +699,14 @@ export function apply(ctx, config = {}) {
       list('screenshots', answer.shots)
       list('viewer rows', answer.views)
       list('port rows', answer.ports)
+      if (Array.isArray(answer.orphans) && answer.orphans.length > 0) {
+        lines.push(`orphaned rows (${answer.orphans.length}):`)
+        for (const row of answer.orphans) lines.push(`- ${row.name}: ${row.sandbox}, ${row.action}`)
+      }
+      if (Array.isArray(answer.sandboxes) && answer.sandboxes.length > 0) {
+        lines.push(`sandboxes cua lists with no row (${answer.sandboxes.length}) — not touched, they may belong to another install:`)
+        for (const row of answer.sandboxes.slice(0, 8)) lines.push(`- ${row.name} (${row.status})`)
+      }
       if (lines.length === 0) lines.push('Nothing to clean: no orphan checkpoint, no expired screenshot, no stale row.')
       lines.push(`${answer.dryRun === true ? 'Would free' : 'Freed'} ${(answer.bytesFreed / 1024 ** 2).toFixed(1)} MB; store now ${(answer.usedBytes / 1024 ** 3).toFixed(1)} GB.`)
       if (Array.isArray(answer.errors) && answer.errors.length > 0) lines.push(`Errors: ${answer.errors.slice(0, 5).join('; ')}`)
@@ -736,23 +744,31 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_suspend',
-    description: 'Pause the VM and keep its disk (resume is instant). For a real power-off use cua_vm_shutdown.',
+    description: 'Pause the computer and keep its disk (resume is instant). Linux: cua sb suspend. Windows: docker pause. For a real power-off use cua_vm_shutdown.',
     parameters: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] },
     output: textOutput('Suspend result.'),
     async execute(args = {}) {
       const result = await call({ op: 'suspend', name: args.name })
+      if (result.kind === 'windows') return { text: `${result.name} is suspended (the Windows container is paused; Start resumes it).` }
       return { text: `${result.name} suspended; its disk stays in the VM store.` }
     }
   })
 
   ctx.tools.register({
     name: 'cua_vm_destroy',
-    description: 'Delete the VM and its disk. Only when the user asks.',
+    description: 'Delete the VM and everything it left in the store. Only when the user asks.',
     parameters: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] },
-    output: textOutput('Destroy result.'),
+    output: textOutput('Destroy result, or the items that survived.'),
     async execute(args = {}) {
       const result = await call({ op: 'destroy', name: args.name })
-      return { text: `${result.name} destroyed. Its disk is gone; the next ensure starts from the base image.` }
+      if (result.complete === false) {
+        // A PARTIAL manifest is not a deletion: the sandbox may still be there
+        // and the row is kept (and marked orphaned) so the name stays visible.
+        const failed = (result.failed ?? []).map((item) => `- ${item.target}: ${item.detail}`).join('\n')
+        return { text: `${result.name} was NOT fully deleted. ${result.detail ?? ''}
+${failed}` }
+      }
+      return { text: `${result.name} destroyed (${result.items?.length ?? 0} store item(s) removed). The next ensure starts from the base image.` }
     }
   })
 }

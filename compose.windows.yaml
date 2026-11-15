@@ -23,9 +23,14 @@
 #   /dev/kvm (the VM needs hardware virtualisation), and /dev/dri/renderD128
 #   only when the computer was created with "Enable GPU" (GPU=Y + RENDERNODE).
 #   The console (8006) is relayed by the supervisor and published at
-#   /vm/port/<name>/ — it is never exposed raw. QMP (7100) is never published at
-#   all: it is reached on the container's own address, which is why the container
-#   joins DSH_CUA_WINDOWS_NETWORK.
+#   /vm/port/<name>/ — it is never exposed raw.
+#
+#   TWO MONITOR PORTS, NEITHER PUBLISHED: `dockurr/windows` v4.35 runs its own
+#   HMP monitor on 7100 (power.sh: MONITOR="telnet:localhost:7100,...") and the
+#   supervisor's QMP socket is appended to the same QEMU command line on 7101 —
+#   two binds on 7100 would kill QEMU at boot with EADDRINUSE. Both are reached
+#   on the container's own address, which is why the container joins
+#   DSH_CUA_WINDOWS_NETWORK; nothing here maps them to the host.
 #
 # RDP — OPT-IN, AND A REAL EXPOSURE
 #   RDP (3389) is published by Docker to the DinD container's network namespace.

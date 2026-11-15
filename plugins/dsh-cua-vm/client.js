@@ -499,7 +499,7 @@ window.__ModuleLoader__.load({
                     ))
             ),
             draft.kind === 'windows' && h('input', {
-              placeholder: 'ISO URL or file name instead of a version (optional)',
+              placeholder: 'ISO: http(s) URL, or a path under the VM store (e.g. windows/11.iso) — optional',
               value: draft.windowsIso, style: S.input,
               onChange: (event) => setDraft({ ...draft, windowsIso: event.target.value })
             }),
@@ -597,7 +597,9 @@ window.__ModuleLoader__.load({
                       void act(name, `Shutting down ${name}…`, 'shutdown', { name })
                     }
                   }, busy && busyLabel !== null ? busyLabel : 'Shutdown'),
-                  ready && windows === false && h('button', {
+                  // Both kinds can be suspended: `cua sb suspend` on Linux,
+                  // `docker pause` on Windows (the tool says which).
+                  ready && h('button', {
                     type: 'button', style: S.button, disabled: busy,
                     onClick: () => void act(name, `Suspending ${name}…`, 'suspend', { name })
                   }, 'Suspend'),
@@ -624,7 +626,22 @@ window.__ModuleLoader__.load({
                   h('button', { type: 'button', style: S.button, onClick: () => void showSpace(name) }, 'Space'),
                   h('button', {
                     type: 'button', style: { ...S.button, color: T.error },
-                    onClick: () => { if (window.confirm(`Delete ${name}? Its disk, checkpoints, screenshots and port rows go with it.`)) void act(name, `Deleted ${name}.`, 'delete', { name }) }
+                    onClick: () => {
+                      if (!window.confirm(`Delete ${name}? Its disk, checkpoints, screenshots and port rows go with it.`)) return
+                      void (async () => {
+                        try {
+                          const payload = await api('delete', { name })
+                          await load()
+                          // A partial manifest is not a deletion: say which
+                          // items survived instead of reporting success.
+                          setNote(payload.complete === false
+                            ? clean(`${name} was NOT fully deleted: ${(payload.failed ?? []).map((item) => item.target).join(', ') || payload.detail || 'see the supervisor log'}`)
+                            : `Deleted ${name}.`)
+                        } catch (error) {
+                          setNote(clean(error?.message ?? error))
+                        }
+                      })()
+                    }
                   }, 'Delete')
                 ),
                 secret[name] && h('div', { style: { ...S.muted, fontFamily: 'ui-monospace, monospace' } },

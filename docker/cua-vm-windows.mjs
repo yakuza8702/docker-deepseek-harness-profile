@@ -49,7 +49,7 @@
 
 import http from 'node:http'
 import net from 'node:net'
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { pngSize } from './cua-vm-space.mjs'
@@ -71,8 +71,27 @@ export const WINDOWS_MIN_CPU = 2
 export const WINDOWS_DEFAULT_CPU = 2
 export const WINDOWS_DEFAULT_MEMORY_GB = 6
 export const WINDOWS_DEFAULT_DISK_GB = 64
-/** The QEMU monitor, INSIDE the container only. Never published. */
-export const WINDOWS_QMP_PORT = 7100
+/**
+ * OUR QMP PORT, AND WHY IT IS NOT 7100.
+ *
+ * `dockurr/windows` v4.35 runs its OWN monitor on 7100:
+ *
+ *   power.sh:  QEMU_PORT=7100
+ *              MONITOR="telnet:localhost:7100,server,nowait,nodelay"
+ *   config.sh: QEMU args = [..., $MON_OPTS, ...$ARGUMENTS]
+ *
+ * so the guest QEMU already binds 7100 before our `$ARGUMENTS` are appended. A
+ * `-qmp tcp:0.0.0.0:7100` there is a second bind on the same port: QEMU exits
+ * with EADDRINUSE at boot and Windows can never become ready. (It also breaks
+ * dockur's own graceful shutdown, which `nc`s a plain HMP `system_powerdown`
+ * into 7100 — QMP answers that with a protocol error.)
+ *
+ * So the supervisor's monitor lives on 7101, next to dockur's, inside the
+ * container only. WINDOWS_HMP_PORT documents the neighbour we must never dial.
+ */
+export const WINDOWS_QMP_PORT = 7101
+/** dockur's own HMP monitor. Read-only knowledge: never connect to it. */
+export const WINDOWS_HMP_PORT = 7100
 /** dockurr's web console (noVNC). Relayed by the supervisor as /vm/port/<name>/. */
 export const WINDOWS_CONSOLE_PORT = 8006
 export const WINDOWS_RDP_PORT = 3389
@@ -253,6 +272,8 @@ export function parseKeySpec(spec) {
  */
 export function createWindowsBackend({ store, qmp, log = () => {} } = {}) {
   const storageRoot = path.join(store, WINDOWS_STORAGE_DIR)
+  /** Monotonic screendump counter: two frames must never share a filename. */
+  let FRAME_SEQUENCE = 0
 
   function containerName(name) {
     // Deliberately not the VM name: a container shows up in `docker ps`, and
@@ -284,36 +305,73 @@ export function createWindowsBackend({ store, qmp, log = () => {} } = {}) {
    * mapping IS the contract, and a dropped DISK_FMT is a raw-format disk that
    * cannot be reused.
    */
+  /**
+   * THE ENVIRONMENT, AS THE PINNED IMAGE ACTUALLY READS IT.
+   *
+   * Only variables that exist in dockurr/windows v4.35 are set. Two are
+   * deliberately absent:
+   *
+   *   VRAM_SIZE  v4.35's display.sh knows GPU/RENDERNODE but the qemux/qemu:7.12
+   *              base it builds on has no VRAM_SIZE consumer — a no-op that
+   *              reads like configuration.
+   *   SHUTDOWN   v4.35's entry.sh traps SIGTERM into a graceful guest shutdown
+   *              unconditionally (power.sh's trap), so "Y" changes nothing.
+   *
+   * A local ISO is not a variable at all: it is bind-mounted at /boot.iso, which
+   * is how the image detects a custom install medium. A REMOTE ISO is a URL in
+   * VERSION — there is no `ISO` variable in v4.35.
+   */
   function environment(spec, password) {
-    const env = [
-      ['VERSION', spec.windowsVersion],
+    const isoUrl = /^https?:\/\//iu.test(String(spec.windowsIso || ''))
+    const env = []
+    if (isoUrl) env.push(['VERSION', spec.windowsIso])
+    else if (!spec.windowsIso) env.push(['VERSION', spec.windowsVersion])
+    env.push(
       ['DISK_SIZE', `${spec.diskGb}G`],
       ['DISK_FMT', 'qcow2'],
       ['RAM_SIZE', `${spec.memory}G`],
       ['CPU_CORES', String(spec.cpu)],
       ['GPU', spec.gpu ? 'Y' : 'N'],
-      ['VRAM_SIZE', '4G'],
-      ['SHUTDOWN', 'Y'],
       ['MANUAL', 'N'],
       ['USERNAME', WINDOWS_USERNAME],
       ['PASSWORD', password],
       // usb-tablet is what makes absolute pointing possible (QMP sends
       // absolute axis values); the QMP socket is the control channel the
-      // supervisor screenshots and types through.
+      // supervisor screenshots and types through — on its own port, next to
+      // dockur's 7100 monitor (see WINDOWS_QMP_PORT).
       ['ARGUMENTS', `-device usb-tablet -qmp tcp:0.0.0.0:${WINDOWS_QMP_PORT},server=on,wait=off`]
-    ]
+    )
     if (spec.gpu) env.push(['RENDERNODE', process.env.CUA_WINDOWS_RENDERNODE || '/dev/dri/renderD128'])
-    // VERSION XOR ISO. dockurr treats ISO as "use this file", so sending both
-    // makes VERSION meaningless; the spec normaliser already refuses that.
-    if (spec.windowsIso) {
-      env.splice(0, 1, ['ISO', spec.windowsIso])
-    }
     return env.map(([key, value]) => `${key}=${value}`)
   }
 
+  /**
+   * The local ISO, resolved and constrained to the store.
+   *
+   * A bind source is a HOST path, so it is validated here, not by the caller:
+   * anything outside `$STORE` (or that does not exist) would either mount the
+   * wrong file into the guest or create an empty directory at the mount point.
+   */
+  function localIsoPath(spec) {
+    const iso = String(spec.windowsIso || '')
+    if (iso === '' || /^https?:\/\//iu.test(iso)) return null
+    const resolved = path.resolve(store, iso)
+    if (resolved !== store && !resolved.startsWith(store + path.sep)) {
+      throw new Error(`windowsIso "${iso}" must be an http(s) URL or a file inside the VM store (${store})`)
+    }
+    if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+      throw new Error(`windowsIso "${iso}" does not exist in the VM store (put the ISO under $STORE/windows/ first)`)
+    }
+    return resolved
+  }
+
   function hostConfig(spec) {
+    const binds = [`${storageDir(spec.name)}:/storage`]
+    const iso = localIsoPath(spec)
+    // /boot.iso is how v4.35 detects a local install medium; it replaces VERSION.
+    if (iso !== null) binds.push(`${iso}:/boot.iso:ro`)
     const host = {
-      Binds: [`${storageDir(spec.name)}:/storage`],
+      Binds: binds,
       CapAdd: ['NET_ADMIN'],
       Devices: [{ PathOnHost: '/dev/kvm', PathInContainer: '/dev/kvm', CgroupPermissions: 'rwm' }],
       // No restart policy: a Windows computer is started and stopped
@@ -381,14 +439,20 @@ export function createWindowsBackend({ store, qmp, log = () => {} } = {}) {
       socket.connect(rdp.port, rdp.host)
     })
     let running = false
+    let qmpStatus = ''
     let qmpError = ''
     try {
       const status = await qmpFor(info, [{ execute: 'query-status' }])
-      running = /running|paused|suspended/u.test(String(status?.[0]?.return?.status ?? ''))
+      qmpStatus = String(status?.[0]?.return?.status ?? '')
+      // ONLY `running` COUNTS. A paused or suspended guest still holds its RDP
+      // listener open, so `paused` used to read as "ready" — the panel showed a
+      // running computer whose screen never changes, and the install timeout
+      // never fired because the predicate had already succeeded.
+      running = qmpStatus === 'running'
     } catch (error) {
       qmpError = error?.message ?? String(error)
     }
-    return { ready: accept && running, rdp, running, qmpError }
+    return { ready: accept && running, rdp, running, qmpStatus, qmpError }
   }
 
     /**
@@ -400,7 +464,12 @@ export function createWindowsBackend({ store, qmp, log = () => {} } = {}) {
     if (row === null) throw new Error(`no Windows container for "${name}"`)
     const info = await inspect(row.Id)
     if (info === null || info.State?.Running !== true) throw new Error('the Windows computer is not running')
-    const fileInGuest = `/storage/cua-shot-${Date.now()}.png`
+    // A MONOTONIC COUNTER + RANDOM SUFFIX, not `Date.now()`. The panel polls a
+    // frame every 1.2 s while the model can take one in the same millisecond;
+    // two screendumps to one name meant the first unlink deleted the second
+    // call's frame, and that call then failed on a missing file.
+    const unique = `${(FRAME_SEQUENCE += 1)}-${randomBytes(4).toString('hex')}`
+    const fileInGuest = `/storage/cua-shot-${unique}.png`
     const hostFile = path.join(storageDir(name), path.basename(fileInGuest))
     await qmpFor(info, [{ execute: 'screendump', arguments: { filename: fileInGuest } }])
     // The /storage bind is the fast path: the file appears on the host (the
@@ -421,7 +490,10 @@ export function createWindowsBackend({ store, qmp, log = () => {} } = {}) {
       if (png === null) throw new Error('the guest produced no frame (screendump wrote nothing and the archive copy failed)')
     }
     if (typeof saveTo === 'string' && saveTo !== '') writeFileSync(saveTo, png)
-    return { png, file: hostFile }
+    // `file` is deliberately NOT part of the contract: the host copy has just
+    // been unlinked (or was never written, on the archive path), so a path to it
+    // would be a trap. Callers that need a file pass `saveTo`.
+    return { png }
   }
 
 
@@ -567,6 +639,14 @@ export function createWindowsBackend({ store, qmp, log = () => {} } = {}) {
           probe.qmpError = error?.message ?? String(error)
         }
       }
+      if (info.State?.Paused === true) {
+        return {
+          state: 'suspended',
+          detail: 'the container is paused (suspend); Start unpauses it',
+          console: publishedPort(info, WINDOWS_CONSOLE_PORT),
+          rdp: publishedPort(info, WINDOWS_RDP_PORT)
+        }
+      }
       if (info.State?.Running !== true) {
         return {
           state: info.State?.ExitCode ? 'error' : 'stopped',
@@ -625,6 +705,36 @@ export function createWindowsBackend({ store, qmp, log = () => {} } = {}) {
       }
       log(`windows: ${name} container started`)
       return { started: true }
+    },
+
+    /**
+     * SUSPEND ON WINDOWS IS `docker pause`, NOT `cua sb suspend`.
+     *
+     * There is no cua sandbox behind a Windows computer: `sb suspend --local
+     * <name>` answers "not found" and the panel's Suspend button would look
+     * broken. A paused container keeps the guest's RAM and its disk exactly as
+     * they were, which is what suspend means here; Start unpauses.
+     */
+    async pause(name) {
+      const row = await findContainer(name)
+      if (row === null) throw new Error(`no Windows container for "${name}"`)
+      const result = await dockerRequest(`/containers/${row.Id}/pause`, { method: 'POST', timeoutMs: 60000 })
+      if (result.status !== 204 && result.status !== 304) {
+        throw new Error(`docker could not pause the container (${result.status}): ${result.json?.message ?? ''}`)
+      }
+      log(`windows: ${name} paused`)
+      return { paused: true }
+    },
+
+    async unpause(name) {
+      const row = await findContainer(name)
+      if (row === null) throw new Error(`no Windows container for "${name}"`)
+      const result = await dockerRequest(`/containers/${row.Id}/unpause`, { method: 'POST', timeoutMs: 60000 })
+      if (result.status !== 204 && result.status !== 304) {
+        throw new Error(`docker could not unpause the container (${result.status}): ${result.json?.message ?? ''}`)
+      }
+      log(`windows: ${name} unpaused`)
+      return { unpaused: true }
     },
 
     async stop(name) {

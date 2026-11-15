@@ -180,7 +180,35 @@ const NEEDLES = {
     // D5: registry mutations are serialised, so an await cannot resurrect a
     // row another handler already moved on.
     ['function mutateRegistry(mutator)', 1],
-    ["withLock('@registry'", 1]
+    ["withLock('@registry'", 1],
+    // S3: every lifecycle op takes the same per-computer lock, and it is
+    // re-entrant so shutdown→suspend and stop→shutdown cannot deadlock.
+    ['function withVmLock(name, fn)', 1],
+    ['VM_LOCK_CONTEXT', 3],
+    // S8/S9: an unreadable registry throws instead of being persisted empty, and
+    // the v1→v2 write happens under the lock (at boot).
+    ['registry.json could not be read', 1],
+    ['await migrateRegistryFile()', 1],
+    // S1: GC is serialised against the lifecycle lock it shares with a convert
+    // or a boot, so it cannot delete a `.tmp` or a restore temp mid-flight.
+    ["return withLock('@gc'", 1],
+    ['withVmLock(groupName, run)', 1],
+    // S5/S15: a failed `sb rm` keeps the row (marked orphaned) and the delete
+    // reports itself as partial.
+    ['row.orphaned = true', 1],
+    ['deleted: complete', 1],
+    ['failed: failures.map', 1],
+    // S10: the quota is a RESERVATION, not a check-then-act.
+    ['function reserveStoreBytes(name, bytes)', 1],
+    ['releaseStoreBytes(name)', 1],
+    ['releaseStoreBytes(spec.name)', 2],
+    // S11/S12/S13: a checkpoint needs room, a QEMU that survives `quit` is not
+    // off, and a failed shutdown puts the preview back.
+    ['diskBytesFor(name)', 1],
+    ["abandonedBecause = 'survived the QMP quit'", 1],
+    ['restorePorts(name, previews)', 1],
+    // S2: mayBeTorn is READ on the start path, not just written.
+    ['meta.mayBeTorn === true', 1]
   ],
   space: [
     ['export const CAPTURE_MAX_PIXELS = 900_000', 1],
@@ -200,15 +228,28 @@ const NEEDLES = {
     ["export const WINDOWS_MIN_MEMORY_GB = 6", 1],
     ["export const WINDOWS_MIN_DISK_GB = 64", 1],
     ["export const WINDOWS_MIN_CPU = 2", 1],
-    ["export const WINDOWS_QMP_PORT = 7100", 1],
+    ["export const WINDOWS_QMP_PORT = 7101", 1],
     ["export const WINDOWS_CONSOLE_PORT = 8006", 1],
     ["export const WINDOWS_RDP_PORT = 3389", 1],
     ["['DISK_FMT', 'qcow2']", 1],
-    ["['SHUTDOWN', 'Y']", 1],
     ["['MANUAL', 'N']", 1],
+    // W1: our monitor lives on 7101 because dockurr v4.35 already binds 7100
+    // for its own HMP monitor; two binds on one port kill QEMU at boot.
+    ['export const WINDOWS_QMP_PORT = 7101', 1],
+    ['export const WINDOWS_HMP_PORT = 7100', 1],
+    // W2: a remote ISO is VERSION=<url>; a local one is /boot.iso. There is no
+    // `ISO` variable in the pinned image.
+    ['const isoUrl = /^https?:', 1],
+    ["['VERSION', spec.windowsIso]", 1],
+    ['/boot.iso:ro', 1],
+    // W5/W6/W7/W8: the real shapes the fixes introduced.
+    ['async pause(name)', 1],
+    ['async unpause(name)', 1],
+    ['qmpStatus === ', 1],
+    ['FRAME_SEQUENCE += 1', 1],
     ["['CPU_CORES', String(spec.cpu)]", 1],
     ["['GPU', spec.gpu ? 'Y' : 'N']", 1],
-    ["['VRAM_SIZE', '4G']", 1],
+    ["['PASSWORD', password]", 1],
     ["['USERNAME', WINDOWS_USERNAME]", 1],
     ["['PASSWORD', password]", 1],
     ['-device usb-tablet -qmp tcp:0.0.0.0:${WINDOWS_QMP_PORT},server=on,wait=off', 1],
@@ -335,6 +376,21 @@ const NEEDLES = {
  *   runCua(['sb','resume'] in a start path for a powered-off computer
  */
 const FORBIDDEN = [
+  {
+    key: 'windows',
+    pattern: "['VRAM_SIZE'",
+    reason: 'VRAM_SIZE is a no-op on the pinned qemux/qemu:7.12 base; asserting it made the gate pass on noise'
+  },
+  {
+    key: 'windows',
+    pattern: "['SHUTDOWN'",
+    reason: 'v4.35 shuts down gracefully unconditionally, so SHUTDOWN=Y changes nothing'
+  },
+  {
+    key: 'windows',
+    pattern: "['ISO'",
+    reason: 'there is no ISO variable in dockurr/windows v4.35: a remote ISO is VERSION=<url>, a local one is /boot.iso'
+  },
   {
     key: 'supervisor',
     pattern: '/cua-vm/shots',

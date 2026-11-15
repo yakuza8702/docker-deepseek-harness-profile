@@ -312,9 +312,9 @@ green. This section is the delta a reader of the older sections needs.
 | W3 | Real `vmShutdown`: close ports → QMP `system_powerdown` (socket parsed from `vmm/qemu/<name>/cmdline`) → wait for exit/`query-status=shutdown` up to `shutdownTimeoutSec` → `quit` → flatten to a checkpoint (`mayBeTorn` on timeout) → `sb rm --force` → `powered-off` + `restoreFrom`; `start` cold-boots from the checkpoint and deletes the restore temp; `stop` = shutdown (`DSH_CUA_VM_LEGACY_STOP=1` restores the suspend alias); an ACPI refusal falls back to suspend *explicitly* |
 | W4 | New `docker/cua-vm-space.mjs`: display from the guest, capture from the PNG's own IHDR, `scale = display/screenshot`, 30 s cache invalidated on resume/restart/zoom; clicks prime one capture then `cua do click` in screenshot pixels, xdotool fallback at `round(x*scale)`; the `sqrt` guess is gone; every pointer/typing result prints `screenshot WxH · display WxH · scale N` plus "do not rescale" when scaled; >900k px refused unless `DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=1`; guest provision **v7** (`apt_ok=`, `display=`, `space_helper=1`, marker written on a broken apt too, exit 2); ImageMagick in the image; shots now under `$STORE/shots` |
 | W5 | `DSH_CUA_VM_GPU` is live: `virgl` makes virgl the default for a create that omits `gpu` (explicit `false` wins, gated on `systemQemuSupportsVirgl`); one `normaliseSpec` + shared `createManaged` so `ensure` carries image/gpu/diskGb/android/rea and a rebuild restores them; `cua_vm_start` tool; `cua_vm_port` prints the URL **and** the loopback port (`result.target` was always `undefined`) |
-| W6 | New `docker/cua-vm-windows.mjs`: Docker Engine API over `DOCKER_HOST`, pinned `dockurr/windows:4.35`, the full env mapping with 64 GB / 6 GB / 2 vCPU floors, `usb-tablet` + QMP 7100 (never published), `NET_ADMIN`, `/storage` bind, labels, no restart policy; `installing` → `ready` on RDP-accept **and** QMP-running, timeout with the last 40 log lines; console 8006 relayed into `ports.json` as `backend:"relay"`; 3389 opt-in only; `DSH_CUA_VM_WINDOWS=0` removes the option |
+| W6 | New `docker/cua-vm-windows.mjs`: Docker Engine API over `DOCKER_HOST`, pinned `dockurr/windows:4.35`, the env mapping the image actually reads (VERSION or a URL, DISK_SIZE/DISK_FMT/RAM_SIZE/CPU_CORES with 64 GB / 6 GB / 2 vCPU floors, GPU/RENDERNODE, MANUAL, USERNAME/PASSWORD, a local ISO as `/boot.iso`), `usb-tablet` + QMP on **7101** (dockurr owns 7100; neither is published), `NET_ADMIN`, `/storage` bind, labels, no restart policy; `installing` → `ready` only on RDP-accept **and** `query-status == running`, timeout with the last 40 log lines; console 8006 relayed into `ports.json` as `backend:"relay"`; 3389 opt-in only; `DSH_CUA_VM_WINDOWS=0` removes the option |
 | W7 | Windows agent surface: `screendump` frames (`space.source='qmp'`), `input-send-event` clicks/keys (ASCII only), and structured "not available" for exec/put/get/disk with the console/RDP hint; the proxy rewrites root-path HTML/JS for relay rows; `compose.windows.yaml`, env pass-through in `compose.yaml`, `.env.example` |
-| W9 | Docs + `tools/check-cua-vm.mjs` (**180 assertions**, the gate prints its own total; registered in `ci-gates.mjs`); `check-cua-rea.mjs` updated in the same commit for the three needle spellings the refactor moved (create flags → spec normaliser, `diskGb` → `spec.diskGb`, recovery row merge → `fresh.vms[name] || known`), none deleted; four new tools; the panel gained kind/version selection, per-kind gating, a Shutdown/Suspend split, installing/error badges, a Space line, Clean up, and password reveal |
+| W9 | Docs + `tools/check-cua-vm.mjs` (**207 assertions**, the gate prints its own total; registered in `ci-gates.mjs`); `check-cua-rea.mjs` updated in the same commit for the three needle spellings the refactor moved (create flags → spec normaliser, `diskGb` → `spec.diskGb`, recovery row merge → `fresh.vms[name] || known`), none deleted; four new tools; the panel gained kind/version selection, per-kind gating, a Shutdown/Suspend split, installing/error badges, a Space line, Clean up, and password reveal |
 
 ### 9.3 Verification actually run
 
@@ -323,9 +323,9 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **180** assertions across 12 files |
+| `node tools/check-cua-vm.mjs` | **207** assertions across 12 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
-| Supervisor smoke against a **throwaway store + stub `cua`** (64 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
+| Supervisor smoke against a **throwaway store + stub `cua`** (71 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
 | ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
 | `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
@@ -351,7 +351,7 @@ regression tests where the bug was testable without a VM.
 | D4 | `space.capture` captured whatever `cua do` was last pointed at | it now runs `do switch local:<name>` before the screenshot (and drops the cached space + prime flag on a switch), exactly like the gui path |
 | D5 | registry read-modify-write across `await`s: a finishing `exec` could write a pre-shutdown snapshot back and resurrect `state: "ready"` | every mutation goes through `mutateRegistry()` — a tiny critical section under `withLock('@registry')` that **re-reads** inside the lock |
 | D6 | a failure between container-create and start left an orphan container holding the name, with no registry row | both failure paths `DELETE` the container before the error travels |
-| D7 | docs claimed 117 assertions and "21/21" needles | gates now print their own totals (**180** assertions, **67** needles) and the docs quote those; the Windows 64 GB quota requirement is stated in README §Personal VM and here |
+| D7 | docs claimed 117 assertions and "21/21" needles | gates now print their own totals (**207** assertions, **67** needles) and the docs quote those; the Windows 64 GB quota requirement is stated in README §Personal VM and here |
 
 A residual from that round: the `stale` flag was read by `startFromCheckpoint` but
 **written nowhere** (the first fix aborted the shutdown before touching the row),
@@ -368,7 +368,48 @@ and a Windows disk floors at 64 GB, so a fresh install must raise the policy
 first. The create now refuses with that exact sentence (and the field to change)
 instead of the generic "store quota reached".
 
-### 9.5 What is still open (TBC)
+### 9.5 Round 3: depth review (supervisor) and Windows source audit
+
+Sixteen supervisor defects and ten Windows defects from a review against the
+pinned image's own sources. All fixed; the ones a test can express without a VM
+are covered in the smoke suite.
+
+**Supervisor**
+
+| # | Defect | Fix |
+|---|---|---|
+| S1 | GC raced the lifecycle: it could delete a `.tmp` a convert was writing or a `.restore.qcow2` a create was about to boot | GC runs under `withLock('@gc')` **and** takes `withVmLock(name)` per computer, the same lock every lifecycle op now holds; restore temps and checkpoint groups are decided inside it |
+| S2 | `mayBeTorn` was written and never read — a torn checkpoint cold-booted silently | `startFromCheckpoint` reads both `stale` and `mayBeTorn`; either one boots the base image and says which reason applied |
+| S3 | Start/Shutdown/Delete/Suspend/Resume/idle-suspend took no per-computer lock while ensure/create did | one re-entrant `withVmLock` (AsyncLocalStorage) around every lifecycle handler, so shutdown→suspend and stop→shutdown cannot deadlock and two chains cannot interleave |
+| S4 | `destroyVm` deleted `vmm/qemu/<name>` even when `sb rm` failed or QEMU was alive | the QEMU directory is removed only when `pidAlive` says the process is gone; otherwise it is reported `skipped` |
+| S5 | a failed `sb rm` still deleted the row → orphan sandbox + a name nobody can create or delete | the row is kept and marked `orphaned`; `cua_vm_gc` reconciles it against `sb ls` and drops it only when cua stops listing the sandbox (unmanaged sandboxes are reported, never touched) |
+| S6 | rebuild paths passed `meta.image` unguarded (a v1 row has no image → `sb create undefined`) | `image` defaults to `linux` in the migration, the normaliser and every rebuild path |
+| S7 | the base-image fallback after a failed checkpoint boot had no `sb rm`, unlike the first attempt | both fallbacks (start and ensure) remove the half-created record first |
+| S8 | `readRegistry` swallowed every error as an empty map, and the next mutation persisted it — one EACCES wiped the store | only ENOENT means empty; anything else throws, and the throw happens before any write |
+| S9 | the v1→v2 migration wrote outside the registry lock | migration runs once at boot through `mutateRegistry` |
+| S10 | quota check-then-act: two creates could both pass `used + requested` | `reserveStoreBytes` holds the claim under `withLock('@store')` for the whole create (both kinds) and releases it in `finally` |
+| S11 | shutdown could convert a checkpoint into a store with no room for it | the requirement (new file minus the one it replaces) is checked first; a skip is recorded in `lastShutdown.checkpointSkipped` and the notes |
+| S12 | after a `quit` timeout the path converted and removed the sandbox without re-checking QEMU | a QEMU that survives `quit` is treated exactly like an unreachable monitor: no convert, no `sb rm`, no clean restore point |
+| S13 | previews were closed before the outcome and never restored on the abandoned path | the preview is snapshotted and reopened when the shutdown aborts |
+| S14 | one unguarded step (`writeViews`) could throw out of the delete manifest and skip the rest | every manifest step is its own try/catch and reports `failed` |
+| S15 | `vmDelete` reported success even when items failed | the result carries `complete`, `deleted` (false on a partial), and the `failed` list; the tool and the panel print it |
+
+**Windows (checked against `dockurr/windows:4.35` and its `qemux/qemu:7.12` base)**
+
+| # | Defect | Fix |
+|---|---|---|
+| W1 | QMP on 7100 collided with dockurr's own HMP monitor (second bind → EADDRINUSE at boot), and dockurr's graceful path speaks HMP there | our QMP moved to **7101**; 7100 stays dockurr's and is never dialled; documented in the module, compose header and README |
+| W2 | there is no `ISO` variable in v4.35 — `windowsIso` was a silent no-op | an http(s) URL becomes `VERSION=<url>`; a local ISO is bind-mounted at `/boot.iso` (and must live inside the store); the comment and the tool text say so |
+| W3 | `VRAM_SIZE` and `SHUTDOWN` do nothing on the pinned image | both removed, with the reason in the module; the gate now **forbids** them and asserts the real mapping |
+| W4 | a container created before a failing credentials/registry write stayed behind | create → credentials → registry is guarded, and a failure removes the container and its storage before the error travels |
+| W5 | `cua_vm_suspend` on a Windows computer ran `cua sb suspend` on a nonexistent sandbox | `docker pause` / `unpause`, `state: suspended`, and Start unpauses |
+| W6 | `readyProbe` counted `paused`/`suspended` as running, so a paused guest reported ready | only `query-status == running` counts |
+| W7 | `screenshot()` returned `{file}` after unlinking that file | the field is gone from the contract; callers use `saveTo` |
+| W8 | two screendumps in the same millisecond shared a filename and one unlinked the other's frame | monotonic counter + random suffix |
+| W9 | `save` on Windows was silently ignored | refused with a sentence that names the working path |
+| W10 | docs (REPORT, BRANCH-NOTES, compose header) claimed the dead envs and 7100 | rewritten against the real mapping |
+
+### 9.6 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),
    screenshot, click, shutdown, Start, and confirm `powered-off → ready` from the

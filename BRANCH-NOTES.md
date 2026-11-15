@@ -649,7 +649,11 @@ prints `screenshot WxH · display WxH · scale N` — and, when they differ, "im
 
 `dockurr/windows` on a DinD engine is a real Windows computer for the *desktop*:
 QMP `screendump` for frames, `input-send-event` for clicks and ASCII keys, and the
-container's own 8006 console relayed to `/vm/port/<name>/`. It is **not** a cua
+container's own 8006 console relayed to `/vm/port/<name>/`. The monitor is on
+**7101**, not 7100: the pinned image already binds 7100 for its own HMP monitor,
+and a second bind kills QEMU at boot. A local ISO is `/boot.iso` (there is no
+`ISO` variable in v4.35); `VRAM_SIZE` and `SHUTDOWN` are not set because the
+image ignores them. Suspend is `docker pause`. It is **not** a cua
 sandbox: no guest agent means no exec, no put/get, no disk growth, no clipboard,
 no a11y tree and no window list — each of those answers "not available for
 Windows" with the paths that do work, instead of a timeout the model reads as a
@@ -657,7 +661,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **180 assertions** across 12 files (the gate prints
+* `tools/check-cua-vm.mjs` — **207 assertions** across 12 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -675,9 +679,9 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (180 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
+green (207 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
-(64 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
+(71 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
 must not be touched, target switching, a concurrent exec burst), a real `qemu-system-x86_64 -S` shutdown
 (timeout → quit → `mayBeTorn`), an ACPI-refusal fallback against a
@@ -686,7 +690,23 @@ boot and a Windows install are **NOT RUN** — no `cua` runtime store, no
 `qemu-img`, and creating a Windows container is a mutation on a shared engine;
 both are listed as TBC in REPORT.md §9.5.
 
-### 15.7 Review round 2
+### 15.7 Review round 3 — depth and source audit
+
+Sixteen supervisor defects (S1 GC/lifecycle races, S2 unread `mayBeTorn`, S3
+missing per-computer locks, S4 unguarded `vmm/qemu` removal, S5 row deleted after
+a failed `sb rm`, S6 missing `image` default, S7 missing fallback cleanup, S8
+registry errors swallowed as empty, S9 migration outside the lock, S10 quota
+check-then-act, S11 no quota before a checkpoint, S12 no re-check after `quit`,
+S13 previews not restored, S14 unguarded manifest step, S15 success reported for
+a partial delete) and ten Windows defects (W1 QMP port collision with dockurr's
+7100 HMP, W2 nonexistent `ISO` variable, W3 dead `VRAM_SIZE`/`SHUTDOWN`, W4
+uncompensated container on a failed registration, W5 no Windows suspend, W6
+`paused` counted as ready, W7 dead `file` field, W8 screendump name race, W9
+silently ignored `save`, W10 overstated docs). The per-defect table is
+REPORT.md §9.5; the gate gained a needle or a FORBIDDEN rule for every mapping
+change (notably: VRAM_SIZE, SHUTDOWN and ISO are now forbidden strings).
+
+### 15.8 Review round 2
 
 Seven defects fixed on this branch (D1 spawn crash, D2 path traversal through
 `name`, D3 unproven-dead checkpoint, D4 capture on the wrong target, D5 registry

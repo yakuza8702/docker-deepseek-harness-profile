@@ -167,15 +167,33 @@ panel hides it).
 
 | Env | Value |
 |---|---|
-| `VERSION` / `ISO` | `windowsVersion` (11/10/ltsc10/2022/2025) **xor** `windowsIso` |
+| `VERSION` | `windowsVersion` (11/10/ltsc10/2022/2025), **or** `windowsIso` when that is an http(s) URL |
 | `DISK_SIZE` | `diskGb`, floored at 64 GB (`diskGbRaised`) |
 | `DISK_FMT` | `qcow2` |
 | `RAM_SIZE` | `memory`, floored at 6 GB (`memoryRaised`) |
 | `CPU_CORES` | floored at 2 |
-| `GPU` / `RENDERNODE` / `VRAM_SIZE` | `Y`/`N` ← Enable GPU; `/dev/dri/renderD128` (`CUA_WINDOWS_RENDERNODE`); `4G` |
-| `SHUTDOWN` / `MANUAL` | `Y` / `N` |
+| `GPU` / `RENDERNODE` | `Y`/`N` ← Enable GPU; `/dev/dri/renderD128` (`CUA_WINDOWS_RENDERNODE`) |
+| `MANUAL` | `N` (unattended install) |
 | `USERNAME` / `PASSWORD` | `cua` / generated (20 url-safe chars) |
-| `ARGUMENTS` | `-device usb-tablet -qmp tcp:0.0.0.0:7100,server=on,wait=off` |
+| `ARGUMENTS` | `-device usb-tablet -qmp tcp:0.0.0.0:7101,server=on,wait=off` |
+
+A **local** ISO is not an environment variable: it is bind-mounted read-only at
+`/boot.iso`, which is how v4.35 detects a custom install medium, and `VERSION`
+is then left unset. `windowsIso` must be an http(s) URL or a path **inside the
+VM store** (e.g. `windows/11.iso`); anything else is refused before a container
+exists.
+
+**Two environment variables are deliberately NOT set**, because the pinned
+image ignores them: `VRAM_SIZE` (v4.35's qemux/qemu:7.12 base has no consumer)
+and `SHUTDOWN` (v4.35 traps SIGTERM into a graceful guest shutdown anyway). A
+no-op that reads like configuration is worse than no setting.
+
+**Two monitor ports, neither published.** dockurr v4.35 already runs its own HMP
+monitor on **7100** (`power.sh`), and appends `$ARGUMENTS` after its monitor
+options — our `-qmp` on the same port was a second bind, EADDRINUSE, and QEMU
+exited at boot. The supervisor's QMP lives on **7101**; both sockets are reached
+on the container's own address (`DSH_CUA_WINDOWS_NETWORK`), never on the host.
+Docker's graceful `stop` still goes through dockurr's own 7100 path.
 
 `HostConfig`: devices `/dev/kvm` (+ `/dev/dri` when GPU), `CapAdd:
 ["NET_ADMIN"]`, bind `$STORE/windows/<name>:/storage`, labels
@@ -202,6 +220,11 @@ under the prefix; WebSockets were already tunnelled. QMP **7100 is never
 published** — it is reached on the container's own address, which is why the
 container joins `DSH_CUA_WINDOWS_NETWORK`. RDP on 3389 is opt-in in
 `compose.windows.yaml` and documented there as a real LAN exposure.
+
+**Suspend is `docker pause`.** A Windows computer has no cua sandbox, so
+`cua_vm_suspend` pauses the container (RAM and disk untouched) and `Start`
+unpauses it. `cua_vm_shutdown` is still `docker stop` (dockurr's own graceful
+shutdown), and the row goes `powered-off`.
 
 **What does not exist on Windows**, on purpose (structured "not available", with
 the paths that do work): `cua_vm_exec` (exit 126), `cua_vm_put`/`cua_vm_get`,

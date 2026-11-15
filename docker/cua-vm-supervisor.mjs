@@ -45,6 +45,7 @@
  */
 
 import { createServer, createServer as netCreateServer, connect as netConnect } from 'node:net'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
@@ -52,7 +53,7 @@ import {
 } from 'node:fs'
 import path from 'node:path'
 import { createSpace, formatSpace, formatSpaceWarning, pngSize, relativeToPixels, resolutionProblem, toDisplayPixels, SPACE_CACHE_MS } from './cua-vm-space.mjs'
-import { createWindowsBackend, windowsEnabled, WINDOWS_IMAGE, WINDOWS_VERSIONS, WINDOWS_RDP_PORT, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB, WINDOWS_MIN_CPU, WINDOWS_QMP_PORT, WINDOWS_CONSOLE_PORT } from './cua-vm-windows.mjs'
+import { createWindowsBackend, windowsEnabled, WINDOWS_IMAGE, WINDOWS_VERSIONS, WINDOWS_RDP_PORT, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB, WINDOWS_MIN_CPU, WINDOWS_QMP_PORT, WINDOWS_HMP_PORT, WINDOWS_CONSOLE_PORT } from './cua-vm-windows.mjs'
 
 const SOCK = process.env.CUA_SUPERVISOR_SOCK || '/tmp/cua-vm/supervisor.sock'
 const CUA_BIN = process.env.CUA_BIN || 'cua'
@@ -213,6 +214,36 @@ async function storeUsage() {
  * then discover the overrun as ENOSPC in the middle of a download. Both create
  * paths (Linux and Windows) call this one function.
  */
+/**
+ * QUOTA RESERVATIONS — check-then-act is not a check.
+ *
+ * `used + requested > quota` was evaluated twice, minutes apart: once before the
+ * create and once (implicitly) when the disk appeared. Two creates that both
+ * start at 18 GB of a 20 GB quota both pass, and the second one dies at ENOSPC
+ * halfway through an image download. A reservation makes the boundary
+ * serialised: the check and the claim happen under one store lock, in-flight
+ * bytes count against the quota, and the claim is released when the create
+ * finishes (success or failure).
+ */
+const RESERVED_BYTES = new Map()
+
+async function reserveStoreBytes(name, bytes) {
+  return withLock('@store', async () => {
+    const config = readConfig()
+    const reserved = [...RESERVED_BYTES.values()].reduce((total, value) => total + value, 0)
+    // `refuseOverQuota` re-measures; the reservation rides in as part of the
+    // request, so "used + reserved + requested" is what gets compared.
+    const over = await refuseOverQuota(config, Math.max(0, bytes) + reserved)
+    if (over !== null) return over
+    RESERVED_BYTES.set(name, Math.max(0, bytes))
+    return null
+  })
+}
+
+function releaseStoreBytes(name) {
+  RESERVED_BYTES.delete(name)
+}
+
 async function refuseOverQuota(config, requestedBytes) {
   const used = await storeUsedBytes()
   const quota = config.diskQuotaGb * 1024 ** 3
@@ -363,6 +394,38 @@ function closePort(name) {
 }
 
 /**
+ * The preview a computer already had, so a failed shutdown can put it back.
+ * Only the shape is kept (port + backend + relay target), never a socket: the
+ * forward is re-created, which is what a restart of the process would do anyway.
+ */
+function snapshotPorts(name) {
+  const entry = ports.get(name)
+  if (!entry) return null
+  return {
+    guestPort: entry.guestPort,
+    backend: entry.backend ?? 'linux',
+    target: entry.target ?? null
+  }
+}
+
+/** Reopen a preview; returns whether one was actually restored. */
+async function restorePorts(name, snapshot) {
+  if (!snapshot) return false
+  try {
+    if (snapshot.backend === 'relay' && snapshot.target) {
+      await openRelay(name, snapshot.guestPort, snapshot.target, { backend: 'relay' })
+    } else {
+      await openPort(name, snapshot.guestPort)
+    }
+    log(`ports: ${name} preview on ${snapshot.guestPort} restored after the aborted shutdown`)
+    return true
+  } catch (error) {
+    log(`ports: ${name} preview could not be restored (${error?.message ?? error})`)
+    return false
+  }
+}
+
+/**
  * BOOT RECONCILIATION. The table outlives the process that wrote it; after a
  * container restart every forward child is gone but ports.json still points at
  * dead loopback ports, so /vm/port/<name>/ answered 502 for a page that looks
@@ -444,7 +507,16 @@ function log(...parts) {
 const REGISTRY_VERSION = 2
 const VM_KINDS = new Set(['linux', 'windows'])
 
-/** One row, upgraded in place. Unknown fields are preserved verbatim. */
+/**
+ * One row, upgraded in place. Unknown fields are preserved verbatim.
+ *
+ * `image` IS PART OF THE UPGRADE, not an optional extra: a v1 row written by an
+ * older build has no `image`, and the rebuild paths used to pass `meta.image`
+ * straight into `sb create` — a v1 row could only produce `sb create undefined`.
+ * The live store this was written against has exactly such a row
+ * (`ws-…`: workspace/tier/cpu/memory/rea/state, no image), so this is a real
+ * migration, not a hypothetical one.
+ */
 function migrateRegistryRow(row) {
   const record = row && typeof row === 'object' ? row : {}
   const windows = record.kind === 'windows' || record.backend === 'windows'
@@ -453,11 +525,9 @@ function migrateRegistryRow(row) {
     ...record,
     kind,
     backend: windows ? 'windows' : 'linux',
-    // Only Windows rows carry these; keeping them off a Linux row means the
-    // panel and the guest surface can branch on `kind` alone.
     ...(windows
       ? { windowsVersion: String(record.windowsVersion || '11'), windowsIso: String(record.windowsIso || '') }
-      : {})
+      : { image: String(record.image || 'linux'), tier: String(record.tier || 'slim') })
   }
 }
 
@@ -473,25 +543,44 @@ function migrateRegistry(parsed) {
   return { version: REGISTRY_VERSION, vms: out }
 }
 
+/**
+ * READ THE REGISTRY, OR FAIL LOUDLY.
+ *
+ * The previous version answered `{vms:{}}` for ANY failure — a missing file (the
+ * normal first boot), a transient EIO, a permission change, a truncated write —
+ * and `mutateRegistry` then persisted that empty map over the real one. One
+ * `EACCES` during an `exec`'s lastUsed update would have silently deleted every
+ * computer from the store. A missing file is the only case that legitimately
+ * means "empty"; everything else throws, and `mutateRegistry` propagates it
+ * WITHOUT writing, because a registry that could not be read must never be
+ * rewritten from a guess.
+ */
 function readRegistry() {
+  let text
+  try {
+    text = readFileSync(REGISTRY, 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { version: REGISTRY_VERSION, vms: {} }
+    throw new Error(`registry.json could not be read (${error?.code ?? error?.message ?? error}); refusing to continue with an empty registry`)
+  }
   let parsed
   try {
-    parsed = JSON.parse(readFileSync(REGISTRY, 'utf8'))
-  } catch {
-    return { version: REGISTRY_VERSION, vms: {} }
+    parsed = JSON.parse(text)
+  } catch (error) {
+    throw new Error(`registry.json is not valid JSON (${error?.message ?? error}); refusing to continue with an empty registry`)
   }
-  const registry = migrateRegistry(parsed)
-  // The migration is a ONE-TIME WRITE, on the read path, so `cua_vm_status` on
-  // a store written by the previous version already returns v2 rows.
-  if (!parsed || parsed.version !== REGISTRY_VERSION || parsed.vms === undefined) {
-    try {
-      writeRegistry(registry)
-      log(`registry: migrated to v${REGISTRY_VERSION} (${Object.keys(registry.vms).length} computer(s))`)
-    } catch (error) {
-      log(`registry: migration write failed (${error && error.message}); continuing in memory`)
-    }
+  return migrateRegistry(parsed)
+}
+
+/** Was the file on disk still a v1 shape? Used by the boot-time migration. */
+function registryNeedsMigration() {
+  try {
+    const parsed = JSON.parse(readFileSync(REGISTRY, 'utf8'))
+    return !parsed || parsed.version !== REGISTRY_VERSION || parsed.vms === undefined
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    return false // unreadable is not "needs migration"; the read path throws
   }
-  return registry
 }
 
 function writeRegistry(registry) {
@@ -515,12 +604,27 @@ function writeRegistry(registry) {
  * a re-read, a field, a write — so a five-minute provisioning run never holds it.
  */
 function mutateRegistry(mutator) {
+  // `readRegistry` THROWS on an unreadable file, and the throw happens before
+  // `writeRegistry`, so a failing read can never be persisted as an empty store.
   return withLock('@registry', async () => {
     const registry = readRegistry()
     const result = await mutator(registry)
     writeRegistry(registry)
     return result
   })
+}
+
+/**
+ * The v1→v2 migration is a WRITE, so it happens under the same lock as every
+ * other write: doing it on the read path meant two concurrent readers could both
+ * decide to "migrate" and the second could write a snapshot that predated the
+ * first's update. Called once at boot; every later mutation writes v2 anyway.
+ */
+async function migrateRegistryFile() {
+  if (!registryNeedsMigration()) return false
+  const count = await mutateRegistry(() => Object.keys(readRegistry().vms).length)
+  log(`registry: migrated to v${REGISTRY_VERSION} (${count} computer(s))`)
+  return true
 }
 
 /**
@@ -901,6 +1005,33 @@ function withLock(key, fn) {
   const next = previous.then(fn, fn)
   CREATE_LOCK.set(key, next.catch(() => {}))
   return next
+}
+
+/**
+ * ONE LIFECYCLE OPERATION PER COMPUTER.
+ *
+ * `ensure`/`vmCreate` took a lock; Start, Shutdown, Delete, Suspend, Resume and
+ * the idle timer did not. Two of those running at once is how a start reads a
+ * row that a delete is halfway through removing, and how the idle timer suspends
+ * a computer that a shutdown has just powered off (both then write the row).
+ *
+ * The lock is RE-ENTRANT within one async chain: `shutdown` may fall back to
+ * `suspend`, `stop` delegates to `shutdown`, and both would otherwise wait for
+ * the lock they already hold. AsyncLocalStorage carries "this chain already owns
+ * name X" across every `await`, so the inner call runs immediately and a
+ * DIFFERENT chain still queues behind `withLock`.
+ */
+const VM_LOCK_CONTEXT = new AsyncLocalStorage()
+
+function withVmLock(name, fn) {
+  assertVmName(name)
+  const held = VM_LOCK_CONTEXT.getStore()
+  if (held instanceof Set && held.has(name)) return fn()
+  return withLock(name, () => {
+    const next = new Set(held ?? [])
+    next.add(name)
+    return VM_LOCK_CONTEXT.run(next, fn)
+  })
 }
 
 async function listSandboxes() {
@@ -1318,6 +1449,15 @@ function qemuImgPath() {
 }
 
 /** Every file this store holds for one computer, as absolute paths. */
+/** Bytes of the live disk, or 0 when there is none (checkpoint sizing). */
+function diskBytesFor(name) {
+  try {
+    return statSync(path.join(CUA_HOME, '.cua', 'vmm', 'qemu', assertVmName(name), 'disk.qcow2')).size
+  } catch {
+    return 0
+  }
+}
+
 function checkpointFilesFor(name) {
   const safe = assertVmName(name)
   try {
@@ -1355,6 +1495,11 @@ function shotFilesFor(name) {
  * stops the rest: a wedged `sb rm` must not keep the 6 GB checkpoint alive.
  */
 async function destroyVm(name, { reason = 'delete', deleteContainer = true } = {}) {
+  return withVmLock(name, () => destroyVmLocked(name, { reason, deleteContainer }))
+}
+
+/** Caller already holds the computer's lifecycle lock. */
+async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true } = {}) {
   // First statement, before any path is built.
   assertVmName(name)
   const items = []
@@ -1362,99 +1507,153 @@ async function destroyVm(name, { reason = 'delete', deleteContainer = true } = {
     items.push({ target, status, ...(detail ? { detail } : {}) })
     if (status === 'failed') log(`destroy ${name}: ${target} failed (${detail})`)
   }
+  /**
+   * EVERY STEP IS ITS OWN TRY/CATCH.
+   *
+   * One unguarded step (the `views.json` write was the obvious one) would throw
+   * out of the manifest and skip everything after it — the trajectory and QEMU
+   * directories, the container, the registry row — leaving a half-deleted
+   * computer that the panel still showed. `record` reports the failure and the
+   * next step runs.
+   */
+  const step = async (label, fn) => {
+    try {
+      await fn()
+    } catch (error) {
+      record(label, 'failed', error?.message ?? String(error))
+    }
+  }
 
   // 1. Port forwards and relays first: a still-listening relay would answer the
   //    browser for a guest that is about to disappear.
   const closed = closePorts(name)
   record('ports.json', closed.rows > 0 ? 'removed' : 'absent', closed.rows > 0 ? `${closed.rows} row(s), ${closed.killed} child process(es) stopped` : 'no row')
 
-  // 2. The sandbox itself. A failure here is REPORTED, never fatal.
+  // 2. The sandbox itself. A failure here is REPORTED and changes the SHAPE of
+  //    the delete (see step 8): a sandbox cua still owns must not lose its row.
   const removed = await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
-  record('sb rm --force', removed.code === 0 ? 'removed' : 'failed', removed.code === 0 ? '' : (removed.stderr || removed.stdout).trim().slice(-300))
+  const sandboxGone = removed.code === 0
+  record('sb rm --force', sandboxGone ? 'removed' : 'failed', sandboxGone ? '' : (removed.stderr || removed.stdout).trim().slice(-300))
 
   // 3. Checkpoints, including the restore temp and any interrupted convert.
-  const checkpoints = checkpointFilesFor(name)
-  if (checkpoints.length === 0) record('checkpoints', 'absent')
-  for (const file of checkpoints) {
-    try {
-      unlinkSync(file)
-      record(file, 'removed')
-    } catch (error) {
-      record(file, 'failed', error.message)
+  await step('checkpoints', async () => {
+    const checkpoints = checkpointFilesFor(name)
+    if (checkpoints.length === 0) { record('checkpoints', 'absent'); return }
+    for (const file of checkpoints) {
+      try {
+        unlinkSync(file)
+        record(file, 'removed')
+      } catch (error) {
+        record(file, 'failed', error.message)
+      }
     }
-  }
+  })
 
   // 4. Screenshots. The supervisor writes `<name>-<stamp>.png` and the region
   //    crop adds `-crop`; both start with the name and a dash.
-  const shots = shotFilesFor(name)
-  if (shots.length === 0) record('shots', 'absent')
-  for (const file of shots) {
-    try {
-      unlinkSync(file)
-      record(file, 'removed')
-    } catch (error) {
-      record(file, 'failed', error.message)
+  await step('shots', async () => {
+    const shots = shotFilesFor(name)
+    if (shots.length === 0) { record('shots', 'absent'); return }
+    for (const file of shots) {
+      try {
+        unlinkSync(file)
+        record(file, 'removed')
+      } catch (error) {
+        record(file, 'failed', error.message)
+      }
     }
-  }
+  })
 
-  // 5. The viewer row (the viewer's own process dies with the VM).
-  const views = readViews()
-  if (views[name]) {
+  // 5. The viewer row. `writeViews` is a file write: it can throw, and before
+  //    this wrapper did, that throw skipped the rest of the manifest.
+  await step('views.json', async () => {
+    const views = readViews()
+    if (!views[name]) { record('views.json', 'absent'); return }
     delete views[name]
     writeViews(views)
     record('views.json', 'removed')
-  } else {
-    record('views.json', 'absent')
-  }
+  })
 
-  // 6. cua's trajectory history and its QEMU state directory. Both are its own
-  //    layout (`trajectories/local_<name>`, `vmm/qemu/<name>`), so both
-  //    spellings are handled and a missing one is not an error.
-  for (const target of [
-    path.join(CUA_HOME, '.cua', 'trajectories', `local_${name}`),
-    path.join(CUA_HOME, '.cua', 'trajectories', name),
-    path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name)
-  ]) {
-    if (!existsSync(target)) {
-      record(target, 'absent')
-      continue
-    }
-    try {
-      rmSync(target, { recursive: true, force: true })
-      record(target, 'removed')
-    } catch (error) {
-      record(target, 'failed', error.message)
-    }
-  }
-
-  // 7. The Windows backend: its container and the storage tree the panel reads
-  //    the generated password from.
-  const registryBefore = readRegistry()
-  const wasWindows = registryBefore.vms[name]?.kind === 'windows'
-  const windowsStore = path.join(WINDOWS_DIR, name)
-  if (deleteContainer && (wasWindows || existsSync(windowsStore))) {
-    try {
-      const result = await windowsBackend.remove(name)
-      record('windows container', result.removed ? 'removed' : 'absent', result.detail)
-    } catch (error) {
-      record('windows container', 'failed', error.message)
-    }
-    if (existsSync(windowsStore)) {
+  // 6. cua's trajectory history and its QEMU state directory.
+  await step('trajectories', async () => {
+    for (const target of [
+      path.join(CUA_HOME, '.cua', 'trajectories', `local_${name}`),
+      path.join(CUA_HOME, '.cua', 'trajectories', name)
+    ]) {
+      if (!existsSync(target)) { record(target, 'absent'); continue }
       try {
-        rmSync(windowsStore, { recursive: true, force: true })
-        record(windowsStore, 'removed')
+        rmSync(target, { recursive: true, force: true })
+        record(target, 'removed')
       } catch (error) {
-        record(windowsStore, 'failed', error.message)
+        record(target, 'failed', error.message)
       }
-    } else {
-      record(windowsStore, 'absent')
     }
-  }
+  })
 
-  // 8. The registry row last: while anything above could still fail, the row is
-  //    the record of what was there.
+  // 7. The QEMU directory holds the live disk and the pid file. Removing it
+  //    while QEMU is alive would delete the file out from under a running
+  //    process (the delete would "succeed" and the guest would keep writing to
+  //    an unlinked inode) — and the next start would then boot a stale image.
+  await step('vmm/qemu', async () => {
+    const vmDir = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name)
+    if (!existsSync(vmDir)) { record(vmDir, 'absent'); return }
+    const pid = qemuPid(name)
+    if (pidAlive(pid)) {
+      record(vmDir, 'skipped', `QEMU (pid ${pid}) is still running; its disk is not deleted under it — stop the process first (cua_vm_shutdown) and delete again`)
+      return
+    }
+    try {
+      rmSync(vmDir, { recursive: true, force: true })
+      record(vmDir, 'removed')
+    } catch (error) {
+      record(vmDir, 'failed', error.message)
+    }
+  })
+
+  // 8. The Windows backend: its container and the storage tree the panel reads
+  //    the generated password from.
+  await step('windows container', async () => {
+    const already = readRegistry().vms[name]
+    const windowsStore = path.join(WINDOWS_DIR, name)
+    if (deleteContainer && (already?.kind === 'windows' || existsSync(windowsStore))) {
+      try {
+        const result = await windowsBackend.remove(name)
+        record('windows container', result.removed ? 'removed' : 'absent', result.detail)
+      } catch (error) {
+        record('windows container', 'failed', error.message)
+      }
+      if (existsSync(windowsStore)) {
+        try {
+          rmSync(windowsStore, { recursive: true, force: true })
+          record(windowsStore, 'removed')
+        } catch (error) {
+          record(windowsStore, 'failed', error.message)
+        }
+      } else {
+        record(windowsStore, 'absent')
+      }
+    }
+  })
+
+  // 9. The registry row.
+  //
+  //    When `sb rm` FAILED the sandbox may still exist, and deleting the row
+  //    would leave an orphan cua knows about and the harness does not: the name
+  //    becomes permanently unusable (create refuses "already exists") with
+  //    nothing in the UI to delete. Keep the row and mark it orphaned instead;
+  //    cua_vm_gc reconciles it against `sb ls` once the sandbox is really gone.
+  const failureCount = items.filter((item) => item.status === 'failed').length
   const hadRow = Boolean(readRegistry().vms[name])
-  if (hadRow) {
+  if (hadRow && !sandboxGone) {
+    await mutateRegistry((registry) => {
+      const row = registry.vms[name]
+      if (!row) return
+      row.orphaned = true
+      row.orphanReason = 'sb rm failed during delete; the sandbox may still exist'
+      row.orphanedAt = new Date().toISOString()
+    })
+    record('registry.json', 'kept', 'the sandbox could not be removed, so the row is marked orphaned (cua_vm_gc reconciles it)')
+  } else if (hadRow) {
     await mutateRegistry((registry) => { delete registry.vms[name] })
     record('registry.json', 'removed')
   } else {
@@ -1462,8 +1661,22 @@ async function destroyVm(name, { reason = 'delete', deleteContainer = true } = {
   }
 
   const failures = items.filter((item) => item.status === 'failed')
-  log(`destroy ${name} (${reason}): ${items.length - failures.length}/${items.length} item(s) cleaned${failures.length ? `, ${failures.length} failed` : ''}`)
-  return { name, items, failures: failures.length }
+  const complete = failures.length === 0 && sandboxGone
+  log(`destroy ${name} (${reason}): ${items.length - failures.length}/${items.length} item(s) cleaned${failures.length ? `, ${failures.length} failed` : ''}${complete ? '' : ' (INCOMPLETE)'}`)
+  return {
+    name,
+    // `deleted` stays truthful: a partial manifest is not a deletion.
+    deleted: complete,
+    complete,
+    items,
+    failures: failures.length,
+    failed: failures.map((item) => ({ target: item.target, detail: item.detail ?? '' })),
+    ...(complete ? {} : {
+      detail: sandboxGone
+        ? `${failures.length} item(s) could not be removed; the registry row was kept`
+        : 'the sandbox could not be removed, so the registry row is kept and marked orphaned; run cua_vm_gc after the sandbox is gone'
+    })
+  }
 }
 
 /**
@@ -1482,125 +1695,176 @@ async function destroyVm(name, { reason = 'delete', deleteContainer = true } = {
  *   ports           rows whose local port is not listening any more.
  */
 async function collectGarbage({ dryRun = false } = {}) {
-  const config = readConfig()
-  const registry = readRegistry()
-  const report = { checkpoints: [], shots: [], views: [], ports: [], bytesFreed: 0, errors: [] }
-  const remove = (file, bytes) => {
-    if (!dryRun) {
-      try { unlinkSync(file) } catch (error) { report.errors.push(`${file}: ${error.message}`); return }
-    }
-    report.bytesFreed += bytes
-  }
-  const sizeOf = (file) => { try { return statSync(file).size } catch { return 0 } }
-
-  // Every entry in the checkpoint directory, grouped by the computer name.
-  let entries = []
-  try {
-    entries = readdirSync(CHECKPOINT_DIR)
-  } catch {
-    entries = []
-  }
-  const groups = new Map()
-  for (const file of entries) {
-    const match = /^(.+?)\.qcow2(\.(.+))?$/u.exec(file)
-    if (!match) continue
-    const name = match[1]
-    const suffix = match[3] || ''
-    const full = path.join(CHECKPOINT_DIR, file)
-    if (suffix === 'restore' || file.endsWith('.restore.qcow2')) {
-      // Restore temps are handled unconditionally below, in their own class.
-      continue
-    }
-    const list = groups.get(name) || []
-    list.push({ file: full, suffix, at: (() => { try { return statSync(full).mtimeMs } catch { return 0 } })() })
-    groups.set(name, list)
-  }
-  for (const [name, files] of groups) {
-    const registered = Boolean(registry.vms[name])
-    const stable = files.filter((entry) => entry.suffix === '').sort((a, b) => b.at - a.at)
-    const tmp = files.filter((entry) => entry.suffix === 'tmp').sort((a, b) => b.at - a.at)
-    // A suffix nobody recognises (`<name>.qcow2.bak`, `.old`) is never a restore
-    // point, whoever owns the name. Left behind by a hand copy or a killed
-    // convert, and each one is a full disk's worth of space.
-    for (const junk of files.filter((entry) => entry.suffix !== '' && entry.suffix !== 'tmp')) {
-      report.checkpoints.push({ file: junk.file, reason: `unrecognised checkpoint artifact (.${junk.suffix})` })
-      remove(junk.file, sizeOf(junk.file))
-    }
-    // HEAL, don't delete: a registered computer whose only checkpoint is a
-    // `.tmp` had its convert killed. The data is complete — `rename` was the step
-    // that never ran — so promote the newest temp instead of throwing away the
-    // last copy of the disk.
-    if (registered && stable.length === 0 && tmp.length > 0) {
-      const newest = tmp.shift()
+  // ONE GC AT A TIME, AND ONE COMPUTER AT A TIME INSIDE IT.
+  //
+  // The checkpoint directory is shared with two asynchronous users: a shutdown
+  // that is flattening a disk into a checkpoint, and a start that is booting
+  // from `<name>.qcow2.restore.qcow2`. `remove()` is a synchronous unlink, so
+  // nothing protected a `.tmp` that a convert was writing or a restore temp a
+  // create was about to open — GC could delete either one mid-flight. The
+  // lifecycle ops hold `withVmLock(name)` for their whole duration and GC now
+  // takes the same lock per name, so it waits for them instead of racing them.
+  return withLock('@gc', async () => {
+    const config = readConfig()
+    let registry = readRegistry()
+    const report = { checkpoints: [], shots: [], views: [], ports: [], orphans: [], sandboxes: [], bytesFreed: 0, errors: [] }
+    const remove = (file, bytes) => {
       if (!dryRun) {
-        try {
-          renameSync(newest.file, path.join(CHECKPOINT_DIR, `${name}.qcow2`))
-          log(`gc: promoted ${path.basename(newest.file)} to ${name}.qcow2 (interrupted convert)`)
-        } catch (error) {
-          report.errors.push(`${newest.file}: ${error.message}`)
+        try { unlinkSync(file) } catch (error) { report.errors.push(`${file}: ${error.message}`); return }
+      }
+      report.bytesFreed += bytes
+    }
+    const sizeOf = (file) => { try { return statSync(file).size } catch { return 0 } }
+
+    // ---------------------------------------------------------------
+    // RECONCILE ORPHANED ROWS (see destroyVm step 9): a row kept because its
+    // sandbox could not be removed is only safe to drop once cua no longer
+    // lists the sandbox. Until then it stays visible — the alternative is a
+    // name nobody can create and nobody can delete.
+    // ---------------------------------------------------------------
+    const orphans = Object.entries(registry.vms).filter(([, row]) => row?.orphaned === true)
+    if (orphans.length > 0) {
+      const { parsed } = await listSandboxes()
+      const listed = new Set((Array.isArray(parsed) ? parsed : []).map((row) => row?.name ?? row?.id ?? ''))
+      for (const [name, row] of orphans) {
+        const stillThere = listed.has(name)
+        report.orphans.push({ name, sandbox: stillThere ? 'still listed by cua' : 'gone from cua', action: stillThere ? 'kept' : (dryRun ? 'would drop the row' : 'row dropped') })
+        if (stillThere) continue
+        if (!dryRun) {
+          await mutateRegistry((fresh) => { delete fresh.vms[name] })
+          registry = readRegistry()
         }
       }
-    }
-    for (const stale of tmp) {
-      report.checkpoints.push({ file: stale.file, reason: registered ? 'interrupted convert (superseded)' : 'orphan temp (no computer)' })
-      remove(stale.file, sizeOf(stale.file))
-    }
-    if (stable.length > 1) {
-      for (const older of stable.slice(1)) {
-        report.checkpoints.push({ file: older.file, reason: registered ? 'superseded checkpoint' : 'orphan (no computer)' })
-        remove(older.file, sizeOf(older.file))
+      // A sandbox cua lists with NO row is not ours to delete (it may belong to
+      // another workspace or a previous install); report it so the cause is
+      // visible instead of silently accumulating disks.
+      for (const row of (Array.isArray(parsed) ? parsed : [])) {
+        const vmName = row?.name ?? row?.id ?? ''
+        if (vmName === '' || registry.vms[vmName]) continue
+        report.sandboxes.push({ name: vmName, status: String(row?.status ?? row?.phase ?? 'unknown') })
       }
     }
-  }
-  // Restore temps: `start` deletes its own, so a survivor is from a crash.
-  for (const file of entries.filter((entry) => entry.endsWith('.restore.qcow2'))) {
-    const full = path.join(CHECKPOINT_DIR, file)
-    report.checkpoints.push({ file: full, reason: 'restore temp' })
-    remove(full, sizeOf(full))
-  }
 
-  // Screenshots past the retention window.
-  if (config.shotsKeepDays > 0) {
-    const cutoff = Date.now() - config.shotsKeepDays * 86400000
-    let shots = []
-    try { shots = readdirSync(path.join(STORE, 'shots')) } catch { shots = [] }
-    for (const file of shots) {
-      if (!file.endsWith('.png')) continue
-      const full = path.join(STORE, 'shots', file)
-      let at = 0
-      try { at = statSync(full).mtimeMs } catch { continue }
-      if (at > cutoff) continue
-      report.shots.push({ file: full, reason: `older than ${config.shotsKeepDays} day(s)` })
-      remove(full, sizeOf(full))
+    // Every entry in the checkpoint directory, grouped by the computer name.
+    let entries = []
+    try {
+      entries = readdirSync(CHECKPOINT_DIR)
+    } catch {
+      entries = []
     }
-  }
+    const groups = new Map()
+    const restoreTemps = new Map()
+    for (const file of entries) {
+      const match = /^(.+?)\.qcow2(?:\.(.+))?$/u.exec(file)
+      if (!match) continue
+      const groupName = match[1]
+      const suffix = match[2] || ''
+      const full = path.join(CHECKPOINT_DIR, file)
+      const bucket = (suffix === 'restore' ? restoreTemps : groups)
+      const list = bucket.get(groupName) || []
+      list.push({ file: full, suffix, at: (() => { try { return statSync(full).mtimeMs } catch { return 0 } })() })
+      bucket.set(groupName, list)
+    }
 
-  // Viewer rows: a computer that is gone, or a ticket that expired.
-  const views = readViews()
-  let viewsChanged = false
-  for (const [name, entry] of Object.entries(views)) {
-    const expired = Number(entry?.expiresAt) > 0 && Number(entry.expiresAt) < Date.now()
-    if (registry.vms[name] && !expired) continue
-    report.views.push({ name, reason: registry.vms[name] ? 'expired' : 'no computer' })
-    delete views[name]
-    viewsChanged = true
-  }
-  if (viewsChanged && !dryRun) writeViews(views)
+    /** One computer's checkpoint decisions, serialised against its lifecycle. */
+    const collectFor = async (groupName, files) => {
+      const safely = VM_NAME_PATTERN.test(groupName)
+      const run = async () => {
+        const registered = safely && Boolean(registry.vms[groupName])
+        const stable = files.filter((entry) => entry.suffix === '').sort((a, b) => b.at - a.at)
+        const tmp = files.filter((entry) => entry.suffix === 'tmp').sort((a, b) => b.at - a.at)
+        for (const junk of files.filter((entry) => entry.suffix !== '' && entry.suffix !== 'tmp')) {
+          report.checkpoints.push({ file: junk.file, reason: `unrecognised checkpoint artifact (.${junk.suffix})` })
+          remove(junk.file, sizeOf(junk.file))
+        }
+        // HEAL, don't delete: a registered computer whose only checkpoint is a
+        // `.tmp` had its convert killed. The data is complete — `rename` was the
+        // step that never ran — so promote the newest temp instead of throwing
+        // away the last copy of the disk.
+        if (registered && stable.length === 0 && tmp.length > 0 && !dryRun) {
+          const newest = tmp.shift()
+          try {
+            renameSync(newest.file, path.join(CHECKPOINT_DIR, `${groupName}.qcow2`))
+            log(`gc: promoted ${path.basename(newest.file)} to ${groupName}.qcow2 (interrupted convert)`)
+          } catch (error) {
+            report.errors.push(`${newest.file}: ${error.message}`)
+          }
+        }
+        for (const stale of tmp) {
+          report.checkpoints.push({ file: stale.file, reason: registered ? 'interrupted convert (superseded)' : 'orphan temp (no computer)' })
+          remove(stale.file, sizeOf(stale.file))
+        }
+        if (stable.length > 1) {
+          for (const older of stable.slice(1)) {
+            report.checkpoints.push({ file: older.file, reason: registered ? 'superseded checkpoint' : 'orphan (no computer)' })
+            remove(older.file, sizeOf(older.file))
+          }
+        }
+      }
+      return safely ? withVmLock(groupName, run) : run()
+    }
 
-  // Ports: rows whose forward/relay is gone, or that name a computer nobody
-  // owns. Both backends answer the same two questions (alive/stop), so a relay
-  // and a cua forward are cleaned up by the same rule.
-  for (const [name, entry] of [...ports]) {
-    const alive = typeof entry?.alive === 'function' ? entry.alive() : Boolean(entry?.child && entry.child.exitCode === null)
-    const listening = alive ? !(await portIsFree(entry.localPort)) : false
-    if (alive && listening && registry.vms[name]) continue
-    report.ports.push({ name, localPort: entry?.localPort ?? 0, reason: !registry.vms[name] ? 'no computer' : 'forward is gone' })
-    closePorts(name)
-  }
-  await reconcilePorts()
+    for (const [groupName, files] of groups) {
+      await collectFor(groupName, files)
+    }
+    // Restore temps: `start` deletes its own, so a survivor is from a crash —
+    // unless a start is running right now, which the lock decides.
+    for (const [groupName, files] of restoreTemps) {
+      const safely = VM_NAME_PATTERN.test(groupName)
+      const run = async () => {
+        for (const entry of files) {
+          report.checkpoints.push({ file: entry.file, reason: 'restore temp' })
+          remove(entry.file, sizeOf(entry.file))
+        }
+      }
+      await (safely ? withVmLock(groupName, run) : run())
+    }
 
-  log(`gc: ${report.checkpoints.length} checkpoint(s), ${report.shots.length} shot(s), ${report.views.length} view(s), ${report.ports.length} port(s)${dryRun ? ' (dry run)' : ''}, ${(report.bytesFreed / 1024 ** 2).toFixed(1)} MB freed`)
-  return { ...report, dryRun, usedBytes: await storeUsedBytes() }
+    // Screenshots past the retention window.
+    if (config.shotsKeepDays > 0) {
+      const cutoff = Date.now() - config.shotsKeepDays * 86400000
+      let shots = []
+      try { shots = readdirSync(path.join(STORE, 'shots')) } catch { shots = [] }
+      for (const file of shots) {
+        if (!file.endsWith('.png')) continue
+        const full = path.join(STORE, 'shots', file)
+        let at = 0
+        try { at = statSync(full).mtimeMs } catch { continue }
+        if (at > cutoff) continue
+        report.shots.push({ file: full, reason: `older than ${config.shotsKeepDays} day(s)` })
+        remove(full, sizeOf(full))
+      }
+    }
+
+    // Viewer rows: a computer that is gone, or a ticket that expired.
+    const views = readViews()
+    let viewsChanged = false
+    for (const [name, entry] of Object.entries(views)) {
+      const expired = Number(entry?.expiresAt) > 0 && Number(entry.expiresAt) < Date.now()
+      if (registry.vms[name] && !expired) continue
+      report.views.push({ name, reason: registry.vms[name] ? 'expired' : 'no computer' })
+      delete views[name]
+      viewsChanged = true
+    }
+    if (viewsChanged && !dryRun) {
+      try { writeViews(views) } catch (error) { report.errors.push(`views.json: ${error.message}`) }
+    }
+
+    // Ports: rows whose forward/relay is gone, or that name a computer nobody
+    // owns. Both backends answer the same two questions (alive/stop), so a relay
+    // and a cua forward are cleaned up by the same rule.
+    for (const [name, entry] of [...ports]) {
+      const alive = typeof entry?.alive === 'function' ? entry.alive() : Boolean(entry?.child && entry.child.exitCode === null)
+      const listening = alive ? !(await portIsFree(entry.localPort)) : false
+      if (alive && listening && registry.vms[name]) continue
+      report.ports.push({ name, localPort: entry?.localPort ?? 0, reason: !registry.vms[name] ? 'no computer' : 'forward is gone' })
+      closePorts(name)
+    }
+    await reconcilePorts()
+
+    log(`gc: ${report.checkpoints.length} checkpoint(s), ${report.shots.length} shot(s), ${report.views.length} view(s), ${report.ports.length} port(s), ${report.orphans.length} orphan row(s)${dryRun ? ' (dry run)' : ''}, ${(report.bytesFreed / 1024 ** 2).toFixed(1)} MB freed`)
+    return { ...report, dryRun, usedBytes: await storeUsedBytes() }
+  })
 }
 
 /** VMs whose screenshot space cua already knows (see the gui pointer branch). */
@@ -1713,12 +1977,26 @@ async function createManaged(spec) {
   // FAIL FAST, NEVER RAISE. `used + requested > quota` is the rule on both
   // create paths: 40 GB of RE kit on a 20 GB quota would otherwise be discovered
   // as ENOSPC in the middle of the Ghidra download.
-  const over = await refuseOverQuota(config, effectiveDiskGb * 1024 ** 3)
+  const over = await reserveStoreBytes(name, effectiveDiskGb * 1024 ** 3)
   if (over !== null) {
     return fail(rea === true
       ? `${over} A REA computer is at least ${effectiveDiskGb} GB (Ghidra + JDK + jadx); delete a computer or raise the quota under Plugins → Personal VM (CUA) → Policy — the quota is yours to change, not the plugin's.`
       : over)
   }
+  // The claim is held for the whole create, so a SECOND create sees it.
+  try {
+    return await createLinuxNow(spec)
+  } finally {
+    releaseStoreBytes(name)
+  }
+}
+
+/** The create itself, with the store quota already reserved for this name. */
+async function createLinuxNow(spec) {
+  const { name, rea } = spec
+  const config = readConfig()
+  const wantedDiskGb = Number(spec.diskGb) > 0 ? Number(spec.diskGb) : 20
+  const effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb
   const blocked = resolutionProblem(DESKTOP_RESOLUTION, RESOLUTION_ALLOW_SCALE)
   if (blocked !== null) return fail(blocked)
 
@@ -1872,8 +2150,20 @@ async function windowsCreateManaged(spec) {
   if (!gate.ok) throw new Error(gate.reason)
   if (spec.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer (create the Windows computer without it, or use a Linux computer)')
   if (spec.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest')
-  if (spec.windowsIso !== '' && !/^[\w./:-]+$/u.test(spec.windowsIso)) {
-    throw new Error('windowsIso must be an http(s) URL or a file name visible to the Docker engine')
+  // dockurr v4.35 has no `ISO` variable: a REMOTE ISO is a URL in VERSION, and a
+  // LOCAL one is bind-mounted at /boot.iso. Both are accepted here and the
+  // backend resolves the path (it must exist inside the store).
+  if (spec.windowsIso !== '' && !/^https?:\/\//iu.test(spec.windowsIso)) {
+    if (path.isAbsolute(spec.windowsIso)) {
+      throw new Error('windowsIso must be an http(s) URL or a path RELATIVE to the VM store (e.g. "windows/11.iso")')
+    }
+    const absolute = path.resolve(STORE, spec.windowsIso)
+    if (absolute !== STORE && !absolute.startsWith(STORE + path.sep)) {
+      throw new Error('windowsIso must stay inside the VM store (put the ISO under $STORE/windows/ and pass its relative path)')
+    }
+    if (!existsSync(absolute)) {
+      throw new Error(`windowsIso "${spec.windowsIso}" does not exist (expected ${absolute})`)
+    }
   }
   if (spec.windowsIso === '' && !WINDOWS_VERSIONS.includes(spec.windowsVersion)) {
     throw new Error(`windowsVersion must be one of ${WINDOWS_VERSIONS.join(', ')} (or give windowsIso instead)`)
@@ -1895,16 +2185,15 @@ async function windowsCreateManaged(spec) {
   if (config.diskQuotaGb < diskGb) {
     return fail(`a Windows computer needs a ${diskGb} GB disk (it does not install below 64 GB), but the VM store quota is ${config.diskQuotaGb} GB. Raise Disk Size under Plugins → Personal VM (CUA) → Policy to at least ${diskGb} GB first.`)
   }
-  const over = await refuseOverQuota(config, diskGb * 1024 ** 3)
+  const over = await reserveStoreBytes(spec.name, diskGb * 1024 ** 3)
   if (over !== null) return fail(over)
-
-  const boot = await windowsBackend.create({ ...spec, diskGb, memory, cpu, rea: false, android: false })
-  writeWindowsCredentials(spec.name, {
-    username: WINDOWS_USERNAME,
-    password: boot.password,
-    container: boot.container,
-    createdAt: new Date().toISOString()
-  })
+  let boot
+  try {
+    boot = await windowsBackend.create({ ...spec, diskGb, memory, cpu, rea: false, android: false })
+  } catch (error) {
+    releaseStoreBytes(spec.name)
+    throw error
+  }
   const row = {
     workspace: spec.workspace,
     kind: 'windows',
@@ -1927,7 +2216,28 @@ async function windowsCreateManaged(spec) {
     state: 'installing',
     installDetail: 'Windows is installing (the first boot re-partitions the disk and runs the OOBE)'
   }
-  await mutateRegistry((fresh) => { fresh.vms[spec.name] = row })
+  // FROM HERE THE CONTAINER EXISTS. Credentials + registry are two more writes,
+  // and either can fail (a full disk, a revoked mode) — a container left behind
+  // would hold the name with no row to delete it and no password to log in with.
+  // The compensation is the same one the backend applies between create and
+  // start: remove the container, drop its storage, then report.
+  try {
+    writeWindowsCredentials(spec.name, {
+      username: WINDOWS_USERNAME,
+      password: boot.password,
+      container: boot.container,
+      createdAt: new Date().toISOString()
+    })
+    await mutateRegistry((fresh) => { fresh.vms[spec.name] = row })
+  } catch (error) {
+    await windowsBackend.remove(spec.name).catch(() => {})
+    try { rmSync(path.join(WINDOWS_DIR, spec.name), { recursive: true, force: true }) } catch {}
+    throw new Error(`the Windows container was created but could not be registered (${error?.message ?? error}); it was removed again`)
+  } finally {
+    // Released before the install watcher starts: the disk is on its way to
+    // the store and the row is what the accounting counts from now on.
+    releaseStoreBytes(spec.name)
+  }
   watchWindowsInstall(spec.name)
   return ok({
     name: spec.name,
@@ -1965,6 +2275,11 @@ const WINDOWS_FILE_BRIDGE = 'Put a file in `$STORE/windows/<name>/` (the guest s
 
 /** The desktop surface of a Windows computer: QMP only. */
 async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relative }) {
+  if (typeof save === 'string' && save !== '') {
+    // A Windows frame is written into the workspace by the supervisor; there is
+    // no guest filesystem to save a path into. Saying so beats ignoring it.
+    return fail('`save` is not available for Windows computers (there is no guest filesystem): use the path returned by the screenshot action, or the console at /vm/port/<name>/.')
+  }
   let measured
   try {
     measured = await windowsBackend.space(name)
@@ -2079,8 +2394,33 @@ async function waitForPowerDown(name, target, timeoutMs) {
 
 /** Suspend: pause the sandbox, keep the disk. Unchanged behaviour. */
 async function suspendVm(name) {
+  return withVmLock(name, () => suspendVmLocked(name))
+}
+
+/** Caller already holds the computer's lifecycle lock. */
+async function suspendVmLocked(name) {
   assertVmName(name)
   const config = readConfig()
+  const meta = readRegistry().vms[name]
+  if (!meta) throw new Error(`no computer named "${name}"`)
+  if (meta.kind === 'windows') {
+    // There is no cua sandbox behind a Windows computer: `sb suspend` answered
+    // "not found" and the Suspend button looked broken. `docker pause` keeps the
+    // guest's RAM and disk exactly as they were — the same promise.
+    try {
+      await windowsBackend.pause(name)
+    } catch (error) {
+      return fail(`${error?.message ?? error}`)
+    }
+    closePorts(name)
+    await mutateRegistry((registry) => {
+      const row = registry.vms[name]
+      if (!row) return
+      row.state = 'suspended'
+      row.lastUsed = new Date().toISOString()
+    })
+    return ok({ name, state: 'suspended', kind: 'windows', detail: 'the container is paused; Start unpauses it' })
+  }
   space.invalidate(name)
   // `always` captures the disk BEFORE the delta goes away, so a suspend is as
   // recoverable as a shutdown. `never` skips it, `shutdown` leaves suspends
@@ -2100,8 +2440,27 @@ async function suspendVm(name) {
 }
 
 async function resumeVm(name) {
+  return withVmLock(name, () => resumeVmLocked(name))
+}
+
+async function resumeVmLocked(name) {
   assertVmName(name)
   space.invalidate(name)
+  const meta = readRegistry().vms[name]
+  if (meta?.kind === 'windows') {
+    try {
+      await windowsBackend.unpause(name)
+    } catch (error) {
+      return fail(`${error?.message ?? error}`)
+    }
+    await mutateRegistry((registry) => {
+      const row = registry.vms[name]
+      if (!row) return
+      row.state = 'ready'
+      row.lastUsed = new Date().toISOString()
+    })
+    return ok({ name, state: 'ready', kind: 'windows' })
+  }
   const result = await runCua(['sb', 'resume', '--local', name], { timeoutMs: 180000 })
   await mutateRegistry((registry) => {
     if (!registry.vms[name]) return
@@ -2128,6 +2487,11 @@ async function resumeVm(name) {
  * `stop` is this function (DSH_CUA_VM_LEGACY_STOP=1 restores the old alias).
  */
 async function shutdownVm(name, { reason = 'shutdown' } = {}) {
+  return withVmLock(name, () => shutdownVmLocked(name, { reason }))
+}
+
+/** Caller already holds the computer's lifecycle lock. */
+async function shutdownVmLocked(name, { reason = 'shutdown' } = {}) {
   assertVmName(name)
   const registry = readRegistry()
   const meta = registry.vms[name]
@@ -2135,6 +2499,9 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
   if (meta.kind === 'windows') return windowsShutdown(name, meta)
   const config = readConfig()
   const notes = []
+  // A preview is a promise to the user: closing it before the outcome is known
+  // is fine, dropping it because the shutdown failed is not. Remember it.
+  const previews = snapshotPorts(name)
   closePorts(name)
   space.invalidate(name)
 
@@ -2153,6 +2520,7 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
    * pidfile is not, so this is `pidAlive`, never "the file exists".
    */
   let qemuMayBeAlive = false
+  let abandonedBecause = 'its monitor does not answer'
   if (target !== null) {
     method = 'acpi'
     let powerdown = null
@@ -2179,7 +2547,7 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
       // the user loses nothing but the power cycle they asked for.
       const detail = powerdown[0].error.desc || powerdown[0].error.class || 'not supported'
       log(`shutdown ${name}: ACPI powerdown refused (${detail}); falling back to suspend`)
-      const suspended = await suspendVm(name)
+      const suspended = await suspendVmLocked(name)
       if (!suspended.ok) return suspended
       return ok({
         name,
@@ -2203,7 +2571,16 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
           if (pidAlive(qemuPid(name))) notes.push(`QMP quit failed (${error?.message ?? error})`)
         }
         const after = await waitForPowerDown(name, target, 15000)
-        if (after.exited) notes.push('QEMU exited after quit, but the guest did not run its own shutdown hooks')
+        if (after.exited) {
+          notes.push('QEMU exited after quit, but the guest did not run its own shutdown hooks')
+        } else {
+          // It survived the forced quit: the disk is still open, so this is the
+          // same situation as an unreachable monitor, and it must be handled by
+          // the same branch — no convert, no `sb rm`, no clean restore point.
+          qemuMayBeAlive = true
+          abandonedBecause = 'survived the QMP quit'
+          notes.push('QEMU survived quit; refusing to convert a disk it still holds')
+        }
       }
     }
   } else {
@@ -2235,6 +2612,7 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
   // `startFromCheckpoint` reads `restoreFrom.stale` and, without a producer, the
   // guard was dead code guarding nothing.
   if (qemuMayBeAlive) {
+    const reopened = await restorePorts(name, previews)
     const markedStale = await mutateRegistry((fresh) => {
       const row = fresh.vms[name]
       if (!row) return false
@@ -2252,11 +2630,12 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
       }
       return true
     })
-    log(`shutdown ${name}: abandoned — QEMU (pid ${qemuPid(name)}) is alive with no monitor; nothing was removed${markedStale ? ', restore point marked stale' : ''}`)
+    log(`shutdown ${name}: abandoned — QEMU (pid ${qemuPid(name)}) is alive (${abandonedBecause}); nothing was removed${markedStale ? ', restore point marked stale' : ''}${reopened ? ', preview restored' : ''}`)
     return fail(
-      `could not power ${name} off: QEMU (pid ${qemuPid(name)}) is still running and its monitor does not answer, so the disk is open. `
-      + `No checkpoint was taken and nothing was removed — the computer is still running. `
+      `could not power ${name} off: QEMU (pid ${qemuPid(name)}) is still running and ${abandonedBecause}, so the disk is open. `
+      + 'No checkpoint was taken and nothing was removed — the computer is still running. '
       + `${markedStale ? 'Its existing restore point is now marked stale, so Start will boot the base image instead of trusting it. ' : ''}`
+      + `${reopened ? 'Its port preview was reopened. ' : ''}`
       + 'Retry in a moment, or use cua_vm_destroy to remove it.'
     )
   }
@@ -2264,11 +2643,30 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
   // 5. The checkpoint. `never` turns the whole path off; a timeout marks the
   // image because a convert of a live qcow2 is not guaranteed consistent.
   let checkpoint = null
+  let checkpointSkipped = ''
   if (config.checkpointPolicy === 'never') {
-    notes.push('checkpoint skipped (checkpointPolicy=never)')
+    checkpointSkipped = 'checkpointPolicy=never'
   } else {
-    checkpoint = checkpointSandbox(name)
-    if (checkpoint === null) notes.push('no disk to checkpoint; Start will use the base image')
+    // A CHECKPOINT COSTS A FULL DISK. Writing one into a store that has no room
+    // for it either fails halfway (leaving a `.tmp`) or fills the volume and
+    // takes the next create down with it. The requirement is the new file MINUS
+    // the checkpoint it replaces, because `rename` overwrites it.
+    const diskBytes = diskBytesFor(name)
+    const existingBytes = (() => { try { return statSync(path.join(CHECKPOINT_DIR, `${name}.qcow2`)).size } catch { return 0 } })()
+    const needed = Math.max(0, diskBytes - existingBytes)
+    const over = await refuseOverQuota(config, needed)
+    if (over !== null) {
+      checkpointSkipped = `the checkpoint needs ~${(needed / 1024 ** 3).toFixed(1)} GB and the store quota does not allow it`
+      notes.push(`${checkpointSkipped} (${over})`)
+    } else {
+      checkpoint = checkpointSandbox(name)
+      if (checkpoint === null) checkpointSkipped = 'no disk to checkpoint'
+    }
+  }
+  if (checkpoint === null) {
+    notes.push(checkpointSkipped === 'no disk to checkpoint'
+      ? 'no disk to checkpoint; Start will use the base image'
+      : `no checkpoint was written (${checkpointSkipped}); Start will use the base image`)
   }
 
   // 6. The sandbox record. A failure is reported, never fatal: the disk is
@@ -2282,7 +2680,12 @@ async function shutdownVm(name, { reason = 'shutdown' } = {}) {
     if (!fresh.vms[name]) return undefined
     fresh.vms[name].state = 'powered-off'
     fresh.vms[name].lastUsed = new Date().toISOString()
-    fresh.vms[name].lastShutdown = { at: new Date().toISOString(), method, reason }
+    fresh.vms[name].lastShutdown = {
+      at: new Date().toISOString(),
+      method,
+      reason,
+      ...(checkpointSkipped !== '' ? { checkpointSkipped } : {})
+    }
     // A CLEAN shutdown always writes a restore point from scratch, so a stale
     // marking from an earlier abandoned attempt cannot survive it.
     fresh.vms[name].restoreFrom = checkpoint !== null
@@ -2324,13 +2727,20 @@ async function startFromCheckpoint(name, meta) {
   // A checkpoint the last shutdown could not vouch for (QEMU was still alive, so
   // the disk was open) is NOT booted: it may be internally inconsistent, and a
   // silent bad boot is worse than a clean base-image one that says why.
+  // TWO REASONS NOT TO TRUST A CHECKPOINT, and both must be READ here or the
+  // field is decoration: `stale` (an abandoned shutdown proved the disk was
+  // open) and `mayBeTorn` (a shutdown timed out and QEMU was forced to quit
+  // while the guest was mid-write). A torn image boots — and then fails in a way
+  // nobody can attribute to the shutdown that produced it.
   const stale = meta.restoreFrom?.stale === true
-  if (!stale && existsSync(checkpoint)) {
+  const torn = meta.mayBeTorn === true
+  const distrust = stale || torn
+  if (!distrust && existsSync(checkpoint)) {
     copyFileSync(checkpoint, restore)
     bootImage = restore
     from = 'checkpoint'
-  } else if (stale) {
-    log(`start: ${name}'s checkpoint is marked stale (the last shutdown could not prove QEMU was down); booting ${bootImage}`)
+  } else if (distrust) {
+    log(`start: ${name}'s checkpoint is ${stale ? 'stale' : 'marked mayBeTorn'}; booting ${bootImage} instead`)
   } else {
     log(`start: ${name} has no checkpoint; booting ${bootImage}`)
   }
@@ -2340,7 +2750,10 @@ async function startFromCheckpoint(name, meta) {
   installQemuShim()
   let created = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, bootImage, meta.gpu === true), { timeoutMs: 1500000 })
   if (created.code !== 0 && from === 'checkpoint') {
-    log(`start: the checkpoint of ${name} did not boot; falling back to ${bootImage === restore ? (meta.image || 'linux') : bootImage}`)
+    log(`start: the checkpoint of ${name} did not boot; falling back to ${meta.image || 'linux'}`)
+    // The failed attempt may have left a half-created sandbox holding the name:
+    // the first attempt always removes one before creating, so must the fallback.
+    await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
     created = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, meta.image || 'linux', meta.gpu === true), { timeoutMs: 1500000 })
     from = 'image'
   }
@@ -2369,7 +2782,9 @@ async function startFromCheckpoint(name, meta) {
       ? 'cold-booted from its checkpoint (the sandbox was removed at shutdown, so there was nothing to resume)'
       : stale
         ? 'cold-booted from the base image: the last shutdown could not prove the guest had stopped, so its checkpoint is not trustworthy'
-        : 'cold-booted from the base image: no checkpoint was available'
+        : torn
+          ? 'cold-booted from the base image: the last shutdown timed out and the guest was force-quit, so its checkpoint may be torn'
+          : 'cold-booted from the base image: no checkpoint was available'
   })
 }
 
@@ -2400,6 +2815,17 @@ async function windowsStart(name, meta) {
       row.installDetail = status.detail
     })
     return ok({ name, state: 'installing', kind: 'windows', detail: status.detail })
+  }
+  if (status.state === 'suspended') {
+    await windowsBackend.unpause(name)
+    await mutateRegistry((registry) => {
+      const row = registry.vms[name]
+      if (!row) return
+      row.state = 'ready'
+      row.lastUsed = new Date().toISOString()
+    })
+    await ensureWindowsConsoleRelay(name)
+    return ok({ name, state: 'ready', kind: 'windows', detail: 'unpaused (suspend kept the guest exactly as it was)' })
   }
   if (status.state === 'stopped') {
     await windowsBackend.start(name)
@@ -2500,6 +2926,9 @@ async function doctorReport() {
       engineReachable: docker.reachable,
       qmpPort: WINDOWS_QMP_PORT,
       qmpPublished: false,
+      // dockur's own HMP monitor sits on 7100 inside the same container; the
+      // supervisor never dials it (see WINDOWS_QMP_PORT in the backend).
+      dockurMonitorPort: WINDOWS_HMP_PORT,
       consolePort: WINDOWS_CONSOLE_PORT,
       rdpPort: WINDOWS_RDP_PORT,
       versions: WINDOWS_VERSIONS
@@ -2595,6 +3024,8 @@ const handlers = {
               ), { timeoutMs: 1500000 })
               if (recreated.code !== 0 && snapshot !== null) {
                 log(`restore from checkpoint failed for ${name}; falling back to the base image`)
+                // A failed create can leave a record that holds the name.
+                await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
                 recreated = await runCua(createArgs(name, known?.tier || spec.tier, known?.cpu || spec.cpu, known?.memory || spec.memory, spec.waitDesktop, known?.image || 'linux', known?.gpu === true), { timeoutMs: 1500000 })
               }
               if (snapshot !== null) { try { unlinkSync(bootImage) } catch {} }
@@ -2665,60 +3096,63 @@ const handlers = {
    * from its checkpoint and never asks cua to resume anything.
    */
   async vmStart({ name }) {
-    const registry = readRegistry()
-    const meta = registry.vms[name]
-    if (!meta) throw new Error(`no computer named "${name}"`)
-    if (meta.kind === 'windows') return windowsStart(name, meta)
-    space.invalidate(name)
-    if (meta.state === 'powered-off') return startFromCheckpoint(name, meta)
-    let result = await runCua(['sb', 'resume', '--local', name], { timeoutMs: 180000 })
-    if (result.code !== 0) result = await runCua(['sb', 'restart', '--local', name], { timeoutMs: 180000 })
-    if (result.code !== 0) {
-      // Same reality as ensure: a QEMU VM whose process is gone cannot start.
-      // Rebuild it from its recorded spec so the Start button is never a dead end.
-      log(`start: recreating ${name} after "${(result.stderr || result.stdout).trim().slice(-160)}"`)
-      const snapshot = checkpointSandbox(name)
-      await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
-      await ensureRuntime()
-      const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : meta.image
-      if (snapshot !== null) copyFileSync(snapshot, bootImage)
-      installQemuShim()
-      result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, bootImage, meta.gpu === true), { timeoutMs: 1500000 })
-      if (result.code !== 0 && snapshot !== null) {
-        log(`restore from checkpoint failed for ${name}; falling back to ${meta.image}`)
-        result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, meta.image, meta.gpu === true), { timeoutMs: 1500000 })
+    return withVmLock(name, async () => {
+      const registry = readRegistry()
+      const meta = registry.vms[name]
+      if (!meta) throw new Error(`no computer named "${name}"`)
+      if (meta.kind === 'windows') return windowsStart(name, meta)
+      space.invalidate(name)
+      if (meta.state === 'powered-off') return startFromCheckpoint(name, meta)
+      let result = await runCua(['sb', 'resume', '--local', name], { timeoutMs: 180000 })
+      if (result.code !== 0) result = await runCua(['sb', 'restart', '--local', name], { timeoutMs: 180000 })
+      if (result.code !== 0) {
+        // Same reality as ensure: a QEMU VM whose process is gone cannot start.
+        // Rebuild it from its recorded spec so the Start button is never a dead end.
+        log(`start: recreating ${name} after "${(result.stderr || result.stdout).trim().slice(-160)}"`)
+        const snapshot = checkpointSandbox(name)
+        await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
+        await ensureRuntime()
+        const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : (meta.image || 'linux')
+        if (snapshot !== null) copyFileSync(snapshot, bootImage)
+        installQemuShim()
+        result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, bootImage, meta.gpu === true), { timeoutMs: 1500000 })
+        if (result.code !== 0 && snapshot !== null) {
+          log(`restore from checkpoint failed for ${name}; falling back to ${meta.image || 'linux'}`)
+          // A failed create can leave a record that holds the name.
+        await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
+        result = await runCua(createArgs(name, meta.tier, meta.cpu, meta.memory, false, meta.image || 'linux', meta.gpu === true), { timeoutMs: 1500000 })
+        }
+        if (snapshot !== null) { try { unlinkSync(bootImage) } catch {} }
+        if (result.code !== 0) return fail((result.stderr || result.stdout).trim().slice(-800))
+        // Same rebuild, same lost floor: this disk came from base/meta.image (or
+        // a checkpoint whose size is not guaranteed), so re-apply the REA size
+        // before the kit is asked to fit into it.
+        await regrowDiskAfterRebuild(name, meta)
       }
-      if (snapshot !== null) { try { unlinkSync(bootImage) } catch {} }
-      if (result.code !== 0) return fail((result.stderr || result.stdout).trim().slice(-800))
-      // Same rebuild, same lost floor: this disk came from base/meta.image (or
-      // a checkpoint whose size is not guaranteed), so re-apply the REA size
-      // before the kit is asked to fit into it.
-      await regrowDiskAfterRebuild(name, meta)
-    }
-    await mutateRegistry((fresh) => {
-      const row = fresh.vms[name]
-      if (!row) return
-      row.state = 'ready'
-      row.lastUsed = new Date().toISOString()
-      delete row.restoreFrom
-      delete row.mayBeTorn
-    })
-    // Version-checked: an up-to-date disk answers in one exec, an outdated one
-    // is re-provisioned here (the first start after an image update takes a
-    // minute longer and the result says so). The REA layer has its own marker,
-    // so a plain computer returns from it in one exec as well.
-    const provisioned = await provisionGuest(name, { gpu: meta.gpu === true })
-    const rea = meta.rea === true ? await provisionReaGuest(name) : null
-    return ok({
-      name,
-      state: 'ready',
-      provisioned: provisioned.ok,
-      rea: rea ? rea.ok : undefined,
-      renderer: provisioned.renderer,
-      output: provisioned.ok ? (rea && !rea.ok ? rea.output.slice(-1200) : undefined) : provisioned.output.slice(-1200)
+      await mutateRegistry((fresh) => {
+        const row = fresh.vms[name]
+        if (!row) return
+        row.state = 'ready'
+        row.lastUsed = new Date().toISOString()
+        delete row.restoreFrom
+        delete row.mayBeTorn
+      })
+      // Version-checked: an up-to-date disk answers in one exec, an outdated one
+      // is re-provisioned here (the first start after an image update takes a
+      // minute longer and the result says so). The REA layer has its own marker,
+      // so a plain computer returns from it in one exec as well.
+      const provisioned = await provisionGuest(name, { gpu: meta.gpu === true })
+      const rea = meta.rea === true ? await provisionReaGuest(name) : null
+      return ok({
+        name,
+        state: 'ready',
+        provisioned: provisioned.ok,
+        rea: rea ? rea.ok : undefined,
+        renderer: provisioned.renderer,
+        output: provisioned.ok ? (rea && !rea.ok ? rea.output.slice(-1200) : undefined) : provisioned.output.slice(-1200)
+      })
     })
   },
-
   /**
    * Create a NAMED computer with an explicit spec, the way the Computers page
    * asks for one. `image` is a cua alias or an OCI reference; unknown aliases
@@ -2851,19 +3285,20 @@ const handlers = {
    * desktop but silently drops the RE kit would be the worst of both.
    */
   async provision({ name }) {
-    const registry = readRegistry()
-    const meta = registry.vms[name]
-    if (!meta) return fail(`no computer named "${name}"`)
-    const result = await provisionGuest(name, { gpu: meta.gpu === true })
-    const rea = meta.rea === true ? await provisionReaGuest(name) : null
-    const both = result.ok && (rea === null || rea.ok)
-    if (!both) {
-      const reaPart = rea !== null && !rea.ok ? `\nrea:\n${rea.output.slice(-900)}` : ''
-      return fail(`provisioning failed:\n${result.output.slice(-1200)}${reaPart}`)
-    }
-    return ok({ name, renderer: result.renderer, rea: rea ? rea.ok : undefined, output: `${result.output.slice(-1500)}${rea ? `\n${rea.output.slice(-900)}` : ''}` })
+    return withVmLock(name, async () => {
+      const registry = readRegistry()
+      const meta = registry.vms[name]
+      if (!meta) return fail(`no computer named "${name}"`)
+      const result = await provisionGuest(name, { gpu: meta.gpu === true })
+      const rea = meta.rea === true ? await provisionReaGuest(name) : null
+      const both = result.ok && (rea === null || rea.ok)
+      if (!both) {
+        const reaPart = rea !== null && !rea.ok ? `\nrea:\n${rea.output.slice(-900)}` : ''
+        return fail(`provisioning failed:\n${result.output.slice(-1200)}${reaPart}`)
+      }
+      return ok({ name, renderer: result.renderer, rea: rea ? rea.ok : undefined, output: `${result.output.slice(-1500)}${rea ? `\n${rea.output.slice(-900)}` : ''}` })
+    })
   },
-
   /**
    * Delete a computer and EVERYTHING it left in the store (see destroyVm): the
    * sandbox, its checkpoints and restore temp, its screenshots, its port and
@@ -3424,38 +3859,40 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
 
   /** Grow the disk of a running computer; the filesystem grows online. */
   async vmDisk({ name, sizeGb }) {
-    const registry = readRegistry()
-    if (!registry.vms[name]) return fail(`no computer named "${name}"`)
-    if (registry.vms[name].kind === 'windows') {
-      return ok({ available: false, name, message: `cua_vm_disk is not available for a Windows computer: ${WINDOWS_NO_AGENT('disk')} Its size is fixed at create time (DISK_SIZE in the container spec); destroy and recreate to change it.` })
-    }
-    try {
-      const result = await growGuestDisk(name, Number(sizeGb))
-      if (result.changed) {
-        log(`disk: ${name} grew to ${result.sizeGb} GB`)
-        await mutateRegistry((fresh) => {
-          if (fresh.vms[name]) fresh.vms[name].diskGb = result.sizeGb
-        })
+    return withVmLock(name, async () => {
+      const registry = readRegistry()
+      if (!registry.vms[name]) return fail(`no computer named "${name}"`)
+      if (registry.vms[name].kind === 'windows') {
+        return ok({ available: false, name, message: `cua_vm_disk is not available for a Windows computer: ${WINDOWS_NO_AGENT('disk')} Its size is fixed at create time (DISK_SIZE in the container spec); destroy and recreate to change it.` })
       }
-      return ok({ name, ...result })
-    } catch (error) {
-      return fail(`${error && error.message}`)
-    }
+      try {
+        const result = await growGuestDisk(name, Number(sizeGb))
+        if (result.changed) {
+          log(`disk: ${name} grew to ${result.sizeGb} GB`)
+          await mutateRegistry((fresh) => {
+            if (fresh.vms[name]) fresh.vms[name].diskGb = result.sizeGb
+          })
+        }
+        return ok({ name, ...result })
+      } catch (error) {
+        return fail(`${error && error.message}`)
+      }
+    })
   },
-
   /** Install the Android SDK + an AVD inside the guest (several GB, one-off). */
   async vmAndroid({ name, api = 35, variant = 'google_apis', arch = 'x86_64', avd = 'cua' }) {
-    const registry = readRegistry()
-    if (!registry.vms[name]) return fail(`no computer named "${name}"`)
-    if (registry.vms[name].kind === 'windows') {
-      return ok({ available: false, name, message: 'Android is not available for Windows computers: the SDK and the AVD run in a Linux guest.' })
-    }
-    const result = await provisionAndroidGuest(name, { api: Number(api) || 35, variant, arch, avd })
-    return result.ok
-      ? ok({ name, installed: true, output: result.output.slice(-1500) })
-      : fail(`android provisioning failed:\n${result.output.slice(-1200)}`)
+    return withVmLock(name, async () => {
+      const registry = readRegistry()
+      if (!registry.vms[name]) return fail(`no computer named "${name}"`)
+      if (registry.vms[name].kind === 'windows') {
+        return ok({ available: false, name, message: 'Android is not available for Windows computers: the SDK and the AVD run in a Linux guest.' })
+      }
+      const result = await provisionAndroidGuest(name, { api: Number(api) || 35, variant, arch, avd })
+      return result.ok
+        ? ok({ name, installed: true, output: result.output.slice(-1500) })
+        : fail(`android provisioning failed:\n${result.output.slice(-1200)}`)
+    })
   },
-
   /**
    * `stop` used to mean "suspend", because cua 0.7.0 has no power command of its
    * own. It means SHUTDOWN now: a real ACPI powerdown, a checkpoint, and a
@@ -3602,6 +4039,15 @@ setInterval(() => {
     handlers.suspend({ name }).catch((error) => log(`idle suspend failed for ${name}: ${error.message}`))
   }
 }, 60000).unref?.()
+
+// THE v1→v2 MIGRATION IS A WRITE, so it runs once, under the registry lock,
+// BEFORE the socket exists: a caller that connects must never observe a v1 file,
+// and two concurrent readers must never race to write it.
+try {
+  await migrateRegistryFile()
+} catch (error) {
+  log(`registry: migration failed (${error?.message ?? error}); the first write will retry it`)
+}
 
 server.listen(SOCK, () => {
   try { chmodSync(SOCK, 0o600) } catch {}
