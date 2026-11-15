@@ -784,28 +784,40 @@ volume, never in the workspace.
 | Kind | Backend | Has |
 |---|---|---|
 | `linux` (default) | QEMU through `cua`, guest agent on `:3211` | exec, put/get, disk growth, Android, REA, the whole desktop |
-| `windows` | a `dockurr/windows` container on a DinD engine | the desktop only: screenshots and input over QMP, plus the web console |
+| `windows` | **direct QEMU** (OVMF + swtpm + qcow2), no container runtime | exec/put/get over SSH, the desktop over QMP, a live VNC view, element actions via dsh-cua |
 
-Windows is opt-in and needs `compose.windows.yaml`:
+Windows is opt-in and needs `compose.windows.yaml`, which only adds devices:
 
 ```bash
 docker compose -f compose.yaml -f compose.windows.yaml up -d
 ```
 
-It adds a `dind` service, sets `DOCKER_HOST=tcp://dind:2375` and
-`DSH_CUA_VM_WINDOWS=1`, and shares the `cua-vm` volume so a Windows
-`/storage` bind is the same tree on both sides.
+It passes `/dev/kvm` (and `/dev/dri` for the display), the render/video GIDs and
+`DSH_CUA_VM_WINDOWS=1`. There is **no DinD service and no privileged sidecar**:
+the supervisor runs `qemu-system-x86_64` itself, under the same hardening as the
+Linux guest (`cap_drop ALL`, read-only rootfs, `no-new-privileges`).
 
-**Raise the disk quota first.** A Windows disk floors at 64 GB and
-`diskQuotaGb` defaults to **20**, so the create is refused until the policy
-allows the floor: Personal VM → Policy → Disk Size ≥ 64 (or edit
-`/cua-vm/config.json`). The refusal says exactly that, with the number, instead
-of the generic "store quota reached". The engine container is
-`privileged` (an in-container engine needs it); the harness keeps `cap_drop ALL`,
-read-only rootfs and `no-new-privileges`. The console is relayed to
-`/vm/port/<name>/`; **RDP 3389 is commented out and documented as a LAN exposure**
-in that file — enable it deliberately. `DSH_CUA_VM_WINDOWS=0` removes the option
-entirely.
+**What a Windows computer is.** OVMF firmware with a per-computer NVRAM and a
+swtpm TPM2, a plain qcow2 disk under `/cua-vm/windows/<name>/`, a pinned
+Microsoft evaluation ISO (downloaded once into `/cua-vm/iso/`, or `windowsIso`),
+and an unattended answer file that installs OpenSSH, Python and dsh-cua. The
+guest's only network is QEMU user-mode (SLIRP): outbound internet, host services
+at `10.0.2.2`, SSH forwarded to loopback. A bridge/tap is possible but not
+default — it needs `CAP_NET_ADMIN`.
+
+**The live view** is QEMU VNC on loopback behind websockify+noVNC, relayed at
+`/vm/port/<name>/`: *Show VM* streams the same screen the model drives and a human
+can take over.
+
+**Honest ceilings:** the GPU option is a virtio-gpu backed by the host render
+node, but Windows has **no accelerated 3D driver** here — Direct3D falls back to
+WARP (CPU), and an EGL handle in `nvidia-smi` is the host-side QEMU context, not
+guest acceleration. QMP typing is ASCII-only, there is no clipboard, no
+accessibility tree, no window list and **no cursor overlay** (the pointer in the
+frame is the real one). `cua_vm_suspend` is QMP `stop`; `cua_vm_shutdown` is the
+same ACPI → checkpoint → `powered-off` path as Linux. The dsh-cua element tools
+attach lazily over SSH only while a Windows computer is ready (~3-8k tokens), and
+`DSH_CUA_VM_WIN_MCP=0` removes them.
 
 ### Shutdown, suspend, and why Start cold-boots
 
@@ -814,6 +826,7 @@ where it was. `cua sb` has no power command, so **Shutdown** is the supervisor's
 own sequence — ACPI `system_powerdown` over QMP, wait (up to
 `shutdownTimeoutSec`, default 120), `quit` on timeout, flatten the disk into
 `$STORE/checkpoints/<name>.qcow2`, remove the sandbox, record `powered-off`.
+Windows uses the same sequence, with QMP bound to the row's own port.
 
 A powered-off computer has **no sandbox left**, so `cua sb resume` can never work
 on it — that was the "stopped VM can never resume" dead end. `cua_vm_start`

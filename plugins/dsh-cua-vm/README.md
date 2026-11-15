@@ -156,88 +156,142 @@ At boot the supervisor reconciles `ports.json`: every forward child died with th
 previous container, so a row pointing at a dead loopback port is dropped instead
 of answering 502 for a preview the panel shows as open.
 
-## Windows computers
+## Windows computers (direct QEMU)
 
-The backend lives in `docker/cua-vm-windows.mjs` and speaks the Docker Engine API
-over `DOCKER_HOST` (`tcp://dind:2375` in `compose.windows.yaml`). It is off
-unless `DSH_CUA_VM_WINDOWS=1`; `0` removes the option entirely (tools refuse,
-panel hides it).
+A Windows computer is **not** a container. It is `qemu-system-x86_64` started by
+the same supervisor that runs the Linux guest: the same `/dev/kvm`, the same
+`/cua-vm` store, the same lifecycle locks, the same shutdown/checkpoint/delete
+machinery. There is no Docker Engine, no DinD sidecar and no second runtime —
+`docker/cua-vm-windows-qemu.mjs` builds the command line and
+`docker/windows-oem/` holds the unattended install.
 
-**The container spec** (everything is derived from one spec object):
+```
+$STORE/iso/                              downloaded install media (one per version)
+$STORE/windows/<name>/disk.qcow2          the system disk (plain qcow2 → checkpointable)
+$STORE/windows/<name>/efi-vars.qcow2      OVMF NVRAM, per computer
+$STORE/windows/<name>/tpm/                swtpm TPM2 state, per computer
+$STORE/windows/<name>/oem/                Autounattend.xml + $OEM$ scripts (a vvfat USB stick)
+$STORE/windows/<name>/credentials.json    generated password + key path, mode 0600
+$STORE/windows/<name>/id_ed25519          the SSH key the supervisor uses
+$STORE/windows/<name>/serial.log          the console — the install progress
+```
 
-| Env | Value |
+### Firmware and devices
+
+| Piece | What runs |
 |---|---|
-| `VERSION` | `windowsVersion` (11/10/ltsc10/2022/2025), **or** `windowsIso` when that is an http(s) URL |
-| `DISK_SIZE` | `diskGb`, floored at 64 GB (`diskGbRaised`) |
-| `DISK_FMT` | `qcow2` |
-| `RAM_SIZE` | `memory`, floored at 6 GB (`memoryRaised`) |
-| `CPU_CORES` | floored at 2 |
-| `GPU` / `RENDERNODE` | `Y`/`N` ← Enable GPU; `/dev/dri/renderD128` (`CUA_WINDOWS_RENDERNODE`) |
-| `MANUAL` | `N` (unattended install) |
-| `USERNAME` / `PASSWORD` | `cua` / generated (20 url-safe chars) |
-| `ARGUMENTS` | `-device usb-tablet -qmp tcp:0.0.0.0:7101,server=on,wait=off` |
+| firmware | **OVMF** (`OVMF_CODE_4M.fd` shared, per-computer `efi-vars.qcow2`), so boot entries survive restarts |
+| TPM | **swtpm** on a unix socket, `tpm-crb` in the guest — a real TPM 2.0, not a registry bypass (the Secure Boot check *is* bypassed: OVMF here is the non-secure-boot build, and that is stated in the answer file) |
+| disk | qcow2, AHCI by default; **virtio-blk** when a virtio-win ISO is provided |
+| NIC | SLIRP user-mode networking, `e1000e` by default; virtio-net with the driver ISO |
+| input | `usb-tablet` (absolute pointer — what QMP `input-send-event` needs) + `usb-kbd` |
+| display | `VGA` by default; `virtio-gpu-pci` with Enable GPU |
+| control | QMP on loopback; VNC on loopback for the live view |
 
-A **local** ISO is not an environment variable: it is bind-mounted read-only at
-`/boot.iso`, which is how v4.35 detects a custom install medium, and `VERSION`
-is then left unset. `windowsIso` must be an http(s) URL or a path **inside the
-VM store** (e.g. `windows/11.iso`); anything else is refused before a container
-exists.
+**Windows has no accelerated 3D here.** The GPU option gives a virtio-gpu device
+backed by the host's `/dev/dri/renderD128` (the same virgl wiring the Linux guest
+uses), but Windows has no accelerated driver for it in this image: Direct3D falls
+back to **WARP (CPU)** and OpenGL is not hardware-accelerated. Expect desktop
+composition and 2D to be fine and anything 3D to be slow. On NVIDIA hosts the
+QEMU process may show an EGL handle in `nvidia-smi` — that is the host-side
+context of the virtio-gpu device, **not** acceleration inside the guest.
 
-**Two environment variables are deliberately NOT set**, because the pinned
-image ignores them: `VRAM_SIZE` (v4.35's qemux/qemu:7.12 base has no consumer)
-and `SHUTDOWN` (v4.35 traps SIGTERM into a graceful guest shutdown anyway). A
-no-op that reads like configuration is worse than no setting.
+### Install media
 
-**Two monitor ports, neither published.** dockurr v4.35 already runs its own HMP
-monitor on **7100** (`power.sh`), and appends `$ARGUMENTS` after its monitor
-options — our `-qmp` on the same port was a second bind, EADDRINUSE, and QEMU
-exited at boot. The supervisor's QMP lives on **7101**; both sockets are reached
-on the container's own address (`DSH_CUA_WINDOWS_NETWORK`), never on the host.
-Docker's graceful `stop` still goes through dockurr's own 7100 path.
+`windowsVersion` picks a pinned Microsoft evaluation ISO
+(`docker/cua-vm-windows-qemu.mjs` → `WINDOWS_ISO_SOURCES`: 11, 10, ltsc10, 2022,
+2025). The first create downloads it **once** into `$STORE/iso/` with progress in
+the supervisor log and a timeout (`DSH_CUA_WINDOWS_ISO_TIMEOUT_MS`, default 1 h).
 
-`HostConfig`: devices `/dev/kvm` (+ `/dev/dri` when GPU), `CapAdd:
-["NET_ADMIN"]`, bind `$STORE/windows/<name>:/storage`, labels
-`dsh.cua.vm=<name>` + `dsh.cua.kind=windows`, and **no restart policy** (a
-deliberately stopped computer must not resurrect itself).
+`windowsIso` overrides it: an `http(s)` URL (downloaded the same way) or a file
+path — inside `$STORE` or inside the workspace — used directly as a QEMU drive.
 
-**Storage quota.** A Windows disk floors at 64 GB and the default policy is
-`diskQuotaGb: 20`, so the first Windows create is refused until you raise it
-(Personal VM → Policy → Disk Size ≥ 64). The message names the number and the
-field; it is a policy decision, not something the plugin silently raises.
+An optional `virtio-win.iso` (`$STORE/iso/virtio-win.iso` or
+`DSH_CUA_WINDOWS_VIRTIO_ISO`) switches the disk and NIC to virtio; without it
+stock Windows installs from its own AHCI/e1000e drivers.
 
-**Ready** = RDP accepting on the published 3389 **and** QMP `query-status`
-saying `running`. Both halves matter: RDP opens while the install is still
-rebooting, and QMP says `running` before the guest exists. Until then the row is
-`installing`, with a live `docker logs` tail; past
-`windowsInstallTimeoutMinutes` (default 60) it becomes `error` with the last 40
-log lines.
+### The unattended install, and OpenSSH on every computer
 
-**Exposure.** The console (8006) is published on the DinD host and **relayed by
-the supervisor** into `ports.json` as `backend: "relay"` (with an informational
-`target` the proxy ignores) → `/vm/port/<name>/`. The proxy rewrites the
-console's root-absolute URLs (`prefixRootPaths`) so an app served at `/` works
-under the prefix; WebSockets were already tunnelled. QMP **7100 is never
-published** — it is reached on the container's own address, which is why the
-container joins `DSH_CUA_WINDOWS_NETWORK`. RDP on 3389 is opt-in in
-`compose.windows.yaml` and documented there as a real LAN exposure.
+`docker/windows-oem/Autounattend.xml` does the partitioning, creates the local
+administrator **cua** with the generated password (shown in the panel, stored
+0600), enables autologon — which is what keeps an INTERACTIVE session alive — and
+runs `cua-firstboot.ps1` at first logon. That script installs:
 
-**Suspend is `docker pause`.** A Windows computer has no cua sandbox, so
-`cua_vm_suspend` pauses the container (RAM and disk untouched) and `Start`
-unpauses it. `cua_vm_shutdown` is still `docker stop` (dockurr's own graceful
-shutdown), and the row goes `powered-off`.
+* **OpenSSH.Server**, started automatically, with the supervisor's public key in
+  `administrators_authorized_keys` (password auth stays on as the human fallback);
+* **Python** from python.org (silent install);
+* **dsh-cua** via pip;
+* a **scheduled task in the interactive session** running `dsh-cua-server` on a
+  named pipe.
 
-**What does not exist on Windows**, on purpose (structured "not available", with
-the paths that do work): `cua_vm_exec` (exit 126), `cua_vm_put`/`cua_vm_get`,
-`cua_vm_disk`, clipboard, accessibility tree, window list, `launch`. Screenshots
-come from QMP `screendump` (`space.source = "qmp"`, no capture budget, scale
-always 1) and a frame is written into `<workspace>/.cua-vm/shots/` because that
-is the only filesystem both sides see. Clicks and keys are QMP
-`input-send-event` (absolute pointer **needs** `usb-tablet`), ASCII only — a
-physical keyboard has no key for `é` or `中`.
+It writes `C:\cua-provision.json` as its marker.
 
-**Stretch, documented only:** exec/put over an OpenSSH OEM script
-(`/oem/...`, `OpenSSH.Server`), which needs a DinD host and a rebuilt image to
-test; it is not wired, and nothing pretends it is.
+**Why the interactive task matters:** SSH lands in **Session 0**, where there is
+no desktop. pywinauto can only drive windows in the user's own session, so the
+SSH side proxies to the interactive `dsh-cua-server` instead of driving the UI
+itself.
+
+### The agent surface
+
+| Tool | How it works on Windows |
+|---|---|
+| `cua_vm_exec` | SSH → `cmd.exe` (the SSH key is per computer; `cwd` is `cd /d`) |
+| `cua_vm_put` / `cua_vm_get` | `scp` over the same key and port |
+| `cua_vm_gui` | QMP: `screendump` for a frame, `input-send-event` for clicks/keys |
+| `cua_vm_port` / Show VM | the **live view**: noVNC + websockify relayed at `/vm/port/<name>/` |
+| `cua_vm_suspend` | QMP `stop` (the VM pauses with its RAM); Start `cont`s it |
+| `cua_vm_shutdown` | QMP `system_powerdown` → wait → `quit` → checkpoint → `powered-off` |
+| `cua_vm_disk`, Android, REA | not available (Linux-only), refused by name |
+
+**Ceilings, stated plainly:** QMP typing is **ASCII-only** (physical keycodes —
+no `é`, no `中`) and there is **no clipboard**, no accessibility tree and no
+window list on this path. There is also **no cursor overlay**: the CUA agent
+cursor is an X11 overlay on the Linux guest and nothing equivalent exists here,
+so the pointer you see in a frame is the real one (VNC draws it for a human).
+
+### Live view
+
+The display is QEMU VNC on `127.0.0.1:<allocated>`. The supervisor starts
+`websockify` in front of it serving the image's own noVNC page and relays THAT
+port through the existing preview pipeline, so **Show VM** streams the same
+screen the model drives and a human can take over. Nothing is published raw.
+
+### Networking
+
+SLIRP gives the guest outbound internet (Windows Update, pip, site testing) and
+reaches **host services at `10.0.2.2`** — a site the model serves on the harness
+at `:3079` is `http://10.0.2.2:3079/` inside Windows. SSH is forwarded from
+`127.0.0.1:<allocated>` to guest `:22`.
+
+A tap/bridge is possible for real LAN presence but needs `CAP_NET_ADMIN` and a
+host bridge, so it is **not** the default and is not wired here; the harness keeps
+`cap_drop ALL`.
+
+### dsh-cua tools (element actions, lazily attached)
+
+While a Windows computer is `ready`, the plugin attaches the guest's MCP tool
+list through
+`ssh … python -m dsh_cua.server --stdio --pipe \\.\pipe\dsh-cua`
+(`plugins/dsh-cua-vm/win-mcp.js`). The tools appear as `cua_win__<name>` and are
+**disposed** when the computer stops being ready, is switched away from, or is
+deleted. **Nothing is written to the profile.**
+
+Why it is worth its cost: `find_elements` + `type_text` return a compact JSON
+receipt (`action_sent`, `effect_verified`) in a few hundred bytes, where the
+screenshot loop costs a PNG per attempt. The cost is the schema: **~3-8k tokens
+while attached**, zero when no Windows computer is active.
+
+Kill switch: `DSH_CUA_VM_WIN_MCP=0` disables the whole path (no SSH bridge, no
+tools, no tokens). The same bridge can also be used as a plain MCP stdio server
+(`node plugins/dsh-cua-vm/win-mcp.js --stdio --port <sshPort> --key <path>`) if
+you prefer a `dsh-mcp-client` row.
+
+### Lifecycle states
+
+`installing` → `booting` → `ready`, plus `suspended`, `powered-off`,
+`shutting-down` and `error` (with `errorLog`, the last 40 serial lines).
+`ready` = QMP says `running` **and** an endpoint answers — SSH banner first, VNC
+accept as the fallback. A paused guest is not ready.
 
 ## REA in the computer
 

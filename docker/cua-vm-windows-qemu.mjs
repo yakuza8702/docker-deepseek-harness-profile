@@ -1,0 +1,829 @@
+/**
+ * cua-vm-windows-qemu — a Windows computer as a DIRECT QEMU process.
+ *
+ * WHY THIS EXISTS (and what it replaced)
+ * --------------------------------------
+ * Windows used to be a third-party Windows container image on a Docker Engine sidecar (DinD).
+ * That architecture had three problems that could not be fixed from inside it:
+ *
+ *   1. it needed a second container runtime (privileged DinD) just to hold a
+ *      QEMU that this image can run itself;
+ *   2. its own monitor owned port 7100, so our QMP collided with it at boot;
+ *   3. the store was split — the container's `/storage` bind had to be the same
+ *      volume as `/cua-vm` or frames and credentials lived in two places.
+ *
+ * So Windows is now what Linux already is: `qemu-system-x86_64` started by the
+ * supervisor, with the SAME /dev/kvm, the SAME `/cua-vm` store, the SAME
+ * lifecycle locks and the SAME shutdown/checkpoint machinery. What changes is
+ * only the firmware and the guest-facing devices:
+ *
+ *   firmware   OVMF (UEFI), with a per-computer vars store under
+ *              `$STORE/windows/<name>/efi-vars.qcow2`, plus a swtpm TPM2 so
+ *              Windows 11's installer is satisfied honestly instead of being
+ *              talked past with registry bypasses.
+ *   disks      qcow2 under `$STORE/windows/<name>/disk.qcow2` — a plain qcow2,
+ *              which is why `qemu-img convert` checkpointing keeps working.
+ *   install    the pinned Microsoft ISO, a FAT `vvfat` directory holding
+ *              `Autounattend.xml` + the OEM scripts (see docker/windows-oem/),
+ *              and — when the operator provides it — the virtio-win drivers ISO.
+ *   control    QMP on loopback (screendump / input-send-event / query-status /
+ *              system_powerdown / quit) and a VNC display on loopback that the
+ *              proxy relays, so "Show VM" is a live stream the user drives.
+ *
+ * WHAT THIS MODULE IS, AND IS NOT
+ * -------------------------------
+ * It is a COMMAND BUILDER plus lifecycle helpers over injected primitives
+ * (`spawn`, `qmp`, `log`, `now`), so the argv can be asserted in a test without
+ * a hypervisor, and so the supervisor keeps owning every lock, the registry and
+ * the quotas. It never reads the registry and never writes it.
+ */
+
+import { execFileSync, spawn } from 'node:child_process'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
+import http from 'node:http'
+import https from 'node:https'
+import path from 'node:path'
+import { randomBytes } from 'node:crypto'
+import { pngSize } from './cua-vm-space.mjs'
+
+/* ------------------------------------------------------------------ *
+ * The pinned images
+ * ------------------------------------------------------------------ */
+
+/**
+ * Windows versions and the ISO each one installs from.
+ *
+ * These are Microsoft's OWN download URLs, not a third-party mirror: the
+ * evaluation ISOs are stable for years and are the only ones that can be pinned
+ * honestly. `windowsIso` overrides any of them (local file or URL).
+ *
+ * A pinned URL is still a remote dependency: the first create downloads ~5.5 GB
+ * into `$STORE/iso/`, once, with progress in the supervisor log and a timeout.
+ */
+export const WINDOWS_ISO_SOURCES = {
+  '11': {
+    label: 'Windows 11 (evaluation)',
+    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/22631.2861.231204-0538.23H2_NI_RELEASE_SVC_REFRESH_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso'
+  },
+  '10': {
+    label: 'Windows 10 (evaluation)',
+    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/19045.2965.230505-1209.22H2_RELEASE_SVC_PROD1_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso'
+  },
+  ltsc10: {
+    label: 'Windows 10 LTSC (evaluation)',
+    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/19044.1288.211006-0501.21H2_RELEASE_SVC_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso'
+  },
+  '2022': {
+    label: 'Windows Server 2022 (evaluation)',
+    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/20348.169.210806-2348.fe_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso'
+  },
+  '2025': {
+    label: 'Windows Server 2025 (evaluation)',
+    url: 'https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso'
+  }
+}
+
+/**
+ * The ORDER the panel offers, written out: `Object.keys` would put the
+ * integer-like keys first (10, 11, 2022, 2025) and leave ltsc10 last, which
+ * reads like a mistake in a dropdown.
+ */
+export const WINDOWS_VERSIONS = ['11', '10', 'ltsc10', '2022', '2025']
+
+/** Floors a Windows install does not survive below (same as the old backend). */
+export const WINDOWS_MIN_MEMORY_GB = 6
+export const WINDOWS_MIN_DISK_GB = 64
+export const WINDOWS_MIN_CPU = 2
+export const WINDOWS_DEFAULT_CPU = 2
+export const WINDOWS_DEFAULT_MEMORY_GB = 6
+export const WINDOWS_DEFAULT_DISK_GB = 64
+export const WINDOWS_USERNAME = 'cua'
+
+/** Which QEMU this module drives. The system build is the only one with OVMF.** */
+export const WINDOWS_QEMU = process.env.DSH_CUA_WINDOWS_QEMU || '/usr/bin/qemu-system-x86_64'
+/** OVMF code image (read-only) and the template for the per-VM vars store. */
+export const OVMF_CODE = process.env.DSH_CUA_WINDOWS_OVMF_CODE || '/usr/share/OVMF/OVMF_CODE_4M.fd'
+export const OVMF_VARS_TEMPLATE = process.env.DSH_CUA_WINDOWS_OVMF_VARS || '/usr/share/OVMF/OVMF_VARS_4M.fd'
+/** swtpm (TPM2 emulator) — a software TPM, no hardware needed. */
+export const SWTPM = process.env.DSH_CUA_WINDOWS_SWTPM || '/usr/bin/swtpm'
+/** Optional virtio-win drivers ISO (see attachDrivers()). */
+export const VIRTIO_WIN_ISO = process.env.DSH_CUA_WINDOWS_VIRTIO_ISO || ''
+
+/** The kill switch: DSH_CUA_VM_WINDOWS=0 removes the option entirely. */
+export function windowsEnabled() {
+  return String(process.env.DSH_CUA_VM_WINDOWS ?? '1') !== '0'
+}
+
+/** Is this host able to boot a Windows computer at all? */
+export function windowsHostCaps() {
+  const exists = (file) => {
+    try { return statSync(file).isFile() } catch { return false }
+  }
+  return {
+    qemu: exists(WINDOWS_QEMU),
+    ovmfCode: exists(OVMF_CODE),
+    ovmfVars: exists(OVMF_VARS_TEMPLATE),
+    swtpm: exists(SWTPM),
+    virtioWin: VIRTIO_WIN_ISO !== '' && exists(VIRTIO_WIN_ISO),
+    kvm: exists('/dev/kvm'),
+    render: exists('/dev/dri/renderD128')
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Paths — everything Windows lives under $STORE
+ * ------------------------------------------------------------------ */
+
+/**
+ * ONE DIRECTORY PER COMPUTER, and nothing outside `$STORE`.
+ *
+ *   $STORE/windows/<name>/disk.qcow2        the system disk (plain qcow2)
+ *   $STORE/windows/<name>/efi-vars.qcow2    OVMF NVRAM (boot order, keys)
+ *   $STORE/windows/<name>/tpm/              swtpm state (persisted TPM2)
+ *   $STORE/windows/<name>/oem/              Autounattend.xml + Setup scripts
+ *   $STORE/windows/<name>/credentials.json  the generated password + SSH key
+ *   $STORE/windows/<name>/serial.log        the console (also the install tail)
+ *   $STORE/iso/                             downloaded install media
+ */
+export function windowsPaths(store, name) {
+  const dir = path.join(store, 'windows', name)
+  return {
+    dir,
+    disk: path.join(dir, 'disk.qcow2'),
+    efiVars: path.join(dir, 'efi-vars.qcow2'),
+    tpmDir: path.join(dir, 'tpm'),
+    tpmSocket: path.join(dir, 'swtpm.sock'),
+    tpmPid: path.join(dir, 'swtpm.pid'),
+    oemDir: path.join(dir, 'oem'),
+    credentials: path.join(dir, 'credentials.json'),
+    sshKey: path.join(dir, 'id_ed25519'),
+    sshKeyPub: path.join(dir, 'id_ed25519.pub'),
+    serialLog: path.join(dir, 'serial.log'),
+    qemuPid: path.join(dir, 'qemu.pid'),
+    qmp: path.join(dir, 'qmp.json'),
+    isoDir: path.join(store, 'iso')
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * The command line
+ * ------------------------------------------------------------------ */
+
+/**
+ * The QEMU argv for one Windows computer.
+ *
+ * DESIGN NOTES THAT MATTER WHEN SOMETHING DOES NOT BOOT:
+ *
+ *   * `q35` + `-cpu host` + KVM: the same acceleration the Linux guest uses;
+ *     without /dev/kvm this refuses at start rather than crawling.
+ *   * The two pflash drives are the firmware. OVMF_CODE is read-only and
+ *     SHARED; `efi-vars.qcow2` is PER COMPUTER, so boot entries and the TPM's
+ *     measured state survive a restart (a fresh vars file re-runs Setup).
+ *   * `swtpm` is a separate process listening on a unix socket; QEMU's chardev
+ *     connects to it. Both are cleaned up by `stopSwtpm`.
+ *   * The install medium and the OEM payload are CD-ROM / USB removable media,
+ *     because that is where Setup looks for `Autounattend.xml`. The OEM payload
+ *     is a `vvfat` directory (no ISO authoring tool needed — the host may have
+ *     none) exposed as a USB stick.
+ *   * `bootindex` puts the install ISO first ONLY while the disk is empty;
+ *     after the first boot the disk owns the boot order (see `installPending`).
+ *   * Networking is SLIRP: outbound internet, the host reachable at 10.0.2.2,
+ *     and SSH forwarded from 127.0.0.1:<port> to guest :22. No bridge, no tap,
+ *     no CAP_NET_ADMIN — the harness keeps `cap_drop ALL`.
+ *   * Video: `-vga std` by default (a plain framebuffer every Windows has an
+ *     inbox driver for). With `gpu: true` the display becomes virtio-gpu backed
+ *     by the host's render node — the SAME virgl wiring as the Linux guest —
+ *     with the honest caveat documented in the README: Windows has no
+ *     accelerated 3D driver here, so Direct3D falls back to WARP (CPU).
+ */
+export function buildQemuArgs(spec) {
+  const p = spec.paths
+  const boot = spec.installPending === true
+  const args = [
+    '-name', `dsh-win-${spec.name}`,
+    '-machine', 'q35,accel=kvm,smm=off',
+    '-cpu', 'host',
+    '-smp', String(spec.cpu),
+    '-m', String(spec.memory * 1024),
+    // firmware: shared code + per-computer NVRAM
+    '-drive', `if=pflash,format=raw,readonly=on,file=${OVMF_CODE}`,
+    '-drive', `if=pflash,format=qcow2,file=${p.efiVars}`,
+    // TPM2: char socket to swtpm + the TPM device Windows 11 requires
+    '-chardev', `socket,id=chrtpm,path=${p.tpmSocket}`,
+    '-tpmdev', 'emulator,id=tpm0,chardev=chrtpm',
+    '-device', 'tpm-crb,tpmdev=tpm0',
+    // system disk
+    '-drive', `file=${p.disk},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap`,
+    '-device', spec.virtio ? 'virtio-blk-pci,drive=disk0,bootindex=1' : 'ide-hd,drive=disk0,bus=ide.0,bootindex=1',
+    // install medium (only while installing) + drivers + OEM payload
+    ...(boot
+      ? ['-drive', `file=${spec.isoPath},media=cdrom,readonly=on,if=none,id=cd0`,
+        '-device', 'ide-cd,drive=cd0,bus=ide.1,bootindex=2']
+      : []),
+    ...(spec.driverIso !== null
+      ? ['-drive', `file=${spec.driverIso},media=cdrom,readonly=on,if=none,id=cd1`,
+        '-device', 'ide-cd,drive=cd1,bus=ide.2']
+      : []),
+    // the OEM payload: a vvfat directory presented as a USB stick
+    '-drive', `file=fat:rw:${p.oemDir},format=raw,if=none,id=oem0`,
+    '-device', 'usb-storage,drive=oem0,bus=xhci.0',
+    // networking: SLIRP + the SSH forward
+    '-netdev', `user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22`,
+    '-device', spec.virtio ? 'virtio-net-pci,netdev=net0' : 'e1000e,netdev=net0',
+    // input: absolute pointer (QMP input-send-event) + keyboard
+    '-device', 'qemu-xhci,id=xhci',
+    '-device', 'usb-kbd',
+    '-device', 'usb-tablet',
+    // display: the panel's live view and the agent's frames
+    '-display', 'none',
+    '-vnc', `127.0.0.1:${spec.vncPort}`,
+    '-device', spec.gpu ? 'virtio-gpu-pci' : 'VGA,vgamem_mb=32',
+    // control + observability
+    '-qmp', `tcp:127.0.0.1:${spec.qmpPort},server=on,wait=off`,
+    '-monitor', 'none',
+    '-serial', `file:${p.serialLog}`,
+    '-pidfile', p.qemuPid,
+    '-no-user-config'
+  ]
+  return args
+}
+
+/**
+ * VNC takes a DISPLAY NUMBER, not a port: QEMU computes `5900 + n`.
+ * These helpers are the only place that arithmetic happens.
+ */
+export function vncDisplayFor(port) {
+  return Math.max(0, Number(port) - 5900)
+}
+
+export function vncPortFor(display) {
+  return 5900 + Number(display)
+}
+
+/* ------------------------------------------------------------------ *
+ * ISO handling
+ * ------------------------------------------------------------------ */
+
+/** A short, stable file name for a URL (the hash keeps two dates apart). */
+function isoFileName(url) {
+  const base = decodeURIComponent(String(url).split('/').pop() || 'windows.iso').replace(/[^\w.-]+/gu, '-')
+  const digest = randomBytes(4).toString('hex')
+  return base.toLowerCase().endsWith('.iso') ? base : `${base}-${digest}.iso`
+}
+
+/**
+ * Make sure an ISO is on disk, downloading it once.
+ *
+ * WHY A TIMEOUT AND A PROGRESS HOOK: a 5.5 GB download over a slow link is
+ * minutes, and a create that reports nothing for minutes looks hung. The
+ * supervisor turns `onProgress` into a log line and keeps the row's
+ * `installDetail` moving; `timeoutMs` bounds the whole transfer.
+ */
+export async function ensureIso({ url, isoDir, timeoutMs = 60 * 60 * 1000, onProgress = () => {}, log = () => {} }) {
+  if (!/^https?:\/\//iu.test(String(url || ''))) return { path: url, downloaded: false }
+  mkdirSync(isoDir, { recursive: true })
+  const target = path.join(isoDir, isoFileName(url))
+  if (existsSync(target) && statSync(target).size > 1024 * 1024) return { path: target, downloaded: false }
+  const partial = `${target}.part`
+  const started = Date.now()
+  let received = 0
+  let lastReport = 0
+  await new Promise((resolve, reject) => {
+    const client = String(url).startsWith('https:') ? https : http
+    const request = client.get(url, { timeout: 60000 }, (response) => {
+      // Redirects are normal for Microsoft's CDN.
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        response.resume()
+        ensureIso({ url: new URL(response.headers.location, url).toString(), isoDir, timeoutMs, onProgress, log })
+          .then(resolve, reject)
+        return
+      }
+      if (response.statusCode !== 200) {
+        response.resume()
+        reject(new Error(`ISO download failed: HTTP ${response.statusCode} for ${url}`))
+        return
+      }
+      const total = Number(response.headers['content-length'] || 0)
+      const out = createWriteStream(partial)
+      response.on('data', (chunk) => {
+        received += chunk.length
+        if (Date.now() - started > timeoutMs) {
+          request.destroy(new Error(`ISO download timed out after ${Math.round(timeoutMs / 1000)} s`))
+          return
+        }
+        if (Date.now() - lastReport > 5000) {
+          lastReport = Date.now()
+          onProgress(total > 0 ? received / total : null, received)
+        }
+      })
+      response.pipe(out)
+      out.on('finish', () => {
+        out.close(() => {
+          try {
+            renameSyncSafe(partial, target)
+            log(`iso: ${path.basename(target)} (${(statSync(target).size / 1024 ** 3).toFixed(2)} GB)`)
+            resolve()
+          } catch (error) {
+            reject(error)
+          }
+        })
+      })
+      out.on('error', reject)
+    })
+    request.on('timeout', () => request.destroy(new Error('ISO download socket timed out')))
+    request.on('error', reject)
+  })
+  return { path: target, downloaded: true, bytes: statSync(target).size }
+}
+
+function renameSyncSafe(from, to) {
+  try { unlinkSync(to) } catch {}
+  copyFileSync(from, to)
+  try { unlinkSync(from) } catch {}
+}
+
+/* ------------------------------------------------------------------ *
+ * The OEM payload
+ * ------------------------------------------------------------------ */
+
+/**
+ * Write the unattended-answer payload into `$STORE/windows/<name>/oem/`.
+ *
+ * The files live in the repository (`docker/windows-oem/`) so they can be read,
+ * diffed and fixed without touching JavaScript, exactly like the guest shell
+ * scripts. The supervisor copies them with the per-computer substitutions:
+ *
+ *   {{COMPUTERNAME}}  a DNS-safe name derived from the computer name
+ *   {{PASSWORD}}      the generated administrator password
+ *   {{SSH_PUBKEY}}    the supervisor's public key (authorized_keys)
+ *   {{PYTHON_URL}}    the pinned python.org installer
+ *   {{DSH_CUA_PIP}}   the dsh-cua package spec
+ */
+export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir, pythonUrl, dshCuaSpec, log = () => {} }) {
+  mkdirSync(p.oemDir, { recursive: true })
+  const substitutions = {
+    '{{COMPUTERNAME}}': `cua-${name}`.slice(0, 15).toUpperCase(),
+    '{{PASSWORD}}': password,
+    '{{SSH_PUBKEY}}': sshPubKey.trim(),
+    '{{PYTHON_URL}}': pythonUrl,
+    '{{DSH_CUA_PIP}}': dshCuaSpec
+  }
+  const files = ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1']
+  for (const file of files) {
+    const source = path.join(sourceDir, file)
+    if (!existsSync(source)) throw new Error(`the OEM payload is missing from this image: ${source}`)
+    let text = readFileSync(source, 'utf8')
+    for (const [needle, value] of Object.entries(substitutions)) text = text.split(needle).join(value)
+    writeFileSync(path.join(p.oemDir, file), text)
+  }
+  // The media is a vvfat directory: Setup reads Autounattend.xml from its root,
+  // and the scripts arrive under $OEM$ so Setup copies them into the image.
+  const setupDir = path.join(p.oemDir, '$OEM$', '$$', 'Setup', 'Scripts')
+  mkdirSync(setupDir, { recursive: true })
+  for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1']) {
+    copyFileSync(path.join(p.oemDir, file), path.join(setupDir, file))
+  }
+  log(`windows: ${name} OEM payload written (${files.length} files + $OEM$ scripts)`)
+  return p.oemDir
+}
+
+/* ------------------------------------------------------------------ *
+ * The backend
+ * ------------------------------------------------------------------ */
+
+/**
+ * The lifecycle object.
+ *
+ * @param {object} options
+ * @param {string} options.store            the VM store
+ * @param {(host: string, port: number, commands: object[], opts?: object) => Promise<object[]>} options.qmp
+ * @param {(...parts: any[]) => void} options.log
+ */
+export function createWindowsBackend({ store, qmp, log = () => {} }) {
+  /** Monotonic counter so two frames never share a serial name. */
+  let FRAME_SEQUENCE = 0
+  /** One QEMU child per computer, so stop/kill act on the right process. */
+  const children = new Map()
+
+  function pathsFor(name) {
+    return windowsPaths(store, name)
+  }
+
+  /** Which of our two QEMU processes is alive (pidfile is written by QEMU). */
+  function qemuPid(name) {
+    try {
+      const pid = Number(readFileSync(pathsFor(name).qemuPid, 'utf8').trim())
+      return Number.isFinite(pid) && pid > 0 ? pid : 0
+    } catch {
+      return 0
+    }
+  }
+
+  function pidAlive(pid) {
+    if (!pid) return false
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return error?.code === 'EPERM'
+    }
+  }
+
+  /** The ports one computer uses: QMP, VNC and the SSH forward. */
+  function portsFor(spec) {
+    return { qmpPort: spec.qmpPort, vncPort: spec.vncPort, sshPort: spec.sshPort }
+  }
+
+  /**
+   * START SWTMP FIRST, THEN QEMU.
+   *
+   * swtpm owns the TPM state directory and the socket; QEMU connects to it as a
+   * chardev, so a QEMU that starts before the socket exists fails with "Failed
+   * to connect to socket". It is a plain child process, killed by `stopSwtpm`.
+   */
+  function startSwtpm(name) {
+    const p = pathsFor(name)
+    mkdirSync(p.tpmDir, { recursive: true })
+    try { unlinkSync(p.tpmSocket) } catch {}
+    const child = spawn(SWTPM, [
+      'socket', '--tpm2',
+      '--ctrl', `type=unixio,path=${p.tpmSocket}`,
+      '--tpmstate', `dir=${p.tpmDir},mode=0600`,
+      '--pid', `file=${p.tpmPid}`,
+      '--log', `file=${path.join(p.dir, 'swtpm.log')},level=1`,
+      '--flags', 'not-need-init,startup-clear'
+    ], { stdio: 'ignore', detached: true })
+    child.unref()
+    children.set(`tpm:${name}`, child)
+    // Wait for the socket: QEMU connects immediately.
+    for (let index = 0; index < 100; index += 1) {
+      if (existsSync(p.tpmSocket)) return true
+      execFileSync('sleep', ['0.1'])
+    }
+    return existsSync(p.tpmSocket)
+  }
+
+  function stopSwtpm(name) {
+    const child = children.get(`tpm:${name}`)
+    children.delete(`tpm:${name}`)
+    try { child?.kill('SIGTERM') } catch {}
+    try {
+      const pid = Number(readFileSync(pathsFor(name).tpmPid, 'utf8').trim())
+      if (pidAlive(pid)) process.kill(pid, 'SIGTERM')
+    } catch {}
+  }
+
+  /**
+   * Boot the computer, or bring it back.
+   *
+   * `installPending` is decided by the caller from the disk's existence: a fresh
+   * create boots the install ISO; every later start boots the disk.
+   */
+  async function boot(spec, { installPending = false } = {}) {
+    const p = pathsFor(spec.name)
+    mkdirSync(p.dir, { recursive: true })
+    const caps = windowsHostCaps()
+    if (!caps.qemu) throw new Error(`the Windows backend needs ${WINDOWS_QEMU} (install qemu-system-x86 in the image)`)
+    if (!caps.kvm) throw new Error('the Windows backend needs /dev/kvm (compose.emulator.yaml)')
+    if (!caps.ovmfCode || !caps.ovmfVars) {
+      throw new Error(`the Windows backend needs OVMF (${OVMF_CODE} + ${OVMF_VARS_TEMPLATE}); install the ovmf package in the image`)
+    }
+    if (!caps.swtpm) throw new Error(`the Windows backend needs swtpm (${SWTPM}); install the swtpm package in the image`)
+    if (!existsSync(p.efiVars)) {
+      // OVMF fails with "Could not open backing file" when vars qcow2 is missing.
+      mkdirSync(path.dirname(p.efiVars), { recursive: true })
+      execFileSync('/usr/bin/qemu-img', ['create', '-f', 'qcow2', '-b', OVMF_VARS_TEMPLATE, '-F', 'raw', p.efiVars, '4M'], { timeout: 30000 })
+      log(`windows: ${spec.name} EFI vars created from ${OVMF_VARS_TEMPLATE}`)
+    }
+    if (!startSwtpm(spec.name)) throw new Error('swtpm did not create its socket (see swtpm.log)')
+    const argv = buildQemuArgs({
+      ...spec,
+      paths: p,
+      installPending,
+      virtio: Boolean(caps.virtioWin),
+      driverIso: caps.virtioWin ? VIRTIO_WIN_ISO : null
+    })
+    const child = spawn(WINDOWS_QEMU, argv, { stdio: 'ignore', detached: true })
+    children.set(`qemu:${spec.name}`, child)
+    child.unref()
+    log(`windows: ${spec.name} qemu started (pid ${child.pid}${installPending ? ', installing' : ''})`)
+    return { pid: child.pid, installPending }
+  }
+
+  /** QMP to this computer's loopback socket, with the supervisor's client. */
+  async function qmpFor(spec, commands, { timeoutMs = 15000 } = {}) {
+    return qmp('127.0.0.1', spec.qmpPort, commands, { timeoutMs })
+  }
+
+  /** `query-status` plus the process table: the only trustworthy "is it up". */
+  async function probe(spec) {
+    const alive = pidAlive(qemuPid(spec.name))
+    let status = ''
+    let error = ''
+    if (alive) {
+      try {
+        const answer = await qmpFor(spec, [{ execute: 'query-status' }], { timeoutMs: 5000 })
+        status = String(answer?.[0]?.return?.status ?? '')
+      } catch (caught) {
+        error = caught?.message ?? String(caught)
+      }
+    }
+    return { alive, status, error }
+  }
+
+  /**
+   * READY = QMP `running` AND a guest endpoint that answers.
+   *
+   * The endpoint is SSH by default (the OEM script installs it, and exec/put/get
+   * depend on it), with VNC-accept as the fallback for a computer created with
+   * `ssh: false` or one whose first boot is still finishing. `paused` is NOT
+   * ready — a paused guest keeps its VNC port open and used to read as running.
+   */
+  async function ready(spec, { ssh = true } = {}) {
+    const state = await probe(spec)
+    if (!state.alive || state.status !== 'running') return { ready: false, ...state }
+    if (ssh) {
+      const banner = await bannerProbe('127.0.0.1', spec.sshPort)
+      if (banner !== null) return { ready: true, endpoint: 'ssh', banner: banner.slice(0, 24), ...state }
+    }
+    const vnc = await bannerProbe('127.0.0.1', spec.vncPort)
+    if (vnc !== null) return { ready: true, endpoint: 'vnc', ...state }
+    return { ready: false, endpoint: 'none', ...state }
+  }
+
+  /** A PNG frame of the guest's framebuffer (QMP screendump). */
+  async function screenshot(spec, { saveTo = null } = {}) {
+    const p = pathsFor(spec.name)
+    const unique = `${(FRAME_SEQUENCE += 1)}-${randomBytes(4).toString('hex')}`
+    const file = path.join(p.dir, `shot-${unique}.png`)
+    await qmpFor(spec, [{ execute: 'screendump', arguments: { filename: file } }])
+    let png = null
+    for (let attempt = 0; attempt < 40 && png === null; attempt += 1) {
+      if (existsSync(file)) {
+        png = readFileSync(file)
+        try { unlinkSync(file) } catch {}
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+    }
+    if (png === null) throw new Error('the guest produced no frame (screendump wrote nothing)')
+    if (typeof saveTo === 'string' && saveTo !== '') writeFileSync(saveTo, png)
+    return { png }
+  }
+
+  /** Absolute pointer, in frame pixels (the frame IS the display). */
+  async function click(spec, x, y, { width, height, button = 'left' } = {}) {
+    const toAbsolute = (value, extent) => Math.max(0, Math.min(0x7fff, Math.round((Number(value) / Math.max(1, Number(extent))) * 0x7fff)))
+    const events = [
+      { type: 'abs', data: { axis: 'x', value: toAbsolute(x, width) } },
+      { type: 'abs', data: { axis: 'y', value: toAbsolute(y, height) } },
+      { type: 'btn', data: { down: true, button } },
+      { type: 'btn', data: { down: false, button } }
+    ]
+    await qmpFor(spec, [{ execute: 'input-send-event', arguments: { events } }])
+    return { x: Number(x), y: Number(y) }
+  }
+
+  async function move(spec, x, y, { width, height } = {}) {
+    const toAbsolute = (value, extent) => Math.max(0, Math.min(0x7fff, Math.round((Number(value) / Math.max(1, Number(extent))) * 0x7fff)))
+    await qmpFor(spec, [{
+      execute: 'input-send-event',
+      arguments: {
+        events: [
+          { type: 'abs', data: { axis: 'x', value: toAbsolute(x, width) } },
+          { type: 'abs', data: { axis: 'y', value: toAbsolute(y, height) } }
+        ]
+      }
+    }])
+    return { x: Number(x), y: Number(y) }
+  }
+
+  async function drag(spec, fromX, fromY, toX, toY, { width, height } = {}) {
+    const toAbsolute = (value, extent) => Math.max(0, Math.min(0x7fff, Math.round((Number(value) / Math.max(1, Number(extent))) * 0x7fff)))
+    const at = (x, y) => [
+      { type: 'abs', data: { axis: 'x', value: toAbsolute(x, width) } },
+      { type: 'abs', data: { axis: 'y', value: toAbsolute(y, height) } }
+    ]
+    await qmpFor(spec, [{ execute: 'input-send-event', arguments: { events: [...at(fromX, fromY), { type: 'btn', data: { down: true, button: 'left' } }] } }])
+    await qmpFor(spec, [{ execute: 'input-send-event', arguments: { events: at(toX, toY) } }])
+    await qmpFor(spec, [{ execute: 'input-send-event', arguments: { events: [...at(toX, toY), { type: 'btn', data: { down: false, button: 'left' } }] } }])
+    return { from: { x: Number(fromX), y: Number(fromY) }, to: { x: Number(toX), y: Number(toY) } }
+  }
+
+  /** Keys and ASCII text, as physical qcodes with the right modifiers. */
+  async function sendKeys(spec, { text = null, key = null } = {}) {
+    const events = []
+    const press = (qcode, { shift = false, ctrl = false, alt = false } = {}) => {
+      const modifiers = []
+      if (ctrl) modifiers.push('ctrl')
+      if (alt) modifiers.push('alt')
+      if (shift) modifiers.push('shift')
+      for (const modifier of modifiers) events.push({ type: 'key', data: { down: true, key: { type: 'qcode', data: modifier } } })
+      events.push({ type: 'key', data: { down: true, key: { type: 'qcode', data: qcode } } })
+      events.push({ type: 'key', data: { down: false, key: { type: 'qcode', data: qcode } } })
+      for (const modifier of modifiers.reverse()) events.push({ type: 'key', data: { down: false, key: { type: 'qcode', data: modifier } } })
+    }
+    if (key !== null) {
+      const parsed = parseKeySpec(key)
+      press(parsed.qcode, { shift: parsed.shift || parsed.shiftModifier, ctrl: parsed.ctrl, alt: parsed.alt })
+    }
+    if (text !== null) {
+      for (const char of String(text)) {
+        const mapped = charToKey(char)
+        if (mapped === null) {
+          throw new Error(`"${char}" cannot be typed on a Windows computer: the QMP keyboard sends physical keys, so only printable ASCII is supported (no clipboard)`)
+        }
+        press(mapped.qcode, { shift: mapped.shift })
+      }
+    }
+    if (events.length === 0) return { sent: 0 }
+    await qmpFor(spec, [{ execute: 'input-send-event', arguments: { events } }])
+    return { sent: events.length }
+  }
+
+  /** Suspend is QMP `stop` (pause the VM, keep RAM); resume is `cont`. */
+  async function pause(spec) {
+    await qmpFor(spec, [{ execute: 'stop' }])
+    return { paused: true }
+  }
+
+  async function unpause(spec) {
+    await qmpFor(spec, [{ execute: 'cont' }])
+    return { unpaused: true }
+  }
+
+  /**
+   * Graceful power-off: `system_powerdown`, then wait, then `quit`.
+   *
+   * The supervisor owns the checkpoint and the registry; this only makes the
+   * process stop. Returns which method worked so shutdown can mark `mayBeTorn`.
+   */
+  async function shutdown(spec, { timeoutMs = 120000 } = {}) {
+    const state = await probe(spec)
+    if (!state.alive) {
+      stopSwtpm(spec.name)
+      return { method: 'already-off', exited: true }
+    }
+    let method = 'acpi'
+    try {
+      const answer = await qmpFor(spec, [{ execute: 'system_powerdown' }], { timeoutMs: 15000 })
+      if (answer?.[0]?.error) {
+        method = 'quit'
+      }
+    } catch {
+      method = 'quit'
+    }
+    const deadline = Date.now() + Math.max(1000, timeoutMs)
+    while (Date.now() < deadline) {
+      if (!pidAlive(qemuPid(spec.name))) {
+        stopSwtpm(spec.name)
+        return { method, exited: true }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+    method = 'quit'
+    try {
+      await qmpFor(spec, [{ execute: 'quit' }], { timeoutMs: 10000 })
+    } catch {}
+    for (let index = 0; index < 30; index += 1) {
+      if (!pidAlive(qemuPid(spec.name))) {
+        stopSwtpm(spec.name)
+        return { method, exited: true, forced: true }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+    return { method: 'quit', exited: false, forced: true }
+  }
+
+  /** Kill the process (last resort, after `shutdown` refused to exit). */
+  function kill(name) {
+    const child = children.get(`qemu:${name}`)
+    children.delete(`qemu:${name}`)
+    try { child?.kill('SIGKILL') } catch {}
+    const pid = qemuPid(name)
+    if (pidAlive(pid)) {
+      try { process.kill(pid, 'SIGKILL') } catch {}
+    }
+    stopSwtpm(name)
+  }
+
+  return {
+    enabled: windowsEnabled,
+    hostCaps: windowsHostCaps,
+    paths: pathsFor,
+    portsFor,
+    qemuPid,
+    pidAlive,
+    boot,
+    probe,
+    ready,
+    qmpFor,
+    screenshot,
+    click,
+    move,
+    drag,
+    sendKeys,
+    pause,
+    unpause,
+    shutdown,
+    kill,
+    stopSwtpm
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * TCP banner probe (readiness, zero dependencies)
+ * ------------------------------------------------------------------ */
+
+/** The first bytes a service says, or null when nothing answers. */
+export async function bannerProbe(host, port, { timeoutMs = 1500, readBytes = 32 } = {}) {
+  const net = await import('node:net')
+  return new Promise((resolve) => {
+    const socket = net.connect(port, host)
+    let done = false
+    const finish = (value) => {
+      if (done) return
+      done = true
+      try { socket.destroy() } catch {}
+      resolve(value)
+    }
+    socket.setTimeout(timeoutMs)
+    socket.on('connect', () => {
+      // SSH speaks first; VNC's server also speaks first. Read the banner.
+      socket.once('data', (chunk) => finish(chunk.subarray(0, readBytes).toString('latin1')))
+    })
+    socket.on('timeout', () => finish(null))
+    socket.on('error', () => finish(null))
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * Keyboard mapping (ASCII only — a physical keyboard has no key for "é")
+ * ------------------------------------------------------------------ */
+
+const QCODE_PUNCT = {
+  ' ': 'spc', '-': 'minus', '=': 'equal', '[': 'bracket_left', ']': 'bracket_right',
+  '\\': 'backslash', ';': 'semicolon', "'": 'apostrophe', '`': 'grave_accent',
+  ',': 'comma', '.': 'dot', '/': 'slash', '\n': 'ret', '\t': 'tab'
+}
+
+const QCODE_SHIFT = {
+  '!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8',
+  '(': '9', ')': '0', '_': 'minus', '+': 'equal', '{': 'bracket_left', '}': 'bracket_right',
+  '|': 'backslash', ':': 'semicolon', '"': 'apostrophe', '~': 'grave_accent',
+  '<': 'comma', '>': 'dot', '?': 'slash'
+}
+
+const NAMED_KEYS = {
+  enter: 'ret', return: 'ret', tab: 'tab', escape: 'esc', esc: 'esc', space: 'spc',
+  backspace: 'backspace', delete: 'delete', del: 'delete', insert: 'insert',
+  up: 'up', down: 'down', left: 'left', right: 'right',
+  home: 'home', end: 'end', pageup: 'pgup', pagedown: 'pgdn',
+  f1: 'f1', f2: 'f2', f3: 'f3', f4: 'f4', f5: 'f5', f6: 'f6',
+  f7: 'f7', f8: 'f8', f9: 'f9', f10: 'f10', f11: 'f11', f12: 'f12'
+}
+
+export function charToKey(char) {
+  if (Object.prototype.hasOwnProperty.call(QCODE_SHIFT, char)) return { qcode: QCODE_SHIFT[char], shift: true }
+  if (Object.prototype.hasOwnProperty.call(QCODE_PUNCT, char)) return { qcode: QCODE_PUNCT[char], shift: false }
+  if (/^[a-z0-9]$/u.test(char)) return { qcode: char, shift: false }
+  if (/^[A-Z]$/u.test(char)) return { qcode: char.toLowerCase(), shift: true }
+  return null
+}
+
+export function parseKeySpec(spec) {
+  const text = String(spec ?? '').trim()
+  if (text === '') throw new Error('key is required')
+  const parts = text.split('+').filter((part) => part !== '')
+  const base = parts.pop() ?? ''
+  const modifiers = parts.map((part) => part.toLowerCase())
+  const named = NAMED_KEYS[base.toLowerCase()]
+  const character = named ? null : (base.length === 1 ? charToKey(base) : null)
+  if (named === undefined && character === null) {
+    throw new Error(`unsupported key for a Windows computer: ${spec} (ASCII keys and ${Object.keys(NAMED_KEYS).join('/')} only)`)
+  }
+  return {
+    qcode: named ?? character.qcode,
+    shift: character?.shift === true,
+    ctrl: modifiers.includes('ctrl') || modifiers.includes('control'),
+    alt: modifiers.includes('alt'),
+    shiftModifier: modifiers.includes('shift')
+  }
+}
+
+/** A generated Windows password: url/shell-safe, 20 chars, ~118 bits. */
+export function generatePassword() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_'
+  return Array.from(randomBytes(20), (byte) => alphabet[byte % alphabet.length]).join('')
+}
+
+/** The frame's own size: a QMP screendump IS the display, so scale is always 1. */
+export function frameSpace(png) {
+  const size = pngSize(png) ?? { width: 0, height: 0 }
+  return {
+    display: { width: size.width, height: size.height },
+    screenshot: { width: size.width, height: size.height },
+    scale: 1,
+    source: 'qmp'
+  }
+}

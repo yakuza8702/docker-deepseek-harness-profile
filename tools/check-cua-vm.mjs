@@ -49,7 +49,8 @@ function pick(name) {
     path.join(ROOT, name),
     path.join(ROOT, 'docker', name),
     path.join(ROOT, 'plugins', name),
-    path.join(ROOT, 'plugins', 'dsh-cua-vm', name)
+    path.join(ROOT, 'plugins', 'dsh-cua-vm', name),
+    path.join(ROOT, 'docker', 'windows-oem', name)
   ]
   for (const candidate of candidates) {
     if (existsSync(candidate) && statSync(candidate).isFile()) return candidate
@@ -66,7 +67,11 @@ function needlePattern(needle) {
 const FILES = {
   supervisor: { label: 'docker/cua-vm-supervisor.mjs', name: 'cua-vm-supervisor.mjs' },
   space: { label: 'docker/cua-vm-space.mjs', name: 'cua-vm-space.mjs' },
-  windows: { label: 'docker/cua-vm-windows.mjs', name: 'cua-vm-windows.mjs' },
+  windows: { label: 'docker/cua-vm-windows-qemu.mjs', name: 'cua-vm-windows-qemu.mjs' },
+  winMcp: { label: 'plugins/dsh-cua-vm/win-mcp.js', name: 'win-mcp.js' },
+  oemAnswer: { label: 'docker/windows-oem/Autounattend.xml', name: 'Autounattend.xml' },
+  oemSetup: { label: 'docker/windows-oem/setupcomplete.cmd', name: 'setupcomplete.cmd' },
+  oemBoot: { label: 'docker/windows-oem/cua-firstboot.ps1', name: 'cua-firstboot.ps1' },
   provision: { label: 'docker/cua-guest-provision.sh', name: 'cua-guest-provision.sh' },
   android: { label: 'docker/cua-guest-android.sh', name: 'cua-guest-android.sh' },
   dockerfile: { label: 'Dockerfile', name: 'Dockerfile' },
@@ -209,6 +214,16 @@ const NEEDLES = {
     ['restorePorts(name, previews)', 1],
     // S2: mayBeTorn is READ on the start path, not just written.
     ['meta.mayBeTorn === true', 1],
+    // The Windows refusals live in the supervisor's create path (the backend
+    // module is only the QEMU command builder).
+    ['REA is not available for Windows computers', 1],
+    ['Android is not available for Windows computers', 1],
+    // The Windows lifecycle now drives the SAME shutdown/start machinery.
+    ['async function windowsShutdown(name, meta)', 1],
+    ['const windowsBackend = createWindowsBackend({ store: STORE, qmp: qmpCommands, log })', 1],
+    ['function sshRun(meta, command,', 1],
+    ['function scpRun(meta, localPath, guestPath', 1],
+    ['await ensureWindowsConsoleRelay(name)', 2],
     // R1: a KEPT item (the disk of a live QEMU) is not a completed delete, and
     // the row keeps it reachable until GC can reclaim it.
     ["const skipped = items.filter((item) => item.status === 'skipped')", 1],
@@ -234,51 +249,90 @@ const NEEDLES = {
     ['export function resolutionProblem(resolution', 1],
     ['DSH_CUA_VM_RESOLUTION_ALLOW_SCALE', 1]
   ],
+  /**
+   * THE WINDOWS BACKEND IS DIRECT QEMU. Every entry below is a fact the boot
+   * depends on: a missing firmware path, a mis-derived VNC display, a missing
+   * `-device usb-tablet` (absolute pointer) or a published QMP socket is a
+   * computer that boots and cannot be driven.
+   */
   windows: [
-    ["export const WINDOWS_IMAGE = process.env.DSH_CUA_WINDOWS_IMAGE || 'dockurr/windows:4.35'", 1],
-    ["export const WINDOWS_MIN_MEMORY_GB = 6", 1],
-    ["export const WINDOWS_MIN_DISK_GB = 64", 1],
-    ["export const WINDOWS_MIN_CPU = 2", 1],
-    ["export const WINDOWS_QMP_PORT = 7101", 1],
-    ["export const WINDOWS_CONSOLE_PORT = 8006", 1],
-    ["export const WINDOWS_RDP_PORT = 3389", 1],
-    ["['DISK_FMT', 'qcow2']", 1],
-    ["['MANUAL', 'N']", 1],
-    // W1: our monitor lives on 7101 because dockurr v4.35 already binds 7100
-    // for its own HMP monitor; two binds on one port kill QEMU at boot.
-    ['export const WINDOWS_QMP_PORT = 7101', 1],
-    ['export const WINDOWS_HMP_PORT = 7100', 1],
-    // W2: a remote ISO is VERSION=<url>; a local one is /boot.iso. There is no
-    // `ISO` variable in the pinned image.
-    ['const isoUrl = /^https?:', 1],
-    ["['VERSION', spec.windowsIso]", 1],
-    ['/boot.iso:ro', 1],
-    // W5/W6/W7/W8: the real shapes the fixes introduced.
-    ['async pause(name)', 1],
-    ['async unpause(name)', 1],
-    ['qmpStatus === ', 1],
-    ['FRAME_SEQUENCE += 1', 1],
-    ["['CPU_CORES', String(spec.cpu)]", 1],
-    ["['GPU', spec.gpu ? 'Y' : 'N']", 1],
-    ["['PASSWORD', password]", 1],
-    ["['USERNAME', WINDOWS_USERNAME]", 1],
-    ["['PASSWORD', password]", 1],
-    ['-device usb-tablet -qmp tcp:0.0.0.0:${WINDOWS_QMP_PORT},server=on,wait=off', 1],
-    ["CapAdd: ['NET_ADMIN']", 1],
-    ["PathOnHost: '/dev/kvm'", 1],
-    ["RestartPolicy: { Name: 'no', MaximumRetryCount: 0 }", 1],
-    ["'dsh.cua.vm': spec.name, 'dsh.cua.kind': 'windows'", 1],
-    ['export function windowsEnabled()', 1],
-    ["String(process.env.DSH_CUA_VM_WINDOWS ?? '1') !== '0'", 1],
+    // direct qemu, no container runtime
+    ["export const WINDOWS_QEMU = process.env.DSH_CUA_WINDOWS_QEMU || '/usr/bin/qemu-system-x86_64'", 1],
+    ['export function windowsHostCaps()', 1],
+    // firmware: shared OVMF code + a per-computer vars store
+    ["export const OVMF_CODE = process.env.DSH_CUA_WINDOWS_OVMF_CODE || '/usr/share/OVMF/OVMF_CODE_4M.fd'", 1],
+    ['if=pflash,format=raw,readonly=on,file=${OVMF_CODE}', 1],
+    ['if=pflash,format=qcow2,file=${p.efiVars}', 1],
+    // TPM2 via swtpm on a unix socket
+    ["export const SWTPM = process.env.DSH_CUA_WINDOWS_SWTPM || '/usr/bin/swtpm'", 1],
+    ['-chardev', 1],
+    ['tpm-crb,tpmdev=tpm0', 1],
+    ['--ctrl', 1],
+    // kvm + host cpu, and the q35 machine
+    ["'-machine', 'q35,accel=kvm,smm=off'", 1],
+    ["'-cpu', 'host'", 1],
+    // disks: plain qcow2 (checkpointing still applies)
+    ['file=${p.disk},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap', 1],
+    // install medium while installing, drivers ISO when present, OEM payload
+    ['if=none,id=cd0', 1],
+    ['file=fat:rw:${p.oemDir},format=raw,if=none,id=oem0', 1],
+    ['usb-storage,drive=oem0,bus=xhci.0', 1],
+    // networking: SLIRP + the SSH forward (no bridge, no tap)
+    ['user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22', 1],
+    ['e1000e,netdev=net0', 1],
+    // absolute pointer + keyboard: the QMP input path depends on both
+    ["'-device', 'usb-tablet'", 1],
+    ["'-device', 'usb-kbd'", 1],
+    // VNC on loopback (the live view) and QMP on loopback (control)
+    ["'-vnc', `127.0.0.1:${spec.vncPort}`", 1],
+    ['tcp:127.0.0.1:${spec.qmpPort},server=on,wait=off', 1],
+    ['export function vncDisplayFor(port)', 1],
+    // the ISO sources are pinned and documented
+    ['export const WINDOWS_ISO_SOURCES = {', 1],
+    ['software-static.download.prss.microsoft.com', 5],
+    ['export async function ensureIso(', 1],
+    ['export function writeOemPayload(', 1],
+    // frames and input over QMP
     ["execute: 'screendump'", 1],
     ["execute: 'input-send-event'", 1],
+    ["execute: 'system_powerdown'", 1],
+    ["execute: 'quit'", 1],
     ['export function charToKey(char)', 1],
-    ['REA is a Linux kit', 1],
-    ['Android is not available for Windows computers', 1],
-    // D6: create and start are two requests; a failure between them must not
-    // leave a container that holds the name but has no registry row.
-    ['(the container was removed)', 2],
-    ['?force=1&v=1', 2]
+    ['export function generatePassword()', 1],
+    ['export function frameSpace(png)', 1],
+    ['export function windowsEnabled()', 1]
+  ],
+  winMcp: [
+    ['export function windowsMcpEnabled()', 1],
+    ["String(process.env.DSH_CUA_VM_WIN_MCP ?? '1') !== '0'", 1],
+    ['export function sshArgv(', 1],
+    ["'notifications/initialized'", 1],
+    ["request('tools/list'", 1],
+    ["request('tools/call'", 1],
+    ['dsh_cua.server', 1],
+    ['--stdio', 1]
+  ],
+  oemAnswer: [
+    ['<unattend xmlns="urn:schemas-microsoft-com:unattend">', 1],
+    ['<LocalAccount wcm:action="add"', 1],
+    ['<Name>cua</Name>', 1],
+    ['{{PASSWORD}}', 3],
+    ['BypassTPMCheck', 1],
+    ['<AutoLogon>', 1]
+  ],
+  oemSetup: [
+    ['cua-firstboot.ps1', 1],
+    ['setupcomplete exit', 1]
+  ],
+  oemBoot: [
+    ['OpenSSH.Server', 2],
+    ['{{SSH_PUBKEY}}', 1],
+    ['administrators_authorized_keys', 1],
+    ['{{PYTHON_URL}}', 1],
+    ['{{DSH_CUA_PIP}}', 1],
+    ['dsh_cua.server', 1],
+    ['Register-ScheduledTask', 1],
+    ['-LogonType Interactive', 1]
   ],
   provision: [
     ['MARKER=/var/lib/cua-provision', 1],
@@ -302,7 +356,9 @@ const NEEDLES = {
     ['imagemagick', 1],
     ['--no-install-recommends', 1],
     ['docker/cua-vm-space.mjs', 1],
-    ['docker/cua-vm-windows.mjs', 1],
+    ['docker/cua-vm-windows-qemu.mjs', 1],
+    ['docker/windows-oem/', 1],
+    ['ovmf swtpm', 1],
     ['tools/check-cua-vm.mjs /opt/seek-harness/check-cua-vm.mjs', 1],
     ['node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check', 1]
   ],
@@ -364,13 +420,18 @@ const NEEDLES = {
     ['DSH_CUA_VM_LEGACY_STOP', 1]
   ],
   composeWindows: [
-    ['docker:27-dind', 1],
-    ['DOCKER_HOST: "tcp://dind:2375"', 1],
-    ['DSH_CUA_VM_WINDOWS: "${DSH_CUA_VM_WINDOWS:-1}"', 1],
+    // The overlay hands over devices and switches; it does NOT add an engine.
     ['- /dev/kvm', 1],
-    ['cua-vm:/cua-vm', 1],
-    ['RDP', 3],
-    ['7100', 1]
+    ['- /dev/dri', 1],
+    ['DSH_CUA_VM_WINDOWS: "${DSH_CUA_VM_WINDOWS:-1}"', 1],
+    ['DSH_CUA_WINDOWS_QEMU:', 1],
+    ['DSH_CUA_WINDOWS_VIRTIO_ISO:', 1],
+    ['DSH_CUA_VM_WIN_MCP:', 1],
+    // SLIRP and the store layout are the documented contract
+    ['10.0.2.2', 2],
+    ['/cua-vm/windows/<name>/', 1],
+    ['/cua-vm/iso/', 1],
+    ['No DinD service', 1]
   ],
   env: [
     ['DSH_CUA_VM_WINDOWS=0', 1],
@@ -390,6 +451,21 @@ const NEEDLES = {
  *   runCua(['sb','resume'] in a start path for a powered-off computer
  */
 const FORBIDDEN = [
+  {
+    key: 'composeWindows',
+    pattern: 'dind',
+    reason: 'the Windows backend is direct QEMU now; a DinD sidecar is the architecture this replaced'
+  },
+  {
+    key: 'windows',
+    pattern: 'dockerRequest',
+    reason: 'the Docker Engine API client was removed with the container backend'
+  },
+  {
+    key: 'windows',
+    pattern: 'dockurr',
+    reason: 'the dockur/windows image is gone; the guest is a pinned Microsoft ISO on direct QEMU'
+  },
   {
     key: 'windows',
     pattern: "['VRAM_SIZE'",

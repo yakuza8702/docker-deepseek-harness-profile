@@ -661,7 +661,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **216 assertions** across 12 files (the gate prints
+* `tools/check-cua-vm.mjs` — **252 assertions** across 16 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -679,7 +679,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (216 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
+green (252 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
 (82 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
@@ -715,7 +715,24 @@ registry yields a structured partial result instead of a bare throw; R3 the
 boot-time and timer-time registry reads are guarded, so a corrupt file logs and
 skips the Windows watches instead of killing the process after the socket exists.
 
-### 15.8 Review round 2
+### 15.8 Architecture change — Windows is direct QEMU
+
+The Docker/DinD Windows backend is gone. Windows is a first-class QEMU computer:
+OVMF + swtpm + qcow2 under `/cua-vm`, a pinned Microsoft ISO (downloaded once or
+`windowsIso`), an unattended answer file that installs OpenSSH/Python/dsh-cua, QMP
+for frames+input, VNC relayed as the live view, SLIRP networking with the host at
+`10.0.2.2`. It reuses registry v2 (`backend: 'qemu'`), the locks, the quota
+reservation, the shutdown/checkpoint path and the delete manifest (which now
+removes the Windows tree and the swtpm socket).
+
+Agent surface: exec/put/get over SSH (Session 0, cmd.exe), the desktop over QMP
+(ASCII-only, no clipboard, no a11y, no cursor overlay), and the guest's dsh-cua
+MCP tools attached lazily over SSH only while a Windows computer is ready
+(`DSH_CUA_VM_WIN_MCP=0` disables it; ~3-8k tokens while attached, zero otherwise).
+The live view is noVNC over websockify through the existing relay pipeline.
+Honest ceilings and the nvidia-smi host-handle note are in the READMEs.
+
+### 15.9 Review round 2
 
 Seven defects fixed on this branch (D1 spawn crash, D2 path traversal through
 `name`, D3 unproven-dead checkpoint, D4 capture on the wrong target, D5 registry

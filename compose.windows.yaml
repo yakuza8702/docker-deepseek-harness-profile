@@ -1,106 +1,75 @@
 # =====================================================================
-# WINDOWS computers — a DinD sidecar, and the switch that adds the option
+# WINDOWS computers — direct QEMU, no Docker Engine
 #
 #   docker compose -f compose.yaml -f compose.windows.yaml up -d
 #
 # WHAT THIS ADDS
-#   * `dind`: a Docker Engine the harness reaches at tcp://dind:2375. A Windows
-#     computer is a container (dockurr/windows) on that engine — see
-#     docker/cua-vm-windows.mjs. The harness never runs Windows itself.
-#   * DSH_CUA_VM_WINDOWS=1 on the harness, which is what makes `kind: "windows"`
-#     appear in the panel at all. DSH_CUA_VM_WINDOWS=0 removes the option
-#     entirely (the tools refuse it, the panel hides it).
+#   * the host devices and groups a Windows guest needs: /dev/kvm (the same
+#     one the Linux guest uses) and, only if you want the virtio-gpu display,
+#     /dev/dri with the render/video GIDs;
+#   * DSH_CUA_VM_WINDOWS=1, which is what makes `kind: "windows"` appear at all
+#     (0 removes the option entirely);
+#   * the two QEMU/serial paths a Windows boot writes, on the same /cua-vm
+#     volume as everything else.
 #
-# WHY THE ENGINE NEEDS THE SAME VOLUME
-#   The Windows container's `/storage` is a bind of `$STORE/windows/<name>`. For
-#   that bind to mean the same directory on both sides — the harness writes the
-#   generated password there, the guest sees it as \\host.lan\Data, and QMP
-#   `screendump` writes the frame there — the SAME named volume is mounted into
-#   both containers at /cua-vm. Without it, a frame falls back to the archive
-#   API and the file bridge does not exist.
+# WHAT IT DELIBERATELY DOES NOT ADD
+#   No DinD service, no privileged sidecar, no second engine. A Windows computer
+#   is `qemu-system-x86_64` started by the SAME supervisor that runs the Linux
+#   guest: OVMF + swtpm + a qcow2 disk under /cua-vm, QMP and VNC on loopback,
+#   and SLIRP networking. The harness keeps cap_drop ALL, read-only rootfs and
+#   no-new-privileges — nothing here adds a capability.
 #
-# WHAT THE GUEST GETS
-#   /dev/kvm (the VM needs hardware virtualisation), and /dev/dri/renderD128
-#   only when the computer was created with "Enable GPU" (GPU=Y + RENDERNODE).
-#   The console (8006) is relayed by the supervisor and published at
-#   /vm/port/<name>/ — it is never exposed raw.
+# NETWORKING
+#   QEMU user-mode networking (SLIRP): the guest gets outbound internet (so it
+#   can fetch testing harnesses, Windows Update and pip packages) and reaches
+#   HOST services through the gateway 10.0.2.2 — e.g. a site the model serves on
+#   the harness at :3079 is http://10.0.2.2:3079/ inside Windows. SSH is
+#   forwarded from 127.0.0.1:<allocated> to guest :22, which is what
+#   cua_vm_exec/put/get use.
+#   A tap/bridge interface is possible for real LAN presence, but it needs
+#   CAP_NET_ADMIN and a host bridge, so it is NOT the default and is not wired
+#   here (see the README's "Bridge networking" note).
 #
-#   TWO MONITOR PORTS, NEITHER PUBLISHED: `dockurr/windows` v4.35 runs its own
-#   HMP monitor on 7100 (power.sh: MONITOR="telnet:localhost:7100,...") and the
-#   supervisor's QMP socket is appended to the same QEMU command line on 7101 —
-#   two binds on 7100 would kill QEMU at boot with EADDRINUSE. Both are reached
-#   on the container's own address, which is why the container joins
-#   DSH_CUA_WINDOWS_NETWORK; nothing here maps them to the host.
+# INSTALL MEDIA AND STORE
+#   Everything Windows lives under /cua-vm:
+#     /cua-vm/iso/                 downloaded install media (one per version)
+#     /cua-vm/windows/<name>/      disk.qcow2, efi-vars.qcow2, tpm/, oem/,
+#                                  credentials.json, id_ed25519, serial.log
+#   The ISO is downloaded once (Microsoft's evaluation URLs, ~5.5 GB) or taken
+#   from windowsIso (a URL, or a file inside the store). The virtio-win drivers
+#   ISO is OPTIONAL: put it at /cua-vm/iso/virtio-win.iso and the guest gets
+#   virtio-blk/virtio-net; without it the disk is AHCI and the NIC is e1000e,
+#   which stock Windows installs from.
 #
-# RDP — OPT-IN, AND A REAL EXPOSURE
-#   RDP (3389) is published by Docker to the DinD container's network namespace.
-#   To reach it from the LAN you must publish it on the `dind` service yourself,
-#   and that is a deliberate act with a real consequence: an unauthenticated
-#   TCP port on the host, one Windows login away from a remote desktop. It is
-#   commented out below. If you enable it, put it behind the same SSO/VPN you put
-#   in front of the harness, and keep the generated password (the panel reveals
-#   it) out of tickets.
-#
-# REQUIREMENTS
-#   * A host with /dev/kvm (nested virtualisation if the host is a VM).
-#   * ~80 GB for the Docker engine's images and one Windows disk (DISK_SIZE
-#     floors at 64 GB).
-#   * The DinD container is `privileged`: that is what an in-container engine
-#     needs. It is a SEPARATE container — the harness keeps cap_drop ALL,
-#     read-only rootfs and no-new-privileges.
+# LIVE VIEW
+#   The display is QEMU VNC on loopback, relayed through websockify+noVNC to
+#   /vm/port/<name>/ — the panel's "Show VM" streams it and a human can drive
+#   the same screen the model is driving. Nothing is published raw.
 # =====================================================================
 
 services:
-  # The engine that owns the Windows containers.
-  dind:
-    image: docker:27-dind
-    container_name: ${CUA_WINDOWS_DIND_NAME:-seek-harness-dind}
-    restart: unless-stopped
-    privileged: true
-    command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock", "--tls=false"]
-    environment:
-      # No TLS between the two containers: the port is on the compose network
-      # only (it is never published), and the harness reaches it as dind:2375.
-      DOCKER_TLS_CERTDIR: ""
-    volumes:
-      # The VM store, shared with the harness so a Windows /storage bind is the
-      # same tree on both sides.
-      - cua-vm:/cua-vm
-      - dind-storage:/var/lib/docker
+  seek-harness:
     devices:
       - /dev/kvm
-      # Drop these two lines on a host without a GPU (and create Windows
-      # computers with Enable GPU unticked).
+      # Drop this line on a host without a GPU; create Windows computers with
+      # "Enable GPU" unticked in that case.
       - /dev/dri
-    # NOTHING IS PUBLISHED. Uncomment the RDP mapping below ONLY if you accept a
-    # raw 3389 on this host — see "RDP — OPT-IN" above.
-    # ports:
-    #   - "${DSH_CUA_WINDOWS_RDP_BIND:-127.0.0.1}:${DSH_CUA_WINDOWS_RDP_PORT:-13389}:3389"
-    healthcheck:
-      test: ["CMD", "docker", "info"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-  seek-harness:
-    depends_on:
-      dind:
-        condition: service_healthy
+    group_add:
+      # Numeric GIDs: names resolve inside the image, not on the host.
+      - "${KVM_GID:-kvm}"
+      - "${RENDER_GID:-993}"
+      - "${VIDEO_GID:-44}"
     environment:
-      # The Windows backend talks to THIS engine, not to the harness's own.
-      DOCKER_HOST: "tcp://dind:2375"
-      # 1 = the Windows option exists, 0 = it does not (kill switch).
       DSH_CUA_VM_WINDOWS: "${DSH_CUA_VM_WINDOWS:-1}"
-      # The network the Windows containers join, so the supervisor can reach
-      # their unpublished QMP port on the container address.
-      DSH_CUA_WINDOWS_NETWORK: "${COMPOSE_PROJECT_NAME:-docker-deepseek-harness-profile}_default"
-      DSH_CUA_WINDOWS_IMAGE: "${DSH_CUA_WINDOWS_IMAGE:-dockurr/windows:4.35}"
-      CUA_WINDOWS_RENDERNODE: "${CUA_WINDOWS_RENDERNODE:-/dev/dri/renderD128}"
-    # dind publishes its ports on its own namespace; the supervisor connects to
-    # the published console/RDP ports through the service name.
-    links:
-      - dind
+      # The Windows backend is qemu; these are the tool paths a slim image can
+      # place elsewhere (they all have image defaults).
+      DSH_CUA_WINDOWS_QEMU: "${DSH_CUA_WINDOWS_QEMU:-/usr/bin/qemu-system-x86_64}"
+      DSH_CUA_WINDOWS_OVMF_CODE: "${DSH_CUA_WINDOWS_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
+      DSH_CUA_WINDOWS_OVMF_VARS: "${DSH_CUA_WINDOWS_OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
+      DSH_CUA_WINDOWS_SWTPM: "${DSH_CUA_WINDOWS_SWTPM:-/usr/bin/swtpm}"
+      # Optional virtio-win ISO: when present, the disk and NIC become virtio.
+      DSH_CUA_WINDOWS_VIRTIO_ISO: "${DSH_CUA_WINDOWS_VIRTIO_ISO:-}"
+      # The guest's dsh-cua MCP tools are attached lazily; 0 disables the path.
+      DSH_CUA_VM_WIN_MCP: "${DSH_CUA_VM_WIN_MCP:-1}"
 
-volumes:
-  dind-storage:
+volumes: {}

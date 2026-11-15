@@ -132,6 +132,19 @@ RUN set -eux; \
 # the supervisor points cua's wrapper at this binary when DSH_CUA_VM_GPU=virgl.
 # Off by default: it costs ~200 MB and needs /dev/dri (or the NVIDIA toolkit)
 # on the host to be worth anything.
+# The Windows computer is a DIRECT QEMU here (see docker/cua-vm-windows-qemu.mjs):
+# it needs the firmware, a software TPM and qemu-img, and no container runtime at
+# all. On by default because DSH_CUA_VM_WINDOWS=0 is the switch that removes the
+# feature — an image that cannot run it should not advertise it.
+ARG WITH_WINDOWS_QEMU=1
+RUN set -eux; \
+    if [ "$WITH_WINDOWS_QEMU" = "1" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends \
+        qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
 ARG WITH_VIRGL_QEMU=0
 RUN set -eux; \
     if [ "$WITH_VIRGL_QEMU" = "1" ]; then \
@@ -885,9 +898,13 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/cua; \
     /usr/local/bin/cua.real --version
 COPY --chmod=0755 docker/cua-vm-supervisor.mjs /usr/local/bin/cua-vm-supervisor
-# The supervisor's two ESM modules, next to it: `import './cua-vm-space.mjs'`
-# resolves relative to /usr/local/bin, so they are not optional copies.
-COPY --chmod=0644 docker/cua-vm-space.mjs docker/cua-vm-windows.mjs /usr/local/bin/
+# The supervisor's ESM modules, next to it: `import './cua-vm-space.mjs'`
+# resolves relative to /usr/local/bin, so they are not optional copies. The
+# Windows backend is qemu + these two files; there is no Docker API layer left.
+COPY --chmod=0644 docker/cua-vm-space.mjs docker/cua-vm-windows-qemu.mjs /usr/local/bin/
+# The unattended answer file and the first-boot script the supervisor copies into
+# $STORE/windows/<name>/oem/ — data files, so they live outside the JS.
+COPY --chmod=0644 docker/windows-oem/ /usr/local/share/cua-vm/windows-oem/
 # Guest provisioning runs INSIDE the VM, piped through `sudo bash` by the
 # supervisor. Kept as real files (not a base64 blob in the supervisor) so
 # they can be read, diffed and run by hand to debug a guest. rea is its own
@@ -920,7 +937,8 @@ RUN set -eux; \
 # The copies below are flat (pick() in the checker handles both layouts) and
 # the Dockerfile is copied only for the length of this RUN.
 # ---------------------------------------------------------------------
-COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-windows.mjs docker/cua-guest-provision.sh Dockerfile /opt/seek-harness/cua-check/
+COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-windows-qemu.mjs docker/cua-guest-provision.sh Dockerfile /opt/seek-harness/cua-check/
+COPY --chmod=0644 docker/windows-oem/Autounattend.xml docker/windows-oem/setupcomplete.cmd docker/windows-oem/cua-firstboot.ps1 /opt/seek-harness/cua-check/
 COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js /opt/seek-harness/cua-check/
 COPY --chmod=0644 docker/proxy.mjs compose.yaml compose.windows.yaml .env.example /opt/seek-harness/cua-check/
 RUN node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check \

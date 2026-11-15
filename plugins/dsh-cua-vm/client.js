@@ -373,7 +373,9 @@ window.__ModuleLoader__.load({
           // tab (the relay serves a full page), and keep the frame viewer for the
           // Linux guests, where the input path is the cua one.
           if (payload.console === true) {
-            window.open(payload.url, '_blank', 'noopener')
+            // The relay serves noVNC at /vm/port/<name>/; its page is vnc.html
+            // and it connects to the websocket the same prefix carries.
+            window.open(`${payload.url}vnc.html?autoconnect=1&resize=scale&reconnect=1&path=websockify`, '_blank', 'noopener')
             return
           }
           setView({ name, hash: payload.hash ?? '' })
@@ -609,7 +611,9 @@ window.__ModuleLoader__.load({
                     type: 'button', style: S.button,
                     onClick: () => void revealPassword(name)
                   }, secret[name] ? 'Hide password' : 'Reveal password'),
-                  windows === false && h('button', {
+                  // A Windows computer runs the same terminal: the command goes
+                  // over SSH (cmd.exe), not through a cua agent.
+                  h('button', {
                     type: 'button',
                     style: { ...S.button, background: exec !== null && exec.name === name ? T.hover : 'transparent' },
                     onClick: () => setExec((current) => (current !== null && current.name === name ? null : { name, cmd: '', out: '', busy: false }))

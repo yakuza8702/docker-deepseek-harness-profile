@@ -53,7 +53,12 @@ import {
 } from 'node:fs'
 import path from 'node:path'
 import { createSpace, formatSpace, formatSpaceWarning, pngSize, relativeToPixels, resolutionProblem, toDisplayPixels, SPACE_CACHE_MS } from './cua-vm-space.mjs'
-import { createWindowsBackend, windowsEnabled, WINDOWS_IMAGE, WINDOWS_VERSIONS, WINDOWS_RDP_PORT, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB, WINDOWS_MIN_CPU, WINDOWS_QMP_PORT, WINDOWS_HMP_PORT, WINDOWS_CONSOLE_PORT } from './cua-vm-windows.mjs'
+import {
+  createWindowsBackend, windowsEnabled, windowsHostCaps,
+  WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
+  WINDOWS_MIN_CPU, WINDOWS_USERNAME, WINDOWS_QEMU,
+  windowsPaths, ensureIso, writeOemPayload, generatePassword, frameSpace
+} from './cua-vm-windows-qemu.mjs'
 
 const SOCK = process.env.CUA_SUPERVISOR_SOCK || '/tmp/cua-vm/supervisor.sock'
 const CUA_BIN = process.env.CUA_BIN || 'cua'
@@ -1154,10 +1159,23 @@ const space = createSpace({
 })
 
 /**
- * The Windows backend, wired to this process's QMP client so the monitor
- * protocol has exactly one implementation.
+ * The Windows backend: DIRECT QEMU, wired to this process's QMP client so the
+ * monitor protocol has exactly one implementation. No Docker Engine, no DinD —
+ * the same /dev/kvm, the same store, the same locks as the Linux computer.
  */
 const windowsBackend = createWindowsBackend({ store: STORE, qmp: qmpCommands, log })
+
+/** The OEM payload lives in the image next to this file. */
+const WINDOWS_OEM_DIR = String(process.env.DSH_CUA_WINDOWS_OEM_DIR || '/usr/local/share/cua-vm/windows-oem')
+/** Pinned python.org installer for the guest (silent install). */
+const WINDOWS_PYTHON_URL = String(process.env.DSH_CUA_WINDOWS_PYTHON_URL
+  || 'https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe')
+/** What pip installs in the guest for the UI-automation server. */
+const WINDOWS_DSH_CUA_SPEC = String(process.env.DSH_CUA_WINDOWS_DSH_CUA || 'dsh-cua')
+/** Free-port ranges for one Windows computer's three sockets. */
+const WINDOWS_QMP_RANGE = [46000, 46500]
+const WINDOWS_SSH_RANGE = [47000, 47500]
+const WINDOWS_VNC_RANGE = [5920, 5999]
 const PROVISION_SCRIPT = String(process.env.DSH_CUA_PROVISION_SCRIPT || '/usr/local/bin/cua-guest-provision.sh')
 const ANDROID_SCRIPT = String(process.env.DSH_CUA_ANDROID_SCRIPT || '/usr/local/bin/cua-guest-android.sh')
 /**
@@ -1610,28 +1628,34 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
     }
   })
 
-  // 8. The Windows backend: its container and the storage tree the panel reads
-  //    the generated password from.
-  await step('windows container', async () => {
+  // 8. The Windows tree: disk, EFI vars, TPM state, OEM payload, credentials and
+  //    the two sockets. QEMU is a child of this process, so it is killed first —
+  //    deleting a qcow2 under a live guest is how a store gets corrupted.
+  await step('windows store', async () => {
     const already = readRegistry().vms[name]
     const windowsStore = path.join(WINDOWS_DIR, name)
-    if (deleteContainer && (already?.kind === 'windows' || existsSync(windowsStore))) {
+    if (already?.kind !== 'windows' && !existsSync(windowsStore)) return
+    if (deleteContainer) {
       try {
-        const result = await windowsBackend.remove(name)
-        record('windows container', result.removed ? 'removed' : 'absent', result.detail)
+        windowsBackend.kill(name)
+        record('windows qemu', 'stopped', 'process and swtpm stopped')
       } catch (error) {
-        record('windows container', 'failed', error.message)
+        record('windows qemu', 'failed', error?.message ?? String(error))
       }
-      if (existsSync(windowsStore)) {
-        try {
-          rmSync(windowsStore, { recursive: true, force: true })
-          record(windowsStore, 'removed')
-        } catch (error) {
-          record(windowsStore, 'failed', error.message)
-        }
-      } else {
-        record(windowsStore, 'absent')
-      }
+      stopLiveView(name)
+    }
+    for (const target of [windowsPaths(STORE, name).tpmSocket, windowsPaths(STORE, name).tpmPid]) {
+      try { unlinkSync(target) } catch {}
+    }
+    if (!existsSync(windowsStore)) {
+      record(windowsStore, 'absent')
+      return
+    }
+    try {
+      rmSync(windowsStore, { recursive: true, force: true })
+      record(windowsStore, 'removed')
+    } catch (error) {
+      record(windowsStore, 'failed', error.message)
     }
   })
 
@@ -2109,325 +2133,6 @@ async function createLinuxNow(spec) {
   })
 }
 
-/* ------------------------------------------------------------------ *
- * WINDOWS LIFECYCLE
- * ------------------------------------------------------------------ */
-
-/**
- * The install runs in the background so a create can answer in seconds: the
- * panel shows `installing` with a live log tail, and the registry flips to
- * `ready` (or `error` with the last 40 lines) when the predicate holds.
- */
-const WINDOWS_WATCHING = new Set()
-
-async function ensureWindowsConsoleRelay(name) {
-  try {
-    const target = await windowsBackend.consoleTarget(name)
-    if (target === null) return null
-    return await openRelay(name, WINDOWS_CONSOLE_PORT, target, { backend: 'relay' })
-  } catch (error) {
-    log(`windows: ${name} console relay failed (${error?.message ?? error})`)
-    return null
-  }
-}
-
-function watchWindowsInstall(name) {
-  assertVmName(name)
-  if (WINDOWS_WATCHING.has(name)) return
-  WINDOWS_WATCHING.add(name)
-  void (async () => {
-    try {
-      for (;;) {
-        await new Promise((resolve) => setTimeout(resolve, 15000))
-        const registry = readRegistry()
-        const meta = registry.vms[name]
-        // The computer was destroyed (or never was a Windows one): stop.
-        if (!meta || meta.kind !== 'windows') return
-        const timeoutMinutes = readConfig().windowsInstallTimeoutMinutes
-        const status = await windowsBackend.status(name, { timeoutMinutes })
-        if (status.state === 'ready') {
-          await mutateRegistry((fresh) => {
-            const row = fresh.vms[name]
-            if (!row) return
-            row.state = 'ready'
-            row.installDetail = status.detail
-            delete row.error
-            delete row.errorLog
-          })
-          await ensureWindowsConsoleRelay(name)
-          log(`windows: ${name} ready (${status.detail})`)
-          return
-        }
-        if (status.state === 'error' || status.state === 'absent' || status.state === 'stopped') {
-          // A container that stopped on its own during the install (OOM, a qemu
-          // crash) is never going to become ready: report it, with the log tail,
-          // instead of polling a dead container for an hour.
-          const tail = await windowsBackend.logs(name, 40).catch(() => '')
-          const detail = status.state === 'error'
-            ? status.detail
-            : status.state === 'absent'
-              ? 'the Windows container disappeared during the install'
-              : `the Windows container stopped during the install (${status.detail})`
-          await mutateRegistry((fresh) => {
-            const row = fresh.vms[name]
-            if (!row) return
-            row.state = 'error'
-            row.error = detail
-            row.errorLog = tail.slice(-4000)
-          })
-          log(`windows: ${name} install stopped (${detail})`)
-          return
-        }
-        await mutateRegistry((fresh) => {
-          const row = fresh.vms[name]
-          if (!row) return
-          row.state = 'installing'
-          row.installDetail = status.detail
-        })
-      }
-    } catch (error) {
-      log(`windows: install watch for ${name} stopped (${error?.message ?? error})`)
-    } finally {
-      WINDOWS_WATCHING.delete(name)
-    }
-  })()
-}
-
-/**
- * A Windows computer, on the container backend.
- *
- * REFUSALS ARE PART OF THE CONTRACT: no REA (a Linux kit), no Android (the AVD
- * runs on the Linux guest), no VERSION together with an ISO (dockurr would
- * ignore the version), and none at all when DSH_CUA_VM_WINDOWS=0.
- */
-async function windowsCreateManaged(spec) {
-  const gate = windowsBackend.available()
-  if (!gate.ok) throw new Error(gate.reason)
-  if (spec.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer (create the Windows computer without it, or use a Linux computer)')
-  if (spec.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest')
-  // dockurr v4.35 has no `ISO` variable: a REMOTE ISO is a URL in VERSION, and a
-  // LOCAL one is bind-mounted at /boot.iso. Both are accepted here and the
-  // backend resolves the path (it must exist inside the store).
-  if (spec.windowsIso !== '' && !/^https?:\/\//iu.test(spec.windowsIso)) {
-    if (path.isAbsolute(spec.windowsIso)) {
-      throw new Error('windowsIso must be an http(s) URL or a path RELATIVE to the VM store (e.g. "windows/11.iso")')
-    }
-    const absolute = path.resolve(STORE, spec.windowsIso)
-    if (absolute !== STORE && !absolute.startsWith(STORE + path.sep)) {
-      throw new Error('windowsIso must stay inside the VM store (put the ISO under $STORE/windows/ and pass its relative path)')
-    }
-    if (!existsSync(absolute)) {
-      throw new Error(`windowsIso "${spec.windowsIso}" does not exist (expected ${absolute})`)
-    }
-  }
-  if (spec.windowsIso === '' && !WINDOWS_VERSIONS.includes(spec.windowsVersion)) {
-    throw new Error(`windowsVersion must be one of ${WINDOWS_VERSIONS.join(', ')} (or give windowsIso instead)`)
-  }
-  const registry = readRegistry()
-  if (registry.vms[spec.name]) throw new Error(`a computer named "${spec.name}" already exists`)
-  const config = readConfig()
-  const running = Object.values(registry.vms).filter((meta) => RUNNING_STATES.has(meta?.state)).length
-  if (running >= config.maxRunning) {
-    return fail(`VM limit reached (${running}/${config.maxRunning} running). Shutdown one, or raise the limit above.`)
-  }
-  const diskGb = Math.max(spec.diskGb > 0 ? spec.diskGb : WINDOWS_MIN_DISK_GB, WINDOWS_MIN_DISK_GB)
-  const memory = Math.max(spec.memory, WINDOWS_MIN_MEMORY_GB)
-  const cpu = Math.max(spec.cpu, WINDOWS_MIN_CPU)
-  // THE QUOTA HAS TO ALLOW THE FLOOR, and the default (20 GB) never does: a
-  // Windows disk floors at 64 GB, so a fresh install has to raise the policy
-  // first. That is a different sentence from "the store is full", and the panel
-  // has one field for it, so say exactly that instead of a generic refusal.
-  if (config.diskQuotaGb < diskGb) {
-    return fail(`a Windows computer needs a ${diskGb} GB disk (it does not install below 64 GB), but the VM store quota is ${config.diskQuotaGb} GB. Raise Disk Size under Plugins → Personal VM (CUA) → Policy to at least ${diskGb} GB first.`)
-  }
-  const over = await reserveStoreBytes(spec.name, diskGb * 1024 ** 3)
-  if (over !== null) return fail(over)
-  let boot
-  try {
-    boot = await windowsBackend.create({ ...spec, diskGb, memory, cpu, rea: false, android: false })
-  } catch (error) {
-    releaseStoreBytes(spec.name)
-    throw error
-  }
-  const row = {
-    workspace: spec.workspace,
-    kind: 'windows',
-    backend: 'windows',
-    windowsVersion: spec.windowsIso === '' ? spec.windowsVersion : '',
-    windowsIso: spec.windowsIso,
-    container: boot.container,
-    image: gate.image,
-    gpu: spec.gpu,
-    android: false,
-    rea: false,
-    diskGb,
-    cpu,
-    memory,
-    // The password is NEVER here: it lives in $STORE/windows/<name>/
-    // credentials.json (0600). This flag is what the panel reveals it with.
-    credentials: true,
-    createdAt: new Date().toISOString(),
-    lastUsed: new Date().toISOString(),
-    state: 'installing',
-    installDetail: 'Windows is installing (the first boot re-partitions the disk and runs the OOBE)'
-  }
-  // FROM HERE THE CONTAINER EXISTS. Credentials + registry are two more writes,
-  // and either can fail (a full disk, a revoked mode) — a container left behind
-  // would hold the name with no row to delete it and no password to log in with.
-  // The compensation is the same one the backend applies between create and
-  // start: remove the container, drop its storage, then report.
-  try {
-    writeWindowsCredentials(spec.name, {
-      username: WINDOWS_USERNAME,
-      password: boot.password,
-      container: boot.container,
-      createdAt: new Date().toISOString()
-    })
-    await mutateRegistry((fresh) => { fresh.vms[spec.name] = row })
-  } catch (error) {
-    await windowsBackend.remove(spec.name).catch(() => {})
-    try { rmSync(path.join(WINDOWS_DIR, spec.name), { recursive: true, force: true }) } catch {}
-    throw new Error(`the Windows container was created but could not be registered (${error?.message ?? error}); it was removed again`)
-  } finally {
-    // Released before the install watcher starts: the disk is on its way to
-    // the store and the row is what the accounting counts from now on.
-    releaseStoreBytes(spec.name)
-  }
-  watchWindowsInstall(spec.name)
-  return ok({
-    name: spec.name,
-    kind: 'windows',
-    state: 'installing',
-    created: true,
-    container: boot.container,
-    diskGb,
-    diskGbRaised: diskGb > spec.diskGb ? diskGb : undefined,
-    memoryRaised: memory > spec.memory ? memory : undefined,
-    gpu: spec.gpu,
-    // A hint, never the secret: the panel's "reveal" reads the 0600 file.
-    passwordHint: 'the generated password is in the computer list (Reveal) — user "cua"',
-    console: `/vm/port/${spec.name}/`,
-    detail: `Windows ${spec.windowsVersion || spec.windowsIso} is installing. The web console is at /vm/port/${spec.name}/ as soon as the guest answers; the panel polls the install.`
-  })
-}
-
-/** The one sentence every Windows refusal uses, so they cannot drift apart. */
-const WINDOWS_NO_AGENT = (tool) => `cua_vm_${tool} is not available for a Windows computer: it has no guest agent, and exec/file-copy/disk all ride the Linux guest's agent. `
-  + 'What does work: `cua_vm_gui` (screenshot/click/type over QMP), the web console at /vm/port/<name>/ (the viewer link in the panel), '
-  + 'and RDP on port 3389 when the operator enabled the opt-in publish in compose.windows.yaml.'
-
-/**
- * GETTING FILES INTO OR OUT OF WINDOWS — the documented paths, and why.
- *
- * The Linux computer has three bridges (9p share, put/get, exec). Windows has
- * none of them: no agent, no share, no shell. The ONE bridge this build has is
- * the guest's own `/storage` bind, which is `$STORE/windows/<name>` on the host —
- * so the panel can drop a file into `storage/` and the guest sees it under
- * `\\host.lan\Data\` (dockurr maps /storage to that share). That is why the
- * refusal names it instead of pretending a copy exists.
- */
-const WINDOWS_FILE_BRIDGE = 'Put a file in `$STORE/windows/<name>/` (the guest sees it as \\\\host.lan\\Data\\) and copy it out of the same place. '
-
-/** The desktop surface of a Windows computer: QMP only. */
-async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relative }) {
-  if (typeof save === 'string' && save !== '') {
-    // A Windows frame is written into the workspace by the supervisor; there is
-    // no guest filesystem to save a path into. Saying so beats ignoring it.
-    return fail('`save` is not available for Windows computers (there is no guest filesystem): use the path returned by the screenshot action, or the console at /vm/port/<name>/.')
-  }
-  let measured
-  try {
-    measured = await windowsBackend.space(name)
-  } catch (error) {
-    return fail(`${error?.message ?? error}. A Windows computer answers its console only while it is running.`)
-  }
-  const width = measured.display.width
-  const height = measured.display.height
-  const toPixels = (value, extent) => {
-    if (relative === true) return Math.round(Math.min(1, Math.max(0, Number(value) || 0)) * extent)
-    const parsed = Math.round(Number(value))
-    if (!Number.isFinite(parsed) || parsed < 0) throw new Error('coordinates must be positive numbers')
-    return parsed
-  }
-  const limits = 'Windows limits: no clipboard, no accessibility tree, no window list (there is no guest agent to ask). Use screenshot + click.'
-
-  switch (action) {
-    case 'screenshot': {
-      const stamp = Date.now()
-      mkdirSync(SHOTS_DIR, { recursive: true })
-      mkdirSync(WINDOWS_ARTIFACT_DIR, { recursive: true })
-      const hostFile = path.join(SHOTS_DIR, `${name}-${stamp}.png`)
-      const artifact = path.join(WINDOWS_ARTIFACT_DIR, `${name}-${stamp}.png`)
-      try {
-        await windowsBackend.screenshot(name, { saveTo: hostFile })
-      } catch (error) {
-        return fail(`${error?.message ?? error}`)
-      }
-      // The frame has to reach the model somehow; with no guest agent the only
-      // filesystem both sides see is the workspace.
-      copyFileSync(hostFile, artifact)
-      return ok({
-        name,
-        action,
-        png: readFileSync(hostFile).toString('base64'),
-        output: `${formatSpace(measured)} (QMP screendump: the PNG IS the display, no capture budget)\n`
-          + `the frame is in the workspace at ${artifact} — image px = display px, and clicks take the same pixels.\n${limits}`
-      })
-    }
-    case 'click':
-    case 'dclick':
-    case 'move':
-    case 'drag': {
-      const fromX = toPixels(x, width)
-      const fromY = toPixels(y, height)
-      try {
-        if (action === 'move') await windowsBackend.move(name, fromX, fromY, { width, height })
-        else if (action === 'drag') await windowsBackend.drag(name, fromX, fromY, toPixels(x2, width), toPixels(y2, height), { width, height })
-        else await windowsBackend.click(name, fromX, fromY, { width, height })
-        if (action === 'dclick') await windowsBackend.click(name, fromX, fromY, { width, height })
-      } catch (error) {
-        return fail(`${error?.message ?? error}`)
-      }
-      return ok({
-        name,
-        action,
-        output: `${action} at ${action === 'drag' ? `${fromX},${fromY} → ${toPixels(x2, width)},${toPixels(y2, height)}` : `${fromX},${fromY}`} (QMP abs pointer, usb-tablet)\n${spaceLine(measured)}\n${limits}`
-      })
-    }
-    case 'type':
-    case 'key':
-    case 'hotkey': {
-      try {
-        await windowsBackend.sendKeys(name, action === 'type' ? { text: String(text ?? '') } : { key: String(key ?? '') })
-      } catch (error) {
-        return fail(`${error?.message ?? error}`)
-      }
-      return ok({ name, action, output: `${action} sent over QMP\n${spaceLine(measured)}\n${limits}${action === 'type' ? '\nASCII only: the QMP keyboard sends physical keys, so there is no clipboard for anything else.' : ''}` })
-    }
-    case 'geometry':
-      return ok({
-        name,
-        action,
-        output: `${spaceLine(measured)}\nWindows: the frame is the whole display, so there is no separately-scaled screenshot.\n${limits}\nThere is no window list and no a11y tree on this backend: use screenshot + click.`
-      })
-    default:
-      return fail(`"${action}" is not available for a Windows computer (no guest agent: no a11y, no window list, no clipboard, no launch). Use screenshot + click + type, or the web console at /vm/port/${name}/.`)
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * SHUTDOWN — a real powerdown, a checkpoint, and a start that works again
- * ------------------------------------------------------------------ */
-
-/**
- * Wait until QEMU is gone.
- *
- * Two independent proofs, because either one alone lies: the pidfile can be
- * stale (the file survives a crash) and `query-status` can be 'shutdown' while
- * the process is still flushing its disk. `shutdown` means the guest has
- * finished powering off and QEMU is exiting, which is the same moment the
- * qcow2 is about to be closed — so the checkpoint is taken after this returns.
- */
 async function waitForPowerDown(name, target, timeoutMs) {
   const deadline = Date.now() + Math.max(1000, timeoutMs)
   const pid = qemuPid(name)
@@ -2459,11 +2164,10 @@ async function suspendVmLocked(name) {
   const meta = readRegistry().vms[name]
   if (!meta) throw new Error(`no computer named "${name}"`)
   if (meta.kind === 'windows') {
-    // There is no cua sandbox behind a Windows computer: `sb suspend` answered
-    // "not found" and the Suspend button looked broken. `docker pause` keeps the
-    // guest's RAM and disk exactly as they were — the same promise.
+    // No cua sandbox behind a Windows computer: suspend is QMP `stop`, which
+    // pauses the VM with its RAM and disk exactly as they were.
     try {
-      await windowsBackend.pause(name)
+      await windowsBackend.pause(meta)
     } catch (error) {
       return fail(`${error?.message ?? error}`)
     }
@@ -2474,7 +2178,7 @@ async function suspendVmLocked(name) {
       row.state = 'suspended'
       row.lastUsed = new Date().toISOString()
     })
-    return ok({ name, state: 'suspended', kind: 'windows', detail: 'the container is paused; Start unpauses it' })
+    return ok({ name, state: 'suspended', kind: 'windows', detail: 'the VM is paused (QMP stop); Start continues it' })
   }
   space.invalidate(name)
   // `always` captures the disk BEFORE the delta goes away, so a suspend is as
@@ -2504,7 +2208,7 @@ async function resumeVmLocked(name) {
   const meta = readRegistry().vms[name]
   if (meta?.kind === 'windows') {
     try {
-      await windowsBackend.unpause(name)
+      await windowsBackend.unpause(meta)
     } catch (error) {
       return fail(`${error?.message ?? error}`)
     }
@@ -2847,34 +2551,567 @@ async function startFromCheckpoint(name, meta) {
  * WINDOWS: start / ensure / shutdown
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * WINDOWS LIFECYCLE
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE LIVE VIEW — noVNC over the relay pipeline.
+ *
+ * A Windows computer's display is QEMU's VNC socket on loopback. Browsers
+ * cannot speak VNC, so the supervisor starts `websockify` in front of it
+ * (serving the image's own noVNC page) and relays THAT port through the normal
+ * `/vm/port/<name>/` pipeline: the proxy's relay rewrite makes the page's
+ * root-absolute URLs work under the prefix, and the websocket upgrade is
+ * tunnelled like every other preview. If websockify is missing the raw VNC port
+ * is relayed instead, and the answer says so — a live view with a caveat is
+ * better than a button that 502s.
+ */
+async function ensureWindowsConsoleRelay(name) {
+  const registry = readRegistry()
+  const meta = registry.vms[name]
+  if (!meta?.ports?.vnc) return null
+  const existing = ports.get(name)
+  if (existing !== undefined) return existing
+  try {
+    const websockify = '/usr/bin/websockify'
+    let targetPort = meta.ports.vnc
+    let kind = 'vnc-raw'
+    if (existsSync(websockify)) {
+      targetPort = await firstFreePort()
+      const novnc = ['/usr/share/novnc', '/usr/share/novnc-python', '/usr/local/share/novnc'].find((dir) => existsSync(path.join(dir, 'vnc.html')))
+      const argv = novnc !== undefined
+        ? [websockify, '--web', novnc, `127.0.0.1:${targetPort}`, `127.0.0.1:${meta.ports.vnc}`]
+        : [websockify, `127.0.0.1:${targetPort}`, `127.0.0.1:${meta.ports.vnc}`]
+      const child = spawn(websockify, argv.slice(1), { stdio: ['ignore', 'ignore', 'ignore'] })
+      LIVE_VIEWS.set(name, child)
+      child.on('exit', () => {
+        if (LIVE_VIEWS.get(name) === child) LIVE_VIEWS.delete(name)
+      })
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        if (!(await portIsFree(targetPort))) break
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      kind = novnc !== undefined ? 'novnc' : 'websockify'
+    }
+    return await openRelay(name, 5900, { host: '127.0.0.1', port: targetPort }, { backend: 'relay', view: kind })
+  } catch (error) {
+    log(`windows: ${name} live view relay failed (${error?.message ?? error})`)
+    return null
+  }
+}
+
+/** websockify children, one per computer, killed with it. */
+const LIVE_VIEWS = new Map()
+
+function stopLiveView(name) {
+  const child = LIVE_VIEWS.get(name)
+  LIVE_VIEWS.delete(name)
+  try { child?.kill('SIGTERM') } catch {}
+}
+
+/**
+ * The port triple one computer owns, allocated once and recorded in its row.
+ *
+ * QMP (control), SSH (the agent surface) and VNC (the live view) are three
+ * LOOPBACK listeners inside the harness container. They are allocated from
+ * disjoint ranges so a restart finds its own ports free and a stale row cannot
+ * hand one computer another's socket.
+ */
+async function allocateWindowsPorts(existing = null) {
+  const taken = new Set()
+  for (const [name, entry] of ports) taken.add(entry.localPort)
+  for (const row of Object.values(readRegistry().vms)) {
+    for (const port of Object.values(row?.ports ?? {})) taken.add(Number(port))
+  }
+  const pick = async ([from, to]) => {
+    for (let port = from; port < to; port += 1) {
+      if (taken.has(port)) continue
+      if (await portIsFree(port)) return port
+    }
+    throw new Error(`no free port in ${from}-${to} for the Windows computer`)
+  }
+  return {
+    qmp: Number(existing?.qmp) > 0 ? Number(existing.qmp) : await pick(WINDOWS_QMP_RANGE),
+    ssh: Number(existing?.ssh) > 0 ? Number(existing.ssh) : await pick(WINDOWS_SSH_RANGE),
+    // VNC's port is 5900 + DISPLAY, and the relay is a TCP port like the others.
+    vnc: Number(existing?.vnc) > 0 ? Number(existing.vnc) : await pick(WINDOWS_VNC_RANGE)
+  }
+}
+
+/** Serial log tail: Windows Setup prints to the serial console, so this is the
+ *  install progress a human (and the timeout error) can read. */
+function windowsLogTail(name, lines = 40) {
+  try {
+    const text = readFileSync(windowsPaths(STORE, name).serialLog, 'utf8')
+    return text.split('\n').filter((line) => line.trim() !== '').slice(-lines).join('\n')
+  } catch {
+    return ''
+  }
+}
+
+const WINDOWS_WATCHING = new Set()
+
+/**
+ * The install watcher: poll until `ready`, or until the timeout says otherwise.
+ *
+ * READY is `QMP running` AND a guest endpoint that answers (SSH banner first,
+ * VNC accept as the fallback) — see windowsBackend.ready. The row carries the
+ * elapsed time and the last serial lines while it installs, so the panel can
+ * show progress without a second call.
+ */
+function watchWindowsInstall(name) {
+  assertVmName(name)
+  if (WINDOWS_WATCHING.has(name)) return
+  WINDOWS_WATCHING.add(name)
+  void (async () => {
+    try {
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 15000))
+        const registry = readRegistry()
+        const meta = registry.vms[name]
+        if (!meta || meta.kind !== 'windows') return
+        const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
+        const started = Date.parse(meta.createdAt || '') || Date.now()
+        const elapsedMinutes = Math.round((Date.now() - started) / 60000)
+        let verdict
+        try {
+          verdict = await windowsBackend.ready(meta, { ssh: meta.ssh !== false })
+        } catch (error) {
+          verdict = { ready: false, error: error?.message ?? String(error) }
+        }
+        if (verdict.ready) {
+          await mutateRegistry((fresh) => {
+            const row = fresh.vms[name]
+            if (!row) return
+            row.state = 'ready'
+            row.endpoint = verdict.endpoint
+            row.installDetail = `ready (${verdict.endpoint} accepting, QMP running)`
+            delete row.error
+            delete row.errorLog
+          })
+          await ensureWindowsConsoleRelay(name)
+          log(`windows: ${name} ready via ${verdict.endpoint}`)
+          return
+        }
+        if (elapsedMinutes > timeoutMinutes) {
+          const tail = windowsLogTail(name, 40)
+          await mutateRegistry((fresh) => {
+            const row = fresh.vms[name]
+            if (!row) return
+            row.state = 'error'
+            row.error = `the Windows install did not become ready within ${timeoutMinutes} minutes (${verdict.error ?? verdict.endpoint ?? 'no endpoint answered'})`
+            row.errorLog = tail.slice(-4000)
+          })
+          log(`windows: ${name} install timed out after ${timeoutMinutes} min`)
+          return
+        }
+        await mutateRegistry((fresh) => {
+          const row = fresh.vms[name]
+          if (!row) return
+          row.state = 'installing'
+          row.installDetail = `installing (${elapsedMinutes} min): ${verdict.endpoint === 'none' ? 'no endpoint yet' : `${verdict.endpoint} answering`}, QMP ${verdict.status || 'not running'}`
+        })
+      }
+    } catch (error) {
+      log(`windows: install watch for ${name} stopped (${error?.message ?? error})`)
+    } finally {
+      WINDOWS_WATCHING.delete(name)
+    }
+  })()
+}
+
+/**
+ * A Windows computer, on the direct-QEMU backend.
+ *
+ * The order matters and is the same for every install:
+ *   quota → ports → ISO (download once) → OEM payload → credentials → boot.
+ * A failure after the boot is compensated by killing the process, exactly like
+ * the container path did with `docker rm`.
+ */
+async function windowsCreateManaged(spec) {
+  if (windowsEnabled() === false) throw new Error('the Windows backend is disabled (DSH_CUA_VM_WINDOWS=0)')
+  if (spec.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer (create the Windows computer without it, or use a Linux computer)')
+  if (spec.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest')
+  const caps = windowsHostCaps()
+  const missing = ['qemu', 'ovmfCode', 'ovmfVars', 'swtpm'].filter((key) => caps[key] !== true)
+  if (missing.length > 0) {
+    throw new Error(`the Windows backend needs ${missing.join(', ')} on the host (install qemu-system-x86, ovmf and swtpm in the image: ${WINDOWS_QEMU})`)
+  }
+  if (spec.windowsIso !== '' && !/^https?:\/\//iu.test(spec.windowsIso)) {
+    // A local ISO is used DIRECTLY as a QEMU drive, so it must be a host path
+    // this process can read: the store, or the workspace (which is a bind).
+    const absolute = path.isAbsolute(spec.windowsIso) ? spec.windowsIso : path.resolve(STORE, spec.windowsIso)
+    const root = realpathSync(WORKSPACE_ROOT)
+    const inStore = absolute === STORE || absolute.startsWith(STORE + path.sep)
+    const inWorkspace = absolute === root || absolute.startsWith(root + path.sep)
+    if (!inStore && !inWorkspace) {
+      throw new Error('windowsIso must be an http(s) URL, a path inside the VM store, or a path inside the workspace')
+    }
+    if (!existsSync(absolute)) throw new Error(`windowsIso "${spec.windowsIso}" does not exist (expected ${absolute})`)
+  }
+  if (spec.windowsIso === '' && !WINDOWS_VERSIONS.includes(spec.windowsVersion)) {
+    throw new Error(`windowsVersion must be one of ${WINDOWS_VERSIONS.join(', ')} (or give windowsIso instead)`)
+  }
+  const registry = readRegistry()
+  if (registry.vms[spec.name]) throw new Error(`a computer named "${spec.name}" already exists`)
+  const config = readConfig()
+  const running = Object.values(registry.vms).filter((meta) => RUNNING_STATES.has(meta?.state)).length
+  if (running >= config.maxRunning) {
+    return fail(`VM limit reached (${running}/${config.maxRunning} running). Shutdown one, or raise the limit above.`)
+  }
+  const diskGb = Math.max(spec.diskGb > 0 ? spec.diskGb : WINDOWS_MIN_DISK_GB, WINDOWS_MIN_DISK_GB)
+  const memory = Math.max(spec.memory, WINDOWS_MIN_MEMORY_GB)
+  const cpu = Math.max(spec.cpu, WINDOWS_MIN_CPU)
+  if (config.diskQuotaGb < diskGb) {
+    return fail(`a Windows computer needs a ${diskGb} GB disk (it does not install below 64 GB), but the VM store quota is ${config.diskQuotaGb} GB. Raise Disk Size under Plugins → Personal VM (CUA) → Policy to at least ${diskGb} GB first.`)
+  }
+  const over = await reserveStoreBytes(spec.name, diskGb * 1024 ** 3)
+  if (over !== null) return fail(over)
+
+  let booted = null
+  try {
+    const paths = windowsPaths(STORE, spec.name)
+    mkdirSync(paths.dir, { recursive: true })
+    mkdirSync(paths.tpmDir, { recursive: true })
+    const portTriple = await allocateWindowsPorts()
+    // The disk is created up-front: its existence is what tells a later start
+    // whether Setup still has to run.
+    execFileSync('/usr/bin/qemu-img', ['create', '-f', 'qcow2', paths.disk, `${diskGb}G`], { timeout: 120000 })
+
+    // ISO: a local file is used as-is; a URL is downloaded once into $STORE/iso.
+    let isoPath
+    if (spec.windowsIso !== '' && !/^https?:\/\//iu.test(spec.windowsIso)) {
+      isoPath = path.isAbsolute(spec.windowsIso) ? spec.windowsIso : path.resolve(STORE, spec.windowsIso)
+    } else {
+      const url = spec.windowsIso !== '' ? spec.windowsIso : WINDOWS_ISO_SOURCES[spec.windowsVersion].url
+      const downloaded = await ensureIso({
+        url,
+        isoDir: paths.isoDir,
+        timeoutMs: Number(process.env.DSH_CUA_WINDOWS_ISO_TIMEOUT_MS || 60 * 60 * 1000),
+        log,
+        onProgress: (fraction, bytes) => log(`iso: ${(bytes / 1024 ** 3).toFixed(2)} GB${fraction === null ? '' : ` (${Math.round(fraction * 100)}%)`}`)
+      })
+      isoPath = downloaded.path
+    }
+
+    // SSH keypair: the agent surface authenticates with it, the password is the
+    // fallback a human can read in the panel.
+    if (!existsSync(paths.sshKey)) {
+      execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', paths.sshKey, '-C', `dsh-cua-${spec.name}`], { timeout: 30000 })
+      chmodSync(paths.sshKey, 0o600)
+    }
+    const sshPubKey = readFileSync(paths.sshKeyPub, 'utf8')
+    const password = generatePassword()
+    writeWindowsCredentials(spec.name, {
+      username: WINDOWS_USERNAME,
+      password,
+      sshKey: paths.sshKey,
+      createdAt: new Date().toISOString()
+    })
+    writeOemPayload({
+      paths,
+      name: spec.name,
+      password,
+      sshPubKey,
+      sourceDir: WINDOWS_OEM_DIR,
+      pythonUrl: WINDOWS_PYTHON_URL,
+      dshCuaSpec: WINDOWS_DSH_CUA_SPEC,
+      log
+    })
+
+    const qemuSpec = {
+      name: spec.name,
+      cpu,
+      memory,
+      gpu: spec.gpu,
+      paths,
+      isoPath,
+      qmpPort: portTriple.qmp,
+      vncPort: portTriple.vnc,
+      sshPort: portTriple.ssh
+    }
+    booted = await windowsBackend.boot(qemuSpec, { installPending: true })
+    const row = {
+      workspace: spec.workspace,
+      kind: 'windows',
+      backend: 'qemu',
+      windowsVersion: spec.windowsIso === '' ? spec.windowsVersion : '',
+      windowsIso: spec.windowsIso,
+      isoPath,
+      ports: portTriple,
+      ssh: true,
+      qemu: WINDOWS_QEMU,
+      gpu: spec.gpu,
+      android: false,
+      rea: false,
+      diskGb,
+      cpu,
+      memory,
+      credentials: true,
+      installTimeoutMinutes: readConfig().windowsInstallTimeoutMinutes,
+      createdAt: new Date().toISOString(),
+      lastUsed: new Date().toISOString(),
+      state: 'installing',
+      endpoint: 'none',
+      installDetail: 'Windows Setup is running (the answer file installs OpenSSH, python and dsh-cua; then the first logon provisions them)'
+    }
+    await mutateRegistry((fresh) => { fresh.vms[spec.name] = row })
+  } catch (error) {
+    // Nothing half-created survives: kill the QEMU we started and drop the disk.
+    if (booted !== null) windowsBackend.kill(spec.name)
+    releaseStoreBytes(spec.name)
+    throw error
+  } finally {
+    releaseStoreBytes(spec.name)
+  }
+  watchWindowsInstall(spec.name)
+  return ok({
+    name: spec.name,
+    kind: 'windows',
+    state: 'installing',
+    created: true,
+    backend: 'qemu',
+    diskGb,
+    diskGbRaised: diskGb > spec.diskGb ? diskGb : undefined,
+    memoryRaised: memory > spec.memory ? memory : undefined,
+    gpu: spec.gpu,
+    passwordHint: 'the generated password is in the computer list (Reveal) — user "cua"',
+    console: `/vm/port/${spec.name}/`,
+    detail: `Windows ${spec.windowsVersion || spec.windowsIso} is installing. The live view is at /vm/port/${spec.name}/ as soon as the display answers; OpenSSH, python and dsh-cua are installed by the answer file, so cua_vm_exec works once the computer is ready.`
+  })
+}
+
+/**
+ * SSH IS THE AGENT SURFACE OF A WINDOWS COMPUTER.
+ *
+ * There is no cua-spacesd to talk to, so exec/put/get go through the OpenSSH
+ * server the answer file installs. Three details that break a naive version:
+ *
+ *   * `-T` (no pty): a pty would translate CRLF and echo the command back.
+ *   * the key is per computer (`$STORE/windows/<name>/id_ed25519`, 0600); the
+ *     generated password is the human fallback, not what the supervisor uses.
+ *   * a Windows command line is parsed by cmd.exe, so a path with spaces is
+ *     quoted with double quotes — NOT POSIX single quotes.
+ */
+function sshBaseArgs(meta) {
+  const paths = windowsPaths(STORE, meta.name ?? '')
+  const keyPath = existsSync(paths.sshKey) ? paths.sshKey : null
+  return [
+    '-T',
+    ...(keyPath !== null ? ['-i', keyPath] : []),
+    '-o', 'BatchMode=yes',
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'ConnectTimeout=10',
+    '-o', 'ServerAliveInterval=15',
+    '-p', String(meta.ports?.ssh ?? 0)
+  ]
+}
+
+/** Quote for cmd.exe (double quotes; no single-quote convention). */
+function quoteForWindows(value) {
+  const text = String(value)
+  return /\s/u.test(text) ? `"${text.replace(/"/gu, '""')}"` : text
+}
+
+/** Run one command in the guest over SSH; never throws on a non-zero exit. */
+function sshRun(meta, command, { timeoutMs = 330000 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn('/usr/bin/ssh', [...sshBaseArgs(meta), `${meta.user ?? 'cua'}@127.0.0.1`, command], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try { child.kill('SIGTERM') } catch {}
+    }, timeoutMs)
+    const done = (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ code: timedOut ? 124 : code, stdout, stderr, timedOut })
+    }
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.on('error', (error) => { stderr += `${error?.message ?? error}`; done(-1) })
+    child.on('close', (code) => done(code ?? -1))
+  })
+}
+
+/** Copy a file in or out with scp (the same key, the same port). */
+function scpRun(meta, localPath, guestPath, { direction }) {
+  return new Promise((resolve) => {
+    const remote = `${meta.user ?? 'cua'}@127.0.0.1:${guestPath}`
+    const args = [
+      '-q',
+      ...sshBaseArgs(meta).filter((arg) => arg !== '-T'),
+      ...(direction === 'to-guest' ? [localPath, remote] : [remote, localPath])
+    ]
+    const child = spawn('/usr/bin/scp', args, { stdio: ['ignore', 'ignore', 'pipe'] })
+    let stderr = ''
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.on('error', (error) => resolve({ code: -1, stderr: `${error?.message ?? error}` }))
+    child.on('close', (code) => resolve({ code: code ?? -1, stderr }))
+  })
+}
+
+/** The one sentence every Windows refusal uses, so they cannot drift apart. */
+const WINDOWS_NO_AGENT = (tool) => `cua_vm_${tool} needs the guest SSH server, which this Windows computer does not answer yet (still installing, or sshd is down). `
+  + 'Once it is ready, exec/put/get work over SSH like the Linux computer; for the desktop use cua_vm_gui (QMP) or the live view at /vm/port/<name>/.'
+
+/**
+ * The desktop surface of a Windows computer: QMP frames and QMP input.
+ *
+ * There is no cursor overlay: CUA's agent cursor is an X11 overlay the Linux
+ * guest draws, and nothing equivalent exists on Windows — the real pointer is
+ * what the frame shows (and what VNC draws for a human).
+ */
+async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relative }) {
+  if (typeof save === 'string' && save !== '') {
+    return fail('`save` is not available for Windows computers: the frame is written into the workspace, and there is no guest filesystem to save a path into. Use the returned workspace path or the live view.')
+  }
+  const meta = readRegistry().vms[name]
+  if (!meta) return fail(`no computer named "${name}"`)
+  let measured
+  try {
+    const frame = await windowsBackend.screenshot(meta)
+    measured = frameSpace(frame.png)
+    if (action === 'screenshot') {
+      const stamp = Date.now()
+      mkdirSync(SHOTS_DIR, { recursive: true })
+      mkdirSync(WINDOWS_ARTIFACT_DIR, { recursive: true })
+      const hostFile = path.join(SHOTS_DIR, `${name}-${stamp}.png`)
+      const artifact = path.join(WINDOWS_ARTIFACT_DIR, `${name}-${stamp}.png`)
+      writeFileSync(hostFile, frame.png)
+      copyFileSync(hostFile, artifact)
+      return ok({
+        name,
+        action,
+        png: frame.png.toString('base64'),
+        output: `${formatSpace(measured)} (QMP screendump: the PNG IS the display, no capture budget)\n`
+          + `the frame is in the workspace at ${artifact} — image px = display px, and clicks take the same pixels.\n`
+          + 'Windows limits: no clipboard, no accessibility tree, no window list, no cursor overlay (the real pointer is in the frame). For element-level actions use the dsh-cua tools once the guest is ready.'
+      })
+    }
+  } catch (error) {
+    return fail(`${error?.message ?? error}. A Windows computer answers its display only while it is running.`)
+  }
+  const width = measured.display.width
+  const height = measured.display.height
+  const toPixels = (value, extent) => {
+    if (relative === true) return Math.round(Math.min(1, Math.max(0, Number(value) || 0)) * extent)
+    const parsed = Math.round(Number(value))
+    if (!Number.isFinite(parsed) || parsed < 0) throw new Error('coordinates must be positive numbers')
+    return parsed
+  }
+  const limits = 'Windows limits: no clipboard, no accessibility tree, no window list, no driver cursor overlay. Use screenshot + click, or the dsh-cua element tools.'
+  switch (action) {
+    case 'click':
+    case 'dclick':
+    case 'move':
+    case 'drag': {
+      const fromX = toPixels(x, width)
+      const fromY = toPixels(y, height)
+      try {
+        if (action === 'move') await windowsBackend.move(meta, fromX, fromY, { width, height })
+        else if (action === 'drag') await windowsBackend.drag(meta, fromX, fromY, toPixels(x2, width), toPixels(y2, height), { width, height })
+        else {
+          await windowsBackend.click(meta, fromX, fromY, { width, height })
+          if (action === 'dclick') await windowsBackend.click(meta, fromX, fromY, { width, height })
+        }
+      } catch (error) {
+        return fail(`${error?.message ?? error}`)
+      }
+      return ok({
+        name,
+        action,
+        output: `${action} at ${action === 'drag' ? `${fromX},${fromY} → ${toPixels(x2, width)},${toPixels(y2, height)}` : `${fromX},${fromY}`} (QMP abs pointer, usb-tablet)\n${spaceLine(measured)}\n${limits}`
+      })
+    }
+    case 'type':
+    case 'key':
+    case 'hotkey': {
+      try {
+        await windowsBackend.sendKeys(meta, action === 'type' ? { text: String(text ?? '') } : { key: String(key ?? '') })
+      } catch (error) {
+        return fail(`${error?.message ?? error}`)
+      }
+      return ok({
+        name,
+        action,
+        output: `${action} sent over QMP\n${spaceLine(measured)}\n${limits}${action === 'type' ? '\nASCII only: the QMP keyboard sends physical keys, so there is no clipboard for anything else.' : ''}`
+      })
+    }
+    case 'geometry':
+      return ok({
+        name,
+        action,
+        output: `${spaceLine(measured)}\nThe frame is the whole display: no separately-scaled capture, no window list and no a11y tree on this backend.`
+      })
+    default:
+      return fail(`"${action}" is not available for a Windows computer (QMP gives frames and input only: no a11y, no window list, no clipboard, no launch). Use screenshot + click + type, or the live view at /vm/port/${name}/.`)
+  }
+}
+
+/**
+ * START a Windows computer.
+ *
+ * Three cases, and they are the same three as Linux + one Windows-only one:
+ *   suspended     QMP `cont` (the VM is paused, RAM intact)
+ *   powered-off   boot QEMU again; the disk decides whether Setup runs
+ *   installing    nothing to do but keep watching
+ * A computer whose process died is re-booted from its own disk, never rebuilt.
+ */
 async function windowsStart(name, meta) {
   assertVmName(name)
-  const timeoutMinutes = readConfig().windowsInstallTimeoutMinutes
-  const status = await windowsBackend.status(name, { timeoutMinutes })
-  if (status.state === 'ready') {
-    await mutateRegistry((registry) => {
-      const row = registry.vms[name]
+  const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
+  const verdict = await windowsBackend.probe(meta)
+  const registry = readRegistry()
+  if (!verdict.alive) {
+    const installPending = !existsSync(windowsPaths(STORE, name).disk)
+      || meta.installComplete !== true
+    try {
+      await windowsBackend.boot({
+        name,
+        cpu: meta.cpu,
+        memory: meta.memory,
+        gpu: meta.gpu === true,
+        paths: windowsPaths(STORE, name),
+        isoPath: meta.isoPath,
+        qmpPort: meta.ports.qmp,
+        vncPort: meta.ports.vnc,
+        sshPort: meta.ports.ssh
+      }, { installPending })
+    } catch (error) {
+      await mutateRegistry((fresh) => {
+        const row = fresh.vms[name]
+        if (!row) return
+        row.state = 'error'
+        row.error = `could not start the Windows computer: ${error?.message ?? error}`
+      })
+      return fail(`could not start ${name}: ${error?.message ?? error}`)
+    }
+    await mutateRegistry((fresh) => {
+      const row = fresh.vms[name]
       if (!row) return
-      row.state = 'ready'
-      row.installDetail = status.detail
+      row.state = installPending ? 'installing' : 'booting'
+      row.installDetail = installPending ? 'Windows Setup is running' : 'the guest is booting'
+      row.lastUsed = new Date().toISOString()
       delete row.restoreFrom
+      delete row.mayBeTorn
     })
+    watchWindowsInstall(name)
     await ensureWindowsConsoleRelay(name)
-    return ok({ name, state: 'ready', kind: 'windows', console: `/vm/port/${name}/`, detail: status.detail })
+    return ok({ name, state: registry.vms[name]?.state ?? 'booting', kind: 'windows', detail: installPending ? 'Windows Setup is running again' : 'the guest is booting from its disk' })
   }
-  if (status.state === 'installing') {
-    await mutateRegistry((registry) => {
-      const row = registry.vms[name]
-      if (!row) return
-      row.state = 'installing'
-      row.installDetail = status.detail
-    })
-    return ok({ name, state: 'installing', kind: 'windows', detail: status.detail })
-  }
-  if (status.state === 'suspended') {
-    await windowsBackend.unpause(name)
-    await mutateRegistry((registry) => {
-      const row = registry.vms[name]
+  if (verdict.status === 'paused' || verdict.status === 'suspended' || meta.state === 'suspended') {
+    await windowsBackend.unpause(meta)
+    await mutateRegistry((fresh) => {
+      const row = fresh.vms[name]
       if (!row) return
       row.state = 'ready'
       row.lastUsed = new Date().toISOString()
@@ -2882,56 +3119,97 @@ async function windowsStart(name, meta) {
     await ensureWindowsConsoleRelay(name)
     return ok({ name, state: 'ready', kind: 'windows', detail: 'unpaused (suspend kept the guest exactly as it was)' })
   }
-  if (status.state === 'stopped') {
-    await windowsBackend.start(name)
-    await mutateRegistry((registry) => {
-      const row = registry.vms[name]
-      if (!row) return
-      row.state = 'installing'
-      row.installDetail = 'the Windows container is booting'
-      delete row.error
-    })
+  if (verdict.status === 'running') {
+    const ready = await windowsBackend.ready(meta, { ssh: meta.ssh !== false })
+    if (ready.ready) {
+      await mutateRegistry((fresh) => {
+        const row = fresh.vms[name]
+        if (!row) return
+        row.state = 'ready'
+        row.endpoint = ready.endpoint
+        row.installComplete = true
+        row.lastUsed = new Date().toISOString()
+        delete row.error
+        row.installDetail = `ready (${ready.endpoint} accepting, QMP running)`
+      })
+      await ensureWindowsConsoleRelay(name)
+      return ok({ name, state: 'ready', kind: 'windows', console: `/vm/port/${name}/`, detail: ready.endpoint })
+    }
     watchWindowsInstall(name)
-    return ok({ name, state: 'installing', kind: 'windows', detail: 'the Windows container is booting (the guest keeps its installed disk)' })
+    await ensureWindowsConsoleRelay(name)
+    return ok({ name, state: 'booting', kind: 'windows', detail: `QMP running, ${ready.endpoint === 'none' ? 'no endpoint answers yet' : `${ready.endpoint} answering`}` })
+  }
+  watchWindowsInstall(name)
+  return ok({ name, state: 'installing', kind: 'windows', detail: `QMP ${verdict.status || 'not answering'}` })
+}
+
+async function windowsEnsure(name, meta) {
+  return windowsStart(name, meta)
+}
+
+/**
+ * SHUTDOWN a Windows computer: QMP `system_powerdown` → wait → `quit` →
+ * checkpoint → `powered-off`.
+ *
+ * This is the SAME state machine the Linux computer uses — the only differences
+ * are where the QMP socket lives (a row field, not a cua cmdline) and the swtpm
+ * process, which is stopped with the guest.
+ */
+async function windowsShutdown(name, meta) {
+  assertVmName(name)
+  const config = readConfig()
+  const preview = snapshotPorts(name)
+  closePorts(name)
+  stopLiveView(name)
+  let outcome
+  try {
+    outcome = await windowsBackend.shutdown(meta, { timeoutMs: config.shutdownTimeoutSec * 1000 })
+  } catch (error) {
+    const reopened = await restorePorts(name, preview)
+    return fail(`could not power ${name} off: ${error?.message ?? error}. Nothing was removed${reopened ? ' and the live view was reopened' : ''}.`)
+  }
+  if (!outcome.exited) {
+    // It survived ACPI and `quit`: the disk is still open, so it is NOT
+    // checkpointed and the computer is still running.
+    const reopened = await restorePorts(name, preview)
+    return fail(`could not power ${name} off: QEMU is still running after a forced quit, so the disk is open and no checkpoint was taken.${reopened ? ' The live view was reopened.' : ''} Use cua_vm_destroy to remove it.`)
+  }
+  let checkpoint = null
+  let checkpointSkipped = ''
+  if (config.checkpointPolicy === 'never') {
+    checkpointSkipped = 'checkpointPolicy=never'
+  } else {
+    const paths = windowsPaths(STORE, name)
+    const diskBytes = (() => { try { return statSync(paths.disk).size } catch { return 0 } })()
+    const existing = (() => { try { return statSync(path.join(CHECKPOINT_DIR, `${name}.qcow2`)).size } catch { return 0 } })()
+    const over = await refuseOverQuota(config, Math.max(0, diskBytes - existing))
+    if (over !== null) {
+      checkpointSkipped = 'the checkpoint does not fit the store quota'
+    } else {
+      checkpoint = checkpointSandbox(name)
+      if (checkpoint === null) checkpointSkipped = 'no disk to checkpoint'
+    }
   }
   await mutateRegistry((registry) => {
     const row = registry.vms[name]
     if (!row) return
-    row.state = 'error'
-    row.error = status.detail
+    row.state = 'powered-off'
+    row.lastUsed = new Date().toISOString()
+    row.lastShutdown = { at: new Date().toISOString(), method: outcome.method, reason: 'shutdown', ...(checkpointSkipped !== '' ? { checkpointSkipped } : {}) }
+    row.restoreFrom = checkpoint !== null
+      ? { kind: 'checkpoint', file: checkpoint }
+      : { kind: 'image', image: 'windows' }
+    if (outcome.forced) row.mayBeTorn = true
+    else delete row.mayBeTorn
   })
-  return fail(`${status.detail}. Recreate the computer (it keeps no disk of its own after a container loss).`)
-}
-
-async function windowsEnsure(name, meta) {
-  assertVmName(name)
-  const timeoutMinutes = readConfig().windowsInstallTimeoutMinutes
-  const status = await windowsBackend.status(name, { timeoutMinutes })
-  if (status.state === 'installing') return ok({ name, state: 'installing', kind: 'windows', created: false, detail: status.detail })
-  if (status.state === 'ready') return ok({ name, state: 'ready', kind: 'windows', created: false, console: `/vm/port/${name}/` })
-  return windowsStart(name, meta)
-}
-
-async function windowsShutdown(name, meta) {
-  assertVmName(name)
-  closePorts(name)
-  const stopped = await windowsBackend.stop(name)
-  await mutateRegistry((registry) => {
-    if (!registry.vms[name]) return
-    registry.vms[name].state = 'powered-off'
-    registry.vms[name].lastUsed = new Date().toISOString()
-    registry.vms[name].lastShutdown = { at: new Date().toISOString(), method: 'docker stop', reason: 'shutdown' }
-    // The container keeps its own disk under $STORE/windows/<name>; Start
-    // starts the container again (there is no flatten step to redo).
-    registry.vms[name].restoreFrom = { kind: 'container', container: registry.vms[name].container }
-    delete registry.vms[name].mayBeTorn
-  })
-  log(`shutdown ${name} (docker stop): ${stopped.stopped ? 'container stopped' : 'no container'}`)
+  log(`shutdown ${name} (${outcome.method}${outcome.forced ? ', forced' : ''}): ${checkpoint !== null ? 'checkpoint captured' : 'no checkpoint'}`)
   return ok({
     name,
     state: 'powered-off',
-    method: 'docker stop',
-    detail: 'the Windows container was stopped (it keeps its disk); Start boots the same installation'
+    method: outcome.method,
+    checkpoint: checkpoint ?? undefined,
+    mayBeTorn: outcome.forced || undefined,
+    detail: `powered off via ${outcome.method}${checkpoint !== null ? '; its disk is checkpointed and Start cold-boots from it' : '; Start boots the disk it already has'}.`
   })
 }
 
@@ -2956,7 +3234,9 @@ async function doctorReport() {
   }
   const kvm = mode('/dev/kvm')
   const render = mode('/dev/dri/renderD128')
-  const docker = await windowsBackend.ping()
+  // No Docker Engine any more: the Windows backend IS qemu, so its health is
+  // the host tools it needs (qemu, OVMF, swtpm, /dev/kvm).
+  const docker = { reachable: windowsBackend.hostCaps().qemu, engine: WINDOWS_QEMU, detail: 'direct qemu (no Docker Engine)' }
   const config = readConfig()
   const usage = await storeUsage()
   const sandboxList = await listSandboxes()
@@ -2977,16 +3257,13 @@ async function doctorReport() {
     },
     windows: {
       enabled: windowsEnabled(),
-      ...(windowsBackend.available().ok ? { image: WINDOWS_IMAGE, engine: windowsBackend.available().engine } : { reason: windowsBackend.available().reason }),
-      engineReachable: docker.reachable,
-      qmpPort: WINDOWS_QMP_PORT,
-      qmpPublished: false,
-      // dockur's own HMP monitor sits on 7100 inside the same container; the
-      // supervisor never dials it (see WINDOWS_QMP_PORT in the backend).
-      dockurMonitorPort: WINDOWS_HMP_PORT,
-      consolePort: WINDOWS_CONSOLE_PORT,
-      rdpPort: WINDOWS_RDP_PORT,
-      versions: WINDOWS_VERSIONS
+      backend: 'qemu',
+      qemu: WINDOWS_QEMU,
+      hostCaps: windowsBackend.hostCaps(),
+      portRanges: { qmp: WINDOWS_QMP_RANGE, ssh: WINDOWS_SSH_RANGE, vnc: WINDOWS_VNC_RANGE },
+      versions: WINDOWS_VERSIONS,
+      isoSources: Object.fromEntries(Object.entries(WINDOWS_ISO_SOURCES).map(([key, value]) => [key, value.label])),
+      liveView: 'noVNC over websockify, relayed at /vm/port/<name>/',
     },
     policy: config,
     store: {
@@ -3230,10 +3507,24 @@ const handlers = {
   async exec({ name, cmd, cwd, timeout = 300 }) {
     if (!name) throw new Error('name is required')
     if (typeof cmd !== 'string' || cmd.trim().length === 0) throw new Error('cmd is required')
-    if (readRegistry().vms[name]?.kind === 'windows') {
-      // Structured, not an exception: the tool has an exit/stdout/stderr shape,
-      // and the model reads the refusal where it reads a result.
-      return ok({ exit: 126, stdout: '', stderr: WINDOWS_NO_AGENT('exec'), ms: 0, available: false })
+    const meta = readRegistry().vms[name]
+    if (meta?.kind === 'windows') {
+      // THE AGENT SURFACE IS SSH. A Windows guest has no cua-spacesd, so the
+      // command runs through the OpenSSH server the answer file installs; the
+      // remote shell is cmd.exe by default and `cwd` is passed to `cd /d`.
+      const started = Date.now()
+      if (meta.state !== 'ready') {
+        return ok({ exit: 126, stdout: '', stderr: WINDOWS_NO_AGENT('exec'), ms: 0, available: false })
+      }
+      const remote = cwd ? `cd /d ${quoteForWindows(cwd)} && ${cmd}` : cmd
+      const result = await sshRun(meta, remote, { timeoutMs: (Number(timeout) || 300) * 1000 + 30000 })
+      await mutateRegistry((registry) => {
+        const row = registry.vms[name]
+        if (!row) return
+        row.lastUsed = new Date().toISOString()
+        row.lastCommand = cmd.slice(0, 500)
+      })
+      return ok({ exit: result.code, stdout: result.stdout, stderr: result.stderr, ms: Date.now() - started, timedOut: result.timedOut })
     }
     const args = ['sb', 'exec', '--local', name, '--timeout', String(Math.max(1, Number(timeout) || 300))]
     if (cwd) args.push('--cwd', String(cwd))
@@ -3262,8 +3553,15 @@ const handlers = {
 
   async put({ name, local, guest }) {
     if (!name) throw new Error('name is required')
-    if (readRegistry().vms[name]?.kind === 'windows') {
-      return ok({ available: false, name, local, guest, message: `${WINDOWS_NO_AGENT('put')} ${WINDOWS_FILE_BRIDGE}` })
+    const putMeta = readRegistry().vms[name]
+    if (putMeta?.kind === 'windows') {
+      if (putMeta.state !== 'ready') return ok({ available: false, name, local, guest, message: WINDOWS_NO_AGENT('put') })
+      const source = workspacePath(local, { mustExist: true })
+      // scp speaks POSIX paths; Windows OpenSSH accepts forward slashes and
+      // `/c/...`-style is NOT valid, so a drive path is normalised here.
+      const result = await scpRun(putMeta, source, guest, { direction: 'to-guest' })
+      if (result.code !== 0) return fail(`vm_put failed over SSH: ${result.stderr.trim().slice(-600)}`)
+      return ok({ local: source, guest })
     }
     if (typeof guest !== 'string' || !guest.startsWith('/')) throw new Error('guest must be an absolute guest path')
     const source = workspacePath(local, { mustExist: true })
@@ -3274,8 +3572,16 @@ const handlers = {
 
   async get({ name, guest, local }) {
     if (!name) throw new Error('name is required')
-    if (readRegistry().vms[name]?.kind === 'windows') {
-      return ok({ available: false, name, guest, local, message: `${WINDOWS_NO_AGENT('get')} ${WINDOWS_FILE_BRIDGE}` })
+    const getMeta = readRegistry().vms[name]
+    if (getMeta?.kind === 'windows') {
+      if (getMeta.state !== 'ready') return ok({ available: false, name, guest, local, message: WINDOWS_NO_AGENT('get') })
+      const root = realpathSync(WORKSPACE_ROOT)
+      const absolute = path.isAbsolute(local) ? path.normalize(local) : path.join(root, local)
+      if (absolute !== root && !absolute.startsWith(root + path.sep)) throw new Error(`path escapes the workspace: ${local}`)
+      mkdirSync(path.dirname(absolute), { recursive: true })
+      const result = await scpRun(getMeta, absolute, guest, { direction: 'from-guest' })
+      if (result.code !== 0) return fail(`vm_get failed over SSH: ${result.stderr.trim().slice(-600)}`)
+      return ok({ guest, local: absolute, bytes: statSync(absolute).size })
     }
     if (typeof guest !== 'string' || !guest.startsWith('/')) throw new Error('guest must be an absolute guest path')
     // Create the destination directory first: a fresh project has no shots/
@@ -3302,11 +3608,15 @@ const handlers = {
     const meta = readRegistry().vms[name]
     const wanted = Number(guestPort) || 8080
     if (meta?.kind === 'windows') {
-      if (wanted !== WINDOWS_CONSOLE_PORT) {
-        return fail(`only the Windows console (${WINDOWS_CONSOLE_PORT}) can be exposed on this backend: the guest has no port-forward agent. Open /vm/port/${name}/ for the console, or use RDP on 3389 when compose.windows.yaml publishes it.`)
+      // A Windows computer's only published surface is its LIVE VIEW: the
+      // noVNC page the supervisor relays. Guest ports are reachable through
+      // SSH (cua_vm_exec → localhost:PORT inside the guest), and there is no
+      // cua port-forward agent to open one.
+      if (wanted !== 5900) {
+        return fail('a Windows computer exposes its live view at /vm/port/<name>/; other guest ports are reachable through cua_vm_exec (ssh → localhost:PORT in the guest), not through the proxy.')
       }
       const relayed = await ensureWindowsConsoleRelay(name)
-      if (relayed === null) return fail('the console relay is not up yet (the container has no published 8006 port)')
+      if (relayed === null) return fail('the live view is not up yet (the display has not started or websockify is missing)')
       return ok(relayed)
     }
     const opened = await openPort(name, wanted)
@@ -3330,7 +3640,18 @@ const handlers = {
         registry.vms[row.name].state = row.state || row.status || registry.vms[row.name].state
       }
     }
-    return ok({ registry: registry.vms, listed: parsed ?? raw, windows: windowsBackend.available() })
+    return ok({
+      registry: registry.vms,
+      listed: parsed ?? raw,
+      windows: {
+        ok: windowsEnabled(),
+        backend: 'qemu',
+        qemu: WINDOWS_QEMU,
+        hostCaps: windowsBackend.hostCaps(),
+        liveView: 'noVNC over websockify at /vm/port/<name>/',
+        ...(windowsEnabled() ? {} : { reason: 'the Windows backend is disabled (DSH_CUA_VM_WINDOWS=0)' })
+      }
+    })
   },
 
   /**
@@ -3393,7 +3714,8 @@ const handlers = {
     if (!name) throw new Error('name is required')
     const registry = readRegistry()
     if (registry.vms[name]?.kind === 'windows') {
-      const measured = await windowsBackend.space(name)
+      const frame = await windowsBackend.screenshot(registry.vms[name])
+      const measured = frameSpace(frame.png)
       return ok({ name, ...measured, line: formatSpace(measured), warning: formatSpaceWarning(measured) || undefined })
     }
     const measured = await space.measure(name)
@@ -3417,38 +3739,49 @@ const handlers = {
     const registry = readRegistry()
     const meta = registry.vms[name]
     if (!meta || meta.kind !== 'windows') return fail(`no Windows computer named "${name}"`)
-    const timeoutMinutes = readConfig().windowsInstallTimeoutMinutes
-    const status = await windowsBackend.status(name, { timeoutMinutes })
-    let logTail = ''
-    try { logTail = await windowsBackend.logs(name, Math.max(1, Math.min(200, Number(tail) || 20))) } catch {}
-    // Keep the row honest even when nobody is watching the install watcher —
-    // under the lock, because that watcher is writing the same row.
-    if (status.state !== meta.state) {
+    const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
+    const verdict = await windowsBackend.probe(meta)
+    const ready = verdict.alive && verdict.status === 'running'
+      ? await windowsBackend.ready(meta, { ssh: meta.ssh !== false })
+      : { ready: false, endpoint: 'none' }
+    const state = !verdict.alive
+      ? (meta.state === 'powered-off' ? 'powered-off' : 'stopped')
+      : verdict.status === 'paused' || verdict.status === 'suspended'
+        ? 'suspended'
+        : ready.ready ? 'ready' : 'installing'
+    // Keep the row honest even when nobody is watching the install watcher.
+    if (state !== meta.state) {
       await mutateRegistry((fresh) => {
         const row = fresh.vms[name]
         if (!row) return
-        row.state = status.state
-        row.installDetail = status.detail
-        if (status.state === 'error') row.error = status.detail
+        row.state = state
+        if (state === 'ready') {
+          row.endpoint = ready.endpoint
+          row.installComplete = true
+          delete row.error
+        }
       })
     }
-    if (status.state === 'ready') await ensureWindowsConsoleRelay(name)
+    if (state === 'ready') await ensureWindowsConsoleRelay(name)
+    const elapsedMinutes = Math.round((Date.now() - (Date.parse(meta.createdAt || '') || Date.now())) / 60000)
     return ok({
       name,
       kind: 'windows',
-      state: status.state,
-      detail: status.detail,
-      console: status.console ? `/vm/port/${name}/` : undefined,
-      rdp: status.rdp ? `${status.rdp.host}:${status.rdp.port}` : undefined,
-      elapsedMinutes: status.elapsedMinutes,
-      logTail: logTail.slice(-4000)
+      backend: 'qemu',
+      state,
+      detail: verdict.alive
+        ? `QMP ${verdict.status || 'not answering'}, ${ready.endpoint === 'none' ? 'no endpoint yet' : `${ready.endpoint} accepting`}`
+        : 'no QEMU process',
+      console: state === 'ready' ? `/vm/port/${name}/` : undefined,
+      ports: meta.ports,
+      elapsedMinutes,
+      logTail: windowsLogTail(name, Math.max(1, Math.min(200, Number(tail) || 20))).slice(-4000)
     })
   },
 
   async vmWindowsLogs({ name, tail = 40 } = {}) {
     if (!name) throw new Error('name is required')
-    const text = await windowsBackend.logs(name, Math.max(1, Math.min(200, Number(tail) || 40)))
-    return ok({ name, log: text.slice(-4000) })
+    return ok({ name, log: windowsLogTail(name, Math.max(1, Math.min(200, Number(tail) || 40))).slice(-4000) })
   },
 
   /**
@@ -3473,6 +3806,34 @@ const handlers = {
     return ok({ name, username: credentials.username, password: credentials.password, createdAt: credentials.createdAt, modeHealed: healed || undefined })
   },
 
+  /**
+   * The facts the harness needs to attach the guest's dsh-cua MCP server, and
+   * nothing more: host, SSH port, key path, user. The password never travels
+   * here — the plugin speaks SSH with the per-computer key.
+   */
+  async vmWindowsMcp({ name = '' } = {}) {
+    const registry = readRegistry()
+    const entries = name === ''
+      ? Object.entries(registry.vms).filter(([, row]) => row?.kind === 'windows')
+      : [[name, registry.vms[name]]]
+    const ready = entries.find(([, row]) => row?.kind === 'windows' && row.state === 'ready')
+    if (ready === undefined) return ok({ available: false, reason: 'no ready Windows computer' })
+    const [targetName, meta] = ready
+    const verdict = await windowsBackend.ready(meta, { ssh: true })
+    if (!verdict.ready) {
+      return ok({ available: false, reason: `not ready (${verdict.endpoint === 'none' ? 'no endpoint answers' : verdict.endpoint})` })
+    }
+    return ok({
+      available: true,
+      name: targetName,
+      host: '127.0.0.1',
+      sshPort: meta.ports?.ssh ?? 0,
+      keyPath: windowsPaths(STORE, targetName).sshKey,
+      user: WINDOWS_USERNAME,
+      endpoint: verdict.endpoint
+    })
+  },
+
   async vmWindowsStart({ name }) {
     const meta = readRegistry().vms[name]
     if (!meta || meta.kind !== 'windows') return fail(`no Windows computer named "${name}"`)
@@ -3490,7 +3851,7 @@ const handlers = {
       // The panel's frame view, on the QMP backend: the same PNG the model
       // would get, base64 for the <img> element.
       try {
-        const frame = await windowsBackend.screenshot(name)
+        const frame = await windowsBackend.screenshot(readRegistry().vms[name])
         return ok({ name, png: frame.png.toString('base64'), source: 'qmp' })
       } catch (error) {
         return fail(`${error?.message ?? error}`)
@@ -3523,18 +3884,19 @@ const handlers = {
       // display, so the coordinates need no conversion.
       try {
         if (kind === 'click') {
-          const measured = await windowsBackend.space(name)
+          const frame = await windowsBackend.screenshot(meta)
+          const measured = frameSpace(frame.png)
           const px = Math.max(0, Math.round(Number(x) || 0))
           const py = Math.max(0, Math.round(Number(y) || 0))
-          await windowsBackend.click(name, px, py, { width: measured.display.width, height: measured.display.height })
+          await windowsBackend.click(meta, px, py, { width: measured.display.width, height: measured.display.height })
           return ok({ name, kind, source: 'qmp' })
         }
         if (kind === 'type') {
-          await windowsBackend.sendKeys(name, { text: String(text ?? '') })
+          await windowsBackend.sendKeys(meta, { text: String(text ?? '') })
           return ok({ name, kind, source: 'qmp' })
         }
         if (kind === 'key') {
-          await windowsBackend.sendKeys(name, { key: String(key ?? '') })
+          await windowsBackend.sendKeys(meta, { key: String(key ?? '') })
           return ok({ name, kind, source: 'qmp' })
         }
         return fail(`unknown input kind: ${kind}`)

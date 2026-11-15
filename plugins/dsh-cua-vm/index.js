@@ -1,6 +1,7 @@
 import net, { createConnection } from 'node:net'
 import path from 'node:path'
 import z from '@deepseek-ai/schemastery'
+import { createDshCuaClient, windowsMcpEnabled } from './win-mcp.js'
 
 export const name = 'cua-vm'
 export const inject = ['tools', 'systemPrompt', 'webServer']
@@ -98,7 +99,7 @@ const CUA_PROMPT_LINES = [
   'On a GPU computer Xorg runs on virgl and reports OpenGL 4.3 (Mesa under-reports 4.2; the session lifts it); if an app refuses, check `cua_vm_gui geometry` or `glxinfo -B`, and use `LIBGL_ALWAYS_SOFTWARE=1` (llvmpipe, slower) only as a genuine, stated fallback.',
   'SPACE: the screenshot and the click share ONE space, and the tool measures it — every desktop result prints `screenshot WxH · display WxH · scale N`. When scale is 1 (a 1200x750 desktop) image pixels are display pixels; when it is not, the result says `image px = 0.9375 × display px; cua maps it — do not rescale`, and that is literal: click the pixel you see, never multiply it.',
   'SHUTDOWN vs SUSPEND: `cua_vm_shutdown` is a real ACPI powerdown, then a checkpoint, then the sandbox is removed (`state: powered-off`); `cua_vm_start` cold-boots from that checkpoint — do NOT expect `sb resume` to work on a powered-off computer, that is the trap the split exists for. `cua_vm_suspend` keeps the sandbox and resumes instantly. Neither happens on its own: the computer runs until the user asks.',
-  'WINDOWS (`kind: "windows"`, via the Docker/DinD backend): a Windows computer has the desktop (`cua_vm_gui` over QMP, plus the console at /vm/port/<name>/) but NO exec, NO put/get, NO disk growth, no clipboard, no accessibility tree and no window list — those answer "not available for Windows" on purpose. It cannot take `rea: true` or `android: true`, and its generated password is per computer (the panel reveals it); RDP on 3389 exists only if the operator opted in.',
+  'WINDOWS (`kind: "windows"`, direct QEMU + OVMF/TPM2): exec/put/get work over the guest OpenSSH server like the Linux computer (Session 0, cmd.exe, `C:\\` paths); the desktop is `cua_vm_gui` over QMP and the LIVE VIEW at /vm/port/<name>/ (noVNC), where a human can drive the same screen. Its GPU is a virtio-gpu with NO Windows 3D driver: Direct3D falls back to WARP (CPU), so do not promise hardware acceleration; there is no mouse-cursor overlay on this path (the real pointer is in the frame). QMP typing is ASCII-only and there is no clipboard, no accessibility tree and no window list — for element-level work use the dsh-cua tools when the guest advertises them. It cannot take `rea: true` or `android: true`; the generated password is per computer (Reveal), and SSH keys are per computer too.',
   'If a tool reports no VM, call `cua_vm_ensure` once, then `cua_vm_exec`.',
   'For reverse-engineering work — a feature to reimplement, a suspicious binary, an APK, an Electron app, a model file — create the computer with `rea: true` (and let the disk be at least 40 GB); REA is not installed on a computer created without it, and installing it by hand inside a 20 GB disk is the wrong fix.'
 ]
@@ -163,6 +164,91 @@ export function apply(ctx, config = {}) {
       // A supervisor that is not up yet must not make every assembly retry:
       // back the same 30 s window off, and keep the names already known.
       reaCache.at = Date.now()
+    }
+  }
+
+  /**
+   * THE dsh-cua TOOLS OF A WINDOWS COMPUTER, ATTACHED ONLY WHILE IT IS THE ONE.
+   *
+   * A Windows guest is reachable over SSH, and inside it `dsh-cua` drives the
+   * desktop from the INTERACTIVE session (pywinauto cannot see windows from
+   * Session 0). Its MCP tool list is what makes element-level work cheap:
+   * `find_elements` + `type_text` return a receipt ("action_sent",
+   * "effect_verified") in a few hundred bytes, where the screenshot loop costs a
+   * PNG per attempt.
+   *
+   * The registration is DYNAMIC and EPHEMERAL:
+   *   * nothing is written to the profile, ever;
+   *   * tools exist only while a `kind: "windows"` computer is `ready`;
+   *   * switching or deleting the computer disposes them;
+   *   * DSH_CUA_VM_WIN_MCP=0 disables the whole path.
+   *
+   * COST: the guest's schema is ~3-8k tokens while it is attached, which is why
+   * it is not attached to a Linux-only workspace at all.
+   */
+  const WIN_MCP = { name: '', client: null, disposers: [], at: 0, reason: 'not attempted' }
+
+  function detachWindowsMcp(reason) {
+    for (const dispose of WIN_MCP.disposers.splice(0)) {
+      try { dispose() } catch { /* the tool registry may already be gone */ }
+    }
+    WIN_MCP.client?.close()
+    WIN_MCP.client = null
+    if (WIN_MCP.name !== '') console.log(`[cua-vm] windows MCP detached (${reason})`)
+    WIN_MCP.name = ''
+    WIN_MCP.reason = reason
+  }
+
+  async function attachWindowsMcp() {
+    if (!windowsMcpEnabled()) {
+      detachWindowsMcp('disabled (DSH_CUA_VM_WIN_MCP=0)')
+      return
+    }
+    let target = null
+    try {
+      const answer = await call({ op: 'vmWindowsMcp', name: '' })
+      target = answer?.available === true ? answer : null
+    } catch (error) {
+      detachWindowsMcp(`no ready Windows computer (${error?.message ?? error})`)
+      return
+    }
+    if (target === null) {
+      detachWindowsMcp('no ready Windows computer')
+      return
+    }
+    if (WIN_MCP.name === target.name && WIN_MCP.client?.state.connected === true) return
+    detachWindowsMcp('switching computers')
+    const client = createDshCuaClient({
+      name: target.name,
+      sshPort: target.sshPort,
+      keyPath: target.keyPath,
+      user: target.user ?? 'cua',
+      timeoutMs: 45000
+    })
+    try {
+      const session = await client.connect()
+      WIN_MCP.client = client
+      WIN_MCP.name = target.name
+      for (const tool of session.tools) {
+        const publicName = `cua_win__${String(tool.name).replace(/[^A-Za-z0-9_]/gu, '_')}`
+        const dispose = ctx.effect(() => ctx.tools.register({
+          name: publicName,
+          description: `${tool.description ?? tool.name} (dsh-cua, Windows computer ${target.name})`,
+          parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} },
+          output: textOutput('The guest tool result as JSON.'),
+          async execute(args = {}) {
+            const result = await client.callTool(tool.name, args)
+            return { text: JSON.stringify(result) }
+          }
+        }), `cua-vm: windows mcp ${publicName}`)
+        if (typeof dispose === 'function') WIN_MCP.disposers.push(dispose)
+      }
+      WIN_MCP.reason = `attached (${session.tools.length} tool(s))`
+      console.log(`[cua-vm] windows MCP attached to ${target.name} (${session.tools.length} tool(s))`)
+    } catch (error) {
+      client.close()
+      WIN_MCP.reason = `attach failed: ${error?.message ?? error}`
+      console.log(`[cua-vm] windows MCP NOT attached: ${error?.message ?? error}`)
     }
   }
 
@@ -273,6 +359,19 @@ export function apply(ctx, config = {}) {
     if (typeof timer.unref === 'function') timer.unref()
     return () => clearInterval(timer)
   }, 'cua-vm: rea awareness cache')
+
+  // The Windows MCP tools are attached by the same 30 s beat: one socket call
+  // when there is nothing to attach, one SSH handshake when a Windows computer
+  // becomes ready, and a disposal the moment it stops being ready.
+  ctx.effect(() => {
+    void attachWindowsMcp()
+    const timer = setInterval(() => { void attachWindowsMcp() }, REA_CACHE_TTL_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => {
+      clearInterval(timer)
+      detachWindowsMcp('plugin disposed')
+    }
+  }, 'cua-vm: windows mcp (lazy)')
 
   ctx.tools.register({
     name: 'cua_vm_status',
@@ -493,7 +592,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_exec',
-    description: 'Run a shell command in the VM; returns exit code, stdout, stderr.',
+    description: 'Run a shell command in the computer: bash in the Linux guest, cmd.exe over SSH on a Windows one.',
     parameters: {
       type: 'object',
       additionalProperties: false,

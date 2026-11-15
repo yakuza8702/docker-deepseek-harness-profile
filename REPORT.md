@@ -323,7 +323,7 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **216** assertions across 12 files |
+| `node tools/check-cua-vm.mjs` | **252** assertions across 16 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
 | Supervisor smoke against a **throwaway store + stub `cua`** (82 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
@@ -417,7 +417,41 @@ are covered in the smoke suite.
 | W9 | `save` on Windows was silently ignored | refused with a sentence that names the working path |
 | W10 | docs (REPORT, BRANCH-NOTES, compose header) claimed the dead envs and 7100 | rewritten against the real mapping |
 
-### 9.6 What is still open (TBC)
+### 9.6 Architecture change: Windows is direct QEMU (replaces the container backend)
+
+The Docker/DinD Windows backend was **removed**. Windows is now what Linux
+already was: `qemu-system-x86_64` started by the supervisor, with the same
+`/dev/kvm`, the same `/cua-vm` store and the same lifecycle machinery.
+
+| Piece | Before | Now |
+|---|---|---|
+| runtime | `dockurr/windows` container on a DinD engine | direct QEMU in the harness container (`docker/cua-vm-windows-qemu.mjs`) |
+| firmware | the image's own QEMU/SeaBIOS | **OVMF** with a per-computer `efi-vars.qcow2` + **swtpm** TPM2 |
+| disk | container `/storage` bind | `$STORE/windows/<name>/disk.qcow2` (plain qcow2 → checkpointable) |
+| install | the image's unattended install | pinned Microsoft ISOs in `$STORE/iso/` + `docker/windows-oem/` (Autounattend, setupcomplete, firstboot) |
+| agent | none (desktop only) | **OpenSSH on every install** → exec/put/get over SSH; dsh-cua MCP lazily attached |
+| display | noVNC console 8006 | QEMU VNC on loopback behind websockify+noVNC, relayed at `/vm/port/<name>/` |
+| control | Docker API + QMP | QMP only (`screendump`, `input-send-event`, `query-status`, `system_powerdown`, `quit`) |
+| GPU | `GPU=Y` env of the image | `virtio-gpu-pci` backed by `/dev/dri/renderD128`; **WARP** 3D, documented |
+| network | bridge of the container | SLIRP + `10.0.2.2` host gateway; bridge/tap documented, not default |
+
+**What is reused, unchanged:** registry v2 (`kind: 'windows'`, `backend: 'qemu'`),
+`withVmLock`, the quota reservation, the shutdown state machine (ACPI →
+checkpoint → `powered-off`), the delete manifest (now removing the Windows tree
+and the swtpm socket), GC, and the port-relay pipeline.
+
+**New files:** `docker/cua-vm-windows-qemu.mjs` (command builder + lifecycle),
+`docker/windows-oem/{Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1}`,
+`plugins/dsh-cua-vm/win-mcp.js` (MCP over SSH, library + `--stdio` CLI).
+**Deleted:** `docker/cua-vm-windows.mjs` (the Docker-API backend) and the DinD
+service in `compose.windows.yaml`.
+
+**Honest ceilings (also in the READMEs):** no accelerated 3D (WARP), no cursor
+overlay, ASCII-only QMP typing, no clipboard/a11y/window list, SSH lands in
+Session 0 so dsh-cua runs as an interactive logon task and the SSH side proxies
+to it, and an `nvidia-smi` EGL handle is the host-side QEMU context.
+
+### 9.7 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),
    screenshot, click, shutdown, Start, and confirm `powered-off → ready` from the
@@ -435,5 +469,11 @@ are covered in the smoke suite.
 6. The registry lock is per-process. Two supervisors on the same store (a
    misconfigured deployment, not a supported one) would still interleave; the
    store has no cross-process lock, and `flock` is the obvious next step.
-7. D6's cleanup path is code-reviewed but not exercised against an engine: it
-   needs a Docker daemon that fails a start on demand.
+7. **A real Windows install** — ISO download, OVMF/swtpm boot, OOBE and the
+   OpenSSH/python/dsh-cua provisioning — needs egress and ~6 GB, and is a
+   mutation; it is **NOT RUN** here.
+8. **The dsh-cua runtime handshake** (MCP initialize/tools/list against a booted
+   guest) is **NOT RUN**: the client is unit-shaped, the guest does not exist in
+   this environment.
+9. **The VNC end-to-end path** through websockify is **NOT RUN** (no guest to
+   display), and the noVNC page's exact URL depends on the shipped noVNC build.

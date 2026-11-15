@@ -10,6 +10,7 @@
     "cordis.patch.yml",
     "index.js",
     "client.js",
+    "win-mcp.js",
     "README.md"
   ],
   "exports": {
