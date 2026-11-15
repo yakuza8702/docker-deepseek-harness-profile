@@ -323,9 +323,9 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **270** assertions across 16 files |
+| `node tools/check-cua-vm.mjs` | **272** assertions across 16 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
-| Supervisor smoke against a **throwaway store + stub `cua`** (82 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
+| Supervisor smoke against a **throwaway store + stub `cua`** (85 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
 | ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
 | `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
@@ -402,6 +402,10 @@ are covered in the smoke suite.
 | R2 | the registry step was outside `step()`, so an unreadable registry threw out of `destroyVm` after the checkpoints/shots/vmm were already unlinked, and the caller got a bare error with no `items`/`failed`/`complete` | the row write is a manifest step like every other one: it reports `failed` and the structured result still comes back |
 | R3 | a corrupt registry killed the supervisor at boot: the listen callback read it unguarded for the Windows-resume loop, so the socket existed and then the process exited 1 | both boot-time reads are guarded (listen callback, idle timer): the failure is logged, the Windows watches are skipped for this boot, and every tool still answers |
 
+> **Historical.** This W-table and §9.5 describe the **removed** container
+> backend (dockurr/windows on a DinD engine). The current Windows computer is
+> direct QEMU — see §9.6 — so no row below is a statement about today's code.
+
 **Windows (checked against `dockurr/windows:4.35` and its `qemux/qemu:7.12` base)**
 
 | # | Defect | Fix |
@@ -466,6 +470,14 @@ to it, and an `nvidia-smi` EGL handle is the host-side QEMU context.
 | D10 | `cua-firstboot.ps1` claimed `vmWindowsStatus` reads the marker | the header now says what the marker is (an audit trail; readiness is the SSH banner) |
 | D11 | the guest's tools lingered up to 30 s after a stop/delete | 5 s attach beat |
 | D8 | answer-file children were out of schema order and used deprecated OOBE skips | reordered (DiskConfiguration→ImageInstall→RunSynchronous→UserData; AutoLogon→FirstLogonCommands→OOBE→UserAccounts), deprecated switches removed, order pinned by gate needles |
+
+### 9.6.2 Pre-verdict round 2 (F1–F3)
+
+| # | Defect | Fix |
+|---|---|---|
+| F1 | the c467edb hunk swapped the checkpoint call sites: the Linux shutdown ran `checkpointDiskFile(…windowsPaths…)` (a path that does not exist for Linux → **no Linux checkpoint at all**) while `windowsShutdown` still called the Linux-only `checkpointSandbox` (→ no Windows checkpoint) | each shutdown is back on its own disk: `checkpointSandbox(name)` for Linux, `checkpointDiskFile(name, windowsPaths(STORE, name).disk)` for Windows. Two gate needles pin the pair, and the smoke now asserts BOTH: a Linux shutdown writes `checkpoints/<name>.qcow2` from the vmm disk and records `restoreFrom.kind === 'checkpoint'`, and a Windows shutdown does the same from `$STORE/windows/<name>/disk.qcow2`. `windowsStart` restores from the same file with the stale/torn gates unchanged |
+| F2 | user-visible copy still described the container backend | plugin README (§kinds + env table: `DSH_CUA_WINDOWS_IMAGE`/`DSH_CUA_WINDOWS_NETWORK` replaced by the QEMU/OVMF/swtpm/virtio vars) and the panel (`Windows (direct QEMU)`, and the provisioning blurb now says SSH exec/put/get + noVNC live view) |
+| F3 | the failed-create port release iterated a `Set` with `Object.values` (always `[]`), so claims leaked; a naive fix would have cleared other creates' claims | `portTriple` is declared before the `try` and the catch releases exactly those three ports |
 
 ### 9.7 What is still open (TBC)
 

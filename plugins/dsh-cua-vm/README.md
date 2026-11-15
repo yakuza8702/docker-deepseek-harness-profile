@@ -4,10 +4,12 @@ The model gets a real computer to build, test and troubleshoot in, while the
 harness keeps `workspace-write`. Two kinds exist:
 
 * **Linux** — a QEMU VM through the `cua` CLI (the default, and the only kind
-  with exec / file copy / disk growth / Android / REA).
-* **Windows** — a `dockurr/windows` container on a Docker engine (DinD overlay),
-  driven over QMP. Desktop only: no guest agent, so no exec, no put/get, no
-  clipboard, no accessibility tree.
+  with disk growth / Android / REA).
+* **Windows** — **direct QEMU** (OVMF + swtpm + a qcow2 disk under `/cua-vm`, no
+  container runtime), driven over QMP with a noVNC live view at
+  `/vm/port/<name>/`. OpenSSH is installed by the answer file, so exec / put /
+  get work over SSH like the Linux computer; there is no clipboard, no
+  accessibility tree and no window list on the QMP path.
 
 ## Why a supervisor
 
@@ -399,9 +401,13 @@ re-ran a ten-minute script on every start and failed on the same line.
 | `DSH_CUA_VM_SHARE_WORKSPACE` | `1` | `0` removes the 9p share |
 | `DSH_CUA_VM_LEGACY_STOP` | *(unset)* | `1` makes `stop` mean suspend again |
 | `DSH_CUA_VM_WINDOWS` | `0` | `1` adds the Windows kind (needs `compose.windows.yaml`) |
-| `DSH_CUA_WINDOWS_IMAGE` | `dockurr/windows:4.35` | pinned on purpose; a floating tag changes the unattended install |
-| `DSH_CUA_WINDOWS_NETWORK` | *(compose project)* | network a Windows container joins, so its QMP port is reachable |
-| `CUA_WINDOWS_RENDERNODE` | `/dev/dri/renderD128` | render node passed to the guest when GPU is enabled |
+| `DSH_CUA_WINDOWS_QEMU` | `/usr/bin/qemu-system-x86_64` | the hypervisor the Windows backend drives |
+| `DSH_CUA_WINDOWS_OVMF_CODE` | `/usr/share/OVMF/OVMF_CODE_4M.fd` | UEFI firmware (shared, read-only) |
+| `DSH_CUA_WINDOWS_OVMF_VARS` | `/usr/share/OVMF/OVMF_VARS_4M.fd` | template for the per-computer NVRAM |
+| `DSH_CUA_WINDOWS_SWTPM` | `/usr/bin/swtpm` | the TPM2 emulator |
+| `DSH_CUA_WINDOWS_VIRTIO_ISO` | *(unset)* | a virtio-win ISO; without it the disk is AHCI and the NIC e1000e |
+| `DSH_CUA_WINDOWS_ISO_TIMEOUT_MS` | `3600000` | bound on the one-time ISO download |
+| `DSH_CUA_VM_WIN_MCP` | `1` | `0` disables the guest dsh-cua tools (and their token cost) |
 | `DSH_CUA_REA_SCRIPT` | `/usr/local/bin/cua-guest-rea.sh` | guest script path (debugging) |
 
 Runtime policy is **not** environment configuration: `$STORE/config.json` holds

@@ -2437,7 +2437,8 @@ async function shutdownVmLocked(name, { reason = 'shutdown' } = {}) {
       checkpointSkipped = `the checkpoint needs ~${(needed / 1024 ** 3).toFixed(1)} GB and the store quota does not allow it`
       notes.push(`${checkpointSkipped} (${over})`)
     } else {
-      checkpoint = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
+      // LINUX: the guest disk is the cua sandbox's own qcow2.
+      checkpoint = checkpointSandbox(name)
       if (checkpoint === null) checkpointSkipped = 'no disk to checkpoint'
     }
   }
@@ -2824,6 +2825,10 @@ async function windowsCreateManaged(spec) {
   if (over !== null) return fail(over)
 
   let booted = null
+  // Declared OUTSIDE the try so the failure path can release exactly the three
+  // ports this create claimed — `Object.values` of a Set is [], which made the
+  // release a silent no-op (and a naive fix would clear other creates' claims).
+  let portTriple = null
   try {
     const paths = windowsPaths(STORE, spec.name)
     mkdirSync(paths.dir, { recursive: true })
@@ -2831,7 +2836,7 @@ async function windowsCreateManaged(spec) {
     // TWO CREATES, TWO NAMES, ONE FREE PORT: the old allocation read "taken"
     // from the registry, which does not yet contain the row being built. The
     // claim is serialised globally and recorded in memory until the row exists.
-    const portTriple = await withLock('@ports', () => allocateWindowsPorts())
+    portTriple = await withLock('@ports', () => allocateWindowsPorts())
     // The disk is created up-front: its existence is what tells a later start
     // whether Setup still has to run.
     execFileSync('/usr/bin/qemu-img', ['create', '-f', 'qcow2', paths.disk, `${diskGb}G`], { timeout: 120000 })
@@ -2919,7 +2924,8 @@ async function windowsCreateManaged(spec) {
     // leaked swtpm holds the TPM state directory) and release the port claim.
     windowsBackend.kill(spec.name)
     windowsBackend.stopSwtpm(spec.name)
-    for (const port of Object.values(CLAIMED_WINDOWS_PORTS)) CLAIMED_WINDOWS_PORTS.delete(port)
+    // Release THIS create's claim only.
+    for (const port of Object.values(portTriple ?? {})) CLAIMED_WINDOWS_PORTS.delete(Number(port))
     releaseStoreBytes(spec.name)
     throw error
   } finally {
@@ -3268,7 +3274,8 @@ async function windowsShutdown(name, meta) {
     if (over !== null) {
       checkpointSkipped = 'the checkpoint does not fit the store quota'
     } else {
-      checkpoint = checkpointSandbox(name)
+      // WINDOWS: its disk is under $STORE/windows/<name>/, not the cua vmm tree.
+      checkpoint = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
       if (checkpoint === null) checkpointSkipped = 'no disk to checkpoint'
     }
   }

@@ -481,7 +481,7 @@ window.__ModuleLoader__.load({
                   h('option', {
                     value: 'windows',
                     disabled: state.windows?.ok !== true
-                  }, state.windows?.ok === true ? 'Windows (Docker/DinD)' : 'Windows (unavailable — see Doctor)')
+                  }, state.windows?.ok === true ? 'Windows (direct QEMU)' : 'Windows (unavailable — see Doctor)')
                 )),
               draft.kind === 'linux'
                 ? h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'Image'),
@@ -544,7 +544,7 @@ window.__ModuleLoader__.load({
             ),
             draft.kind === 'linux'
               ? h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Enable REA adds Node 22, rea-agents, a JDK 21, Ghidra 12.1.4 and JADX to the computer, roughly 3.5 GB installed, and lifts the disk to at least a 40 GB one. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field. Leaving Enable GPU unticked uses the host default (virgl when this host can do it).')
-              : h('div', { style: S.muted }, 'Windows runs as a container on the Docker engine (dockurr/windows, pinned tag), so it needs /dev/kvm and the DinD overlay (compose.windows.yaml, DSH_CUA_VM_WINDOWS=1). Disk floors at 64 GB and RAM at 6 GB. The install takes tens of minutes and the computer lists as installing until RDP answers AND the QMP monitor says running. A Windows computer has the desktop (cua_vm_gui over QMP, plus the console at /vm/port/<name>/) but no exec, no put/get and no disk growth, and it cannot take REA or Android. Its password is generated and shown with Reveal — it is stored 0600 in the VM store, never in the registry.'),
+              : h('div', { style: S.muted }, 'Windows is a DIRECT QEMU computer (OVMF firmware, a swtpm TPM2, a qcow2 disk under the VM store) — there is no container runtime. It needs /dev/kvm and compose.windows.yaml for the devices (DSH_CUA_VM_WINDOWS=1). Disk floors at 64 GB and RAM at 6 GB. The install takes tens of minutes and lists as installing until SSH answers AND QMP says running. Once ready: exec/put/get work over SSH, the desktop is cua_vm_gui over QMP, and the live view at /vm/port/<name>/ is a noVNC stream a human can drive. It cannot take REA or Android, and the disk does not grow. Its password is generated and shown with Reveal — stored 0600 in the VM store, never in the registry.'),
             draft.rea === true && (form.diskQuotaGb < 40 || form.diskQuotaGb - (state.usedBytes ?? 0) / 1024 ** 3 < draft.diskGb) && h('div', { style: { ...S.muted, color: T.error } },
               `The VM store quota is ${form.diskQuotaGb} GB, so a 40 GB or larger REA disk cannot be created. Raise Disk Size in the Policy tab first.`),
             h('div', { style: S.row },

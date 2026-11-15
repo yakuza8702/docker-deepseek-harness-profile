@@ -224,10 +224,12 @@ const NEEDLES = {
     ['function sshRun(meta, command,', 1],
     ['function scpRun(meta, localPath, guestPath', 1],
     ['await ensureWindowsConsoleRelay(name)', 2],
-    // B2: ONE checkpoint writer, used by both disks (the Windows disk is
-    // $STORE/windows/<name>/disk.qcow2, not the Linux vmm path).
+    // F1: EACH SHUTDOWN CHECKPOINTS ITS OWN DISK. These two needles are a pair
+    // on purpose: swapping them (which happened) makes both platforms silently
+    // skip their checkpoint.
     ['function checkpointDiskFile(name, disk)', 1],
     ['checkpointDiskFile(name, windowsPaths(STORE, name).disk)', 1],
+    ['checkpoint = checkpointSandbox(name)', 2],
     // B2: Start restores a Windows checkpoint over the disk.
     ['restored from its checkpoint', 1],
     // D4: the watcher records that the install finished.
@@ -237,9 +239,12 @@ const NEEDLES = {
     ['async function replaceLiveView(name, preview)', 1],
     // D7: a rejected relay kills the websockify it spawned.
     ['stopLiveView(name)\n      throw error', 1],
-    // D9: the port claim is serialised and tracked in memory.
+    // D9: the port claim is serialised and tracked in memory, and a failed
+    // create releases EXACTLY its own three ports (`Object.values` of a Set is
+    // [], which made the first version a no-op).
     ["withLock('@ports'", 1],
     ['const CLAIMED_WINDOWS_PORTS = new Set()', 1],
+    ['for (const port of Object.values(portTriple ?? {})) CLAIMED_WINDOWS_PORTS.delete(Number(port))', 1],
     // R1: a KEPT item (the disk of a live QEMU) is not a completed delete, and
     // the row keeps it reachable until GC can reclaim it.
     ["const skipped = items.filter((item) => item.status === 'skipped')", 1],
@@ -398,7 +403,8 @@ const NEEDLES = {
     ["'Install Android'", 1],
     // kind + version
     ["value: 'linux' }, 'Linux (Cua guest)'", 1],
-    ['Windows (Docker/DinD)', 1],
+    // F2: the kind picker and the provisioning blurb must say what runs now.
+    ['Windows (direct QEMU)', 1],
     ["disabled: state.windows?.ok !== true", 1],
     ['windowsVersion', 2],
     ["kind: 'windows'", 1],
@@ -425,6 +431,7 @@ const NEEDLES = {
     ['- KEPT ${item.target}: ${item.reason}', 1],
     // B3: the create result must not describe the container backend.
     ['Live view: ${answer.console} (noVNC over QEMU VNC, never published raw).', 1],
+    // F2: the create result must not describe the container backend either.
     ['runs commands over SSH in cmd.exe', 1],
     // D11: a stop/delete takes the guest's tools away within 5 s.
     ['}, 5000)', 1],

@@ -661,7 +661,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **270 assertions** across 16 files (the gate prints
+* `tools/check-cua-vm.mjs` — **272 assertions** across 16 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -679,7 +679,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (270 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
+green (272 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
 (82 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
@@ -745,6 +745,18 @@ failed boot, a leaked websockify on a rejected relay, the port-allocation race
 claiming a consumer that does not exist, a 30 s tool linger (now 5 s), and the
 answer file's schema order (reordered, deprecated OOBE skips removed, order
 pinned by needles).
+
+### 15.8.2 Pre-verdict round 2
+
+F1 was a regression introduced by the first fix: the call sites were swapped, so
+the Linux shutdown looked for a Windows path (no checkpoint at all) and the
+Windows one looked in the cua vmm tree. Each shutdown is back on its own disk,
+the pair is pinned by gate needles, and the smoke asserts both directions (with a
+`qemu-img` stub, since this host has none). F2 cleared the last user-visible
+container copy (plugin README kinds + env table, the panel's kind picker and
+provisioning blurb). F3 fixed the failed-create port release — `Object.values` of
+a `Set` is `[]`, so it had been a no-op; it now releases exactly the three ports
+that create claimed.
 
 ### 15.9 Review round 2
 
