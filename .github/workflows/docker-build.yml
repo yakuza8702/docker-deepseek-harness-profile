@@ -26,6 +26,10 @@
 #                   INCLUDES pre-releases/alphas. Builds the upstream
 #                   monorepo from source (slow, much larger image).
 #                   Use for bleeding-edge tags like dsh-v0.1.2-alpha.1.
+#                   Resolution order: `git ls-remote --tags` (git protocol,
+#                   no REST API, no rate limit) → the tags API WITH the
+#                   workflow token → unauthenticated tags API. Finding no
+#                   dsh-v* tag at all is a hard error, not a silent fallback.
 #
 # Channel selection: workflow input (manual runs) > repository variable
 # `vars.DSH_CHANNEL` (also applies to the cron) > default "npm".
@@ -107,34 +111,149 @@ jobs:
         id: upstream
         env:
           GH_TOKEN: ${{ github.token }}
+          # Event inputs arrive as ENV, never spliced into the shell text: an input
+          # that carries a quote or a $(...) must stay data, and the old inline
+          # `[ "${{ github.event.inputs.dsh_version }}" != "latest" ]` rendered as
+          # a literal `[ "latest" != "latest" ]` on a default run — correct, but it
+          # read like templating debris. The comparison itself is NOT dead: on a
+          # manual run with a non-"latest" dsh_version it selects that version, and
+          # VER feeds build_key / :dsh-<ver> / the DSH_VERSION build-arg below.
+          EVENT_NAME: ${{ github.event_name }}
+          CHANNEL_INPUT: ${{ github.event.inputs.channel }}
+          VERSION_INPUT: ${{ github.event.inputs.dsh_version }}
+          DSH_CHANNEL_VAR: ${{ vars.DSH_CHANNEL }}
+          UPSTREAM_REPO: deepseek-ai/deepseek-harness
         run: |
+          set -euo pipefail
+
+          UPSTREAM_REPO_URL="https://github.com/${UPSTREAM_REPO}.git"
+          TAG_PATTERN='refs/tags/dsh-v*'
+
+          # --- newest dsh-v* tag from a list of tag NAMES on stdin -------------
+          # Ordering = GNU version sort on the version part, with a FINAL release
+          # ranked above the pre-releases of its own base. Plain `sort -V` gets
+          # that wrong: a shorter string loses to its own extension, so
+          # 0.2.1-rc.5 would outrank 0.2.1. Annotated-tag dereference entries
+          # (`dsh-v0.2.1-alpha.2^{}`) are stripped and de-duplicated first.
+          # Returns 1 (printing nothing) when the list holds no dsh-v* tag.
+          newest_dsh_tag() {
+            local tags decorated
+            tags="$(sed -e 's/\^{}$//' | grep -E '^dsh-v[0-9]' | sort -u || true)"
+            if [ -z "$tags" ]; then
+              return 1
+            fi
+            decorated="$(printf '%s\n' "$tags" | awk '
+              {
+                ver  = substr($0, 6)                      # strip the "dsh-v" prefix
+                dash = index(ver, "-")
+                if (dash > 0) { base = substr(ver, 1, dash - 1); rank = 0 }  # pre-release
+                else          { base = ver;                        rank = 1 }  # final release
+                printf "%s\t%d\t%s\n", base, rank, $0
+              }')"
+            printf '%s\n' "$decorated" \
+              | sort -t "$(printf '\t')" -k1,1V -k2,2n -k3,3V \
+              | tail -n 1 | cut -f3
+          }
+
+          # --- PRIMARY: git ls-remote (no REST API, no rate limit) -------------
+          # `git ls-remote --tags <url> <pattern>` asks the git server directly for
+          # refs; returns annotated ^{} lines too, which newest_dsh_tag strips.
+          tags_from_git() {
+            local listing
+            listing="$(git ls-remote --tags "$UPSTREAM_REPO_URL" "$TAG_PATTERN")" || return 1
+            printf '%s\n' "$listing" | awk 'NF >= 2 { print $2 }' | sed -e 's#^refs/tags/##'
+          }
+
+          # --- FALLBACK: REST API, authenticated when a token is present -------
+          # GH_TOKEN is sent as a bearer token only when non-empty; unauthenticated
+          # curl is the last resort (60 req/h — that is what returned the 403).
+          tags_from_api() {
+            local page url names acc="" count curl_hdrs=()
+            if [ -n "${GH_TOKEN:-}" ]; then
+              curl_hdrs=(-H "Authorization: Bearer ${GH_TOKEN}")
+            fi
+            for page in 1 2 3 4 5; do
+              url="https://api.github.com/repos/${UPSTREAM_REPO}/tags?per_page=100&page=${page}"
+              names="$(curl -fsSL --max-time 30 --retry 2 --retry-delay 2 \
+                ${curl_hdrs[@]+"${curl_hdrs[@]}"} \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$url" \
+                | python3 -c 'import json,sys; [print(t["name"]) for t in json.load(sys.stdin)]')" || return 1
+              count="$(printf '%s' "$names" | grep -c . || true)"
+              acc="${acc}${names}"$'\n'
+              if [ "$count" -lt 100 ]; then
+                break
+              fi
+            done
+            printf '%s' "$acc"
+          }
+
+          # --- npm `latest` dist-tag, with retry/backoff -----------------------
+          npm_latest_version() {
+            local url='https://registry.npmjs.org/@deepseek-ai%2Fdsh' attempt=1 delay=2 body ver
+            while :; do
+              if body="$(curl -fsSL --max-time 30 "$url")"; then
+                if ver="$(printf '%s' "$body" \
+                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["dist-tags"]["latest"])')" \
+                  && [ -n "$ver" ]; then
+                  printf '%s\n' "$ver"
+                  return 0
+                fi
+              fi
+              if [ "$attempt" -ge 4 ]; then
+                echo "::error::could not resolve dist-tags.latest of @deepseek-ai/dsh from ${url} after ${attempt} attempts" >&2
+                return 1
+              fi
+              echo "npm registry resolution attempt ${attempt} failed; retrying in ${delay}s" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
           # channel precedence: workflow input > repo variable vars.DSH_CHANNEL > npm
-          CH="${{ github.event.inputs.channel || vars.DSH_CHANNEL || 'npm' }}"
-          case "$CH" in npm|github-tag) ;; *) echo "Unknown channel '$CH'"; exit 1;; esac
+          CH="${CHANNEL_INPUT:-${DSH_CHANNEL_VAR:-npm}}"
+          case "$CH" in npm|github-tag) ;; *) echo "::error::Unknown channel '$CH'"; exit 1;; esac
           echo "channel=${CH}" >> "$GITHUB_OUTPUT"
 
           if [ "$CH" = "github-tag" ]; then
             # newest dsh-v* tag from the official repo (includes pre-releases)
-            TAG="$(curl -fsSL 'https://api.github.com/repos/deepseek-ai/deepseek-harness/tags?per_page=100' \
-              | python3 -c "import json,sys;tags=json.load(sys.stdin);print(next(t['name'] for t in tags if t['name'].startswith('dsh-v')))")"
+            TAG=""
+            GIT_ERR=""
+            if GIT_LIST="$(tags_from_git 2>/dev/null)"; then
+              TAG="$(printf '%s\n' "$GIT_LIST" | newest_dsh_tag)" || TAG=""
+            else
+              GIT_ERR="git ls-remote failed"
+            fi
+            if [ -z "$TAG" ]; then
+              if [ -n "$GIT_ERR" ]; then
+                echo "${GIT_ERR}; falling back to the GitHub tags API" >&2
+              fi
+              if API_LIST="$(tags_from_api)"; then
+                TAG="$(printf '%s\n' "$API_LIST" | newest_dsh_tag)" || TAG=""
+              fi
+            fi
+            if [ -z "$TAG" ]; then
+              echo "::error::No 'dsh-v*' tag found in ${UPSTREAM_REPO}: git ls-remote '${TAG_PATTERN}' and GET https://api.github.com/repos/${UPSTREAM_REPO}/tags returned no matching tag. Check the repo name and that the tag pattern still exists upstream." >&2
+              exit 1
+            fi
             VER="${TAG#dsh-v}"
             echo "source_ref=${TAG}" >> "$GITHUB_OUTPUT"
             echo "Upstream source tag: ${TAG} (version ${VER})"
           else
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
-               [ "${{ github.event.inputs.dsh_version }}" != "latest" ] && \
-               [ -n "${{ github.event.inputs.dsh_version }}" ]; then
-              VER="${{ github.event.inputs.dsh_version }}"
+            # A manual run may pin an explicit version; push/schedule runs carry no
+            # inputs and follow npm `latest` unless DSH_VERSION_PIN freezes one.
+            if [ "${EVENT_NAME:-}" = "workflow_dispatch" ] \
+               && [ -n "${VERSION_INPUT:-}" ] \
+               && [ "${VERSION_INPUT}" != "latest" ]; then
+              VER="${VERSION_INPUT}"
+              echo "version from the dsh_version input: ${VER}"
+            elif [ -n "${DSH_VERSION_PIN:-}" ]; then
+              VER="${DSH_VERSION_PIN}"
+              echo "version frozen by DSH_VERSION_PIN"
             else
-              # push/schedule runs carry no inputs: follow npm `latest` unless
-              # DSH_VERSION_PIN (workflow env) freezes a release.
-              if [ -n "${DSH_VERSION_PIN:-}" ]; then
-                VER="$DSH_VERSION_PIN"
-                echo "version frozen by DSH_VERSION_PIN"
-              else
-                VER="$(curl -fsSL 'https://registry.npmjs.org/@deepseek-ai%2Fdsh' \
-                  | python3 -c "import json,sys;print(json.load(sys.stdin)['dist-tags']['latest'])")"
-              fi
+              VER="$(npm_latest_version)"
             fi
             echo "source_ref=" >> "$GITHUB_OUTPUT"
             echo "Upstream @deepseek-ai/dsh version: ${VER} (npm)"
