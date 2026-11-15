@@ -223,6 +223,11 @@ const REPO_GATES = [
   { file: "check-cua-vm.mjs", args: [], label: "personal VM chain (spec → guest → proxy → compose)" },
   { file: "check-recovery-page.mjs", args: [], label: "recovery page scripts parse" },
   { file: "check-tool-trim.mjs", args: [], label: "MCP catalogue trim policy" },
+  // OFFLINE, and deliberately a HARD gate: the build-time bundle patches are
+  // content-anchored, and on 2026-11-15 an upstream bundler change turned that
+  // into a red image build at Dockerfile:394. This replays both directions
+  // (applies cleanly / still refuses) against committed minified fixtures.
+  { file: "check-anchors.mjs", args: [], label: "build-time bundle anchors (offline, both directions)" },
   { file: "check-profile-switcher.mjs", args: [staged.root, staged.modules], label: "profile chooser + reset" },
 ];
 

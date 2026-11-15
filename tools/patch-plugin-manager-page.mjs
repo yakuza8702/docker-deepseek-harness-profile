@@ -51,7 +51,19 @@ const MARKER = "plugins.page.top";
 //    NOT minified — the declaration is a multi-line block — so this anchor is
 //    whitespace-tolerant and the replacement CLONES the matched block (keeping the
 //    file's own indentation) instead of hardcoding a layout.
-const ANCHOR_DECL = /([ \t]*)"plugins\.item": \{\s*\n\s*kind: "list",\s*\n\s*scope: "root"\s*\n\s*\},/u;
+// 0.2.2-rc.2 changed the BUILD, not the page: the bundle is now emitted by a
+// minifier that uses backticks and one line, so
+//     "plugins.item": {
+//       kind: "list",
+//       scope: "root"
+//     },
+// became
+//     "plugins.item":{kind:`list`,scope:`root`},
+// and the old literal (double quotes + newlines) matched 0 times — the CI build
+// failed at step #394 with "slot declaration seen 0x". The anchor is now a regex
+// over the SHAPE (either quote style, any whitespace) and still requires exactly
+// one match: a third shape fails the build instead of silently dropping the slot.
+const ANCHOR_DECL = /([ \t]*)(["`])plugins\.item\2\s*:\s*\{[^{}]*?kind\s*:\s*(["`])list\3[^{}]*?scope\s*:\s*(["`])root\4[^{}]*?\}\s*,/u;
 
 // 2. The render site: immediately before the FIRST group of the page's main list —
 //    the group the shipped bundles live in. Upstream renamed it in 0.2.1-alpha.2:
@@ -63,8 +75,14 @@ const ANCHOR_DECL = /([ \t]*)"plugins\.item": \{\s*\n\s*kind: "list",\s*\n\s*sco
 //    fails the build with every variant's count printed — so the next re-anchor is
 //    a one-line change instead of a bisect through a 200 KB bundle.
 const ANCHOR_RENDER_VARIANTS = [
-  { since: "0.2.1-alpha.2+", anchor: 'renderGroup("basic", t("basicTitle"), basicCards)' },
-  { since: "<= 0.2.1-alpha.1", anchor: 'renderGroup("official", t("officialTitle"), officialCards)' },
+  {
+    since: "0.2.1-alpha.2+ (either quote style / minifier output)",
+    re: /renderGroup\(\s*(["`])basic\1\s*,\s*t\(\s*(["`])basicTitle\2\s*\)\s*,\s*basicCards\s*\)/u,
+  },
+  {
+    since: "<= 0.2.1-alpha.1",
+    re: /renderGroup\(\s*(["`])official\1\s*,\s*t\(\s*(["`])officialTitle\2\s*\)\s*,\s*officialCards\s*\)/u,
+  },
 ];
 
 // 3. The page's own exclusion test: `…filter(p => !<SET>.has(p.name))`, the filter
@@ -202,10 +220,10 @@ for (const root of roots) {
 
   if (!slotsDone) {
     const declCount = countRe(after, ANCHOR_DECL);
-    const variant = ANCHOR_RENDER_VARIANTS.find((candidate) => count(after, candidate.anchor) === 1);
+    const variant = ANCHOR_RENDER_VARIANTS.find((candidate) => countRe(after, candidate.re) === 1);
     if (declCount !== 1 || variant === undefined) {
       const seen = ANCHOR_RENDER_VARIANTS
-        .map((candidate) => `${candidate.since} ${count(after, candidate.anchor)}x`)
+        .map((candidate) => `${candidate.since} ${countRe(after, candidate.re)}x`)
         .join(", ");
       console.error(
         `[plugins-page] ERROR: anchors moved in ${file} (slot declaration seen ${declCount}x, render site: ${seen}; expected 1 each).\n` +
@@ -214,10 +232,19 @@ for (const root of roots) {
       process.exit(1);
     }
     const declaration = ANCHOR_DECL.exec(after)[0];
-    const clone = declaration.replace('"plugins.item"', `"${MARKER}"`);
-    after = after
-      .replace(declaration, `${clone}\n${declaration}`)
-      .replace(variant.anchor, `renderSlot("${MARKER}", {}), ${variant.anchor}`);
+    // Keep the file's own quote style for the KEY (a backticked key is legal, and
+    // cloning the matched block is what keeps the property list valid).
+    const keyed = declaration.replace(/(["`])plugins\.item\1/u, `"${MARKER}"`);
+    // ORDER MATTERS: splice the render site by index FIRST, then insert the
+    // declaration by unique-text replace. Doing it the other way round shifted
+    // every index after the declaration and dropped `renderSlot(...)` into the
+    // middle of the slot object (the file still parsed, which is why only the
+    // NEXT anchor caught it).
+    const anchorMatch = new RegExp(variant.re.source, "u").exec(after);
+    const withRender = after.slice(0, anchorMatch.index)
+      + `renderSlot("${MARKER}", {}), `
+      + after.slice(anchorMatch.index);
+    after = withRender.replace(declaration, `${keyed}\n${declaration}`);
     console.log(`[plugins-page] render site: ${variant.since} shape`);
   }
 

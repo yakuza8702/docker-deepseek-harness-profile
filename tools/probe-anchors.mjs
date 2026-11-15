@@ -26,18 +26,29 @@ const PACKAGE = '@deepseek-ai/dsh-client-ui-plugin-manager'
 const SIDEBAR_PACKAGE = '@deepseek-ai/dsh-client-ui-sidebar'
 
 // ── the anchors, mirrored from tools/patch-plugin-manager-page.mjs ────────────
-const ANCHOR_SLOT_DECL = /([ \t]*)"plugins\.item": \{\s*\n\s*kind: "list",\s*\n\s*scope: "root"\s*\n\s*\},/u
+// 0.2.2-rc.2 changed the BUILD: `lib/client.js` is now minified with backtick
+// string literals on one line, so a literal (double quotes + newlines) matched 0
+// times and the image build failed at Dockerfile:394. Both here and in the
+// patcher the anchors are SHAPE regexes now — either quote style, any spacing —
+// and each still has to resolve EXACTLY once.
+const ANCHOR_SLOT_DECL = /([ \t]*)(["`])plugins\.item\2\s*:\s*\{[^{}]*?kind\s*:\s*(["`])list\3[^{}]*?scope\s*:\s*(["`])root\4[^{}]*?\}\s*,/u
 const ANCHOR_RENDER_VARIANTS = [
-  { since: '0.2.1-alpha.2+', anchor: 'renderGroup("basic", t("basicTitle"), basicCards)' },
-  { since: '<= 0.2.1-alpha.1', anchor: 'renderGroup("official", t("officialTitle"), officialCards)' },
+  {
+    since: '0.2.1-alpha.2+ (either quote style / minifier output)',
+    re: /renderGroup\(\s*(["`])basic\1\s*,\s*t\(\s*(["`])basicTitle\2\s*\)\s*,\s*basicCards\s*\)/u,
+  },
+  {
+    since: '<= 0.2.1-alpha.1',
+    re: /renderGroup\(\s*(["`])official\1\s*,\s*t\(\s*(["`])officialTitle\2\s*\)\s*,\s*officialCards\s*\)/u,
+  },
 ]
 const ANCHOR_LIST_FILTERS = [
   { kind: 'has', re: /\.filter\(\s*\(?(\w+)\)?\s*=>\s*!(\w+)\.has\(\1\.name\)/u },
   { kind: 'includes', re: /\.filter\(\s*\(?(\w+)\)?\s*=>\s*!(\w+)\.includes\(\1\.name\)/u },
 ]
 
-const SIDEBAR_SLOT_DECL = /([ \t]*)"sidebar\.footer\.action": \{\s*\n\s*kind: "list",\s*\n\s*scope: "root"\s*\n\s*\},?/u
-const SIDEBAR_RENDER = 'renderSlot("sidebar.settings", { wide })'
+const SIDEBAR_SLOT_DECL = /([ \t]*)(["`])sidebar\.footer\.action\2\s*:\s*\{[^{}]*?kind\s*:\s*(["`])list\3[^{}]*?scope\s*:\s*(["`])root\4[^{}]*?\}\s*,?/u
+const SIDEBAR_RENDER = /renderSlot\(\s*(["`])sidebar\.settings\1\s*,\s*\{\s*wide\s*\}\s*\)/u
 
 const count = (text, needle) => text.split(needle).length - 1
 
@@ -64,7 +75,10 @@ function probe(source) {
     hint: declCount === 1 ? 'declares the child slot the top section clones' : 'expected exactly one "plugins.item" list-slot declaration',
   })
 
-  const variants = ANCHOR_RENDER_VARIANTS.map((v) => ({ ...v, found: count(source, v.anchor) }))
+  const variants = ANCHOR_RENDER_VARIANTS.map((v) => ({
+    ...v,
+    found: (source.match(new RegExp(v.re.source, 'gu')) ?? []).length,
+  }))
   const renderHit = variants.find((v) => v.found === 1)
   checks.push({
     anchor: 'render site (group before the main list)',
@@ -100,7 +114,7 @@ function probe(source) {
 
 function probeSidebar(source) {
   const declCount = (source.match(new RegExp(SIDEBAR_SLOT_DECL.source, 'gu')) ?? []).length
-  const renderCount = count(source, SIDEBAR_RENDER)
+  const renderCount = (source.match(new RegExp(SIDEBAR_RENDER.source, 'gu')) ?? []).length
   return [
     {
       anchor: 'sidebar slot declaration "sidebar.footer.action"',
@@ -138,6 +152,15 @@ if (values['from-file'] !== undefined) {
   // Offline / CI-fixture mode: probe a bundle you already have on disk.
   version = `file:${values['from-file']}`
   checks = probe(readFileSync(values['from-file'], 'utf8'))
+  // The sidebar is a second bundle; probing only one of them offline hid a real
+  // drift (the 0.2.2-rc.2 minifier changed both).
+  if (values['skip-sidebar'] !== true) {
+    if (values['sidebar-from-file'] !== undefined) {
+      checks = checks.concat(probeSidebar(readFileSync(values['sidebar-from-file'], 'utf8')))
+    } else {
+      console.log('probe-anchors: (sidebar not probed offline — pass --sidebar-from-file <client.js> or --skip-sidebar)')
+    }
+  }
 } else {
   const work = mkdtempSync(join(tmpdir(), 'probe-anchors-'))
   try {

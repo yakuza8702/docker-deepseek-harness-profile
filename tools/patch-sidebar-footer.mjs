@@ -46,16 +46,17 @@ const TARGET = path.join(PACKAGE, TARGET_SUBPATH);
 
 const MARKER = "sidebar.footer.trailing";
 
-// 1. The slot contract: clone the existing LIST slot beside it (the file is not
-//    minified, so the block is multi-line; cloning keeps its own indentation).
-//    The trailing comma is optional — this block is upstream's last manifest
-//    entry and carries none, so the clone supplies the separator instead.
-const ANCHOR_SLOT = /([ \t]*)"sidebar\.footer\.action": \{\s*\n\s*kind: "list",\s*\n\s*scope: "root"\s*\n\s*\},?/u;
+// 1. The slot contract: clone the existing LIST slot beside it. 0.2.2-rc.2 began
+//    shipping a MINIFIED bundle (backticks, one line), so the anchor is a SHAPE
+//    regex — either quote style, any spacing — with the trailing comma optional
+//    (this block is upstream's last manifest entry and may carry none; the clone
+//    supplies the separator).
+const ANCHOR_SLOT = /([ \t]*)(["`])sidebar\.footer\.action\2\s*:\s*\{[^{}]*?kind\s*:\s*(["`])list\3[^{}]*?scope\s*:\s*(["`])root\4[^{}]*?\}\s*,?/u;
 
 // 2. The render site: the Settings slot inside `settingsArea`. Wrapped in an array
-//    so the trailing slot becomes its next sibling in the same flex row.
-const ANCHOR_RENDER = 'renderSlot("sidebar.settings", { wide })';
-const REPLACE_RENDER = `[${ANCHOR_RENDER}, renderSlot("${MARKER}", { wide })]`;
+//    so the trailing slot becomes its next sibling in the same flex row. The
+//    pattern matches the minified form too (`renderSlot(`sidebar.settings`,{wide})`).
+const ANCHOR_RENDER = /renderSlot\(\s*(["`])sidebar\.settings\1\s*,\s*\{\s*wide\s*\}\s*\)/u;
 
 /** Occurrences of a literal. */
 const count = (text, needle) => text.split(needle).length - 1;
@@ -69,18 +70,35 @@ const countRe = (text, pattern) => [...text.matchAll(new RegExp(pattern.source, 
  * @returns the names the appended CSS needs.
  */
 function classNames(source) {
+  // OLD SHAPE (<= 0.2.2-rc.1): a literal CSS-modules map, `"footArea":"hHd-Xa_footArea"`.
   const of = (name) => {
     const found = new RegExp(`"${name}":\\s*"([^"]+)"`).exec(source);
     return found === null ? null : found[1];
   };
-  const names = {
+  const literal = {
     footArea: of("footArea"),
     footerActions: of("footerActions"),
     settingsArea: of("settingsArea"),
     collapsed: of("collapsed"),
   };
-  const missing = Object.entries(names).filter(([, value]) => value === null).map(([key]) => key);
-  if (missing.length > 0) throw new Error(`class map has no ${missing.join(", ")}`);
+  if (!Object.values(literal).some((value) => value === null)) return literal;
+
+  // NEW SHAPE (0.2.2-rc.2+): the bundle ships the built stylesheet — classes are
+  // `.hHd-Xa_footArea{…}` — and the map is a runtime proxy, so there is no literal
+  // to read. The hash prefix is stable within a build, so take it from the
+  // stylesheet and reconstruct the four names.
+  const seeded = /\.([A-Za-z0-9_-]+)_footArea\s*[{,]/u.exec(source)
+    ?? /\.([A-Za-z0-9_-]+)_footerActions\s*[{,]/u.exec(source);
+  if (seeded === null) throw new Error("class map has no footArea (neither the literal map nor the stylesheet prefix was found)");
+  const prefix = seeded[1];
+  const names = {
+    footArea: `${prefix}_footArea`,
+    footerActions: `${prefix}_footerActions`,
+    settingsArea: `${prefix}_settingsArea`,
+    collapsed: `${prefix}_collapsed`,
+  };
+  const absent = Object.entries(names).filter(([, value]) => !source.includes(value)).map(([key]) => key);
+  if (absent.length > 0) throw new Error(`class map has no ${absent.join(", ")} (stylesheet prefix ${prefix})`);
   return names;
 }
 
@@ -203,7 +221,7 @@ for (const root of roots) {
   }
 
   const slotCount = countRe(before, ANCHOR_SLOT);
-  const renderCount = count(before, ANCHOR_RENDER);
+  const renderCount = countRe(before, ANCHOR_RENDER);
   if (slotCount !== 1 || renderCount !== 1) {
     console.error(
       `[sidebar-footer] ERROR: anchors moved in ${file} (list slot seen ${slotCount}x, Settings render site seen ${renderCount}x, expected 1 each).\n` +
@@ -216,8 +234,10 @@ for (const root of roots) {
 
   // The stylesheet is one string literal; anchor on the class map's own hash so a
   // different variable name or minifier output cannot break the match.
-  const CSS_RE = /"((?:[^"\\]|\\.)*)"/g;
-  const candidates = [...before.matchAll(CSS_RE)].filter((match) => match[1].includes(`${names.footArea}{`));
+  // The stylesheet may be quoted with " or ' or ` (the 0.2.2-rc.2+ minified bundle
+  // uses backticks), so all three are candidates and the class name decides.
+  const CSS_RE = /(["'`])((?:\\[\s\S]|(?!\1)[^\\])*)\1/g;
+  const candidates = [...before.matchAll(CSS_RE)].filter((match) => match[2].includes(`${names.footArea}{`));
   if (candidates.length !== 1) {
     console.error(
       `[sidebar-footer] ERROR: expected exactly one stylesheet literal naming ${names.footArea} in ${file}, found ${candidates.length}.\n` +
@@ -227,18 +247,21 @@ for (const root of roots) {
   }
   const css = candidates[0];
   const cssStart = css.index + 1;
-  const cssEnd = cssStart + css[1].length;
+  const cssEnd = cssStart + css[2].length;
 
   const slot = ANCHOR_SLOT.exec(before)[0];
   const block = slot.replace(/,\s*$/u, "");
   const clone = `${block.replace('"sidebar.footer.action"', `"${MARKER}"`)},`;
   const regrown = `${clone}\n${slot}`;
 
-  const after = (
-    before.slice(0, cssEnd) + stylesheet(names) + before.slice(cssEnd)
-  )
-    .replace(slot, regrown)
-    .replace(ANCHOR_RENDER, REPLACE_RENDER);
+  // The render site is spliced by INDEX (a regex match, not a literal): taking the
+  // index before the stylesheet insertion would be off by `stylesheet(names).length`,
+  // so the splice happens on the ALREADY-rewritten text and is found there.
+  const withCss = before.slice(0, cssEnd) + stylesheet(names) + before.slice(cssEnd);
+  const withSlot = withCss.replace(slot, regrown);
+  const renderMatch = new RegExp(ANCHOR_RENDER.source, "u").exec(withSlot);
+  const replacement = `[${renderMatch[0]}, renderSlot("${MARKER}", { wide })]`;
+  const after = withSlot.slice(0, renderMatch.index) + replacement + withSlot.slice(renderMatch.index + renderMatch[0].length);
 
   fs.writeFileSync(file, after);
   console.log(`[sidebar-footer] patched: ${file} (classes ${names.footArea}/${names.settingsArea})`);

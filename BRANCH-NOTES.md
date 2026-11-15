@@ -661,6 +661,8 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
+* `tools/check-anchors.mjs` — **14 assertions**, offline: both build-time bundle
+  patches apply to minified fixtures and still refuse a moved anchor.
 * `tools/check-cua-vm.mjs` — **304 assertions** across 16 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
@@ -795,6 +797,26 @@ false`, same triple on two consecutive starts). Z2 releases the create's port
 claim when the row is written (the row is the source of truth), Z3 derives the
 ISO allowlist through the same name normalisation the download uses, and Z4
 treats an existing raw relay as the live view when websockify is absent.
+
+### 15.8.6 CI drift: the bundle patch anchors
+
+The pushed branch failed its image build at `Dockerfile:394`. It was not this
+branch: `git diff 1986ed2..HEAD` over the two patchers, the probe and the
+Dockerfile patch steps is empty. `dsh-v0.2.2-rc.3` (the tag CI resolves) began
+shipping a MINIFIED `lib/client.js` — backtick literals, one line — and every
+anchor was a literal with double quotes and newlines (`"plugins.item": {` …).
+
+Re-anchored as SHAPES (either quote style, any whitespace) in
+`patch-plugin-manager-page.mjs`, `patch-sidebar-footer.mjs` and
+`probe-anchors.mjs`; the sidebar's CSS-modules map is now reconstructed from the
+stylesheet's hash prefix because the literal map is gone. A splice-order bug in
+the plugin-manager patch (declaration replaced before the render site, shifting
+the index) was found and fixed by the same tests.
+
+New: `tools/check-anchors.mjs` with minified fixtures under `tools/fixtures/`
+— it applies both patches, re-runs them (idempotent), and proves the refusal
+still fires when an anchor is renamed. Hard gate in `ci-gates`, and a `RUN` step
+before the real patches in the Dockerfile.
 
 ### 15.9 Review round 2
 

@@ -371,6 +371,17 @@ RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/
 # the exact rewritten line pnpm itself writes. Offline — no network in the gate.
 RUN node /opt/seek-harness/lockfile-integrity.mjs --self-test
 
+# OFFLINE SELF-TEST OF THE ANCHOR CONTRACT. The two bundle patches below are
+# content-anchored and fail the build when upstream moves the code — correct, but
+# the first signal used to be a red image build (0.2.2-rc.3 shipped a minified
+# bundle and this step was 394). This replays both directions on committed
+# fixtures: the patch applies to the minified shape, and it still REFUSES when an
+# anchor is renamed. No network.
+COPY --chmod=0644 tools/check-anchors.mjs /opt/seek-harness/tools/check-anchors.mjs
+COPY --chmod=0644 tools/fixtures/plugin-manager-client.min.js tools/fixtures/sidebar-client.min.js /opt/seek-harness/tools/fixtures/
+COPY --chmod=0644 tools/patch-plugin-manager-page.mjs tools/patch-sidebar-footer.mjs tools/probe-anchors.mjs /opt/seek-harness/tools/
+RUN node /opt/seek-harness/tools/check-anchors.mjs
+
 # Gate the recovery page's inline JavaScript BEFORE it can ship.
 #
 # The page is emitted from a template literal, so one mistake in it (an escape

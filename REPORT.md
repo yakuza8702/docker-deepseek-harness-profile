@@ -324,6 +324,7 @@ green. This section is the delta a reader of the older sections needs.
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
 | `node tools/check-cua-vm.mjs` | **304** assertions across 16 files |
+| `node tools/check-anchors.mjs` | **14** assertions — both directions, offline |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
 | `node tests/supervisor-smoke.mjs` — throwaway store + stub `cua` (92 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
@@ -531,6 +532,65 @@ to it, and an `nvidia-smi` EGL handle is the host-side QEMU context.
 | Z2 | create-time claims were released only on error and on delete, never after the row was written — the comment says claims are for "rows not yet written", so they leaked | the claim triple is released in the same flow as the row write; a second start proves nothing lingers (`portsChanged: false`) |
 | Z3 | the always-keep allowlist built names with a raw `basename` while the download writes them through `isoFileName` (sanitise + digest) | the allowlist goes through `isoTargetPath`, so both sides agree by construction |
 | Z4 | with no websockify no child ever exists in `LIVE_VIEWS`, so every `view`/status tick rebuilt the relay instead of reusing it | a raw relay row that still targets this computer's VNC port **and** is listening is treated as the view (no kill, no rebuild) |
+
+### 9.6.6 CI build failure: upstream bundler drift (post-merge, not ours)
+
+The pushed branch failed GitHub Actions run 43723421276 at `Dockerfile:394`:
+
+```
+[plugins-page] ERROR: anchors moved in /opt/dsh-src/packages/client/ui-plugin-manager/lib/client.js
+(slot declaration seen 0x, render site: 0.2.1-alpha.2+ 0x, <= 0.2.1-alpha.1 0x; expected 1 each)
+```
+
+**Ownership: upstream drift, not this branch.** `git diff 1986ed2..HEAD` over
+`tools/patch-plugin-manager-page.mjs`, `tools/patch-sidebar-footer.mjs`,
+`tools/probe-anchors.mjs` and the Dockerfile's patch steps is **empty** — the
+last change to the patcher predates the branch. Main fails the same way.
+
+**Cause.** The CI `github-tag` channel resolves the newest `dsh-v*` tag
+(`dsh-v0.2.2-rc.3` at the time of the run) and that release started publishing a
+**minified** `lib/client.js`:
+
+| | before (≤ 0.2.2-rc.1) | rc.2+ |
+|---|---|---|
+| slot declaration | `"plugins.item": {` newline `kind: "list",` newline `scope: "root"` newline `},` | `"plugins.item":{kind:`list`,scope:`root`},` |
+| render site | `renderGroup("basic", t("basicTitle"), basicCards)` | `renderGroup(`basic`,t(`basicTitle`),basicCards)` |
+
+Every anchor was a literal with double quotes and newlines, so it matched 0 times
+— and the patcher correctly refused to build.
+
+**Re-anchored (shape, not spelling):**
+
+* `tools/patch-plugin-manager-page.mjs` — the slot declaration is a regex over
+  the shape with either quote style and any whitespace; the render site is a
+  regex variant list (`basic`, `official`) instead of two literals; the marker
+  key keeps the file's quoting. A third shape still fails the build.
+* `tools/patch-sidebar-footer.mjs` — same treatment for `sidebar.footer.action`
+  and `renderSlot(\`sidebar.settings\`,{wide})`, plus `classNames()`: the bundle no
+  longer ships a literal CSS-modules map, so the four class names are
+  reconstructed from the stylesheet's own hash prefix (`.hHd-Xa_footArea{…}`),
+  with the literal map kept as the old-shape path. The stylesheet literal scan
+  now accepts `'` and `` ` `` as well as `"`.
+* `tools/probe-anchors.mjs` — the same anchors (it is the ten-second advisory
+  probe), and `--from-file` now also probes `--sidebar-from-file` instead of
+  silently skipping the sidebar offline.
+* A splice-order bug found while testing: the plugin-manager patch replaced the
+  declaration (shifting every later index) *before* splicing the render site,
+  which dropped `renderSlot(...)` inside the slot object. The render splice now
+  happens first, by index, and the declaration is inserted by unique text after.
+
+**New offline guard.** `tools/check-anchors.mjs` (+ `tools/fixtures/*.min.js`,
+shaped like the real minified bundles) replays both directions for both patches —
+applies cleanly, marker present, output parses, idempotent, and **still exits 1
+when an anchor is renamed**. It runs in `ci-gates` as a hard gate and as a
+`RUN` step in the Dockerfile, so this class of drift is caught offline in a
+second instead of at build time.
+
+**Verified against the real artifacts** (`npm pack` of 0.2.2-rc.3, the exact
+bundles the image patches): both patchers exit 0 and their output parses; both
+still exit 1 on a renamed anchor; both old-shape fixtures (`pmold2`, `sbold`)
+also patch. `probe-anchors --from-file … --sidebar-from-file …` reports every
+anchor resolving.
 
 ### 9.7 What is still open (TBC)
 
