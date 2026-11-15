@@ -775,6 +775,80 @@ emulator, which this image no longer ships:
 docker compose -f compose.yaml -f compose.emulator.yaml up -d
 ```
 
+That is the only requirement. The panel is **Plugins → Personal VM (CUA)**; the
+model drives the same computer through `cua_vm_*`. Disks live in the `cua-vm`
+volume, never in the workspace.
+
+### One computer, two kinds
+
+| Kind | Backend | Has |
+|---|---|---|
+| `linux` (default) | QEMU through `cua`, guest agent on `:3211` | exec, put/get, disk growth, Android, REA, the whole desktop |
+| `windows` | a `dockurr/windows` container on a DinD engine | the desktop only: screenshots and input over QMP, plus the web console |
+
+Windows is opt-in and needs `compose.windows.yaml`:
+
+```bash
+docker compose -f compose.yaml -f compose.windows.yaml up -d
+```
+
+It adds a `dind` service, sets `DOCKER_HOST=tcp://dind:2375` and
+`DSH_CUA_VM_WINDOWS=1`, and shares the `cua-vm` volume so a Windows
+`/storage` bind is the same tree on both sides. The engine container is
+`privileged` (an in-container engine needs it); the harness keeps `cap_drop ALL`,
+read-only rootfs and `no-new-privileges`. The console is relayed to
+`/vm/port/<name>/`; **RDP 3389 is commented out and documented as a LAN exposure**
+in that file — enable it deliberately. `DSH_CUA_VM_WINDOWS=0` removes the option
+entirely.
+
+### Shutdown, suspend, and why Start cold-boots
+
+`cua sb suspend` pauses QEMU and keeps its sandbox: fast, and it resumes exactly
+where it was. `cua sb` has no power command, so **Shutdown** is the supervisor's
+own sequence — ACPI `system_powerdown` over QMP, wait (up to
+`shutdownTimeoutSec`, default 120), `quit` on timeout, flatten the disk into
+`$STORE/checkpoints/<name>.qcow2`, remove the sandbox, record `powered-off`.
+
+A powered-off computer has **no sandbox left**, so `cua sb resume` can never work
+on it — that was the "stopped VM can never resume" dead end. `cua_vm_start`
+therefore cold-boots it from the checkpoint (and deletes the `.restore.qcow2`
+temp afterwards). `DSH_CUA_VM_LEGACY_STOP=1` restores the old behaviour where
+`stop` meant suspend.
+
+### GPU
+
+`DSH_CUA_VM_GPU=virgl` (set by `compose.gpu.yaml`) makes virgl the **default**
+for a create that does not mention `gpu`; an explicit `gpu: false` still wins, and
+the flag is only offered when the installed QEMU actually has
+`virtio-gpu-gl-pci`. Build with `--build-arg WITH_VIRGL_QEMU=1` and pass
+`/dev/dri` (`compose.gpu.yaml`).
+
+### Coordinates
+
+cua captures at most ~900k pixels, so the default desktop is **1200x750** —
+exactly that budget, which makes the screenshot and the click the same space. A
+larger `DSH_CUA_VM_RESOLUTION` is refused at create time unless
+`DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=1` accepts a scaled capture; either way every
+desktop result prints `screenshot WxH · display WxH · scale N` and says "do not
+rescale" when the two differ.
+
+### The store
+
+`diskQuotaGb` (default 20) counts cua's own tree **plus** checkpoints, screenshots
+and Windows storage, and a create whose `used + requested` exceeds it is refused
+before it starts. **Clean up** in the panel (or `cua_vm_gc`) removes orphan
+checkpoints (newest kept), boot temps, screenshots older than `shotsKeepDays`
+(7), stale viewer rows and dead port rows.
+
+`cua_vm_destroy` removes a whole manifest — sandbox, checkpoints, shots, port
+rows and their child processes, viewer row, trajectory and QEMU directories, the
+Windows container and its storage, and the registry row — reporting each item,
+and finishing even when `sb rm` fails.
+
+`cua_vm_doctor` reports what only the supervisor can see: `/dev/kvm` and its
+mode, the render node, whether the installed QEMU has `virtio-gpu-gl-pci`,
+whether `DOCKER_HOST` answers, and the itemised store usage.
+
 ## Auto-update workflow
 
 `.github/workflows/docker-build.yml` keeps `:latest` in sync with the official project:

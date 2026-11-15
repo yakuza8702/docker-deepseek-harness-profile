@@ -345,6 +345,7 @@ RUN DSH_SLIM_BIN=/opt/seek-harness/mcp-slim.mjs DSH_SLIM_POLICIES=/opt/seek-harn
 # bottom of this stage, after the plugin exists, because it asserts the plugin
 # surface as well as the guest script and the supervisor.
 COPY --chmod=0644 tools/check-cua-rea.mjs /opt/seek-harness/check-cua-rea.mjs
+COPY --chmod=0644 tools/check-cua-vm.mjs /opt/seek-harness/check-cua-vm.mjs
 # Hide the image-owned MCP rows from a user-installed MCP manager (see the file).
 COPY --chmod=0644 tools/patch-mcp-manager.mjs /opt/seek-harness/patch-mcp-manager.mjs
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
@@ -921,7 +922,9 @@ RUN set -eux; \
 # ---------------------------------------------------------------------
 COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-windows.mjs docker/cua-guest-provision.sh Dockerfile /opt/seek-harness/cua-check/
 COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js /opt/seek-harness/cua-check/
+COPY --chmod=0644 docker/proxy.mjs compose.yaml compose.windows.yaml .env.example /opt/seek-harness/cua-check/
 RUN node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check \
+ && node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check \
  && rm -f /opt/seek-harness/cua-check/Dockerfile
 
 ENV NODE_ENV=production \

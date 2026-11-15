@@ -278,3 +278,78 @@ cat /var/lib/cua-provision            # version=6 … kvm=yes
 3. VM over MCP (`cua mcp` behind a stdio→HTTP bridge at `/vm/mcp`) so other
    agents can use the same per-workspace computer.
 4. HTTPS in front of the harness so Show VM uses the real viewer everywhere.
+
+---
+
+## 9. Branch `cua-vm-improve` — real shutdown, real accounting, a second kind
+
+Branch: `cua-vm-improve`, from `main` (`1986ed2`). Six work items, each committed
+green. This section is the delta a reader of the older sections needs.
+
+### 9.1 The three bugs this branch exists for
+
+1. **"Shutdown" only suspended.** `cua sb` has no power command, so the button
+   called `suspend` — the QEMU process, its RAM and its disk handles lived on,
+   and the panel said "powered off". Worse, once a VM *was* powered off (the
+   sandbox removed), `cua sb resume` answered "sandbox not found" for ever and
+   every Start was a dead end that ended in a rebuild.
+2. **The store was measured with `du` of one directory.** Checkpoints (6 GB
+   each, flattened), screenshots and Windows storage were invisible, so the
+   accounting said "0.0 GB of 20 GB" while the volume filled — and the next
+   create died at ENOSPC mid-download. The quota test was `used > quota`, not
+   `used + requested > quota`.
+3. **The click space was guessed.** cua captures at most ~900k px, so a
+   1280x800 desktop is delivered as a 1200x750 PNG; the tool resolved fractions
+   with `sqrt(900000 / area)` — a guess at the capture size — and clicked
+   display pixels. Every "the click landed 6% off" report was this.
+
+### 9.2 What changed, by work item
+
+| Item | Change |
+|---|---|
+| W1 | Registry **v2** (`{version:2, vms:{}}`) with a read-migration of v1 rows; four new policy keys (`shutdownTimeoutSec`, `checkpointPolicy`, `shotsKeepDays`, `windowsInstallTimeoutMinutes`); Windows credentials in `$STORE/windows/<name>/credentials.json`, mode 0600, never in the registry |
+| W2 | Accounting = `.cua` + checkpoints + shots + windows, and `used + requested > quota` refused on both create paths; a delete **manifest** (sandbox, checkpoints incl. `.restore.qcow2`/`.tmp`, shots, ports + child procs, views, trajectories, `vmm/qemu/<name>`, Windows container + storage, registry row, each reported, cleanup continues when `sb rm` fails); `cua_vm_gc`; boot reconciliation of `ports.json` |
+| W3 | Real `vmShutdown`: close ports → QMP `system_powerdown` (socket parsed from `vmm/qemu/<name>/cmdline`) → wait for exit/`query-status=shutdown` up to `shutdownTimeoutSec` → `quit` → flatten to a checkpoint (`mayBeTorn` on timeout) → `sb rm --force` → `powered-off` + `restoreFrom`; `start` cold-boots from the checkpoint and deletes the restore temp; `stop` = shutdown (`DSH_CUA_VM_LEGACY_STOP=1` restores the suspend alias); an ACPI refusal falls back to suspend *explicitly* |
+| W4 | New `docker/cua-vm-space.mjs`: display from the guest, capture from the PNG's own IHDR, `scale = display/screenshot`, 30 s cache invalidated on resume/restart/zoom; clicks prime one capture then `cua do click` in screenshot pixels, xdotool fallback at `round(x*scale)`; the `sqrt` guess is gone; every pointer/typing result prints `screenshot WxH · display WxH · scale N` plus "do not rescale" when scaled; >900k px refused unless `DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=1`; guest provision **v7** (`apt_ok=`, `display=`, `space_helper=1`, marker written on a broken apt too, exit 2); ImageMagick in the image; shots now under `$STORE/shots` |
+| W5 | `DSH_CUA_VM_GPU` is live: `virgl` makes virgl the default for a create that omits `gpu` (explicit `false` wins, gated on `systemQemuSupportsVirgl`); one `normaliseSpec` + shared `createManaged` so `ensure` carries image/gpu/diskGb/android/rea and a rebuild restores them; `cua_vm_start` tool; `cua_vm_port` prints the URL **and** the loopback port (`result.target` was always `undefined`) |
+| W6 | New `docker/cua-vm-windows.mjs`: Docker Engine API over `DOCKER_HOST`, pinned `dockurr/windows:4.35`, the full env mapping with 64 GB / 6 GB / 2 vCPU floors, `usb-tablet` + QMP 7100 (never published), `NET_ADMIN`, `/storage` bind, labels, no restart policy; `installing` → `ready` on RDP-accept **and** QMP-running, timeout with the last 40 log lines; console 8006 relayed into `ports.json` as `backend:"relay"`; 3389 opt-in only; `DSH_CUA_VM_WINDOWS=0` removes the option |
+| W7 | Windows agent surface: `screendump` frames (`space.source='qmp'`), `input-send-event` clicks/keys (ASCII only), and structured "not available" for exec/put/get/disk with the console/RDP hint; the proxy rewrites root-path HTML/JS for relay rows; `compose.windows.yaml`, env pass-through in `compose.yaml`, `.env.example` |
+| W9 | Docs + `tools/check-cua-vm.mjs` (117 assertions, registered in `ci-gates.mjs`); `check-cua-rea.mjs` updated in the same commit for exactly the two needle spellings the refactor changed; four new tools; the panel gained kind/version selection, per-kind gating, a Shutdown/Suspend split, installing/error badges, a Space line, Clean up, and password reveal |
+
+### 9.3 Verification actually run
+
+| Check | Result |
+|---|---|
+| `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
+| `bash -n` on `docker/cua-guest-provision.sh` | green |
+| `node tools/check-cua-rea.mjs` | 21/21 needles (after the two spelling updates) |
+| `node tools/check-cua-vm.mjs` | 117 assertions green |
+| `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
+| Supervisor smoke against a **throwaway store + stub `cua`** (37 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint |
+| Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
+| ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
+| `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
+| A real guest boot, guest provisioning, Windows install, container create | **NOT RUN** — no `cua` runtime image store, no `qemu-img`, and creating a Windows container is a mutation on a shared engine |
+
+**Measured on the host that carried this work** (read-only observation of a live
+`/cua-vm`): `/cua-vm/home/.cua` 8.11 GB, `/cua-vm/checkpoints` **11.19 GB**
+(one checkpoint *plus* one `.restore.qcow2` boot temp), shots 0.03 GB. The old
+accounting reported **8.11 GB**; the real usage was **19.33 GB of a 20 GB
+quota** — a 58% under-report, one create away from ENOSPC, and 6 GB of it is
+exactly what `cua_vm_gc` now drops (a restore temp that no shutdown removed).
+
+### 9.4 What is still open (TBC)
+
+1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),
+   screenshot, click, shutdown, Start, and confirm `powered-off → ready` from the
+   checkpoint. Needs `cua runtime setup qemu` and a 1.3 GB image pull.
+2. **`qemu-img` absent on the test host**, so the checkpoint *convert* itself is
+   unexercised (the state machine around it is tested).
+3. **Windows**: the container spec is asserted statically and the Docker client is
+   exercised only via `/_ping`; a full create → install → ready cycle needs a DinD
+   host and ~80 GB, and is deliberately not attempted here.
+4. **W8 (OpenSSH OEM script)** is documented only: exec/put on Windows stays
+   "not available".
+5. `prefixRootPaths` is a heuristic. It is applied only to `backend:"relay"` rows,
+   but a console that builds URLs at runtime from a config string (not a literal)
+   would still need a `<base>`-style fix.

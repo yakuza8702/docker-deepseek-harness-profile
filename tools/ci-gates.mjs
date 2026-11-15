@@ -216,6 +216,11 @@ if (!JSON_OUT) {
  *    repository files). These are the ones a push can always answer. */
 const REPO_GATES = [
   { file: "check-cua-rea.mjs", args: [], label: "REA kit chain" },
+  // The personal VM's own chain: registry v2, the accounting/quota rule, the
+  // delete manifest, the shutdown/checkpoint/start split, the measured
+  // coordinate space, the Windows backend, the proxy's console rewrite and the
+  // compose wiring. All repository files, so a push can always answer it.
+  { file: "check-cua-vm.mjs", args: [], label: "personal VM chain (spec → guest → proxy → compose)" },
   { file: "check-recovery-page.mjs", args: [], label: "recovery page scripts parse" },
   { file: "check-tool-trim.mjs", args: [], label: "MCP catalogue trim policy" },
   { file: "check-profile-switcher.mjs", args: [staged.root, staged.modules], label: "profile chooser + reset" },

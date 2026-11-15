@@ -602,3 +602,80 @@ and exactly the six stage-2 needles (three in `client.js`, three in `index.js`)
 red, which is what a gate is supposed to look like before its half exists.
 This commit closes those six: the gate is **66/66** with `node --check` green on
 both plugin files.
+
+---
+
+## 15. Branch `cua-vm-improve` — shutdown that powers off, accounting that adds up
+
+From `main` (`1986ed2`). Six items, each green and committed; the full handoff is
+REPORT.md §9, the plugin's own documentation is `plugins/dsh-cua-vm/README.md`.
+
+### 15.1 The two state machines
+
+`registry.json` is v2 (`{version:2, vms:{}}`) and migrates v1 **on read**: a row
+gains `kind`/`backend` (a `backend:"windows"` row keeps its kind), the file is
+rewritten, and no one has to delete their store. Every row also records
+`restoreFrom` after a shutdown, which is the field `cua_vm_start` reads.
+
+The shutdown state machine is the piece that was missing:
+
+```
+ready ──suspend──▶ suspended ──resume──▶ ready
+ready ──shutdown─▶ close ports → system_powerdown → wait → [quit] → checkpoint → sb rm
+                                                    └──▶ powered-off ──start──▶ create from checkpoint → ready
+```
+
+`powered-off` deliberately has **no** edge back through `resume`: the sandbox is
+gone, so `cua sb resume` can only fail. That is the "stopped VM can never resume"
+trap, and it is why `cua_vm_start` exists as its own tool.
+
+### 15.2 Why the store line moved
+
+`du -sb $CUA_HOME/.cua` was the whole story when the store held one image and one
+delta. It is not any more: a checkpoint is a flattened 6 GB disk, screenshots
+accumulate, and a Windows container keeps 64 GB under `$STORE/windows`. The line
+now adds four disjoint roots, and the quota test is `used + requested > quota`,
+refused before anything is created — the old `used > quota` let the last create
+discover the overrun as ENOSPC inside a download.
+
+### 15.3 The coordinate contract, in one sentence
+
+`cua do click` takes **screenshot** pixels and maps them itself, so the tool
+measures the two spaces (`xdotool` geometry vs the PNG's IHDR, cached 30 s) and
+prints `screenshot WxH · display WxH · scale N` — and, when they differ, "image px
+= 0.9375 × display px; cua maps it — do not rescale".
+
+### 15.4 The Windows kind, and what it is not
+
+`dockurr/windows` on a DinD engine is a real Windows computer for the *desktop*:
+QMP `screendump` for frames, `input-send-event` for clicks and ASCII keys, and the
+container's own 8006 console relayed to `/vm/port/<name>/`. It is **not** a cua
+sandbox: no guest agent means no exec, no put/get, no disk growth, no clipboard,
+no a11y tree and no window list — each of those answers "not available for
+Windows" with the paths that do work, instead of a timeout the model reads as a
+broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
+
+### 15.5 Gates
+
+* `tools/check-cua-vm.mjs` — 117 assertions across 12 files: registry v2 + the
+  migration, the four policy keys, the 0600 credentials, the accounting roots and
+  the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
+  chain, the spec normaliser and the GPU default, the measured space (including a
+  `FORBIDDEN` rule for `/cua-vm/shots` and `Math.sqrt(900000`), the Windows env
+  mapping and QMP arguments, the proxy's relay rewrite, and the compose wiring.
+* `tools/check-cua-rea.mjs` — exactly **two** needle spellings changed in the
+  same commit, because the refactor moved where they live (the create flags into
+  the spec normaliser, `diskGb` into `createManaged`). No needle was deleted.
+* `tools/ci-gates.mjs` — registered, so a bare checkout answers it in seconds:
+  **7 passed / 0 failed / 3 skipped** (up from 6).
+
+### 15.6 Evidence
+
+`node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
+green, `ci-gates` 7/0/3, and four runtime checks that need no image: a supervisor
+smoke on a throwaway store with a stub `cua` (migration, quota, manifest, GC,
+shutdown, cold boot), a real `qemu-system-x86_64 -S` shutdown (timeout → quit →
+`mayBeTorn`), an ACPI-refusal fallback against a protocol-level QMP peer, and unit
+tests for the two new modules. A real guest boot and a Windows install are **NOT
+RUN** — no `cua` runtime store, no `qemu-img`, and creating a Windows container is
+a mutation on a shared engine; both are listed as TBC in REPORT.md §9.4.
