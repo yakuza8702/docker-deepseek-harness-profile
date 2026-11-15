@@ -813,6 +813,13 @@ stylesheet's hash prefix because the literal map is gone. A splice-order bug in
 the plugin-manager patch (declaration replaced before the render site, shifting
 the index) was found and fixed by the same tests.
 
+The guard then failed its own first CI run (43727653717) in the image layout: it
+spawned children with cwd-relative paths, so from `/` (docker build's default) the
+probe looked for `/tools/probe-anchors.mjs` and exactly two assertions failed.
+Every path now comes from `import.meta.url` and children run with `cwd: HERE`;
+verified from the repo, from `/`, in a flat `/opt/seek-harness/tools/` layout, and
+negatively in both.
+
 New: `tools/check-anchors.mjs` with minified fixtures under `tools/fixtures/`
 — it applies both patches, re-runs them (idempotent), and proves the refusal
 still fires when an anchor is renamed. Hard gate in `ci-gates`, and a `RUN` step

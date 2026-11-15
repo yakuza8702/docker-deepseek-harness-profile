@@ -592,6 +592,21 @@ still exit 1 on a renamed anchor; both old-shape fixtures (`pmold2`, `sbold`)
 also patch. `probe-anchors --from-file … --sidebar-from-file …` reports every
 anchor resolving.
 
+**Second CI failure — the guard itself, in the image layout.** Run 43727653717
+died at the NEW step (`Dockerfile:383 RUN node /opt/seek-harness/tools/check-anchors.mjs`)
+with "2 anchor self-test(s) failed", while the same gate exited 0 locally. Cause:
+the guard ran children with a path **relative to the caller's cwd**
+(`run(['tools/probe-anchors.mjs', …])`). In a checkout the cwd is the repo root,
+so it resolved; in the image the build runs as `node /opt/seek-harness/tools/check-anchors.mjs`
+from `/`, so it looked for `/tools/probe-anchors.mjs` and both "probe-anchors
+agrees offline" assertions failed — exactly two. Fix: every path is resolved from
+`import.meta.url` (the guard's own directory), children run with `cwd: HERE`, and
+a missing sibling now prints a packaging message instead of MODULE_NOT_FOUND.
+Re-verified in three layouts — repo (invoked from the repo **and** from `/`), the
+flat `/opt/seek-harness/tools/` layout from `/`, and the negative case in both
+(a renamed fixture anchor gives exit 1 with 6 failures) — plus a simulation of the
+full Dockerfile sequence (383 → 405 → 418) against the real 0.2.2-rc.3 bundles.
+
 ### 9.7 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),

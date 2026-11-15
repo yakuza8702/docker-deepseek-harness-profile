@@ -26,13 +26,16 @@
  * Usage: node tools/check-anchors.mjs [--quiet]
  */
 import { execFileSync } from 'node:child_process'
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// EVERY path below is resolved from THIS FILE's directory. The guard lives in
+// `tools/` in a checkout and in `/opt/seek-harness/tools/` inside the image, and
+// it is invoked from an arbitrary cwd — so a path that depends on `process.cwd()`
+// (or on a `../` layout) works in exactly one of those places.
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const ROOT = path.resolve(HERE, '..')
 const QUIET = process.argv.includes('--quiet')
 
 let failures = 0
@@ -50,10 +53,18 @@ const check = (label, condition, detail = '') => {
   }
 }
 
-/** Run a node script and capture its exit code without throwing. */
+/**
+ * Run a node script and capture its exit code without throwing.
+ *
+ * `cwd: HERE` — the guard runs from `/` inside the image (`RUN node
+ * /opt/seek-harness/tools/check-anchors.mjs`), so anything resolved against the
+ * caller's cwd is wrong there and right in a checkout. That is exactly how the
+ * first version failed the build: `run(['tools/probe-anchors.mjs', …])` looked
+ * for `/tools/probe-anchors.mjs` and both probe assertions failed.
+ */
 function run(argv) {
   try {
-    const stdout = execFileSync(process.execPath, argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    const stdout = execFileSync(process.execPath, argv, { encoding: 'utf8', cwd: HERE, stdio: ['ignore', 'pipe', 'pipe'] })
     return { code: 0, stdout }
   } catch (error) {
     return { code: error.status ?? 1, stdout: `${error.stdout ?? ''}${error.stderr ?? ''}` }
@@ -77,52 +88,74 @@ const CASES = [
   {
     name: 'plugin-manager',
     package: '@deepseek-ai/dsh-client-ui-plugin-manager',
-    script: 'tools/patch-plugin-manager-page.mjs',
-    fixture: 'tools/fixtures/plugin-manager-client.min.js',
+    script: 'patch-plugin-manager-page.mjs',
+    fixture: 'fixtures/plugin-manager-client.min.js',
     marker: 'plugins.page.top',
     rename: ['"plugins.item":{kind:`list`', '"plugins.entry":{kind:`list`'],
   },
   {
     name: 'sidebar',
     package: '@deepseek-ai/dsh-client-ui-sidebar',
-    script: 'tools/patch-sidebar-footer.mjs',
-    fixture: 'tools/fixtures/sidebar-client.min.js',
+    script: 'patch-sidebar-footer.mjs',
+    fixture: 'fixtures/sidebar-client.min.js',
     marker: 'sidebar.footer.trailing',
     probe: 'sidebar',
     rename: ['"sidebar.footer.action":{kind:`list`', '"sidebar.footer.act":{kind:`list`'],
   },
 ]
 
+// PACKAGING CHECK FIRST: every input must be beside this file. A missing copy
+// used to surface as MODULE_NOT_FOUND from a child process, which reads like an
+// anchor failure; say what is actually wrong.
+{
+  const needed = ['probe-anchors.mjs', ...CASES.map((c) => c.script), ...CASES.map((c) => c.fixture)]
+  const absent = needed.filter((file) => !existsSync(path.join(HERE, file)))
+  if (absent.length > 0) {
+    console.error(`anchor self-test: these files must sit next to check-anchors.mjs (${HERE}): ${absent.join(', ')}`)
+    console.error('The Dockerfile copies them into /opt/seek-harness/tools/; a checkout has them under tools/.')
+    process.exit(1)
+  }
+}
+
 for (const testCase of CASES) {
   const work = mkdtempSync(path.join(tmpdir(), 'check-anchors-'))
   try {
-    const target = layout(work, testCase.package, path.join(ROOT, testCase.fixture))
+    const fixture = path.join(HERE, testCase.fixture)
+    const target = layout(work, testCase.package, fixture)
 
-    const first = run([path.join(ROOT, testCase.script), work])
+    const first = run([path.join(HERE, testCase.script), work])
     check(`${testCase.name}: the patch applies to the minified fixture`, first.code === 0, `exit ${first.code}`)
     const patched = readFileSync(target, 'utf8')
     check(`${testCase.name}: the marker is in the output`, patched.includes(testCase.marker))
     check(`${testCase.name}: the patched bundle still parses`, parses(target))
 
-    const second = run([path.join(ROOT, testCase.script), work])
+    const second = run([path.join(HERE, testCase.script), work])
     check(`${testCase.name}: a second run is a no-op`, second.code === 0 && /already patched/u.test(second.stdout), `exit ${second.code}`)
 
     // NEGATIVE: rename the anchor and confirm the build-time refusal still fires.
-    const pristine = readFileSync(path.join(ROOT, testCase.fixture), 'utf8')
+    const pristine = readFileSync(fixture, 'utf8')
     const broken = pristine.replace(testCase.rename[0], testCase.rename[1])
     check(`${testCase.name}: the fixture actually contains the anchor to rename`, broken !== pristine)
     writeFileSync(target, broken)
-    const refused = run([path.join(ROOT, testCase.script), work])
+    const refused = run([path.join(HERE, testCase.script), work])
     check(`${testCase.name}: a moved anchor still FAILS (never silently ships)`, refused.code === 1, `exit ${refused.code}`)
 
     // The probe reads the same anchors; both must agree on the pristine fixtures.
     // (`--from-file` is the plugin-manager bundle; the sidebar is its own flag.)
-    const probeArgs = testCase.probe === 'sidebar'
-      ? ['tools/probe-anchors.mjs', '--from-file', path.join(ROOT, 'tools/fixtures/plugin-manager-client.min.js'),
-        '--sidebar-from-file', path.join(ROOT, testCase.fixture)]
-      : ['tools/probe-anchors.mjs', '--from-file', path.join(ROOT, testCase.fixture), '--skip-sidebar']
-    const probe = run(probeArgs)
-    check(`${testCase.name}: probe-anchors agrees offline`, probe.code === 0, `exit ${probe.code}`)
+    const probeScript = path.join(HERE, 'probe-anchors.mjs')
+    if (!existsSync(probeScript)) {
+      // The image build copies it; a checkout always has it. A missing probe is a
+      // packaging mistake, not an anchor drift — say so instead of failing the
+      // contract this guard exists to protect.
+      console.log(`  note ${testCase.name}: probe-anchors.mjs is not beside this guard — skipping the cross-check`)
+    } else {
+      const probeArgs = testCase.probe === 'sidebar'
+        ? [probeScript, '--from-file', path.join(HERE, 'fixtures/plugin-manager-client.min.js'),
+          '--sidebar-from-file', fixture]
+        : [probeScript, '--from-file', fixture, '--skip-sidebar']
+      const probe = run(probeArgs)
+      check(`${testCase.name}: probe-anchors agrees offline`, probe.code === 0, `exit ${probe.code}`)
+    }
   } finally {
     rmSync(work, { recursive: true, force: true })
   }
