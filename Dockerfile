@@ -947,10 +947,18 @@ RUN set -eux; \
 # or a dropped field ships a plain desktop that reads like a RE workstation.
 # The copies below are flat (pick() in the checker handles both layouts) and
 # the Dockerfile is copied only for the length of this RUN.
+#
+# THE COPY LIST IS THE GATE'S INPUT SET, NOT A SUBSET OF IT. check-cua-vm.mjs
+# also asserts the Android provisioner and plugins/dsh-cua-vm/win-mcp.js, and a
+# gate that cannot open a file it asserts is a FAILED build, not a skipped
+# needle (this RUN died on 43729614226 precisely because the tree was one file
+# short). When a needle class is added to either gate, its file is added here in
+# the same commit; `node tools/check-cua-vm.mjs --root <tree>` is the check that
+# the two lists still agree.
 # ---------------------------------------------------------------------
-COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-windows-qemu.mjs docker/cua-guest-provision.sh Dockerfile /opt/seek-harness/cua-check/
+COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-guest-android.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-windows-qemu.mjs docker/cua-guest-provision.sh Dockerfile /opt/seek-harness/cua-check/
 COPY --chmod=0644 docker/windows-oem/Autounattend.xml docker/windows-oem/setupcomplete.cmd docker/windows-oem/cua-firstboot.ps1 /opt/seek-harness/cua-check/
-COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js /opt/seek-harness/cua-check/
+COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js plugins/dsh-cua-vm/win-mcp.js /opt/seek-harness/cua-check/
 COPY --chmod=0644 docker/proxy.mjs compose.yaml compose.windows.yaml .env.example /opt/seek-harness/cua-check/
 RUN node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check \
  && node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check \

@@ -636,43 +636,82 @@ for (const [key, spec] of Object.entries(FILES)) {
   }
 }
 
+/**
+ * LAYOUT. `--root` is either a checkout (docker/, plugins/, tools/, tests/) or
+ * the FLAT directory the image assembles under /opt/seek-harness/cua-check/.
+ * The discriminators are repo-only paths that the image never copies: `tools/`
+ * holds this gate itself. Anything asserted about the CHECKOUT is gated on this
+ * flag instead of being skipped whenever a file happens to be absent, so
+ * deleting tests/ from a checkout still fails the gate.
+ */
+const REPO_LAYOUT = existsSync(path.join(ROOT, 'tools')) || existsSync(path.join(ROOT, '.git'))
+
+/** One of the files an assertion needs, or null — never an unhandled ENOENT. */
+function sourceOf(label, name) {
+  const file = pick(name)
+  if (file === null) {
+    console.log(`  FAIL ${label}: file not found`)
+    return null
+  }
+  return readFileSync(file, 'utf8')
+}
+
 /** Semantic assertions the needle list cannot express (order, not presence). */
 {
   const quietMode = process.argv.includes('--quiet')
-  const windowsSource = readFileSync(path.join(ROOT, 'docker', 'cua-vm-windows-qemu.mjs'), 'utf8')
-  const controller = windowsSource.indexOf("'-device', 'qemu-xhci,id=xhci'")
-  const usbStorage = windowsSource.indexOf('usb-storage,drive=oem0,bus=xhci.0')
+  // K1: these used to hardcode ROOT/docker/, which is how a FAILED assertion in
+  // the image turned into a truncated stack trace: readFileSync threw before the
+  // gate could print its summary, and the build log showed a Node abort instead
+  // of "the xhci controller is missing". Resolve through pick(), fail cleanly.
+  const windowsSource = sourceOf('K1', 'cua-vm-windows-qemu.mjs')
   total += 1
-  if (controller !== -1 && usbStorage !== -1 && controller < usbStorage) {
-    if (!quietMode) console.log('  ok   K1 the USB controller precedes the device that names bus xhci.0')
-  } else {
+  if (windowsSource === null) {
     failures += 1
-    missing.push('docker/cua-vm-windows-qemu.mjs: the xhci controller must come BEFORE usb-storage,bus=xhci.0 (QEMU parses argv in order: "Bus \'xhci.0\' not found")')
-    console.log('  FAIL K1 xhci ordering')
+    missing.push('docker/cua-vm-windows-qemu.mjs: file not found (K1 xhci ordering cannot be checked)')
+  } else {
+    const controller = windowsSource.indexOf("'-device', 'qemu-xhci,id=xhci'")
+    const usbStorage = windowsSource.indexOf('usb-storage,drive=oem0,bus=xhci.0')
+    if (controller !== -1 && usbStorage !== -1 && controller < usbStorage) {
+      if (!quietMode) console.log('  ok   K1 the USB controller precedes the device that names bus xhci.0')
+    } else {
+      failures += 1
+      missing.push('docker/cua-vm-windows-qemu.mjs: the xhci controller must come BEFORE usb-storage,bus=xhci.0 (QEMU parses argv in order: "Bus \'xhci.0\' not found")')
+      console.log('  FAIL K1 xhci ordering')
+    }
   }
   // L5: the runtime suite ships IN the repository (it used to live outside it,
   // so every "pinned by a test" claim pointed at something a reviewer could not
-  // open).
-  total += 1
+  // open). It is a statement about the CHECKOUT: the image does not ship tests/
+  // (and must not pay for them in a layer), so in the flat layout this assertion
+  // is out of scope and says so out loud — it is never silently dropped.
   const suite = ['supervisor-smoke.mjs', 'modules-unit.mjs', 'qmp-shutdown.mjs']
-    .every((file) => existsSync(path.join(ROOT, 'tests', file)))
-  if (suite) {
-    if (!quietMode) console.log('  ok   L5 the runtime suite is committed under tests/')
+  if (!REPO_LAYOUT) {
+    if (!quietMode) console.log('  n/a  L5 the runtime suite lives in the checkout, not in the flat image check tree')
   } else {
-    failures += 1
-    missing.push('tests/: supervisor-smoke.mjs, modules-unit.mjs and qmp-shutdown.mjs must be committed')
-    console.log('  FAIL L5 runtime suite')
+    total += 1
+    if (suite.every((file) => existsSync(path.join(ROOT, 'tests', file)))) {
+      if (!quietMode) console.log('  ok   L5 the runtime suite is committed under tests/')
+    } else {
+      failures += 1
+      missing.push('tests/: supervisor-smoke.mjs, modules-unit.mjs and qmp-shutdown.mjs must be committed')
+      console.log('  FAIL L5 runtime suite')
+    }
   }
 
-  const supervisorSource = readFileSync(path.join(ROOT, 'docker', 'cua-vm-supervisor.mjs'), 'utf8')
+  const supervisorSource = sourceOf('M1', 'cua-vm-supervisor.mjs')
   total += 1
-  const isoInAccounted = /const ACCOUNTED_PATHS = \(\) => \[[^\]]*ISO_DIR/su.test(supervisorSource)
-  if (isoInAccounted) {
-    if (!quietMode) console.log('  ok   M1 the ISO cache is part of the accounted store')
-  } else {
+  if (supervisorSource === null) {
     failures += 1
-    missing.push('docker/cua-vm-supervisor.mjs: ISO_DIR must be in ACCOUNTED_PATHS (the ISO cache is the largest thing in a Windows store)')
-    console.log('  FAIL M1 ISO accounting')
+    missing.push('docker/cua-vm-supervisor.mjs: file not found (M1 ISO accounting cannot be checked)')
+  } else {
+    const isoInAccounted = /const ACCOUNTED_PATHS = \(\) => \[[^\]]*ISO_DIR/su.test(supervisorSource)
+    if (isoInAccounted) {
+      if (!quietMode) console.log('  ok   M1 the ISO cache is part of the accounted store')
+    } else {
+      failures += 1
+      missing.push('docker/cua-vm-supervisor.mjs: ISO_DIR must be in ACCOUNTED_PATHS (the ISO cache is the largest thing in a Windows store)')
+      console.log('  FAIL M1 ISO accounting')
+    }
   }
 }
 
