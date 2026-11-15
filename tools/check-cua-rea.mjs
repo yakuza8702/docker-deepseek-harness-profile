@@ -147,8 +147,13 @@ const NEEDLES = {
     ['...(known || {}),', 1],
     ['const reaBack = known?.rea === true ? await provisionReaGuest(name) : null', 1],
     ['rea: false,', 1],
-    ['android = false, rea = false', 1],
-    ['const wantedDiskGb = Number(diskGb) > 0 ? Number(diskGb) : 20', 1],
+    // 2026-11: the create signature became a normalised spec (kind + one shape
+    // for every caller), so the two create flags are asserted where they are
+    // ADMITTED now: the normaliser's flags literal. Same invariant, same commit.
+    ['android: input.android === true, rea: input.rea === true', 1],
+    // 2026-11: disk sizing moved into createManaged (shared by ensure and the
+    // panel), so the field it reads is `spec.diskGb`. Same floor, same commit.
+    ['const wantedDiskGb = Number(spec.diskGb) > 0 ? Number(spec.diskGb) : 20', 1],
     ['const effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb', 1],
     ['Plugins → Personal VM (CUA) → Policy', 1],
     ['rea: rea === true,', 1],

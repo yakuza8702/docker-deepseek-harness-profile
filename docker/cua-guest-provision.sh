@@ -39,10 +39,28 @@
 #   SHARE_TAG=NAME      QEMU 9p mount tag to mount at /workspace ("" = off)
 #   RESOLUTION=WxH      desktop geometry (default 1200x750, see below)
 #   MARKER_VERSION=N    bump to force a re-provision on existing disks
+#
+# THE MARKER IS A REPORT, NOT A CHECKMARK (v7)
+# --------------------------------------------
+# v6 wrote the marker only after every step succeeded, which meant a guest whose
+# apt sources were unfixable looked *unprovisioned* for ever: every start re-ran
+# a ten-minute script that failed on the same line. v7 writes the marker even
+# when apt is broken and records WHAT was achieved:
+#
+#   version=7             the layer version
+#   apt_ok=0|1            did `apt-get update` work at all
+#   reason=…              why not, when apt_ok=0
+#   display=WxH           the geometry the desktop actually ended up with
+#   space_helper=1        /usr/local/bin/cua-space is installed, which is the
+#                         one interface the supervisor measures the desktop with
+#
+# and it exits 2 (not 0) on the broken-apt path, so the supervisor reports
+# `ok:false` with the reason on THIS start and on every later one — the state is
+# visible instead of being silently "already provisioned".
 # =====================================================================
 set -u
 
-VERSION="${MARKER_VERSION:-6}"
+VERSION="${MARKER_VERSION:-7}"
 GPU="${GPU:-0}"
 SHARE_TAG="${SHARE_TAG:-dshworkspace}"
 # cua captures at most ~900k pixels: a 1280x800 display is delivered as a
@@ -60,6 +78,14 @@ say() { echo "[provision] $*"; }
 die() { echo "[provision] FAILED: $*"; exit 1; }
 
 if [ -f "$MARKER" ] && grep -qx "version=$VERSION" "$MARKER" 2>/dev/null; then
+  # A marker that records a broken apt is NOT "already provisioned": it is
+  # "provisioned as far as it could go". Say so on every start until the guest
+  # is fixed, so the panel and the model see the same truth.
+  if grep -qx "apt_ok=0" "$MARKER" 2>/dev/null; then
+    REASON=$(sed -n 's/^reason=//p' "$MARKER" | head -1)
+    say "NOT OK apt_broken=1 marker=v$VERSION reason=${REASON:-unknown}"
+    exit 2
+  fi
   say "already provisioned (v$VERSION)"
   exit 0
 fi
@@ -107,6 +133,10 @@ if [ "$APT_OK" = "1" ]; then
   say "packages installed"
 else
   say "apt still broken; the GPU/desktop steps below will be skipped"
+fi
+if [ "$APT_OK" != "1" ]; then
+  PROVISION_REASON="apt-get update failed (placeholder sources or no network); desktop/GPU packages are missing"
+  say "reason: $PROVISION_REASON"
 fi
 
 # ---------------------------------------------------------------------
@@ -289,6 +319,31 @@ if [ "$GPU" = "1" ] && [ "$APT_OK" = "1" ]; then
   esac
 fi
 
+# ---------------------------------------------------------------------
+# 7. the space helper — one stable way to ask the desktop its size
+#
+# The supervisor measures the coordinate space as "xdotool geometry inside the
+# guest + the PNG it just captured". Two commands with a fallback chain lived in
+# the supervisor; the guest now owns the first half behind ONE name, so a Cua
+# image that moves xdotool (or a desktop that needs a different query) is fixed
+# in the guest layer, not in the tool layer.
+# ---------------------------------------------------------------------
+cat >/usr/local/bin/cua-space <<'EOS'
+#!/bin/bash
+# Print "<width> <height>" of the X display, or exit 3 when there is none.
+export DISPLAY="${DISPLAY:-:1}"
+for _ in $(seq 1 20); do
+  out=$(xdotool getdisplaygeometry 2>/dev/null) || out=""
+  if [ -n "$out" ]; then printf '%s\n' "$out"; exit 0; fi
+  sleep 0.25
+done
+exit 3
+EOS
+chmod 0755 /usr/local/bin/cua-space
+SPACE_HELPER=0
+/usr/local/bin/cua-space >/dev/null 2>&1 && SPACE_HELPER=1
+say "space helper: $SPACE_HELPER"
+
 # KVM is what makes the official Android emulator usable; report it so a
 # failure shows up before the model spends an hour downloading an AVD.
 KVM=no
@@ -299,6 +354,10 @@ say "nested kvm: $KVM"
 
 cat >"$MARKER" <<EOF
 version=$VERSION
+apt_ok=$APT_OK
+reason=${PROVISION_REASON:-}
+display=${GEOM:-unknown}
+space_helper=$SPACE_HELPER
 gpu=$GPU
 renderer=$RENDERER
 kvm=$KVM
@@ -306,7 +365,14 @@ share=$SHARE_TAG
 resolution=$RESOLUTION
 provisioned=$(date -Is)
 EOF
-say "OK v$VERSION renderer=$RENDERER kvm=$KVM"
+if [ "$APT_OK" != "1" ]; then
+  # The marker is written (so this failure is not re-run blindly) and the exit
+  # code says NOT OK. The supervisor reports `provisioned: false` with the
+  # reason on this start and on every later one.
+  say "NOT OK apt_broken=1 marker=v$VERSION reason=${PROVISION_REASON:-unknown}"
+  exit 2
+fi
+say "OK v$VERSION renderer=$RENDERER kvm=$KVM display=${GEOM:-unknown} space_helper=$SPACE_HELPER"
 
 # Restart spacesd detached: it is the channel this script is running on, so a
 # restart in the foreground would kill the answer. Without it the new

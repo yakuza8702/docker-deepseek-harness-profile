@@ -116,8 +116,14 @@ RUN set -eux; \
       tini bubblewrap \
       docker-ce-cli docker-compose-plugin docker-buildx-plugin \
       xvfb x11vnc x11-utils openbox websockify novnc \
-      fonts-liberation fonts-noto-cjk; \
+      fonts-liberation fonts-noto-cjk \
+      imagemagick; \
     rm -rf /var/lib/apt/lists/*
+# imagemagick is the GUI's crop engine (`cua_vm_gui` with a `region`), and the
+# only reason it is here: the supervisor reads a PNG's size from its own IHDR
+# (zero dependency) and never needs `identify` for coordinates. --no-install-
+# recommends keeps the ~120 MB of documentation/ghostscript fonts out; the
+# convert(1) path used here needs nothing beyond libmagickcore.
 
 # Optional: a virgl-capable QEMU. cua provisions its own QEMU, but that build
 # has no virtio-gpu-gl-pci (verified: "This QEMU was built without
@@ -878,6 +884,9 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/cua; \
     /usr/local/bin/cua.real --version
 COPY --chmod=0755 docker/cua-vm-supervisor.mjs /usr/local/bin/cua-vm-supervisor
+# The supervisor's two ESM modules, next to it: `import './cua-vm-space.mjs'`
+# resolves relative to /usr/local/bin, so they are not optional copies.
+COPY --chmod=0644 docker/cua-vm-space.mjs docker/cua-vm-windows.mjs /usr/local/bin/
 # Guest provisioning runs INSIDE the VM, piped through `sudo bash` by the
 # supervisor. Kept as real files (not a base64 blob in the supervisor) so
 # they can be read, diffed and run by hand to debug a guest. rea is its own
@@ -910,7 +919,7 @@ RUN set -eux; \
 # The copies below are flat (pick() in the checker handles both layouts) and
 # the Dockerfile is copied only for the length of this RUN.
 # ---------------------------------------------------------------------
-COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-vm-supervisor.mjs Dockerfile /opt/seek-harness/cua-check/
+COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-windows.mjs docker/cua-guest-provision.sh Dockerfile /opt/seek-harness/cua-check/
 COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js /opt/seek-harness/cua-check/
 RUN node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check \
  && rm -f /opt/seek-harness/cua-check/Dockerfile

@@ -351,6 +351,50 @@ function vmPortRoute(rawUrl) {
   return { name, path: `${suffix}${query}` };
 }
 
+/**
+ * The WHOLE row, because the port table now carries a backend.
+ *
+ * A `backend: "relay"` row is a container console (the Windows backend's 8006):
+ * it is not served by a guest that knows it lives behind a prefix, so its
+ * root-absolute URLs have to be rewritten (see prefixRootPaths below). The proxy
+ * still dials only `localPort` — `target` is informational and never used to
+ * build an upstream address, so a forged row cannot point the proxy at another
+ * host.
+ */
+function vmPortEntry(name) {
+  try {
+    const table = JSON.parse(fs.readFileSync(VM_PORTS_FILE, "utf8"));
+    return table[name] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Prefix root-absolute URLs so a console served at / can live under
+ * /vm/port/<name>/.
+ *
+ * WHAT IT TOUCHES: attribute values (href/src/action/poster/data-src/content), CSS
+ * `url(...)`, and JavaScript string literals that start with `/` and look like a
+ * path. WHAT IT NEVER TOUCHES: protocol-relative `//host`, already-prefixed
+ * paths, fragments, and anything with whitespace in it (so a sentence that
+ * happens to contain " /usr/bin" in a comment stays a sentence).
+ *
+ * It is a heuristic, and it is deliberately only applied to `backend: "relay"`
+ * rows — a guest port a Linux VM serves is a real app that must not be rewritten
+ * under it.
+ */
+export function prefixRootPaths(text, prefix) {
+  const keep = `(?!\\/|${prefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/)`;
+  return String(text)
+    .replace(new RegExp(`(\\b(?:href|src|action|poster|data-src|content)=)(["'])/${keep}`, "gu"), `$1$2${prefix}/`)
+    .replace(new RegExp(`(url\\(\\s*)(["']?)/${keep}`, "gu"), `$1$2${prefix}/`)
+    .replace(new RegExp(`(["'\`])/${keep}([A-Za-z0-9_@~][^"'\`\\s]*)`, "gu"), `$1${prefix}/$2`);
+}
+
+/** Content types whose bodies can carry a URL. JSON and binaries are copied. */
+const REWRITABLE_TYPES = /text\/html|text\/css|javascript|ecmascript|image\/svg/u;
+
 /** The loopback port the supervisor recorded for this VM, or null. */
 function vmPortTarget(name) {
   try {
@@ -521,13 +565,39 @@ function vmPortUnavailable(res, upgrade, name) {
 }
 
 function forwardToVmPort(req, res, port, upstreamPath, name) {
+  const entry = vmPortEntry(name);
+  const relay = entry?.backend === "relay";
   const headers = { ...req.headers };
   headers.host = `127.0.0.1:${port}`;
+  if (relay && req.method === "GET") {
+    // A compressed body cannot be rewritten, and a 304 cannot be either: ask
+    // for identity and for a full body, and answer no-store.
+    delete headers["accept-encoding"];
+    delete headers["if-none-match"];
+    delete headers["if-modified-since"];
+  }
   const upstream = http.request(
     { host: "127.0.0.1", port, method: req.method, path: upstreamPath, headers },
     (upRes) => {
-      res.writeHead(upRes.statusCode, upRes.headers);
-      upRes.pipe(res);
+      const type = String(upRes.headers["content-type"] || "");
+      if (!relay || req.method !== "GET" || !REWRITABLE_TYPES.test(type)) {
+        res.writeHead(upRes.statusCode, upRes.headers);
+        upRes.pipe(res);
+        return;
+      }
+      // Buffered on purpose: the length changes, so it cannot be streamed.
+      const chunks = [];
+      upRes.on("data", (chunk) => chunks.push(chunk));
+      upRes.on("end", () => {
+        const body = Buffer.concat(chunks);
+        const out = Buffer.from(prefixRootPaths(body.toString("utf8"), `/vm/port/${name}`), "utf8");
+        const outHeaders = { ...upRes.headers };
+        delete outHeaders["transfer-encoding"];
+        outHeaders["content-length"] = String(out.length);
+        outHeaders["cache-control"] = "no-store";
+        res.writeHead(upRes.statusCode, outHeaders);
+        res.end(out);
+      });
     }
   );
   upstream.on("error", () => vmPortUnavailable(res, false, name));
