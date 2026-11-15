@@ -661,7 +661,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — **252 assertions** across 16 files (the gate prints
+* `tools/check-cua-vm.mjs` — **270 assertions** across 16 files (the gate prints
   its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
@@ -679,7 +679,7 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green (252 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
+green (270 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
 that need no image: a supervisor smoke on a throwaway store with a stub `cua`
 (82 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
 review regressions — missing `cua`, traversal names, an abandoned QEMU that
@@ -731,6 +731,20 @@ MCP tools attached lazily over SSH only while a Windows computer is ready
 (`DSH_CUA_VM_WIN_MCP=0` disables it; ~3-8k tokens while attached, zero otherwise).
 The live view is noVNC over websockify through the existing relay pipeline.
 Honest ceilings and the nvidia-smi host-handle note are in the READMEs.
+
+### 15.8.1 Pre-verdict fixes
+
+Eleven defects from the pre-verdict review, all fixed in `cua-vm-improve`:
+VNC display-vs-port (QEMU binds 5900+display — the argv now passes the display,
+pinned by a unit test), the Windows checkpoint writing the Linux path (one
+writer, fed from `$STORE/windows/<name>/disk.qcow2`; Start converts it back),
+plugin copy still describing the container backend, `installComplete` never set,
+an aborted shutdown reopening a relay to a killed websockify, a leaked swtpm on a
+failed boot, a leaked websockify on a rejected relay, the port-allocation race
+(now under `withLock('@ports')` + an in-memory claim), the firstboot header
+claiming a consumer that does not exist, a 30 s tool linger (now 5 s), and the
+answer file's schema order (reordered, deprecated OOBE skips removed, order
+pinned by needles).
 
 ### 15.9 Review round 2
 

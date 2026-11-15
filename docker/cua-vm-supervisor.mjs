@@ -1439,7 +1439,20 @@ df -BG --output=size,avail / | tail -1`, 180000)
 }
 
 function checkpointSandbox(name) {
-  const disk = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name, 'disk.qcow2')
+  return checkpointDiskFile(name, path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name, 'disk.qcow2'))
+}
+
+/**
+ * Flatten ANY disk behind `<name>` into `$STORE/checkpoints/<name>.qcow2`.
+ *
+ * The Linux guest's disk lives under `$CUA_HOME/.cua/vmm/qemu/<name>/`, the
+ * Windows computer's under `$STORE/windows/<name>/`. The Windows shutdown used
+ * to call the Linux-only helper, which looked in the wrong directory, returned
+ * null on every machine, and recorded `checkpointSkipped: "no disk to
+ * checkpoint"` — a checkpoint path that existed only in the docs. One writer,
+ * one output name, two callers.
+ */
+function checkpointDiskFile(name, disk) {
   if (!existsSync(disk)) return null
   const target = path.join(CHECKPOINT_DIR, `${name}.qcow2`)
   try {
@@ -1544,6 +1557,12 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
 
   // 1. Port forwards and relays first: a still-listening relay would answer the
   //    browser for a guest that is about to disappear.
+  // Guarded: `readRegistry` throws on a corrupt file, and a delete must still
+  // produce a structured manifest when the registry is unreadable (R2).
+  try {
+    for (const port of Object.values(readRegistry().vms[name]?.ports ?? {})) CLAIMED_WINDOWS_PORTS.delete(Number(port))
+  } catch {}
+
   const closed = closePorts(name)
   record('ports.json', closed.rows > 0 ? 'removed' : 'absent', closed.rows > 0 ? `${closed.rows} row(s), ${closed.killed} child process(es) stopped` : 'no row')
 
@@ -2418,7 +2437,7 @@ async function shutdownVmLocked(name, { reason = 'shutdown' } = {}) {
       checkpointSkipped = `the checkpoint needs ~${(needed / 1024 ** 3).toFixed(1)} GB and the store quota does not allow it`
       notes.push(`${checkpointSkipped} (${over})`)
     } else {
-      checkpoint = checkpointSandbox(name)
+      checkpoint = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
       if (checkpoint === null) checkpointSkipped = 'no disk to checkpoint'
     }
   }
@@ -2567,6 +2586,24 @@ async function startFromCheckpoint(name, meta) {
  * is relayed instead, and the answer says so — a live view with a caveat is
  * better than a button that 502s.
  */
+/**
+ * Put the live view back after an aborted shutdown.
+ *
+ * `restorePorts` alone is wrong here: `stopLiveView` already killed the
+ * websockify child, so the relay would be reopened to a port nobody listens on
+ * and every request would 502 while the message said "reopened".
+ */
+async function replaceLiveView(name, preview) {
+  try {
+    const relay = await ensureWindowsConsoleRelay(name)
+    if (relay !== null) return true
+    return await restorePorts(name, preview)
+  } catch (error) {
+    log(`windows: ${name} live view could not be reopened (${error?.message ?? error})`)
+    return false
+  }
+}
+
 async function ensureWindowsConsoleRelay(name) {
   const registry = readRegistry()
   const meta = registry.vms[name]
@@ -2594,7 +2631,15 @@ async function ensureWindowsConsoleRelay(name) {
       }
       kind = novnc !== undefined ? 'novnc' : 'websockify'
     }
-    return await openRelay(name, 5900, { host: '127.0.0.1', port: targetPort }, { backend: 'relay', view: kind })
+    try {
+      return await openRelay(name, 5900, { host: '127.0.0.1', port: targetPort }, { backend: 'relay', view: kind })
+    } catch (error) {
+      // `openRelay` can reject AFTER websockify was spawned (no free relay port,
+      // a listen failure); without this the child outlives the failure and the
+      // next attempt spawns a second one on the same VNC port.
+      stopLiveView(name)
+      throw error
+    }
   } catch (error) {
     log(`windows: ${name} live view relay failed (${error?.message ?? error})`)
     return null
@@ -2618,8 +2663,11 @@ function stopLiveView(name) {
  * disjoint ranges so a restart finds its own ports free and a stale row cannot
  * hand one computer another's socket.
  */
+/** Ports claimed by creates that have not written their registry row yet. */
+const CLAIMED_WINDOWS_PORTS = new Set()
+
 async function allocateWindowsPorts(existing = null) {
-  const taken = new Set()
+  const taken = new Set(CLAIMED_WINDOWS_PORTS)
   for (const [name, entry] of ports) taken.add(entry.localPort)
   for (const row of Object.values(readRegistry().vms)) {
     for (const port of Object.values(row?.ports ?? {})) taken.add(Number(port))
@@ -2631,12 +2679,14 @@ async function allocateWindowsPorts(existing = null) {
     }
     throw new Error(`no free port in ${from}-${to} for the Windows computer`)
   }
-  return {
+  const chosen = {
     qmp: Number(existing?.qmp) > 0 ? Number(existing.qmp) : await pick(WINDOWS_QMP_RANGE),
     ssh: Number(existing?.ssh) > 0 ? Number(existing.ssh) : await pick(WINDOWS_SSH_RANGE),
-    // VNC's port is 5900 + DISPLAY, and the relay is a TCP port like the others.
+    // VNC's port is 5900 + DISPLAY; QEMU is handed the DISPLAY (see buildQemuArgs).
     vnc: Number(existing?.vnc) > 0 ? Number(existing.vnc) : await pick(WINDOWS_VNC_RANGE)
   }
+  for (const port of Object.values(chosen)) CLAIMED_WINDOWS_PORTS.add(port)
+  return chosen
 }
 
 /** Serial log tail: Windows Setup prints to the serial console, so this is the
@@ -2686,6 +2736,10 @@ function watchWindowsInstall(name) {
             if (!row) return
             row.state = 'ready'
             row.endpoint = verdict.endpoint
+            // THE INSTALL IS OVER. Without this, `windowsStart` recomputes
+            // installPending from a flag that never became true and re-attaches
+            // the install ISO on every later start.
+            row.installComplete = true
             row.installDetail = `ready (${verdict.endpoint} accepting, QMP running)`
             delete row.error
             delete row.errorLog
@@ -2774,7 +2828,10 @@ async function windowsCreateManaged(spec) {
     const paths = windowsPaths(STORE, spec.name)
     mkdirSync(paths.dir, { recursive: true })
     mkdirSync(paths.tpmDir, { recursive: true })
-    const portTriple = await allocateWindowsPorts()
+    // TWO CREATES, TWO NAMES, ONE FREE PORT: the old allocation read "taken"
+    // from the registry, which does not yet contain the row being built. The
+    // claim is serialised globally and recorded in memory until the row exists.
+    const portTriple = await withLock('@ports', () => allocateWindowsPorts())
     // The disk is created up-front: its existence is what tells a later start
     // whether Setup still has to run.
     execFileSync('/usr/bin/qemu-img', ['create', '-f', 'qcow2', paths.disk, `${diskGb}G`], { timeout: 120000 })
@@ -2858,8 +2915,11 @@ async function windowsCreateManaged(spec) {
     }
     await mutateRegistry((fresh) => { fresh.vms[spec.name] = row })
   } catch (error) {
-    // Nothing half-created survives: kill the QEMU we started and drop the disk.
-    if (booted !== null) windowsBackend.kill(spec.name)
+    // Nothing half-created survives: kill the QEMU we started, stop its TPM (a
+    // leaked swtpm holds the TPM state directory) and release the port claim.
+    windowsBackend.kill(spec.name)
+    windowsBackend.stopSwtpm(spec.name)
+    for (const port of Object.values(CLAIMED_WINDOWS_PORTS)) CLAIMED_WINDOWS_PORTS.delete(port)
     releaseStoreBytes(spec.name)
     throw error
   } finally {
@@ -3072,6 +3132,25 @@ async function windowsStart(name, meta) {
   const verdict = await windowsBackend.probe(meta)
   const registry = readRegistry()
   if (!verdict.alive) {
+    // A checkpoint is only a restore point if Start USES it. For Windows that
+    // means converting it back over `disk.qcow2` before boot; a stale or torn
+    // one is not trusted, exactly like the Linux path.
+    const restore = meta.restoreFrom
+    const distrust = restore?.stale === true || meta.mayBeTorn === true
+    if (restore?.kind === 'checkpoint' && distrust !== true && existsSync(restore.file)) {
+      const target = windowsPaths(STORE, name).disk
+      const staged = `${target}.restore.qcow2`
+      try {
+        execFileSync('/usr/bin/qemu-img', ['convert', '-O', 'qcow2', restore.file, staged], { timeout: 300000 })
+        renameSync(staged, target)
+        log(`start: ${name} restored from its checkpoint`)
+      } catch (error) {
+        try { unlinkSync(staged) } catch {}
+        log(`start: ${name} could not restore its checkpoint (${error?.message ?? error}); booting the existing disk`)
+      }
+    } else if (restore?.kind === 'checkpoint' && distrust) {
+      log(`start: ${name} refuses its ${restore.stale === true ? 'stale' : 'torn'} checkpoint; booting the existing disk`)
+    }
     const installPending = !existsSync(windowsPaths(STORE, name).disk)
       || meta.installComplete !== true
     try {
@@ -3165,14 +3244,17 @@ async function windowsShutdown(name, meta) {
   try {
     outcome = await windowsBackend.shutdown(meta, { timeoutMs: config.shutdownTimeoutSec * 1000 })
   } catch (error) {
-    const reopened = await restorePorts(name, preview)
-    return fail(`could not power ${name} off: ${error?.message ?? error}. Nothing was removed${reopened ? ' and the live view was reopened' : ''}.`)
+    // `stopLiveView` killed websockify, so reopening the relay alone would point
+    // at a dead target. Rebuild the whole view, and only CLAIM it worked when it
+    // did.
+    const reopened = await replaceLiveView(name, preview)
+    return fail(`could not power ${name} off: ${error?.message ?? error}. Nothing was removed${reopened ? '' : '; the live view could NOT be reopened'}.`)
   }
   if (!outcome.exited) {
     // It survived ACPI and `quit`: the disk is still open, so it is NOT
     // checkpointed and the computer is still running.
-    const reopened = await restorePorts(name, preview)
-    return fail(`could not power ${name} off: QEMU is still running after a forced quit, so the disk is open and no checkpoint was taken.${reopened ? ' The live view was reopened.' : ''} Use cua_vm_destroy to remove it.`)
+    const reopened = await replaceLiveView(name, preview)
+    return fail(`could not power ${name} off: QEMU is still running after a forced quit, so the disk is open and no checkpoint was taken.${reopened ? ' The live view was reopened.' : ' The live view could NOT be reopened.'} Use cua_vm_destroy to remove it.`)
   }
   let checkpoint = null
   let checkpointSkipped = ''

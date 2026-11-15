@@ -323,7 +323,7 @@ green. This section is the delta a reader of the older sections needs.
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
 | `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
-| `node tools/check-cua-vm.mjs` | **252** assertions across 16 files |
+| `node tools/check-cua-vm.mjs` | **270** assertions across 16 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
 | Supervisor smoke against a **throwaway store + stub `cua`** (82 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing while marking its existing restore point stale, that produced marking makes Start boot the base image and clear it, a clean shutdown leaves no marking, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
@@ -451,6 +451,22 @@ overlay, ASCII-only QMP typing, no clipboard/a11y/window list, SSH lands in
 Session 0 so dsh-cua runs as an interactive logon task and the SSH side proxies
 to it, and an `nvidia-smi` EGL handle is the host-side QEMU context.
 
+### 9.6.1 Pre-verdict fixes (B1–B3, D4–D11)
+
+| # | Defect | Fix |
+|---|---|---|
+| B1 | `-vnc 127.0.0.1:<port>`: QEMU reads the suffix as a **display number** and binds 5900+port, so the relay/probe/websockify all missed | the argv now carries `vncDisplayFor(spec.vncPort)`; a gate needle and a unit test pin the display form (and that the raw port never appears) |
+| B2 | the Windows checkpoint called the Linux-only helper, always returned null, and the quota guard protected a file that was never written | one writer (`checkpointDiskFile`) fed from `$STORE/windows/<name>/disk.qcow2`; Start converts the checkpoint back over the disk (skipping stale/torn ones) |
+| B3 | plugin copy still described the container backend (DinD, 8006 console, "exec not available", ISO bind-mounted at /boot.iso) | rewritten: SSH exec/put/get, noVNC live view, URL-or-local ISO |
+| D4 | the install watcher never set `installComplete`, so every later Start re-attached the install ISO | set in the ready transition |
+| D5 | an aborted shutdown reopened the relay to the websockify it had just killed, and claimed success | `replaceLiveView` rebuilds the view and the message reflects whether it worked |
+| D6 | `boot()` could throw after swtpm started, leaking the TPM and breaking the next boot | `stopSwtpm` on every failure path, plus a belt-and-braces stop in the create catch |
+| D7 | a rejected `openRelay` leaked the websockify child | the child is killed before the rejection propagates |
+| D9 | two concurrent creates could take the same "free" port (the registry lacks the row being built) | allocation under `withLock('@ports')` with an in-memory claim set, released on failure/delete |
+| D10 | `cua-firstboot.ps1` claimed `vmWindowsStatus` reads the marker | the header now says what the marker is (an audit trail; readiness is the SSH banner) |
+| D11 | the guest's tools lingered up to 30 s after a stop/delete | 5 s attach beat |
+| D8 | answer-file children were out of schema order and used deprecated OOBE skips | reordered (DiskConfiguration→ImageInstall→RunSynchronous→UserData; AutoLogon→FirstLogonCommands→OOBE→UserAccounts), deprecated switches removed, order pinned by gate needles |
+
 ### 9.7 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),
@@ -477,3 +493,5 @@ to it, and an `nvidia-smi` EGL handle is the host-side QEMU context.
    this environment.
 9. **The VNC end-to-end path** through websockify is **NOT RUN** (no guest to
    display), and the noVNC page's exact URL depends on the shipped noVNC build.
+   The display-number conversion itself is pinned by a unit test (`-vnc :31` for
+   port 5931), which is the part that was wrong.

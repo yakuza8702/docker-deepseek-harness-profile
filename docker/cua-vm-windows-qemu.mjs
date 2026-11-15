@@ -236,7 +236,12 @@ export function buildQemuArgs(spec) {
     '-device', 'usb-tablet',
     // display: the panel's live view and the agent's frames
     '-display', 'none',
-    '-vnc', `127.0.0.1:${spec.vncPort}`,
+    // QEMU READS THIS AS A DISPLAY NUMBER, NOT A PORT: `-vnc host:31` binds
+    // 5900+31. Passing the raw port (5931) binds 11831 — the relay, the banner
+    // probe and websockify all point at 5931, so the live view never connects
+    // and the non-SSH readiness probe never answers. The conversion lives in one
+    // function so it cannot drift again.
+    '-vnc', `127.0.0.1:${vncDisplayFor(spec.vncPort)}`,
     '-device', spec.gpu ? 'virtio-gpu-pci' : 'VGA,vgamem_mb=32',
     // control + observability
     '-qmp', `tcp:127.0.0.1:${spec.qmpPort},server=on,wait=off`,
@@ -496,18 +501,27 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
       log(`windows: ${spec.name} EFI vars created from ${OVMF_VARS_TEMPLATE}`)
     }
     if (!startSwtpm(spec.name)) throw new Error('swtpm did not create its socket (see swtpm.log)')
-    const argv = buildQemuArgs({
-      ...spec,
-      paths: p,
-      installPending,
-      virtio: Boolean(caps.virtioWin),
-      driverIso: caps.virtioWin ? VIRTIO_WIN_ISO : null
-    })
-    const child = spawn(WINDOWS_QEMU, argv, { stdio: 'ignore', detached: true })
-    children.set(`qemu:${spec.name}`, child)
-    child.unref()
-    log(`windows: ${spec.name} qemu started (pid ${child.pid}${installPending ? ', installing' : ''})`)
-    return { pid: child.pid, installPending }
+    // FROM HERE swtpm IS RUNNING, so every failure has to stop it again: a
+    // leaked swtpm keeps the TPM state directory open and the next boot fails
+    // with "TPM is already in use" — the kind of failure that only appears on
+    // the SECOND attempt, long after the first error was read.
+    try {
+      const argv = buildQemuArgs({
+        ...spec,
+        paths: p,
+        installPending,
+        virtio: Boolean(caps.virtioWin),
+        driverIso: caps.virtioWin ? VIRTIO_WIN_ISO : null
+      })
+      const child = spawn(WINDOWS_QEMU, argv, { stdio: 'ignore', detached: true })
+      children.set(`qemu:${spec.name}`, child)
+      child.unref()
+      log(`windows: ${spec.name} qemu started (pid ${child.pid}${installPending ? ', installing' : ''})`)
+      return { pid: child.pid, installPending }
+    } catch (error) {
+      stopSwtpm(spec.name)
+      throw error
+    }
   }
 
   /** QMP to this computer's loopback socket, with the supervisor's client. */

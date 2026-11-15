@@ -273,8 +273,10 @@ While a Windows computer is `ready`, the plugin attaches the guest's MCP tool
 list through
 `ssh … python -m dsh_cua.server --stdio --pipe \\.\pipe\dsh-cua`
 (`plugins/dsh-cua-vm/win-mcp.js`). The tools appear as `cua_win__<name>` and are
-**disposed** when the computer stops being ready, is switched away from, or is
-deleted. **Nothing is written to the profile.**
+**disposed** within ~5 s of the computer stopping, being switched away from, or
+being deleted (the attach check runs on a 5 s beat, not the 30 s cache beat —
+a stale `cua_win__*` call against a stopped computer is a confusing SSH error).
+**Nothing is written to the profile.**
 
 Why it is worth its cost: `find_elements` + `type_text` return a compact JSON
 receipt (`action_sent`, `effect_verified`) in a few hundred bytes, where the

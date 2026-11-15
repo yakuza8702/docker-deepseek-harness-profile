@@ -224,6 +224,22 @@ const NEEDLES = {
     ['function sshRun(meta, command,', 1],
     ['function scpRun(meta, localPath, guestPath', 1],
     ['await ensureWindowsConsoleRelay(name)', 2],
+    // B2: ONE checkpoint writer, used by both disks (the Windows disk is
+    // $STORE/windows/<name>/disk.qcow2, not the Linux vmm path).
+    ['function checkpointDiskFile(name, disk)', 1],
+    ['checkpointDiskFile(name, windowsPaths(STORE, name).disk)', 1],
+    // B2: Start restores a Windows checkpoint over the disk.
+    ['restored from its checkpoint', 1],
+    // D4: the watcher records that the install finished.
+    ['row.installComplete = true', 3],
+    // D5: an aborted shutdown rebuilds the live view instead of relaying to a
+    // dead websockify.
+    ['async function replaceLiveView(name, preview)', 1],
+    // D7: a rejected relay kills the websockify it spawned.
+    ['stopLiveView(name)\n      throw error', 1],
+    // D9: the port claim is serialised and tracked in memory.
+    ["withLock('@ports'", 1],
+    ['const CLAIMED_WINDOWS_PORTS = new Set()', 1],
     // R1: a KEPT item (the disk of a live QEMU) is not a completed delete, and
     // the row keeps it reachable until GC can reclaim it.
     ["const skipped = items.filter((item) => item.status === 'skipped')", 1],
@@ -284,9 +300,13 @@ const NEEDLES = {
     ["'-device', 'usb-tablet'", 1],
     ["'-device', 'usb-kbd'", 1],
     // VNC on loopback (the live view) and QMP on loopback (control)
-    ["'-vnc', `127.0.0.1:${spec.vncPort}`", 1],
+    // B1: QEMU reads the value after the colon as a DISPLAY NUMBER (it binds
+    // 5900+display), so the raw port must never be passed here.
+    ["'-vnc', `127.0.0.1:${vncDisplayFor(spec.vncPort)}`", 1],
     ['tcp:127.0.0.1:${spec.qmpPort},server=on,wait=off', 1],
     ['export function vncDisplayFor(port)', 1],
+    // D6: a failed boot stops the swtpm it started.
+    ['stopSwtpm(spec.name)', 2],
     // the ISO sources are pinned and documented
     ['export const WINDOWS_ISO_SOURCES = {', 1],
     ['software-static.download.prss.microsoft.com', 5],
@@ -314,6 +334,13 @@ const NEEDLES = {
   ],
   oemAnswer: [
     ['<unattend xmlns="urn:schemas-microsoft-com:unattend">', 1],
+    // D8: schema order, asserted by position rather than by presence: a
+    // RunSynchronous before DiskConfiguration is rejected on some media.
+    ['<DiskConfiguration>\n        <Disk', 1],
+    ['</ImageInstall>\n      <RunSynchronous>', 1],
+    ['<AutoLogon>\n        <Username>cua</Username>', 1],
+    ['</FirstLogonCommands>\n      <OOBE>', 1],
+    ['</OOBE>\n      <UserAccounts>', 1],
     ['<LocalAccount wcm:action="add"', 1],
     ['<Name>cua</Name>', 1],
     ['{{PASSWORD}}', 3],
@@ -332,7 +359,9 @@ const NEEDLES = {
     ['{{DSH_CUA_PIP}}', 1],
     ['dsh_cua.server', 1],
     ['Register-ScheduledTask', 1],
-    ['-LogonType Interactive', 1]
+    ['-LogonType Interactive', 1],
+    // D10: the marker is an audit trail, not a readiness signal.
+    ['an AUDIT marker', 1]
   ],
   provision: [
     ['MARKER=/var/lib/cua-provision', 1],
@@ -394,6 +423,11 @@ const NEEDLES = {
     ["op: 'vmDoctor'", 1],
     // R1: a partial delete prints what failed AND what was kept on purpose.
     ['- KEPT ${item.target}: ${item.reason}', 1],
+    // B3: the create result must not describe the container backend.
+    ['Live view: ${answer.console} (noVNC over QEMU VNC, never published raw).', 1],
+    ['runs commands over SSH in cmd.exe', 1],
+    // D11: a stop/delete takes the guest's tools away within 5 s.
+    ['}, 5000)', 1],
     ['- FAILED ${item.target}: ${item.detail}', 1],
     // the port answer is url + localPort; `target` was never in the payload
     ['result.url', 1],

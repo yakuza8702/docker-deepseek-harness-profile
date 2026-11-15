@@ -16,8 +16,11 @@
                      proxies to this listener instead of driving the desktop
                      itself.
 
-  It writes C:\cua-provision.json as its marker, which is what `vmWindowsStatus`
-  reads (through SSH) to report `installed: true`.
+  It writes C:\cua-provision.json as an AUDIT marker: it records which steps
+  succeeded and when, so a human (or a later `cua_vm_exec 'type
+  C:\cua-provision.json'`) can see what the install actually did. Readiness is
+  NOT derived from it — `vmWindowsStatus` waits for the SSH banner, which only
+  exists once the `openssh` step has run.
 #>
 param([string]$Mode = 'Setup')
 

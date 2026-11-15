@@ -365,7 +365,11 @@ export function apply(ctx, config = {}) {
   // becomes ready, and a disposal the moment it stops being ready.
   ctx.effect(() => {
     void attachWindowsMcp()
-    const timer = setInterval(() => { void attachWindowsMcp() }, REA_CACHE_TTL_MS)
+    // FIVE SECONDS, not the 30 s cache beat: a shutdown or a delete must take the
+    // guest's tools away promptly — a model that calls `cua_win__*` against a
+    // stopped computer gets a confusing SSH failure, and 30 s of that is long
+    // enough to blame the wrong thing.
+    const timer = setInterval(() => { void attachWindowsMcp() }, 5000)
     if (typeof timer.unref === 'function') timer.unref()
     return () => {
       clearInterval(timer)
@@ -448,7 +452,7 @@ export function apply(ctx, config = {}) {
       required: ['name'],
       properties: {
         name: { type: 'string', description: 'Computer name: lowercase letters, digits and dashes.' },
-        kind: { type: 'string', enum: ['linux', 'windows'], description: 'linux (default, the Cua guest) or windows (Docker/DinD backend; desktop only, no exec/put/get).' },
+        kind: { type: 'string', enum: ['linux', 'windows'], description: 'linux (default, the Cua guest) or windows (direct QEMU with OVMF/TPM2; exec/put/get work over SSH, the desktop is QMP plus a noVNC live view).' },
         cpu: { type: 'number', description: 'vCPUs (default 2; Windows floors at 2).' },
         memory: { type: 'number', description: 'RAM in GB (default 4; Windows floors at 6).' },
         image: { type: 'string', description: 'Image reference. Default "linux" (Ubuntu 24.04 slim Cua disk). Linux only.' },
@@ -457,7 +461,7 @@ export function apply(ctx, config = {}) {
         android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating (Linux only).' },
         rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true. Linux only.' },
         windowsVersion: { type: 'string', enum: ['11', '10', 'ltsc10', '2022', '2025'], description: 'Windows version (VERSION in the container spec). Windows only.' },
-        windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL, or a path relative to the VM store (the ISO must be under $STORE; it is bind-mounted at /boot.iso). Windows only; mutually exclusive with windowsVersion.' }
+        windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL (downloaded once into $STORE/iso/) or a file path inside the VM store or the workspace (attached directly as a QEMU drive). Windows only; mutually exclusive with windowsVersion.' }
       }
     },
     output: textOutput('The computer, its renderer, disk, Android and REA status.'),
@@ -470,11 +474,11 @@ export function apply(ctx, config = {}) {
         if (input.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest.')
         const answer = await call({ op: 'vmWindowsCreate', ...input })
         const parts = [`${answer.name} is ${answer.state} (Windows).`]
-        if (answer.console) parts.push(`Console: ${answer.console} (relayed from the container's 8006, never published raw).`)
+        if (answer.console) parts.push(`Live view: ${answer.console} (noVNC over QEMU VNC, never published raw).`)
         parts.push(answer.passwordHint)
         if (answer.diskGbRaised !== undefined) parts.push(`Disk raised to ${answer.diskGbRaised} GB: Windows does not install below 64 GB.`)
         if (answer.memoryRaised !== undefined) parts.push(`RAM raised to ${answer.memory} GB: Windows does not install below 6 GB.`)
-        parts.push('`cua_vm_exec`, `cua_vm_put`, `cua_vm_get` and `cua_vm_disk` answer "not available" for this computer — drive it with `cua_vm_gui` or the console.')
+        parts.push('Once it is ready, `cua_vm_exec` runs commands over SSH in cmd.exe, `cua_vm_put`/`cua_vm_get` copy files over scp, and `cua_vm_gui` drives the screen over QMP — `cua_vm_disk`, Android and REA are the Linux-only ones.')
         if (answer.detail) parts.push(answer.detail)
         return { text: parts.join(' ') }
       }
