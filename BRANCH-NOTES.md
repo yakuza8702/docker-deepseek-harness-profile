@@ -657,25 +657,40 @@ broken VM. `DSH_CUA_VM_WINDOWS=0` removes the option entirely.
 
 ### 15.5 Gates
 
-* `tools/check-cua-vm.mjs` — 117 assertions across 12 files: registry v2 + the
+* `tools/check-cua-vm.mjs` — **176 assertions** across 12 files (the gate prints
+  its own total, so a doc cannot drift from it): registry v2 + the
   migration, the four policy keys, the 0600 credentials, the accounting roots and
   the quota rule, the delete manifest, GC, the shutdown/QMP/checkpoint/start
   chain, the spec normaliser and the GPU default, the measured space (including a
   `FORBIDDEN` rule for `/cua-vm/shots` and `Math.sqrt(900000`), the Windows env
   mapping and QMP arguments, the proxy's relay rewrite, and the compose wiring.
-* `tools/check-cua-rea.mjs` — exactly **two** needle spellings changed in the
-  same commit, because the refactor moved where they live (the create flags into
-  the spec normaliser, `diskGb` into `createManaged`). No needle was deleted.
+* `tools/check-cua-rea.mjs` — **67 needles** across 5 files, with exactly
+  **three** spellings changed in the same commit because the refactor moved where
+  they live (the create flags into the spec normaliser, `diskGb` into
+  `createManaged`, the recovery-row merge into `fresh.vms[name] || known`). No
+  needle was deleted.
 * `tools/ci-gates.mjs` — registered, so a bare checkout answers it in seconds:
   **7 passed / 0 failed / 3 skipped** (up from 6).
 
 ### 15.6 Evidence
 
 `node --check` on all seven `.mjs`, `bash -n` on the guest script, both gates
-green, `ci-gates` 7/0/3, and four runtime checks that need no image: a supervisor
-smoke on a throwaway store with a stub `cua` (migration, quota, manifest, GC,
-shutdown, cold boot), a real `qemu-system-x86_64 -S` shutdown (timeout → quit →
-`mayBeTorn`), an ACPI-refusal fallback against a protocol-level QMP peer, and unit
-tests for the two new modules. A real guest boot and a Windows install are **NOT
-RUN** — no `cua` runtime store, no `qemu-img`, and creating a Windows container is
-a mutation on a shared engine; both are listed as TBC in REPORT.md §9.4.
+green (176 assertions / 67 needles), `ci-gates` 7/0/3, and four runtime checks
+that need no image: a supervisor smoke on a throwaway store with a stub `cua`
+(61 assertions: migration, quota, manifest, GC, shutdown, cold boot, and the
+review regressions — missing `cua`, traversal names, an abandoned QEMU that
+must not be touched, target switching, a concurrent exec burst), a real `qemu-system-x86_64 -S` shutdown
+(timeout → quit → `mayBeTorn`), an ACPI-refusal fallback against a
+protocol-level QMP peer, and unit tests for the two new modules. A real guest
+boot and a Windows install are **NOT RUN** — no `cua` runtime store, no
+`qemu-img`, and creating a Windows container is a mutation on a shared engine;
+both are listed as TBC in REPORT.md §9.5.
+
+### 15.7 Review round 2
+
+Seven defects fixed on this branch (D1 spawn crash, D2 path traversal through
+`name`, D3 unproven-dead checkpoint, D4 capture on the wrong target, D5 registry
+write races, D6 orphan container, D7 doc counts), with the reasoning in
+REPORT.md §9.4 and five of them covered by new assertions — `runCua` and
+`assertVmName` and `mutateRegistry` and the abandoned-shutdown branch are now
+gate needles, so none of them can be refactored away silently.

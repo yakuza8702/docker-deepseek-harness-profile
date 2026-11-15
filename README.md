@@ -794,7 +794,13 @@ docker compose -f compose.yaml -f compose.windows.yaml up -d
 
 It adds a `dind` service, sets `DOCKER_HOST=tcp://dind:2375` and
 `DSH_CUA_VM_WINDOWS=1`, and shares the `cua-vm` volume so a Windows
-`/storage` bind is the same tree on both sides. The engine container is
+`/storage` bind is the same tree on both sides.
+
+**Raise the disk quota first.** A Windows disk floors at 64 GB and
+`diskQuotaGb` defaults to **20**, so the create is refused until the policy
+allows the floor: Personal VM → Policy → Disk Size ≥ 64 (or edit
+`/cua-vm/config.json`). The refusal says exactly that, with the number, instead
+of the generic "store quota reached". The engine container is
 `privileged` (an in-container engine needs it); the harness keeps `cap_drop ALL`,
 read-only rootfs and `no-new-privileges`. The console is relayed to
 `/vm/port/<name>/`; **RDP 3389 is commented out and documented as a LAN exposure**

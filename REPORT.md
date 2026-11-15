@@ -314,7 +314,7 @@ green. This section is the delta a reader of the older sections needs.
 | W5 | `DSH_CUA_VM_GPU` is live: `virgl` makes virgl the default for a create that omits `gpu` (explicit `false` wins, gated on `systemQemuSupportsVirgl`); one `normaliseSpec` + shared `createManaged` so `ensure` carries image/gpu/diskGb/android/rea and a rebuild restores them; `cua_vm_start` tool; `cua_vm_port` prints the URL **and** the loopback port (`result.target` was always `undefined`) |
 | W6 | New `docker/cua-vm-windows.mjs`: Docker Engine API over `DOCKER_HOST`, pinned `dockurr/windows:4.35`, the full env mapping with 64 GB / 6 GB / 2 vCPU floors, `usb-tablet` + QMP 7100 (never published), `NET_ADMIN`, `/storage` bind, labels, no restart policy; `installing` → `ready` on RDP-accept **and** QMP-running, timeout with the last 40 log lines; console 8006 relayed into `ports.json` as `backend:"relay"`; 3389 opt-in only; `DSH_CUA_VM_WINDOWS=0` removes the option |
 | W7 | Windows agent surface: `screendump` frames (`space.source='qmp'`), `input-send-event` clicks/keys (ASCII only), and structured "not available" for exec/put/get/disk with the console/RDP hint; the proxy rewrites root-path HTML/JS for relay rows; `compose.windows.yaml`, env pass-through in `compose.yaml`, `.env.example` |
-| W9 | Docs + `tools/check-cua-vm.mjs` (117 assertions, registered in `ci-gates.mjs`); `check-cua-rea.mjs` updated in the same commit for exactly the two needle spellings the refactor changed; four new tools; the panel gained kind/version selection, per-kind gating, a Shutdown/Suspend split, installing/error badges, a Space line, Clean up, and password reveal |
+| W9 | Docs + `tools/check-cua-vm.mjs` (**176 assertions**, the gate prints its own total; registered in `ci-gates.mjs`); `check-cua-rea.mjs` updated in the same commit for the three needle spellings the refactor moved (create flags → spec normaliser, `diskGb` → `spec.diskGb`, recovery row merge → `fresh.vms[name] || known`), none deleted; four new tools; the panel gained kind/version selection, per-kind gating, a Shutdown/Suspend split, installing/error badges, a Space line, Clean up, and password reveal |
 
 ### 9.3 Verification actually run
 
@@ -322,10 +322,10 @@ green. This section is the delta a reader of the older sections needs.
 |---|---|
 | `node --check` on every `.mjs` (supervisor, space, windows, plugin, proxy, gates) | green |
 | `bash -n` on `docker/cua-guest-provision.sh` | green |
-| `node tools/check-cua-rea.mjs` | 21/21 needles (after the two spelling updates) |
-| `node tools/check-cua-vm.mjs` | 117 assertions green |
+| `node tools/check-cua-rea.mjs` | **67** needles across 5 files (after the three spelling updates) |
+| `node tools/check-cua-vm.mjs` | **176** assertions across 12 files |
 | `node tools/ci-gates.mjs` | **7 passed, 0 failed, 3 skipped** (baseline was 6/0/3) |
-| Supervisor smoke against a **throwaway store + stub `cua`** (37 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint |
+| Supervisor smoke against a **throwaway store + stub `cua`** (61 assertions) | PASS — registry v1→v2 migration, quota refusal, delete manifest (9 items), GC (orphan kept, artifact removed, restore temp, expired view, promoted interrupted convert), shutdown of a dead QEMU, cold boot from checkpoint, **and the review regressions**: a missing `cua` does not kill the supervisor, `"../.."` names are refused before any path is built, a live no-QMP QEMU makes the shutdown refuse and change nothing, a stale restore point is not booted, `vmSpace` switches the cua target before capturing, and a shutdown survives a concurrent exec burst |
 | Shutdown against a **real QEMU** (`qemu-system-x86_64 -S`, KVM present) | PASS — `system_powerdown`, 10 s timeout, `quit`, process exit, `mayBeTorn`, `powered-off` |
 | ACPI-refusal fallback against a protocol-level QMP peer | PASS — `fallback:"acpi-unsupported"`, `state:"suspended"` |
 | `cua-vm-space` / `cua-vm-windows` unit tests (real PNG, tar, key map, password, cache TTL) | PASS (26 assertions) |
@@ -338,7 +338,27 @@ accounting reported **8.11 GB**; the real usage was **19.33 GB of a 20 GB
 quota** — a 58% under-report, one create away from ENOSPC, and 6 GB of it is
 exactly what `cua_vm_gc` now drops (a restore temp that no shutdown removed).
 
-### 9.4 What is still open (TBC)
+### 9.4 Review fixes (second round)
+
+Seven defects were found in review; all are fixed on the same branch, with
+regression tests where the bug was testable without a VM.
+
+| # | Defect | Fix |
+|---|---|---|
+| D1 | `runCua`'s spawn `error` handler read a property off `done()`'s `undefined` return and threw **inside the listener** — any image without `cua` on PATH killed the supervisor on the first tool call | both spawn failure channels (sync throw, async `error`) resolve the same `{code:-1, stderr}` via a single-shot `done()`; no `uncaughtException` band-aid |
+| D2 | `vmDelete`/`destroy` accepted any `name`, and `path.join(WINDOWS_DIR, name)` / `vmm/qemu/<name>` / `trajectories/local_<name>` then became `rmSync(recursive)` targets — `"../.."` deleted arbitrary host directories | one `assertVmName()` (the create regex) called from the **request dispatcher** (no op can forget it) *and* from every path helper (`windowsCredentialsPath`, `checkpointFilesFor`, `shotFilesFor`, `qmpTarget`, `qemuPid`, `destroyVm`, `shutdownVm`, `startFromCheckpoint`, …) |
+| D3 | the "QMP unreachable" branch checkpointed without proving QEMU was dead — a live QEMU's open qcow2 was converted and advertised as a clean restore point | `pidAlive(qemuPid(name))` decides. Alive ⇒ the shutdown is **refused**: no checkpoint, no `sb rm`, no `powered-off` (removing the sandbox while QEMU runs would let Start build a second QEMU on the same disk); the row records `lastShutdown.method: "abandoned"` and the error says the computer is still running. `cua_vm_start` also refuses a `stale: true` restore point and boots the base image, saying why (defensive: a row written by an older build) |
+| D4 | `space.capture` captured whatever `cua do` was last pointed at | it now runs `do switch local:<name>` before the screenshot (and drops the cached space + prime flag on a switch), exactly like the gui path |
+| D5 | registry read-modify-write across `await`s: a finishing `exec` could write a pre-shutdown snapshot back and resurrect `state: "ready"` | every mutation goes through `mutateRegistry()` — a tiny critical section under `withLock('@registry')` that **re-reads** inside the lock |
+| D6 | a failure between container-create and start left an orphan container holding the name, with no registry row | both failure paths `DELETE` the container before the error travels |
+| D7 | docs claimed 117 assertions and "21/21" needles | gates now print their own totals (**176** assertions, **67** needles) and the docs quote those; the Windows 64 GB quota requirement is stated in README §Personal VM and here |
+
+The Windows quota requirement is not cosmetic: `diskQuotaGb` defaults to 20 GB
+and a Windows disk floors at 64 GB, so a fresh install must raise the policy
+first. The create now refuses with that exact sentence (and the field to change)
+instead of the generic "store quota reached".
+
+### 9.5 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),
    screenshot, click, shutdown, Start, and confirm `powered-off → ready` from the
@@ -353,3 +373,8 @@ exactly what `cua_vm_gc` now drops (a restore temp that no shutdown removed).
 5. `prefixRootPaths` is a heuristic. It is applied only to `backend:"relay"` rows,
    but a console that builds URLs at runtime from a config string (not a literal)
    would still need a `<base>`-style fix.
+6. The registry lock is per-process. Two supervisors on the same store (a
+   misconfigured deployment, not a supported one) would still interleave; the
+   store has no cross-process lock, and `flock` is the obvious next step.
+7. D6's cleanup path is code-reviewed but not exercised against an engine: it
+   needs a Docker daemon that fails a start on demand.

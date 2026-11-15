@@ -526,9 +526,21 @@ export function createWindowsBackend({ store, qmp, log = () => {} } = {}) {
         throw new Error(`docker could not create the Windows container (${created.status}): ${created.json?.message ?? created.buffer.toString('utf8').slice(-300)}`)
       }
       const id = created.json?.Id ?? ''
-      const started = await dockerRequest(`/containers/${encodeURIComponent(id)}/start`, { method: 'POST', timeoutMs: 120000 })
+      // CREATE AND START ARE TWO REQUESTS. A container that is created but never
+      // started is invisible to the panel (no registry row, no credentials) and
+      // it holds the name: the next create answers "a container already exists"
+      // and the operator has to leave the UI to `docker rm` it by hand. Any
+      // failure between the two therefore removes it before the error travels.
+      let started
+      try {
+        started = await dockerRequest(`/containers/${encodeURIComponent(id)}/start`, { method: 'POST', timeoutMs: 120000 })
+      } catch (error) {
+        await dockerRequest(`/containers/${encodeURIComponent(id)}?force=1&v=1`, { method: 'DELETE', timeoutMs: 60000 }).catch(() => {})
+        throw new Error(`docker did not answer the start of the Windows container: ${error?.message ?? error} (the container was removed)`)
+      }
       if (started.status !== 204 && started.status !== 304) {
-        throw new Error(`docker could not start the Windows container (${started.status}): ${started.json?.message ?? started.buffer.toString('utf8').slice(-300)}`)
+        await dockerRequest(`/containers/${encodeURIComponent(id)}?force=1&v=1`, { method: 'DELETE', timeoutMs: 60000 }).catch(() => {})
+        throw new Error(`docker could not start the Windows container (${started.status}): ${started.json?.message ?? started.buffer.toString('utf8').slice(-300)} (the container was removed)`)
       }
       log(`windows: ${spec.name} installing (image ${WINDOWS_IMAGE}, ${spec.diskGb} GB, ${spec.memory} GB RAM, ${spec.cpu} vCPU${spec.gpu ? ', GPU' : ''})`)
       return {

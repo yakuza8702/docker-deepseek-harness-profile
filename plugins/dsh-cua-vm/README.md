@@ -182,6 +182,11 @@ panel hides it).
 `dsh.cua.vm=<name>` + `dsh.cua.kind=windows`, and **no restart policy** (a
 deliberately stopped computer must not resurrect itself).
 
+**Storage quota.** A Windows disk floors at 64 GB and the default policy is
+`diskQuotaGb: 20`, so the first Windows create is refused until you raise it
+(Personal VM → Policy → Disk Size ≥ 64). The message names the number and the
+field; it is a policy decision, not something the plugin silently raises.
+
 **Ready** = RDP accepting on the published 3389 **and** QMP `query-status`
 saying `running`. Both halves matter: RDP opens while the install is still
 rebooting, and QMP says `running` before the guest exists. Until then the row is

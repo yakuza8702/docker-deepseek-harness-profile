@@ -147,7 +147,34 @@ const NEEDLES = {
     ["backend: 'relay'", 1],
     // boot work
     ['void reconcilePorts()', 1],
-    ['watchWindowsInstall(name)', 2]
+    ['watchWindowsInstall(name)', 2],
+    // D1: a failed spawn is a RESULT. The old handler read a property off
+    // `done()`'s return and threw inside the 'error' listener, killing the
+    // process; the fix routes it through the same single-shot `done`.
+    ["child.on('error', (error) => done(-1, false,", 1],
+    ['if (settled) return', 1],
+    // D2: a name is a path segment, validated at the dispatcher AND at the
+    // helpers that build a path from it.
+    ['const VM_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{1,30}$/', 1],
+    ['function assertVmName(name)', 1],
+    ['assertVmName(request.name)', 1],
+    ['assertVmName', 12],
+    // D3: "QMP unreachable" is not "the computer is off" — the pid decides.
+    ['let qemuMayBeAlive = false', 1],
+    ['qemuMayBeAlive = pidAlive(qemuPid(name))', 2],
+    ["method = qemuMayBeAlive ? 'abandoned' : 'already-off'", 1],
+    // ...and an abandoned computer is LEFT ALONE: no checkpoint, no sb rm, no
+    // `powered-off` lie that would make Start build a second QEMU on the disk.
+    ['could not power ${name} off: QEMU (pid ${qemuPid(name)}) is still running', 1],
+    ['nothing was removed', 1],
+    ['const stale = meta.restoreFrom?.stale === true', 1],
+    // D4: measuring must point cua at the computer being measured first.
+    ['if (DO_TARGET !== name)', 2],
+    ['space.clear()', 2],
+    // D5: registry mutations are serialised, so an await cannot resurrect a
+    // row another handler already moved on.
+    ['function mutateRegistry(mutator)', 1],
+    ["withLock('@registry'", 1]
   ],
   space: [
     ['export const CAPTURE_MAX_PIXELS = 900_000', 1],
@@ -189,7 +216,11 @@ const NEEDLES = {
     ["execute: 'input-send-event'", 1],
     ['export function charToKey(char)', 1],
     ['REA is a Linux kit', 1],
-    ['Android is not available for Windows computers', 1]
+    ['Android is not available for Windows computers', 1],
+    // D6: create and start are two requests; a failure between them must not
+    // leave a container that holds the name but has no registry row.
+    ['(the container was removed)', 2],
+    ['?force=1&v=1', 2]
   ],
   provision: [
     ['MARKER=/var/lib/cua-provision', 1],
@@ -311,6 +342,7 @@ const FORBIDDEN = [
 ]
 
 let failures = 0
+let total = 0
 const missing = []
 
 console.log(`cua-vm gate — ${ROOT}`)
@@ -328,6 +360,7 @@ for (const [key, spec] of Object.entries(FILES)) {
   let bad = 0
   for (const [needle, min] of NEEDLES[key] ?? []) {
     checked += 1
+    total += 1
     const hits = (text.match(new RegExp(needlePattern(needle), 'gu')) || []).length
     if (hits < min) {
       bad += 1
@@ -337,6 +370,7 @@ for (const [key, spec] of Object.entries(FILES)) {
   }
   for (const rule of FORBIDDEN.filter((entry) => entry.key === key)) {
     checked += 1
+    total += 1
     if (text.includes(rule.pattern)) {
       bad += 1
       failures += 1
@@ -358,5 +392,6 @@ if (failures > 0) {
   process.exit(1)
 }
 
-console.log('\npersonal VM wired end to end: registry, accounting, shutdown, space, Windows, proxy, compose.')
+console.log(`\npersonal VM wired end to end: registry, accounting, shutdown, space, Windows, proxy, compose.`)
+console.log(`${total} assertion(s) across ${Object.keys(FILES).length} file(s).`)
 process.exit(0)

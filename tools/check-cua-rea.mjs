@@ -144,7 +144,12 @@ const NEEDLES = {
     ['\\[rea\\] OK', 1],
     ['already provisioned', 1],
     ['node=(v[0-9][^\\s]*)', 1],
-    ['...(known || {}),', 1],
+    // 2026-11: the recovery row now merges the LIVE row over the stale copy it
+    // read before the rebuild (`fresh.vms[name] || known`), because registry
+    // writes are serialised and the old snapshot could otherwise resurrect a
+    // field a concurrent update had just removed. Same invariant (the rebuilt
+    // computer keeps what the old row knew), same commit.
+    ['...(fresh.vms[name] || known || {}),', 1],
     ['const reaBack = known?.rea === true ? await provisionReaGuest(name) : null', 1],
     ['rea: false,', 1],
     // 2026-11: the create signature became a normalised spec (kind + one shape
@@ -182,6 +187,7 @@ const NEEDLES = {
 }
 
 let failures = 0
+let total = 0
 const missing = []
 
 console.log(`cua-rea gate — ${ROOT}`)
@@ -199,6 +205,7 @@ for (const [key, spec] of Object.entries(FILES)) {
   let bad = 0
   for (const [needle, min] of NEEDLES[key]) {
     checked += 1
+    total += 1
     const pattern = new RegExp(needlePattern(needle), 'gu')
     const hits = (text.match(pattern) || []).length
     if (hits < min) {
@@ -222,5 +229,6 @@ if (failures > 0) {
   process.exit(1)
 }
 
-console.log('\nREA kit wired end to end: provisioner, supervisor, image gate, plugin surface.')
+console.log(`\nREA kit wired end to end: provisioner, supervisor, image gate, plugin surface.`)
+console.log(`${total} needle(s) across ${Object.keys(FILES).length} file(s).`)
 process.exit(0)
