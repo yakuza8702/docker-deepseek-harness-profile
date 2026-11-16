@@ -52,6 +52,12 @@ done
 printf 'display=%s\\n' "$DISPLAY" >> "${ARGV_LOG}"
 MODE="$(cat "${FAIL_MARKER}" 2>/dev/null || echo ok)"
 case "$MODE" in
+  slow)
+    # THE LIVE FAILURE SHAPE: a QEMU that is STILL INITIALIZING when it is asked
+    # for its pidfile. It writes the file only after ~100 ms. A boot window of
+    # 0 ms (the unset→0 defect) declared this dead on the first poll.
+    sleep 0.1
+    ;;
   egl)
     case "$DISPLAY" in
       egl-headless*)
@@ -93,7 +99,7 @@ process.env.DSH_CUA_WINDOWS_QEMU = QEMU
 process.env.DSH_CUA_WINDOWS_SWTPM = SWTPM
 process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = '1500'
 
-const { createWindowsBackend, windowsPaths, waitForQemuBoot, qemuStderrExcerpt, classifyQemuInitFailure } =
+const { createWindowsBackend, windowsPaths, waitForQemuBoot, qemuStderrExcerpt, classifyQemuInitFailure, qemuBootWindowMs } =
   await import('../docker/cua-vm-windows-qemu.mjs')
 
 let failures = 0
@@ -103,7 +109,7 @@ const check = (label, ok, detail = '') => {
 }
 
 const backend = createWindowsBackend({ store: STORE, qmp: async () => [{ return: {} }], log: () => {} })
-const NAMES = ['win-egl', 'win-kvm', 'win-clean']
+const NAMES = ['win-egl', 'win-kvm', 'win-clean', 'win-slow']
 
 /** A bootable-enough windows directory: the vars file must already exist. */
 function prepare(name) {
@@ -189,6 +195,53 @@ try {
       argvLines.length === 1 && argvLines[0].includes('egl-headless'), argvLines.join(' | '))
     check('F3: ...and the error says so in words (no silent TCG)',
       /KVM|accelerator/iu.test(caught?.message ?? '') && /NOT retried without the GPU/u.test(caught?.message ?? ''), String(caught?.message).slice(0, 200))
+    backend.kill(spec.name)
+  }
+
+  // ---- F3 (live failure shape): BOTH WINDOWS UNSET, QEMU WRITES ITS PIDFILE
+  //      LATE ----
+  //
+  // THE ACTUAL USER BUG, REPLAYED. `qemuBootWindowMs()` computed 0 when its env
+  // var was UNSET (`Number(undefined ?? '')` → 0, `0 >= 0` → accepted), so the
+  // first poll ran against an already-expired deadline and declared a QEMU that
+  // was ~1 ms old dead: "died during init (none): no stderr output". The suites
+  // missed it because both SET the window. Here NEITHER is set, and the stub
+  // QEMU deliberately takes ~100 ms to write its pidfile — far longer than 0 ms,
+  // comfortably inside the real 15 s default. With the old code this start dies
+  // at ~1 ms; with the fix it reports a live computer.
+  {
+    writeFileSync(ARGV_LOG, '')
+    writeFileSync(FAIL_MARKER, 'slow')
+    const savedBoot = process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS
+    const savedEarly = process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+    delete process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS
+    delete process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+    const spec = specFor('win-slow')
+    const p = spec.paths
+    const started = Date.now()
+    // CAPTURED WHILE UNSET: the suite's own header sets 1500 at import time, so
+    // the value must be read here, not after the restore below.
+    const windowWhileUnset = qemuBootWindowMs()
+    let booted = null
+    let caught = null
+    try {
+      booted = await backend.boot(spec, { installPending: true })
+    } catch (error) {
+      caught = error
+    } finally {
+      if (savedBoot === undefined) delete process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS
+      else process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = savedBoot
+      if (savedEarly === undefined) delete process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+      else process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS = savedEarly
+    }
+    const elapsed = Date.now() - started
+    check('F3: with BOTH windows UNSET the default is used (15000 ms), not 0',
+      windowWhileUnset === 15000, String(windowWhileUnset))
+    check('F3: a QEMU that writes its pidfile ~100 ms after spawn is NOT called dead',
+      caught === null && typeof booted?.pid === 'number' && booted.pid > 0,
+      caught === null ? JSON.stringify(booted) : String(caught?.message).split('\n')[0])
+    check('F3: ...the boot really waited for the late pidfile (>= 90 ms) and the pidfile is on disk',
+      elapsed >= 90 && existsSync(p.qemuPid), `${elapsed}ms pidfile=${existsSync(p.qemuPid)}`)
     backend.kill(spec.name)
   }
 

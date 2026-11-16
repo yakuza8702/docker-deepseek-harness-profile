@@ -901,6 +901,13 @@ problem, not a setting:
   build: `main` has no Windows code at all), or
 * the image's `COPY` and the supervisor's `DSH_CUA_WINDOWS_OEM_DIR` disagree.
 
+The stick itself is a **read-only** medium, and that is deliberate twice over:
+nothing in the guest writes to it, and the image's rootfs is read-only, so vvfat
+in `rw` mode is not an option (it wants a temp dir under `/var/tmp`, which is
+`EROFS`). The argv therefore carries `read-only=on` on the `-drive` — QEMU's
+`usb-storage` needs a writable **node**, and without that token it refuses the
+read-only vvfat node with `Block node is read-only` during init.
+
 Pull or build a newer image from this branch with the virgl QEMU, then recreate
 the container **keeping the `/cua-vm` volume** (the store and every existing
 computer survive — only the container is replaced):

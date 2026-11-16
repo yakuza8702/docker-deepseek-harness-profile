@@ -3033,10 +3033,18 @@ const WINDOWS_WATCHING = new Set()
  * refuses to return a dead start, but a QEMU can also die a second later (OOM,
  * a disk that filled up) — so the watcher's FIRST tick happens inside a short
  * window and treats "no pidfile / no live pid" as DEATH, not as progress.
+ *
+ * UNSET IS NOT ZERO (same defect as `qemuBootWindowMs`). `Number(env ?? '')`
+ * made an unset variable 0, `0 >= 0` passed, and the first tick fired with no
+ * wait at all — the row was judged dead before the QEMU it was watching had a
+ * chance to write its pidfile. Only a NON-EMPTY raw value is parsed now.
  */
 function windowsEarlyDeathWindowMs() {
-  const raw = Number(process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS ?? '')
-  if (Number.isFinite(raw) && raw >= 0) return Math.min(60000, Math.max(0, Math.trunc(raw)))
+  const raw = process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.min(60000, Math.max(0, Math.trunc(parsed)))
+  }
   return 5000
 }
 

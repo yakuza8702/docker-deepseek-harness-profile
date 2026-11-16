@@ -343,6 +343,9 @@ const NEEDLES = {
     ['function windowsQemuStderrTail(name, lines = 20)', 1],
     ['function windowsEarlyDeathWindowMs()', 1],
     ["DSH_CUA_WINDOWS_EARLY_CHECK_MS", 1],
+    // N1's second half: the same unset→0 trap in the watchdog's first tick.
+    ['const raw = process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS', 1],
+    ["if (raw !== undefined && raw !== '') {", 1],
     ['first ? windowsEarlyDeathWindowMs() : 15000', 1],
     ["const errorText = `${why}", 1],
     ['the Windows computer did not start:', 1],
@@ -482,7 +485,17 @@ const NEEDLES = {
     // install medium while installing, drivers ISO when present, OEM payload
     ['if=none,id=cd0', 1],
     // M9: read-only vvfat — nothing in the guest writes this staging directory.
-    ['file=fat:ro:${p.oemDir},format=raw,if=none,id=oem0', 1],
+    //
+    // M10: `read-only=on` IS PART OF THIS ARGV, not decoration. usb-storage
+    // attaches a SCSI disk whose block node must be WRITABLE; a `fat:ro:` vvfat
+    // node is read-only, so QEMU 10.0.13 refused the pair with
+    // `-device usb-storage,drive=oem0,bus=xhci.0: Block node is read-only`
+    // ~118 ms into a real Windows create — the pidfile was never written and the
+    // serial log stayed 0 bytes. `read-only=on` marks the MEDIUM read-only (a
+    // write-protected stick, which is what an install medium is) and boots.
+    // `fat:rw:` is not the alternative: this image's rootfs is read-only, and
+    // vvfat in rw mode wants a temp dir under /var/tmp (EROFS).
+    ['file=fat:ro:${p.oemDir},format=raw,read-only=on,if=none,id=oem0', 1],
     ['usb-storage,drive=oem0,bus=xhci.0', 1],
     // networking: SLIRP + the SSH forward (no bridge, no tap)
     ['user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22', 1],
@@ -555,6 +568,11 @@ const NEEDLES = {
     ['export async function waitForQemuBoot({ child, pidFile, isAlive, windowMs = 15000, pollMs = 50 } = {})', 1],
     ['export function qemuBootWindowMs()', 1],
     ["DSH_CUA_WINDOWS_BOOT_SETTLE_MS", 1],
+    // N1: UNSET IS NOT ZERO. `Number(env ?? '')` made an unset variable 0 and
+    // `0 >= 0` accepted it, so the 15000 fallback was unreachable and the boot
+    // window was 0 ms on every real host. The raw string is inspected first.
+    ['const raw = process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS', 1],
+    ["if (raw !== undefined && raw !== '') {", 1],
     ["if (pid > 0) {", 1],
     ["reason: pidFileInvalid ? 'pidfile-invalid' : 'timeout'", 1],
     ['export function qemuInitError(', 1],
@@ -1061,6 +1079,39 @@ function sourceOf(label, name) {
       failures += 1
       missing.push('tests/: supervisor-smoke.mjs, modules-unit.mjs, qmp-shutdown.mjs and windows-boot.mjs must be committed')
       console.log('  FAIL L5 runtime suite')
+    }
+  }
+
+  // N3: THE SUITES MUST WITNESS THE **UNSET** SHAPE. Every existing case SET the
+  // window (`windows-boot.mjs:94`, `supervisor-smoke.mjs:242`), and a test that
+  // supplies a number can never observe the default — which is exactly why the
+  // unset→0 defect passed every green run. A semantic assertion (delete the env,
+  // not just set it), because "the file exists" cannot express it.
+  if (!REPO_LAYOUT) {
+    if (!quietMode) console.log('  n/a  N3 the unset-window cases live with the suite in the checkout')
+  } else {
+    total += 1
+    const unitSource = existsSync(path.join(ROOT, 'tests', 'modules-unit.mjs'))
+      ? readFileSync(path.join(ROOT, 'tests', 'modules-unit.mjs'), 'utf8')
+      : ''
+    const smokeSource = existsSync(path.join(ROOT, 'tests', 'supervisor-smoke.mjs'))
+      ? readFileSync(path.join(ROOT, 'tests', 'supervisor-smoke.mjs'), 'utf8')
+      : ''
+    const deletesBoot = /delete process\.env\.DSH_CUA_WINDOWS_BOOT_SETTLE_MS/u.test(unitSource)
+    const assertsDefault = /qemuBootWindowMs\(\) === 15000/u.test(unitSource)
+    const assertsEarly = /earlyWindow === 5000/u.test(unitSource)
+    const explicitZero = /qemuBootWindowMs\(\) === 0/u.test(unitSource)
+    // The smoke case must UNSET both variables for the CHILD supervisor, not
+    // merely shorten them: that is the production shape of the live failure.
+    const smokeUnsets = /delete env\.DSH_CUA_WINDOWS_BOOT_SETTLE_MS/u.test(smokeSource)
+      && /delete env\.DSH_CUA_WINDOWS_EARLY_CHECK_MS/u.test(smokeSource)
+    const smokeLatePidfile = /exec sleep 120/u.test(smokeSource) && /sleep 0\.1/u.test(smokeSource)
+    if (deletesBoot && assertsDefault && assertsEarly && explicitZero && smokeUnsets && smokeLatePidfile) {
+      if (!quietMode) console.log('  ok   N3 the suite exercises the UNSET window (not only the overridden one)')
+    } else {
+      failures += 1
+      missing.push('N3: tests/modules-unit.mjs must DELETE the window env and assert unset → 15000 / 5000 (plus an explicit "0" → 0), and tests/supervisor-smoke.mjs must run a supervisor with BOTH windows unset against a stub QEMU that writes its pidfile ~100 ms late — otherwise the unset→0 defect is invisible again')
+      console.log('  FAIL N3 unset-window coverage')
     }
   }
 

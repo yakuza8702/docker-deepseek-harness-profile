@@ -1111,5 +1111,97 @@ try {
   try { kvmSup.kill('SIGKILL') } catch {}
 }
 
+// ---- F3: BOTH BOOT WINDOWS UNSET, AND A QEMU THAT WRITES ITS PIDFILE LATE ----
+//
+// THE USER'S LIVE FAILURE, THROUGH THE REAL SUPERVISOR. `qemuBootWindowMs()`
+// used `Number(process.env.X ?? '')`, which turns an UNSET variable into 0 and
+// accepts it (`0 >= 0`), so the production boot window was 0 ms: `boot()` polled
+// once against an already-expired deadline and reported a QEMU that was ~1 ms
+// old dead — "died during init (none): no stderr output" — while QEMU was still
+// initializing. No suite caught it because every suite SET the window.
+//
+// This case sets NEITHER `DSH_CUA_WINDOWS_BOOT_SETTLE_MS` NOR
+// `DSH_CUA_WINDOWS_EARLY_CHECK_MS` (both are deleted from the child env), and its
+// stub QEMU writes its pidfile only after ~100 ms — longer than 0 ms, far inside
+// the real 15 s default. With the old code the create fails; with the fix it
+// succeeds, with the default window.
+{
+  const slowStore = path.join(STORE, 'slow-window')
+  mkdirSync(path.join(slowStore, 'iso'), { recursive: true })
+  writeFileSync(path.join(slowStore, 'iso', 'tiny.iso'), 'not a real iso')
+  const slowSock = path.join(slowStore, 's.sock')
+  const slowBin = path.join(slowStore, 'bin')
+  mkdirSync(slowBin, { recursive: true })
+  // The late-pidfile stub: it is still INITIALIZING for 100 ms — the exact moment
+  // the 0 ms window used to call it dead.
+  const SLOW_QEMU = path.join(slowBin, 'qemu-system-x86_64')
+  writeFileSync(SLOW_QEMU, `#!/bin/sh
+PIDFILE=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "-pidfile" ] && PIDFILE="$a"
+  prev="$a"
+done
+sleep 0.1
+[ -z "$PIDFILE" ] || printf '%s\\n' "$$" > "$PIDFILE"
+exec sleep 120
+`, { mode: 0o755 })
+  // qemu-img/ssh-keygen come from the suite's own stub dir; qemu from slowBin.
+  const slow = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')], {
+    env: (() => {
+      const env = {
+        ...process.env,
+        CUA_VM_STORE: slowStore,
+        CUA_VM_HOME: path.join(slowStore, 'home'),
+        CUA_SUPERVISOR_SOCK: slowSock,
+        CUA_BIN: STUB,
+        CUA_WORKSPACE_ROOT: '/workspace',
+        DSH_CUA_WINDOWS_FAKE_HOST_CAPS: '1',
+        DSH_CUA_WINDOWS_OEM_DIR: path.join(REPO, 'docker', 'windows-oem'),
+        DSH_CUA_WINDOWS_QEMU: SLOW_QEMU,
+        DSH_CUA_VM_WINDOWS: '1',
+        PATH: `${slowBin}:${STUB_BIN}:${process.env.PATH ?? ''}`,
+        PNG_SOURCE
+      }
+      // UNSET, not merely short: this is the production shape.
+      delete env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS
+      delete env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+      return env
+    })(),
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  let slowErr = ''
+  slow.stderr.on('data', (chunk) => { slowErr += chunk })
+  let slowUp = false
+  for (let i = 0; i < 100; i += 1) {
+    if (existsSync(slowSock)) { slowUp = true; break }
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  const askSlow = (payload) => new Promise((resolve) => {
+    const socket = net.connect(slowSock)
+    let buffer = ''
+    socket.setEncoding('utf8')
+    socket.on('connect', () => socket.write(`${JSON.stringify(payload)}\n`))
+    socket.on('data', (chunk) => { buffer += chunk })
+    socket.on('close', () => { try { resolve(JSON.parse(buffer.split('\n')[0])) } catch { resolve(null) } })
+    socket.on('error', () => resolve(null))
+  })
+  check('F3: a supervisor with BOTH boot windows unset starts', slowUp, slowErr.trim().split('\n').slice(-1)[0] ?? '')
+  if (slowUp) {
+    const started = Date.now()
+    const created = await askSlow({ op: 'vmWindowsCreate', name: 'ws-win-slow', kind: 'windows', windowsIso: 'iso/tiny.iso' })
+    const elapsed = Date.now() - started
+    check('F3: a QEMU whose pidfile lands ~100 ms after spawn is NOT declared dead',
+      created?.ok === true, JSON.stringify(created).slice(0, 300))
+    check('F3: ...the create really waited for it (>= 90 ms)',
+      elapsed >= 90, `${elapsed}ms`)
+    check('F3: ...and the real QEMU pidfile is on disk',
+      existsSync(path.join(slowStore, 'windows', 'ws-win-slow', 'qemu.pid')))
+    check('F3: ...no "died during init" line was logged',
+      !/died during init/u.test(slowErr), slowErr.split('\n').filter((line) => /died during init/u.test(line)).join(' / ').slice(0, 200))
+  }
+  try { slow.kill('SIGKILL') } catch {}
+}
+
 console.log(failures === 0 ? '\nsmoke: PASS' : `\nsmoke: ${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

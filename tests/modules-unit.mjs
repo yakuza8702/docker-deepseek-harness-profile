@@ -3,7 +3,7 @@
  * modules-unit.mjs — the pure parts of the two new modules, and the Windows
  * container spec, asserted without a VM, a container or a daemon.
  */
-import { mkdtempSync, writeFileSync, rmSync, existsSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import zlib from 'node:zlib'
@@ -17,7 +17,7 @@ import {
   OEM_PAYLOAD_FILES, oemPayloadDir, oemPayloadDirStatus, oemPayloadDeniedDir, resolveOemSourceDir, writeOemPayload,
   oemPayloadMissingError, oemPayloadDeniedError, windowsKvmPreflight,
   formatWindowsInstallDetail, qmpStateLabel, endpointLabel, windowsTailLines, windowsPortsOf, windowsBootSpec,
-  windowsReadinessSignals
+  windowsReadinessSignals, qemuBootWindowMs, waitForQemuBoot
 } from '../docker/cua-vm-windows-qemu.mjs'
 import {
   KVM_GID_COMMAND, deviceNodePresent, formatKvmStatus, kvmDoctorFacts, kvmPreflightError, kvmStatus
@@ -154,7 +154,18 @@ check('the TPM2 chardev points at the swtpm socket', argv.join(' ').includes(`so
 check('the system disk is a plain qcow2 (checkpointable)', argv.join(' ').includes(`file=${paths.disk},if=none,id=disk0,format=qcow2`) )
 check('kvm + host cpu are the acceleration', has('q35,accel=kvm,smm=off') && has('host'))
 check('the install ISO gets bootindex 2 only while installing', argv.join(' ').includes('if=none,id=cd0') && argv.join(' ').includes('bootindex=2'))
-check('the OEM payload is a READ-ONLY vvfat USB stick', argv.join(' ').includes(`file=fat:ro:${paths.oemDir}`) && has('usb-storage,drive=oem0,bus=xhci.0'))
+// M9 + M10: the OEM medium is READ-ONLY **and** its block node is attached
+// with `read-only=on`. Without that token usb-storage attaches a writable SCSI
+// disk to a read-only vvfat BlockBackend and QEMU 10.0.13 refuses it:
+//   -device usb-storage,drive=oem0,bus=xhci.0: Block node is read-only
+// (observed ~118 ms into a real create; pidfile never written, serial.log 0 B).
+check('the OEM payload is a READ-ONLY vvfat USB stick',
+  argv.join(' ').includes(`file=fat:ro:${paths.oemDir},format=raw,read-only=on,if=none,id=oem0`)
+  && has('usb-storage,drive=oem0,bus=xhci.0'))
+check('M10: the OEM drive declares read-only=on (usb-storage cannot attach a ro node without it)',
+  argv.filter((item) => item.startsWith('file=fat:ro:')).every((item) => item.includes('read-only=on'))
+  && !argv.some((item) => item.startsWith('file=fat:rw:')),
+  argv.find((item) => item.startsWith('file=fat:')))
 check('the USB controller is declared before the device that uses its bus', argv.indexOf('qemu-xhci,id=xhci') !== -1
   && argv.indexOf('qemu-xhci,id=xhci') < argv.indexOf('usb-storage,drive=oem0,bus=xhci.0'))
 check('networking is SLIRP with an SSH forward', argv.join(' ').includes('user,id=net0,hostfwd=tcp:127.0.0.1:47100-:22'))
@@ -587,6 +598,84 @@ check('windowsKvmPreflight is the shared module (no second message)',
   check('the readiness contract names the SSH banner and QMP',
     windowsReadinessSignals('win-test').signals.join('|') === 'the guest SSH banner answers|QMP says running'
     && /\/vm\/port\/win-test\//u.test(windowsReadinessSignals('win-test').onReady))
+}
+
+// ---- F3: THE BOOT WINDOW'S DEFAULT SURVIVES AN UNSET ENV ----
+//
+// THE LIVE BUG. `Number(process.env.X ?? '')` turns an unset variable into 0,
+// `0 >= 0` passed, and `qemuBootWindowMs()` returned 0 ms — so `waitForQemuBoot`
+// polled once against an already-expired deadline and reported a QEMU that was
+// ~1 ms old as dead ("died during init (none): no stderr output"). The suites
+// never caught it because both SET the variables (tests/windows-boot.mjs:94,
+// tests/supervisor-smoke.mjs:242): a test that supplies a number cannot observe
+// the default. These cases DELETE the variable instead.
+{
+  const savedBoot = process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS
+  const savedEarly = process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+  const restore = () => {
+    if (savedBoot === undefined) delete process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS
+    else process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = savedBoot
+    if (savedEarly === undefined) delete process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+    else process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS = savedEarly
+  }
+  try {
+    // UNSET — the production shape, and the one that broke.
+    delete process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS
+    delete process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+    check('F3: unset env → qemuBootWindowMs() === 15000', qemuBootWindowMs() === 15000, String(qemuBootWindowMs()))
+    // `windowsEarlyDeathWindowMs` is module-private in the supervisor (it is not
+    // exported), so this asserts the SAME expression on a fresh import of the
+    // module's own shape: the source must not fall back to `Number(env ?? '')`.
+    const supervisorSource = readFileSync(path.join(REPO, 'docker', 'cua-vm-supervisor.mjs'), 'utf8')
+    check('F3: windowsEarlyDeathWindowMs() parses only a NON-EMPTY raw value',
+      /const raw = process\.env\.DSH_CUA_WINDOWS_EARLY_CHECK_MS\n\s+if \(raw !== undefined && raw !== ''\) \{/u.test(supervisorSource)
+      && /function windowsEarlyDeathWindowMs\(\) \{\n\s+const raw = process\.env\.DSH_CUA_WINDOWS_EARLY_CHECK_MS/u.test(supervisorSource)
+      && !/Number\(process\.env\.DSH_CUA_WINDOWS_EARLY_CHECK_MS \?\? ''\)/u.test(supervisorSource))
+    // The same expression, evaluated here, must give the 5000 default.
+    const earlyWindow = (() => {
+      const raw = process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS
+      if (raw !== undefined && raw !== '') {
+        const parsed = Number(raw)
+        if (Number.isFinite(parsed) && parsed >= 0) return Math.min(60000, Math.max(0, Math.trunc(parsed)))
+      }
+      return 5000
+    })()
+    check('F3: unset env → the early-death window is the 5000 ms default', earlyWindow === 5000, String(earlyWindow))
+    // '' is unset's twin: `Number('') === 0` is exactly the trap.
+    process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = ''
+    check('F3: empty-string env → 15000 (not 0)', qemuBootWindowMs() === 15000, String(qemuBootWindowMs()))
+    // AN EXPLICIT 0 IS HONORED — it is a real request for the shortest window,
+    // not a typo to be upgraded to 15 s.
+    process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = '0'
+    check('F3: an EXPLICIT "0" is honored as 0', qemuBootWindowMs() === 0, String(qemuBootWindowMs()))
+    process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = '1500'
+    check('F3: a set value is still read (1500)', qemuBootWindowMs() === 1500, String(qemuBootWindowMs()))
+    process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = 'nonsense'
+    check('F3: an unparsable value falls back to 15000', qemuBootWindowMs() === 15000, String(qemuBootWindowMs()))
+    process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = '999999'
+    check('F3: the window is still capped at 120000', qemuBootWindowMs() === 120000, String(qemuBootWindowMs()))
+  } finally {
+    restore()
+  }
+}
+
+// F3 (second half): a window of 0 must still observe ONE real poll interval. A
+// zero window used to mean "check once, immediately" — which is how a QEMU that
+// had been alive for 1 ms was declared dead. The floor is pollMs.
+{
+  const pidFile = path.join(os.tmpdir(), `cua-none-${process.pid}-${Date.now()}.pid`)
+  try { rmSync(pidFile, { force: true }) } catch {}
+  const started = Date.now()
+  const verdict = await waitForQemuBoot({ child: { once: () => {} }, pidFile, isAlive: () => false, windowMs: 0, pollMs: 40 })
+  const elapsed = Date.now() - started
+  check('F3: windowMs 0 still waits one poll interval before declaring a timeout',
+    verdict.ok === false && verdict.reason === 'timeout' && elapsed >= 35, `${elapsed}ms ${JSON.stringify(verdict)}`)
+  // ...and a pidfile written DURING that interval is still seen, which is the
+  // exact live shape: QEMU writes it a few ms after spawn.
+  writeFileSync(pidFile, `${process.pid}\n`)
+  const seen = await waitForQemuBoot({ child: { once: () => {} }, pidFile, isAlive: (pid) => pid === process.pid, windowMs: 0, pollMs: 40 })
+  check('F3: ...so a pidfile that appears within it is accepted', seen.ok === true, JSON.stringify(seen))
+  try { rmSync(pidFile, { force: true }) } catch {}
 }
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)

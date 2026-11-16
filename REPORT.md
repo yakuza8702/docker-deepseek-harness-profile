@@ -794,6 +794,55 @@ regular file and a LIVE `missing` create through the real supervisor
 (`DSH_CUA_KVM_DEVICE=/dev/dsh-no-such-kvm`). A live Windows install (ISO,
 OVMF/swtpm, OOBE) stays NOT RUN as before.
 
+### 9.6.11 Two live-verified boot defects (N1, N2) + the test blind spot (N3)
+
+Both of these were reproduced on the real container with QEMU 10.0.13 — they are
+not review findings. A Windows create on this branch failed in two independent
+ways, in this order: the 0 ms boot window declared the QEMU dead in ~1 ms, and
+once that was fixed the argv itself was rejected by QEMU in ~118 ms.
+
+| # | Defect | Fix |
+|---|---|---|
+| N1 | **The boot window was 0 ms on every real host.** `qemuBootWindowMs()` did `Number(process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS ?? '')`: an UNSET variable becomes `Number('') === 0`, `0 >= 0` passed the guard, and the `return 15000` fallback was **unreachable**. `waitForQemuBoot` therefore polled once against an already-expired deadline and reported an initializing QEMU as *"died during init (none): no stderr output"* while it was ~1 ms old. `windowsEarlyDeathWindowMs()` (`DSH_CUA_WINDOWS_EARLY_CHECK_MS`, fallback 5000) had the identical `Number(env ?? '')` shape, so the install watchdog's first tick also fired with no wait | both read the **raw** string first and parse only when `raw !== undefined && raw !== ''`; the 15000 / 5000 fallbacks are now reachable. `waitForQemuBoot` additionally clamps the **effective** window to one poll interval (`pollMs`, ≥10 ms, documented in the function): an explicitly-set `0` is still honored as *the shortest window there is*, but the loop always observes one real interval before it may declare a timeout — the deadline is no longer satisfiable before a single observation |
+| N2 | **The OEM USB stick could not be attached.** `-drive file=fat:ro:…,format=raw,if=none,id=oem0` + `-device usb-storage,drive=oem0,bus=xhci.0` is a read-only BlockBackend behind a device that needs a **writable** node: QEMU 10.0.13 answered `-device usb-storage,drive=oem0,bus=xhci.0: Block node is read-only` and exited at ~118 ms (pidfile never written, `serial.log` 0 bytes). Adding `read-only=on` to the `-drive` makes the pair boot (verified: pidfile written, serial log non-empty). `fat:rw:` is **not** an option here: this image's rootfs is read-only and vvfat in rw mode wants a temp dir under `/var/tmp` (`EROFS`) | the OEM drive is `file=fat:ro:${p.oemDir},format=raw,read-only=on,if=none,id=oem0`; the `usb-storage` device is unchanged. `read-only=on` marks the **medium** read-only (a write-protected stick, which is what an unattended install medium is) rather than the node |
+| N3 | **The suite could not see either one.** `tests/windows-boot.mjs:94` sets `DSH_CUA_WINDOWS_BOOT_SETTLE_MS = '1500'` and `tests/supervisor-smoke.mjs:242` sets both variables — a test that supplies a number can never observe the **default**, so the unset→0 defect was invisible to every green run | `tests/modules-unit.mjs` now **deletes** both variables and asserts `qemuBootWindowMs() === 15000` and the 5000 ms early-death default, then `''` → 15000, explicit `'0'` → 0 (honored), `'1500'` → 1500, unparsable → 15000, `'999999'` → the 120000 cap, plus the `windowMs: 0` poll-interval floor. `tests/supervisor-smoke.mjs` adds a case that runs the **real supervisor with BOTH variables unset** and a stub QEMU that writes its pidfile only after ~100 ms — the exact live shape: it must create successfully and log no "died during init". `tests/windows-boot.mjs` adds the same late-pidfile boot through `backend.boot()` |
+
+Gate needles (added, none deleted): the new OEM argv (`…,read-only=on,if=none,id=oem0`)
+in `tools/check-cua-vm.mjs`'s M9 class, the split `fat:ro:`/`read-only=on`
+assertion and the "no `fat:rw:`" check in `tests/modules-unit.mjs`, the
+`raw !== undefined && raw !== ''` shape of both window readers, and a new **N3**
+semantic assertion in `tools/check-cua-vm.mjs` that fails unless the suite really
+DELETES the window env and runs a supervisor with both unset. The `usb-storage` device needle is
+untouched, so the M9 class keeps both halves.
+
+**Verified live (this container, QEMU 10.0.13, `/dev/kvm` `0666` and openable).**
+
+* `qemuBootWindowMs()`: unset → **15000**, `''` → **15000**, `'0'` → **0**
+  (explicit), `'1500'` → 1500, `'nonsense'` → 15000, `'999999'` → 120000;
+  `windowsEarlyDeathWindowMs()`: unset → **5000**.
+* **Boot replay against `/usr/bin/qemu-system-x86_64`** with a copied store dir
+  under `/tmp` (`disk.qcow2` + `oem/`), `gpu: false`, `installPending: false`,
+  both env vars unset: `BOOT OK pid=4780 in 177 ms`, `qemu.pid` written and
+  readable (`4780`), `serial.log` present, `qemu-stderr.log` **empty** — no
+  read-only error. The OEM error was also reproduced and fixed directly:
+  `qemu-system-x86_64: -device usb-storage,drive=oem0,bus=xhci.0: Block node is
+  read-only` without `read-only=on`; with it, the same argv boots and only stops
+  when killed.
+* `node tools/check-cua-vm.mjs` → **475** assertions (checkout) / **473** (flat
+  tree, L5 + N3 `n/a`), all pass. `node tools/check-cua-rea.mjs` → **67**. `node
+  tools/ci-gates.mjs` → **9 passed / 1 failed / 1 skipped**; the failure is
+  `check-office.mjs` (`@deepseek-ai/dsh-skill-office is not installed`),
+  **pre-existing** and reproduced on the stashed tree.
+* `tests/{supervisor-smoke,modules-unit,windows-boot,qmp-shutdown}.mjs` all
+  **PASS**, including the three new F3 cases. `node --check` clean on every
+  changed file.
+
+**NOT RUN, with the reason.** A full Windows install (ISO download, OVMF/swtpm,
+OOBE) is still not attempted here; the replay boots real QEMU with a real OVMF
+`NVRAM` and a real vvfat OEM directory, but with an empty disk (no install
+medium), so what it proves is that QEMU **accepts the argv and initializes** —
+which is exactly the two defects above.
+
 ### 9.7 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),

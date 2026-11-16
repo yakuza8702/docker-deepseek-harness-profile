@@ -292,10 +292,21 @@ export function windowsReadinessSignals(name = '<name>') {
  *
  * Overridable so the smoke suite can exercise the SAME code without spending 15 s
  * per case (a test that stubs the timer would not be testing this code).
+ *
+ * UNSET IS NOT ZERO. The previous version did `Number(process.env.X ?? '')`,
+ * which turns an UNSET variable into `Number('') === 0`; `0 >= 0` then passed and
+ * the function returned 0 ms — the fallback was unreachable, so the default boot
+ * window on every real host was 0 ms. `waitForQemuBoot` polled once against an
+ * already-expired deadline and declared a QEMU that was ~1 ms old dead ("died
+ * during init (none): no stderr output"). The raw string is inspected FIRST:
+ * only a non-empty value is parsed, so unset and '' both reach the 15000 default.
  */
 export function qemuBootWindowMs() {
-  const raw = Number(process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS ?? '')
-  if (Number.isFinite(raw) && raw >= 0) return Math.min(120000, Math.max(0, Math.trunc(raw)))
+  const raw = process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.min(120000, Math.max(0, Math.trunc(parsed)))
+  }
   return 15000
 }
 
@@ -358,8 +369,16 @@ export function classifyQemuInitFailure(stderr) {
  * a value, and `boot()` decides what to do with it.
  */
 export async function waitForQemuBoot({ child, pidFile, isAlive, windowMs = 15000, pollMs = 50 } = {}) {
-  const window = Math.max(0, Number(windowMs) || 0)
   const step = Math.max(10, Number(pollMs) || 50)
+  // THE FLOOR IS ONE FULL POLL INTERVAL. A window of 0 was never "do not wait":
+  // when it was the *effective* value (the unset→0 defect above, or a caller that
+  // asked for 0), the loop below ran ONE check against a deadline that had
+  // already passed and reported a one-millisecond-old QEMU dead. A start that is
+  // given any window at least gets to observe one real interval, so `pollMs`
+  // (≥10 ms) is the floor — and `Date.now() >= deadline` only fires after that
+  // observation, never before it. An explicitly-set 0 is still honored as "the
+  // shortest window there is", not silently upgraded to 15 s.
+  const window = Math.max(step, Math.max(0, Number(windowMs) || 0))
   const deadline = Date.now() + window
   let exited = false
   let pidFileInvalid = false
@@ -687,7 +706,20 @@ export function buildQemuArgs(spec) {
     // the OEM payload: a READ-ONLY vvfat directory presented as a USB stick
     // (nothing in the guest writes to it; `rw` only gives Setup a chance to
     // corrupt the staging directory until the host copy breaks)
-    '-drive', `file=fat:ro:${p.oemDir},format=raw,if=none,id=oem0`,
+    //
+    // `read-only=on` IS NOT DECORATION. usb-storage attaches a SCSI disk whose
+    // node must be WRITABLE; a `fat:ro:` vvfat is a read-only BlockBackend, so
+    // the pair above failed on QEMU 10.0.13 with
+    //   qemu-system-x86_64: -device usb-storage,drive=oem0,bus=xhci.0:
+    //   Block node is read-only
+    // at ~118 ms into a real Windows create (pidfile never written, serial.log
+    // empty). `read-only=on` marks the medium read-only instead of the node, and
+    // the device then advertises a write-protected USB stick — which is what an
+    // unattended install medium is. `fat:rw:` is NOT the alternative here: this
+    // image's rootfs is read-only, and vvfat in rw mode wants a temp dir under
+    // /var/tmp (EROFS). Verified bootable on QEMU 10.0.13 with the exact argv
+    // below (see REPORT.md §9.6.11).
+    '-drive', `file=fat:ro:${p.oemDir},format=raw,read-only=on,if=none,id=oem0`,
     '-device', 'usb-storage,drive=oem0,bus=xhci.0',
     // networking: SLIRP + the SSH forward
     '-netdev', `user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22`,

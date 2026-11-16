@@ -1051,3 +1051,57 @@ formatter headlines. Gate needles: `check-cua-vm` 428 → **470** assertions in 
 checkout (469 flat), including three new **FORBIDDEN** rules — `stdio: 'ignore'`
 for the Windows QEMU spawn, the `undefined answering` template, and (existing)
 the virtual-disk quota sentence.
+
+## N1–N3 — two live-verified boot defects, and the blind spot that hid them
+
+Both were reproduced on the container with QEMU 10.0.13, in the order a real
+Windows create hit them.
+
+**N1 — the boot window was 0 ms on every real host.** `qemuBootWindowMs()` read
+`Number(process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS ?? '')`. An UNSET variable
+becomes `Number('') === 0`; `0 >= 0` passed the guard; the function returned 0
+and the `return 15000` fallback was **unreachable**. `waitForQemuBoot` then
+polled once against an already-expired deadline and reported a QEMU that was
+~1 ms old as *"died during init (none): no stderr output"* — the exact live
+message. `windowsEarlyDeathWindowMs()` had the same `Number(env ?? '')` shape, so
+the install watchdog's first tick also fired with no wait.
+
+*Fix:* both read the **raw** string and parse only when
+`raw !== undefined && raw !== ''`, so unset and `''` reach the 15000 / 5000
+fallbacks while an explicit `'0'` is still honored as 0. `waitForQemuBoot` also
+clamps the **effective** window to one poll interval (`pollMs`, ≥10 ms): a zero
+window no longer means "check once, immediately", it means the shortest window
+there is — the loop always observes one real interval before a timeout, and a
+pidfile that lands during it is accepted.
+
+**N2 — the OEM USB stick could not be attached.** `fat:ro:` vvfat is a
+read-only BlockBackend and `usb-storage` needs a writable node, so
+`-device usb-storage,drive=oem0,bus=xhci.0` was refused with
+`Block node is read-only` at ~118 ms (pidfile never written, `serial.log` 0
+bytes). *Fix:* `read-only=on` on the `-drive`, which marks the **medium**
+read-only (a write-protected stick) instead of the node; the device is
+unchanged. Verified bootable on QEMU 10.0.13. `fat:rw:` is not an alternative —
+this image's rootfs is read-only and vvfat in rw mode wants `/var/tmp` (EROFS).
+
+**N3 — the blind spot.** `tests/windows-boot.mjs:94` sets the settle window and
+`tests/supervisor-smoke.mjs:242` sets both variables, and a test that supplies a
+number can never observe the default. The new assertions **delete** them instead:
+`tests/modules-unit.mjs` (unset → 15000 + 5000, `''` → 15000, `'0'` → 0,
+`'1500'` → 1500, unparsable → 15000, `'999999'` → the 120000 cap, and the
+`windowMs: 0` poll floor), `tests/supervisor-smoke.mjs` (a real supervisor with
+**both unset** and a stub QEMU that writes its pidfile only after ~100 ms — the
+live failure shape, through the create handler), and `tests/windows-boot.mjs`
+(the same late pidfile through `backend.boot()`).
+
+Gate needles (added, none deleted): the new OEM argv in the M9 class of
+`tools/check-cua-vm.mjs`; in `tests/modules-unit.mjs` the `read-only=on` argv
+match plus "no `fat:rw:`", and the `raw !== undefined && raw !== ''` shape of the
+early-death reader. `usb-storage,drive=oem0,bus=xhci.0` is untouched, so M9 still
+pins both halves.
+
+**Verification.** Live replay against `/usr/bin/qemu-system-x86_64` with a store
+copied under `/tmp` and both env vars unset: `BOOT OK pid=4780 in 177 ms`,
+`qemu.pid` written, `serial.log` present, `qemu-stderr.log` empty. Gate **475**
+(checkout) / **473** (flat, L5 + N3 `n/a`), `check-cua-rea` **67**, `ci-gates` 9/1/1
+(`check-office` is pre-existing), and all four suites PASS. No Windows *install*
+(OOBE) was attempted: the replay proves QEMU accepts the argv and initializes.
