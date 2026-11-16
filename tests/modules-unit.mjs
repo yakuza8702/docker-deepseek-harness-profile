@@ -24,7 +24,7 @@ import {
   WINDOWS_IMAGE_SELECTIONS,
   formatWindowsInstallDetail, qmpStateLabel, endpointLabel, windowsTailLines, windowsPortsOf, windowsBootSpec,
   windowsReadinessSignals, qemuBootWindowMs, waitForQemuBoot,
-  windowsRowName, windowsQmpAdapter, cdbootKeyScheduleMs, cdbootKeysEnabled, runCdbootKeys, startupNshText,
+  windowsRowName, windowsQmpAdapter, cdbootKeyScheduleMs, cdbootKeysEnabled, runCdbootKeys, cdbootPromptSeen, readSerialTail, startupNshText,
   createWindowsBackend
 } from '../docker/cua-vm-windows-qemu.mjs'
 import {
@@ -187,17 +187,24 @@ check('kvm + host cpu are the acceleration', has('q35,accel=kvm,smm=off') && has
     buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: true })
       .includes('virtio-blk-pci,drive=disk0,bootindex=2'))
 }
-// S1: THE ANSWER-FILE MEDIUM IS A FAT32 HARD DISK, NOT A vvfat USB STICK.
-// dockur/windows' mechanism: Setup reliably finds Autounattend.xml on a disk
-// root; our old `fat:ro:` directory behind usb-storage was not visible, which
-// is why the user had to click through Setup.
-// F1: WRITABLE, NOT READ-ONLY. QEMU 10 answers a read-only block node behind
-// ide-hd with "Block node is read-only" and the create dies before swtpm's
-// socket (the reported cascade). dockur's SETUP overlay is a writable disk.
-check('F1: the answer medium is setup.img as a WRITABLE hard disk',
+// S1/F1: THE ANSWER-FILE MEDIUM IS A PARTITIONED FAT32 IMAGE — AND SINCE THE
+// LIVE FORENSIC ROUND IT IS DELIVERED AS **REMOVABLE MEDIA**.
+//
+// Inside the guest, WinPE mounted setup.img as C:, `dir C:\` listed
+// Autounattend.xml, `more` byte-verified it, no Panther error — and Setup STILL
+// showed its language page. Setup's answer-file search covers REMOVABLE-media
+// roots (and the boot media), never fixed-disk roots, so an `ide-hd` attach can
+// never be read no matter how correct the image is. usb-storage + removable=on
+// makes Windows classify it as removable media.
+// F1: WRITABLE, NOT READ-ONLY. QEMU 10 rejects a read-only block node behind
+// ide-hd ("Block node is read-only") and the create died before swtpm's socket.
+check('F1: the answer medium is setup.img as a WRITABLE removable usb-storage stick',
   argv.join(' ').includes(`file=${paths.setupImg},format=raw,if=none,id=setup0`)
   && !argv.join(' ').includes('id=setup0,readonly=on')
-  && has('ide-hd,drive=setup0,bus=ide.2'))
+  && has('usb-storage,drive=setup0,removable=on,bus=xhci.0')
+  && !has('ide-hd,drive=setup0,bus=ide.2'))
+check('F1: ...and the usb-storage device follows the xHCI controller it names (argv order)',
+  argv.indexOf('usb-storage,drive=setup0,removable=on,bus=xhci.0') > argv.indexOf('qemu-xhci,id=xhci'))
 check('F1/F2: no ide-hd device in the argv sits behind a read-only block node', (() => {
   // Map each ide-hd device to its drive id, then look up the -drive line that
   // declares that id: `readonly=on` on a hard-disk backend is what QEMU 10
@@ -209,18 +216,24 @@ check('F1/F2: no ide-hd device in the argv sits behind a read-only block node', 
     return typeof drive === 'string' && !/read-?only/u.test(drive)
   })
 })())
+check('F1: ...and the usb-storage answer node is writable too (Setup writes scratch)',
+  (() => {
+    const drive = argv.find((item) => String(item).includes('id=setup0'))
+    return typeof drive === 'string' && !/read-?only/u.test(drive)
+  })())
 check('S1: the vvfat USB OEM stick is GONE from the install argv',
-  !argv.join(' ').includes('fat:ro:') && !argv.join(' ').includes('usb-storage')
-  && !argv.join(' ').includes('id=oem0'))
-check('S1: the system qcow2 is attached (ide.0) BEFORE setup.img (ide.2), so it stays Windows Disk 0',
+  !argv.join(' ').includes('fat:ro:') && !argv.join(' ').includes('id=oem0'))
+check('S1: the system qcow2 is declared before setup.img, so it stays Windows Disk 0',
   argv.indexOf('ide-hd,drive=disk0,bus=ide.0,bootindex=2') !== -1
-  && argv.indexOf('ide-hd,drive=disk0,bus=ide.0,bootindex=2') < argv.indexOf('ide-hd,drive=setup0,bus=ide.2'))
+  && argv.indexOf('ide-hd,drive=disk0,bus=ide.0,bootindex=2')
+     < argv.findIndex((item) => String(item).includes('id=setup0')))
 check('S1: the setup disk is only attached while installing (no stale answer disk after Setup)',
   !buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: false, virtio: false })
     .join(' ').includes('setup0'))
-check('S1: a driver ISO moved to ide.3 so ide.2 belongs to setup.img', (() => {
+check('S1: a driver ISO keeps its own CD slot (ide.3), away from the answer medium', (() => {
   const withDrivers = buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: '/drv.iso', sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: false })
-  return withDrivers.includes('ide-cd,drive=cd1,bus=ide.3') && withDrivers.includes('ide-hd,drive=setup0,bus=ide.2')
+  return withDrivers.includes('ide-cd,drive=cd1,bus=ide.3')
+    && withDrivers.includes('usb-storage,drive=setup0,removable=on,bus=xhci.0')
     && !withDrivers.join(' ').includes('ide-cd,drive=cd1,bus=ide.2')
 })())
 check('the USB controller is declared before the USB input devices',
@@ -869,6 +882,94 @@ check('windowsKvmPreflight is the shared module (no second message)',
       check('R1: a failed send is NOT fatal and does not stop the schedule',
         keys.join(',') === '2,3' && sent.join(',') === '200,300', `keys=${keys.join(',')} sent=${sent.join(',')}`)
       check('R1: ...and it says so without throwing', lines.some((line) => /could not press/u.test(line)), lines.join(' | ').slice(0, 160))
+    }
+
+    // ---- F2: THE SCHEDULE IS ANCHORED ON SERIAL ACTIVITY, NOT ON SPAWN ----
+    //
+    // The live forensic child proved the fixed 1.5/3.5/5.5 s presses land while
+    // OVMF is still enumerating devices — BEFORE cdboot prints its prompt — so
+    // the first press could never dismiss the window. These tests drive the
+    // watcher against a STUBBED SERIAL TIMELINE with a virtual clock: no QEMU,
+    // no real sleep, and the exact fire times are assertable.
+    const runTimeline = async (timeline, extra = {}) => {
+      let t = 0
+      const waits = []
+      const keys = []
+      const lines = []
+      const sent = await runCdbootKeys({
+        scheduleMs: [1500, 3500, 5500],
+        readSerial: () => timeline(t),
+        now: () => t,
+        wait: async (ms) => { waits.push(ms); t += ms },
+        sendKey: async (key) => { keys.push({ key, at: t }) },
+        log: (line) => lines.push(line),
+        ...extra
+      })
+      return { t, waits, keys, lines, sent }
+    }
+    const PROMPT = 'cdboot.efi 10.0.26100.1\r\nPress any key to boot from CD or DVD . . .'
+    {
+      // The prompt is the anchor: the console is silent until it appears at 4 s,
+      // the poll that sees it fires at ~4.1 s, then retries 0.8 s apart.
+      const run = await runTimeline((t) => (t >= 4040 ? PROMPT : ''))
+      const at = run.keys.map((entry) => entry.at)
+      check('F2: a prompt at 4 s anchors the presses at ~4.1 / 4.9 / 5.7 s',
+        at.length === 3 && at[0] >= 4000 && at[0] <= 4300
+        && at[1] - at[0] === 800 && at[2] - at[1] === 800, at.join(','))
+      check('F2: ...and NO spawn-relative press was sent before the prompt',
+        at.every((value) => value >= 4000) && run.lines.every((line) => !/fixed-time fallback/u.test(line)),
+        run.lines.join(' | ').slice(0, 200))
+      check('F2: the presses are logged as serial-anchored', run.lines.every((line) => /pressed enter/u.test(line) && /serial:/u.test(line)),
+        run.lines.join(' | ').slice(0, 160))
+    }
+    {
+      // No prompt signature ever (an older/different cdboot wording), but the
+      // console DID start printing at 0.6 s: fire at growth + 1.5 s.
+      const run = await runTimeline((t) => (t >= 600 ? 'BdsDxe: loading Boot0001 from PciRoot(0x0)' : ''))
+      const at = run.keys.map((entry) => entry.at)
+      // A growth anchor is a guess, so it keeps retrying until the window
+      // closes: an early press must never be the LAST one.
+      check('F2: first serial output + ~1.5 s is the anchor when the prompt text never appears',
+        at.length >= 3 && at[0] >= 2100 && at[0] <= 2400 && at[1] - at[0] === 800
+        && at.at(-1) <= 8900, at.join(','))
+    }
+    {
+      // COMPLETELY SILENT console: the fixed-time schedule is the fallback and
+      // its offsets are honoured exactly (the historical behaviour).
+      const run = await runTimeline(() => '')
+      // The prompt never arrives, so the fixed schedule is replayed with its own
+      // relative gaps as soon as the detection window closes (8 s): three
+      // presses at 8.0 / 10.0 / 12.0 s, each logged with its nominal offset.
+      check('F2: a silent serial console falls back to the fixed-time schedule (3 presses, 2 s gaps)',
+        run.keys.map((entry) => entry.at).join(',') === '8000,10000,12000', run.keys.map((entry) => entry.at).join(','))
+      check('F2: ...logged as the fallback (with the nominal offsets), so the two paths are never confused',
+        run.lines.length === 3 && run.lines.every((line) => /fixed-time fallback/u.test(line))
+        && run.lines.map((line) => /~(\d+) ms/u.exec(line)?.[1]).join(',') === '1500,3500,5500',
+        run.lines.join(' | ').slice(0, 160))
+    }
+    {
+      // The BdsDxe spelling of the same boot attempt anchors too, and a failing
+      // send is still non-fatal in this mode.
+      let attempts = 0
+      const run = await runTimeline((t) => (t >= 2000 ? 'BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM"' : ''), {
+        sendKey: async () => { attempts += 1; if (attempts === 1) throw new Error('QMP not ready') }
+      })
+      check('F2: "BdsDxe: starting Boot0001" is a prompt signature as well',
+        run.lines.some((line) => /could not press/u.test(line)) && run.lines.filter((line) => /pressed enter/u.test(line)).length === 2,
+        run.lines.join(' | ').slice(0, 200))
+    }
+    check('F2: the signature matcher is exported and case/space tolerant',
+      cdbootPromptSeen('press ANY key to boot from cd or dvd') === true
+      && cdbootPromptSeen('BdsDxe:  starting Boot0001') === true
+      && cdbootPromptSeen('BdsDxe: starting Boot0002') === false
+      && cdbootPromptSeen('') === false)
+    {
+      // readSerialTail reads only the tail of a growing file and never throws.
+      const tailFile = path.join(os.tmpdir(), `cua-serial-tail-${process.pid}.log`)
+      writeFileSync(tailFile, `${'x'.repeat(20000)}${PROMPT}`)
+      check('F2: readSerialTail returns the tail (where the prompt is) and tolerates a missing file',
+        readSerialTail(tailFile, 4096).includes('Press any key') && readSerialTail(path.join(os.tmpdir(), 'nope-no-such.log')) === '')
+      rmSync(tailFile, { force: true })
     }
 
     // ---- R5: the EFI Shell fallback script ----

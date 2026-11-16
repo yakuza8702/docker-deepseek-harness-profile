@@ -845,16 +845,26 @@ They are documented together because from the panel they all looked like "the
 install is stuck".
 
 **1. The install CD's "Press any key to boot from CD or DVD" is now pressed for
-you.** OVMF reached the DVD, `cdboot.efi 10.0.26100.1` printed that prompt,
+you — and it is anchored on the serial console, not on a spawn-relative
+clock.** OVMF reached the DVD, `cdboot.efi 10.0.26100.1` printed that prompt,
 nobody pressed a key within its 5 s window, and the firmware printed
 `EFI_TIMEOUT` and fell into the **EFI Internal Shell** — a dead end no answer
-file can leave. `boot()` now sends **Enter over QMP** (`input-send-event`, the
-same path the GUI uses) at **1.5 s / 3.5 s / 5.5 s** after an *install* start, so
-a dropped event costs nothing. The schedule is configurable
-(`DSH_CUA_WINDOWS_CDBOOT_KEYS_MS=1500,3500,5500`) and can be switched off
-(`DSH_CUA_WINDOWS_CDBOOT_KEYS=0`). It is **gated on the install phase**: booting
-an already-installed disk never types into the guest. A failed send is logged and
-skipped, never fatal.
+file can leave. `boot()` sends **Enter over QMP** (`input-send-event`, the same
+path the GUI uses), fired by a watcher on `$STORE/windows/<name>/serial.log`: it
+polls the log's size and tail and starts pressing as soon as the log carries the
+prompt signature (`Press any key to boot from CD`, or `BdsDxe: starting
+Boot0001`) — or, for a firmware that never prints that text, once ordinary boot
+output has appeared (+1.5 s). Presses repeat every 0.8 s; a prompt anchor stops
+after three, a growth anchor keeps retrying until the ~8 s window closes (an
+early guess must not be the last press). This is a **fix for a live-verified
+miss**: the old fixed **1.5 / 3.5 / 5.5 s after spawn** presses landed while OVMF
+was still enumerating — before the prompt existed — so the first boot never
+dismissed it. The fixed offsets survive only as the fallback (a silent console, or
+a store where QEMU never created the log) and are configurable
+(`DSH_CUA_WINDOWS_CDBOOT_KEYS_MS=1500,3500,5500`); the whole feature can be
+switched off (`DSH_CUA_WINDOWS_CDBOOT_KEYS=0`). It is **gated on the install
+phase**: booting an already-installed disk never types into the guest. A failed
+send is logged and skipped, never fatal.
 
 **2. The boot order now follows the phase.** The argv used to put the disk at
 `bootindex=1` and the CD at `bootindex=2` while a comment claimed the ISO booted
@@ -886,23 +896,47 @@ key press is ever missed, the EFI Shell chain-loads the install media instead of
 stopping at a prompt. It is a fallback, not the mechanism — the key press is what
 gets an install onto the CD.
 
-**The answer file rides on a real, PARTITIONED disk.** Setup no longer sees a
-`vvfat` USB stick: a 64 MiB image `$STORE/windows/<name>/setup.img` is built with
-`mtools` and attached **writable** after the system disk, and it is a real disk —
-an MBR with one active FAT32-LBA partition at LBA 2048 — not a partitionless
-superfloppy. That distinction is the difference between an install that runs and
-one that asks for a language: the firmware (EDK2) mounts a raw FAT volume from
-any block device, but **Windows does not mount a partitionless fixed disk at
-all**, so WinPE's drive-root search finds no drive. (dockur/windows' overlay is a
-superfloppy too; it works there because of how their flow hands the medium to
-QEMU, so "we mirror dockur" was never the guarantee — see `buildSetupImage()`.)
+**The answer file rides on a real, PARTITIONED disk — delivered as REMOVABLE
+media.** Setup no longer sees a `vvfat` USB stick: a 64 MiB image
+`$STORE/windows/<name>/setup.img` is built with `mtools`, attached **writable**,
+and it is a real disk — an MBR with one active FAT32-LBA partition at LBA 2048 —
+not a partitionless superfloppy. That distinction is the difference between a
+disk WinPE can mount and one it cannot: the firmware (EDK2) mounts a raw FAT
+volume from any block device, but **Windows does not mount a partitionless fixed
+disk at all**. (dockur/windows' overlay is a superfloppy too; it works there
+because of how their flow hands the medium to QEMU, so "we mirror dockur" was
+never the guarantee — see `buildSetupImage()`.)
+
+That was still not enough, and the next round was verified **inside the guest**:
+WinPE mounted `setup.img` as `C:`, `dir C:\` listed `Autounattend.xml`, `more
+C:\Autounattend.xml` byte-matched, there were **no Panther parse errors** — and
+Setup still showed its interactive language page. The delivery class was wrong:
+**Setup searches for an answer file on REMOVABLE-media roots (and the boot
+media), never on a fixed-disk root.** An `ide-hd` is a fixed disk — mounted and
+listed, never scanned. `setup.img` is now a **usb-storage device with
+`removable=on`** (on the same `qemu-xhci` controller the pointer and keyboard
+use), so Windows classifies it as removable media and scans its root.
+`removable=on` is explicit because QEMU 10's usb-storage defaults it to *off*
+when omitted (verified with `query-block`: omitted → `removable:false`;
+`removable=on` → `removable:true`). The image itself is unchanged: MBR + FAT32
+partition, `Autounattend.xml` at the root, rebuilt fresh on every create.
+
+Windows' documented answer-file search order, and where this lands:
+
+| # | Location Windows looks at | This medium |
+|---|---|---|
+| 1 | root of every **removable** drive | **✓ here** — usb-storage + `removable=on` |
+| 2 | root of the **boot media** (the install DVD) | not used (untouched Microsoft ISO) |
+| 3 | `%WINDIR%\Panther\Unattend.xml`, `\$WINNT$.~BT\` on the target disk | belt-and-braces via `$OEM$` / `setupcomplete.cmd` |
+| 4 | `HKLM\SYSTEM\Setup` → `UnattendFile` (registry override) | not used |
+| — | a **fixed-disk** root (the old `ide-hd` attach) | **never scanned** — the bug |
 
 | QEMU bus | Device | Windows sees |
 |---|---|---|
-| `ide.0` | `disk.qcow2` | **Disk 0** — what `Autounattend.xml`'s `<DiskID>0</DiskID>` targets |
+| `ide.0` | `disk.qcow2` (fixed disk) | **Disk 0** — what `Autounattend.xml`'s `<DiskID>0</DiskID>` targets |
 | `ide.1` | install CD-ROM | boot device during install |
-| `ide.2` | `setup.img` (MBR + FAT32 partition, rw) | Disk 1 — the answer medium |
 | `ide.3` | virtio-win CD-ROM (optional) | not a disk |
+| `xhci.0` (USB) | `usb-storage,drive=setup0,removable=on` → `setup.img` | removable media — the answer medium |
 
 The build is `mformat -F -H 2048 -i setup.img@@1048576` → write the MBR (type
 `0x0C`, start LBA 2048, CHS `0xFE/0xFF/0xFF`, signature `0x55AA`) → `mcopy -s -i
@@ -991,27 +1025,27 @@ The unattended install is four data files that ship **inside the image** at
 `/usr/local/share/cua-vm/windows-oem/`: `Autounattend.xml`, `setupcomplete.cmd`,
 `cua-firstboot.ps1` and `Unattend.vbs`. The create path stages them into
 `/cua-vm/windows/<name>/oem/`, builds them into `setup.img` — an MBR plus one
-FAT32 partition at LBA 2048 (mtools) — and attaches that image as a **writable**
-hard disk before QEMU starts, so a missing file stops the computer before the
-first boot — it is an **image** problem, not a setting:
+FAT32 partition at LBA 2048 (mtools) — and attaches that image as a **writable
+removable usb-storage stick** before QEMU starts, so a missing file stops the
+computer before the first boot — it is an **image** problem, not a setting:
 
 * your image was built **before the Windows backend existed** (a `main`-branch
   build: `main` has no Windows code at all), or
 * the image's `COPY` and the supervisor's `DSH_CUA_WINDOWS_OEM_DIR` disagree.
 
-The medium is attached **writable**, and that is deliberate. QEMU 10 rejects a
-read-only block node on an IDE hard-disk device (`-device ide-hd,drive=setup0:
-Block node is read-only`) and the create dies before QEMU reaches device realize
-— which surfaced as the misleading *"swtpm did not create its socket"* cascade.
-`readonly=on` is legal on a CD-ROM or a usb-storage stick, not on `ide-hd`.
-dockur/windows attaches its SETUP overlay as a writable hard disk for the same
-reason: Setup may write logs/scratch to it. (Its overlay is a partitionless FAT32
-superfloppy; ours carries an MBR because Windows never enumerates a partitionless
-fixed disk — the firmware does, and that is exactly what made the bug look like
-"the answer file is not being read".) The image is rebuilt fresh on every
-create (and its answer file byte-verified), so writes left by one install never
-reach the next. The image needs **mtools in the image**; without it a create
-refuses with a message naming the package, not a QEMU that cannot boot.
+The medium is attached **writable** *and as removable media*, and both are
+deliberate. QEMU 10 rejects a read-only block node on an IDE hard-disk device
+(`-device ide-hd,drive=setup0: Block node is read-only`) and the create dies
+before QEMU reaches device realize — which surfaced as the misleading *"swtpm did
+not create its socket"* cascade. It is legal behind usb-storage (both writable
+and read-only nodes were verified on QEMU 10.0.13), but the node stays writable
+because Setup may write logs/scratch to it. The **removable** half is what makes
+Setup read it at all: a fixed-disk root is never scanned for an answer file, so
+`usb-storage,drive=setup0,removable=on` (QEMU 10 defaults that property to *off*)
+is the delivery class that works. The image is rebuilt fresh on every create (and
+its answer file byte-verified), so writes left by one install never reach the
+next. The image needs **mtools in the image**; without it a create refuses with a
+message naming the package, not a QEMU that cannot boot.
 
 Pull or build a newer image from this branch with the virgl QEMU, then recreate
 the container **keeping the `/cua-vm` volume** (the store and every existing

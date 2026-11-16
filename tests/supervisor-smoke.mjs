@@ -955,12 +955,15 @@ try {
     // attaches it AFTER the system disk, so the qcow2 remains Windows Disk 0.
     check('S1: the create built the answer disk at $STORE/windows/<name>/setup.img',
       existsSync(path.join(STORE, 'windows', bootName, 'setup.img')))
-    // F1: WRITABLE. `readonly=on` on an ide-hd is exactly what QEMU 10 refused
-    // ("Block node is read-only"), which is why this assertion flipped.
-    check('F1: the install argv attaches setup.img WRITABLE on ide.2 (no readonly=on)',
+    // F1: WRITABLE, AND — SINCE THE LIVE FORENSIC ROUND — REMOVABLE. `readonly=on`
+    // on an ide-hd is what QEMU 10 refused ("Block node is read-only"); more
+    // importantly, a FIXED-disk root is never scanned for Autounattend.xml, so
+    // the medium must report removable media (usb-storage + removable=on).
+    check('F1: the install argv attaches setup.img WRITABLE as a REMOVABLE usb-storage stick',
       /-drive file=[^ ]*\/setup\.img,format=raw,if=none,id=setup0/u.test(installArgv)
       && !/id=setup0[^ ]*read-?only/u.test(installArgv)
-      && /ide-hd,drive=setup0,bus=ide\.2/u.test(installArgv), installArgv.slice(0, 200))
+      && /usb-storage,drive=setup0,removable=on,bus=xhci\.0/u.test(installArgv)
+      && !/ide-hd,drive=setup0/u.test(installArgv), installArgv.slice(0, 200))
     // F1/F4: the media exists BEFORE the boot and is writable by the runtime
     // uid (the supervisor runs as uid 1000 in the image).
     {
@@ -969,9 +972,11 @@ try {
       check('F1/F4: setup.img exists before boot, owner-writable, owned by this uid',
         st !== null && (st.mode & 0o200) !== 0 && st.uid === process.getuid(), st === null ? 'missing' : `mode=${(st.mode & 0o777).toString(8)} uid=${st.uid}`)
     }
-    check('S1: ...after the system disk, and with no usb-storage OEM stick',
+    check('S1: ...declared after the system disk, and with no vvfat OEM stick',
       installArgv.indexOf('id=setup0') > installArgv.indexOf('id=disk0')
-      && !/usb-storage|fat:ro:/u.test(installArgv))
+      && !/fat:ro:|id=oem0/u.test(installArgv)
+      && installArgv.indexOf('usb-storage,drive=setup0') > installArgv.indexOf('qemu-xhci,id=xhci'),
+      installArgv.slice(0, 200))
     // F1: THE MEDIUM IS A PARTITIONED DISK BEFORE QEMU EVER SEES IT. The create
     // calls buildSetupImage() (stubs here), which writes the MBR with a real
     // file write — so this reads bytes the production code wrote, not a stub

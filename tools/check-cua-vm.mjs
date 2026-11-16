@@ -518,14 +518,17 @@ const NEEDLES = {
     // not reliably enumerate that stick, which is why a human had to click
     // through Setup. Never reintroduce it.
     //
-    // F1/M9: THE MEDIUM IS WRITABLE. This needle used to require
-    // `readonly=on` (the OLD OEM stick's write protection). QEMU 10 rejects a
-    // read-only node behind ide-hd ("Block node is read-only") and the create
-    // died before swtpm's socket existed. The needle now pins the writable
-    // setup0 drive; the semantic assertion below rejects ANY `readonly=on`
-    // reappearing on this drive. Never delete this needle class — retarget it.
+    // F1/M9: THE MEDIUM IS WRITABLE **AND REMOVABLE**. This needle used to
+    // require `readonly=on` (the OLD OEM stick's write protection) and then the
+    // writable `ide-hd` shape. QEMU 10 rejects a read-only node behind ide-hd
+    // ("Block node is read-only"), and — the live forensic finding — Setup
+    // never scans a FIXED-disk root for Autounattend.xml, so an ide-hd attach
+    // can never be read however correct the image is. The needle class is
+    // RETARGETED, never deleted: it now pins the writable setup0 drive behind
+    // usb-storage with `removable=on`, and the semantic assertion below rejects
+    // ANY `readonly=on` reappearing on this drive and any `ide-hd` setup0 form.
     ['file=${p.setupImg},format=raw,if=none,id=setup0', 1],
-    ['ide-hd,drive=setup0,bus=ide.2', 1],
+    ['usb-storage,drive=setup0,removable=on,bus=xhci.0', 1],
     ["setupImg: path.join(dir, 'setup.img')", 1],
     ['export function buildSetupImage(', 1],
     ['export function verifySetupImage(', 1],
@@ -626,6 +629,13 @@ const NEEDLES = {
     ['export function cdbootKeyScheduleMs()', 1],
     ['export async function runCdbootKeys({', 1],
     ['if (installPending && cdbootKeysEnabled() && child?.pid)', 1],
+    // F2: THE ANCHOR IS SERIAL ACTIVITY, NOT THE SPAWN CLOCK. A fixed 1.5 s
+    // press lands before OVMF has reached the CD; the prompt (or first output
+    // + 1.5 s) is the event that actually opens the window.
+    ['export const CDBOOT_PROMPT_PATTERN', 1],
+    ['export function cdbootPromptSeen(text)', 1],
+    ['export function readSerialTail(file, bytes = 8192)', 1],
+    ['serialLog: p.serialLog', 1],
     // R5: belt and braces for the Shell fallback.
     ['export function startupNshText()', 1],
     ["writeFileSync(path.join(p.oemDir, 'startup.nsh'), startupNshText())", 1],
@@ -1157,14 +1167,18 @@ function sourceOf(label, name) {
     missing.push('docker/cua-vm-windows-qemu.mjs: file not found (K1 xhci ordering cannot be checked)')
   } else {
     // S1/S2: DISK ORDER IS THE CONTRACT. The system qcow2 is attached on ide.0
-    // and setup.img on ide.2 AFTER it, so Windows Setup sees the qcow2 as Disk 0
-    // — the disk Autounattend.xml's <DiskID>0</DiskID> targets. This is an ORDER
+    // and setup.img's block node is declared AFTER it (its usb-storage device
+    // follows the xHCI controller), so Windows Setup sees the qcow2 as Disk 0 —
+    // the disk Autounattend.xml's <DiskID>0</DiskID> targets. This is an ORDER
     // assertion, not a presence one: reordering the argv silently partitions the
     // answer medium instead.
     const diskAttach = windowsSource.indexOf('ide-hd,drive=disk0,bus=ide.0')
-    const setupAttach = windowsSource.indexOf('ide-hd,drive=setup0,bus=ide.2')
+    const setupDrive = windowsSource.indexOf('id=setup0')
+    const setupAttach = windowsSource.indexOf('usb-storage,drive=setup0,removable=on')
+    const xhciAttach = windowsSource.indexOf('qemu-xhci,id=xhci')
     const noUsbStick = !/usb-storage,drive=oem0/u.test(windowsSource) && !/file=fat:ro:/u.test(windowsSource)
-    const setupAfterDisk = diskAttach !== -1 && setupAttach !== -1 && diskAttach < setupAttach
+    const setupAfterDisk = diskAttach !== -1 && setupDrive !== -1 && setupAttach !== -1
+      && diskAttach < setupDrive && xhciAttach !== -1 && xhciAttach < setupAttach
     // F1/M9: NO READ-ONLY BLOCK NODE ON AN ide-hd. QEMU 10 refuses
     // `-device ide-hd,drive=setup0`: "Block node is read-only", and the create
     // then cascades into "swtpm did not create its socket". The setup drive
@@ -1174,11 +1188,17 @@ function sourceOf(label, name) {
       && !/id=setup0[^\n]*read-?only/iu.test(windowsSource)
       && !/drive=setup0[^\n]*read-?only/iu.test(windowsSource)
       && !/id=oem0[^\n]*read-?only/iu.test(windowsSource)
+      // F1: the ATTACH SHAPE is part of the contract now: removable media, and
+      // never the old fixed-disk argv literal (a fixed-disk root is not scanned
+      // for Autounattend.xml). Matched as the ARGV literal, not the words, so a
+      // comment may still quote the historical failure.
+      && !/'ide-hd,drive=setup0,bus=ide\.2'/u.test(windowsSource)
+      && /usb-storage,drive=setup0,removable=on/u.test(windowsSource)
     if (setupAfterDisk && noUsbStick && setupWritable) {
-      if (!quietMode) console.log('  ok   K1 the answer disk (ide.2) is attached WRITABLE after the system disk (ide.0) and the vvfat OEM stick is gone')
+      if (!quietMode) console.log('  ok   K1 the answer image is attached WRITABLE as a REMOVABLE usb-storage stick (after the system disk, after xhci) and the vvfat OEM stick is gone')
     } else {
       failures += 1
-      missing.push('docker/cua-vm-windows-qemu.mjs: setup.img must attach WRITABLE (no readonly=on: QEMU 10 rejects a read-only node on ide-hd) on ide.2 AFTER disk0 on ide.0 (so the qcow2 is Windows Disk 0 / DiskID 0), and no usb-storage/file=fat:ro: OEM stick may remain (the stick Setup could not see)')
+      missing.push('docker/cua-vm-windows-qemu.mjs: setup.img must attach WRITABLE (no readonly=on) as a REMOVABLE usb-storage device (removable=on, bus=xhci.0) declared AFTER disk0 on ide.0 (so the qcow2 is Windows Disk 0 / DiskID 0) and AFTER qemu-xhci; a fixed-disk (ide-hd) setup0 is never scanned by Setup for Autounattend.xml, and no usb-storage/file=fat:ro: OEM stick may remain')
       console.log('  FAIL K1 answer-disk order / writability / no vvfat stick')
     }
   }

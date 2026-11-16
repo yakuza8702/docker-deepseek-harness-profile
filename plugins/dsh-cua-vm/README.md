@@ -192,7 +192,7 @@ $STORE/windows/<name>/disk.qcow2          the system disk (plain qcow2 → check
 $STORE/windows/<name>/efi-vars.qcow2      OVMF NVRAM, per computer
 $STORE/windows/<name>/tpm/                swtpm TPM2 state, per computer
 $STORE/windows/<name>/oem/                Autounattend.xml + $OEM$ scripts (staging)
-$STORE/windows/<name>/setup.img          MBR + FAT32 answer disk (mtools; attached rw on ide.2)
+$STORE/windows/<name>/setup.img          MBR + FAT32 answer disk (mtools; rw, usb-storage removable=on)
 $STORE/windows/<name>/credentials.json    generated password + key path, mode 0600
 $STORE/windows/<name>/id_ed25519          the SSH key the supervisor uses
 $STORE/windows/<name>/serial.log          the console — the install progress

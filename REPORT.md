@@ -905,6 +905,11 @@ proves the fixed argv initializes, which is the defect class reported.
 
 ### 9.6.13 The next live-verified blocker: a PARTITIONLESS answer disk, and a missing `<InstallFrom>` (F1–F4)
 
+> **SUPERSEDED IN PART by §9.6.14.** The partition table and the `<InstallFrom>` were both
+> necessary and are still in place — but they were not sufficient: the medium was also a
+> **fixed disk**, and Setup never scans a fixed-disk root for `Autounattend.xml`. The attach
+> class (`ide.2`) described below is history; the delivery is now removable USB mass storage.
+
 Reproduced on the user's container with the previous round's image. WinPE reached
 the **interactive language screen** on every create, i.e. the answer file was
 never read. What blockstats showed:
@@ -969,6 +974,96 @@ medium is now a disk with a partition table (asserted at the byte level and by
 (2) is the one reasoned rather than read value — the media is not on this host —
 and is documented as such in `WINDOWS_IMAGE_SELECTIONS` (with the
 `windowsImageIndex` override as the escape hatch).
+
+### 9.6.14 The live-verified answer-file delivery bug: WinPE mounted the medium and still never read it (F1–F4)
+
+**The finding, from inside the guest.** Everything upstream of Setup was correct:
+
+* WinPE mounted `setup.img` as **`C:`** — a healthy FAT32 partition on a fixed disk;
+* `dir C:\` listed `Autounattend.xml`;
+* `more C:\Autounattend.xml` was byte-verified (the `<InstallFrom>` `/IMAGE/NAME`
+  block was there);
+* **no Panther parse errors** anywhere in the Setup logs — Setup did not reject
+  the file, it never opened it;
+* and Setup **still** showed its interactive language page.
+
+Screenshots of that forensic round (guest-side captures, referenced by path, not
+committed): `$STORE/windows/<name>/shots/winpe-c-root-dir.png`,
+`.../winpe-c-root-autounattend-more.png`, `.../setup-language-page.png`; the
+guest's own `setupact.log`/`setuperr.log` tails were copied out under
+`$STORE/windows/<name>/forensics/`.
+
+**The cause is the DELIVERY CLASS, not the file.** WinPE/Setup searches for
+`Autounattend.xml` on **removable-media roots** (and on the boot media), plus
+`%WINDIR%\Panther\` / `\$WINNT$.~BT\` and the `HKLM\SYSTEM\Setup\UnattendFile`
+registry override. A **fixed-disk root is not scanned at all**. `setup.img` was
+attached `ide-hd` (a fixed disk): mounted, listable, correct — and invisible to
+the search. The earlier `fat:ro:` vvfat + usb-storage attempt failed for an
+unrelated reason (read-only block node) and was abandoned; the medium stayed a
+fixed disk, so the *real* failure survived that "fix".
+
+**Root cause #2, in the same round: the cdboot key presses were on the wrong
+clock.** The fixed schedule (1.5 / 3.5 / 5.5 s after **spawn**) fired while OVMF
+was still enumerating devices — i.e. before `cdboot.efi` had printed "Press any
+key to boot from CD or DVD" — so the first boot never dismissed the prompt at
+all. A wall-clock delay measured from spawn cannot be the anchor for a window
+that opens when the *firmware* reaches the CD.
+
+| # | Defect / work item | Fix |
+|---|---|---|
+| F1 | the answer medium was a **fixed disk** (`ide-hd`), and Setup never scans a fixed-disk root | the partitioned FAT32 image is unchanged; its delivery is now **`usb-storage,drive=setup0,removable=on,bus=xhci.0`** (device declared after `-device qemu-xhci,id=xhci`, since QEMU resolves `bus=xhci.0` at realize and an earlier declaration is a parse-order trap). `removable=on` is **explicit**: QEMU 10's usb-storage defaults the property to *off* when omitted. The qcow2 stays `ide.0` (Windows **Disk 0** / `DiskID 0`, no change), the install CD stays `ide.1` `bootindex=1`, and the optional driver CD keeps `ide.3`. The drive node is still declared right after the system disk, so the block graph order is unchanged and the image is attached before any device names it. The node stays **writable** (QEMU 10 refuses `readonly=on` behind ide-hd; usb-storage accepts either, verified both ways) |
+| F2 | the presses were spawn-relative, so the first boot missed the window entirely | the schedule is anchored on **`serial.log`**: a watcher stats the file and reads its tail, and fires when the log carries the prompt signature (`Press any key to boot from CD` / `BdsDxe: starting Boot0001`) or when first output has appeared +1.5 s. Presses repeat every 0.8 s; a prompt anchor stops after three, a growth anchor retries until the ~8 s window closes. The fixed offsets survive as the fallback for a silent console and for a store where QEMU never created the log (it never created it → the historical schedule runs, unchanged) |
+| F3 | docs described the old fixed-time presses and the ide-hd medium as the guarantee | `README.md`: the Windows troubleshooting section now explains the serial anchor (and why the fixed schedule missed), the removable delivery, and Windows' answer-file search order with a table that marks the fixed-disk root as "never scanned". The "OEM payload is missing" section and the bus table were corrected. The dockur comparison is restated correctly: their overlay is a partitionless *superfloppy*, ours is an MBR disk, and neither fact is why their flow works — the medium's **class** is |
+| F4 | nothing asserted the attach class or the anchor; the gate needles still pinned `ide-hd,setup0` | `tools/check-cua-vm.mjs`: the needle class was **retargeted, not deleted** — `ide-hd,drive=setup0,bus=ide.2` → `usb-storage,drive=setup0,removable=on,bus=xhci.0`, plus new needles for `CDBOOT_PROMPT_PATTERN`, `cdbootPromptSeen`, `readSerialTail` and `serialLog: p.serialLog`. The K1 semantic still rejects ANY `read-?only` near `setup0`, and now also rejects an `ide-hd,drive=setup0` shape while requiring the removable usb-storage form, declared after both `disk0` and `qemu-xhci`. `tests/modules-unit.mjs`: the argv test demands the removable device and the absence of the ide-hd form; the cdboot tests drive a **stubbed serial timeline** (prompt at 4 s → presses at ~4.1/4.9/5.7 s; first output at 0.6 s, no prompt text → growth anchor + retries; silent console → the fixed fallback; a failing send is non-fatal) and exercise `readSerialTail` on a real file. `tests/supervisor-smoke.mjs`: the create asserts the install argv carries the removable usb-storage shape (and no `ide-hd,drive=setup0`), positioned after xhci, with no `fat:ro:`/`oem0` stick |
+
+**Verified live in this container (QEMU 10.0.13, KVM, real OVMF, real swtpm, real mtools).**
+
+* The device class first, on the raw argv: `-drive file=setup.img,...id=setup0` +
+  `-device usb-storage,drive=setup0,removable=on` **starts** with a writable node
+  and, separately, with a `readonly=on` node — both accepted (the old ide-hd
+  rejection does not apply). `query-block` reports
+  `"device":"setup0","removable":true,"inserted":{"ro":false,...}`; with
+  `removable=off` — and with the property omitted on 10.0.13 — the same query
+  reports `removable:false`. That is why the property is spelled out in the argv.
+* A **full boot of the new argv**: a throwaway store under `/tmp/cua-replay`,
+  `setup.img` built by the real `writeOemPayload()` + `buildSetupImage()` (the
+  image `file` reports as
+  `DOS/MBR boot sector; partition 1 : ID=0xc, active, startsector 2048, 129024 sectors`),
+  an OVMF vars qcow2, a real swtpm socket, KVM. QEMU stayed up; `query-status`
+  → `running`; `query-block` → `setup0 removable:true, ro:false` with the real
+  `setup.img` filename; HMP `info usb` →
+  `Device 0.1, Port 1, Speed 5000 Mb/s, Product QEMU USB MSD` beside
+  `QEMU USB Keyboard` / `QEMU USB Tablet` — i.e. the answer medium enumerates on
+  the guest's USB bus as removable media. `serial.log` received **1772 bytes** of
+  OVMF output (`BdsDxe: failed to load Boot0001 "UEFI QEMU DVD-ROM"…` /
+  `BdsDxe: starting Boot0003 "EFI Internal Shell"` / the shell banner), then the
+  shell ran `startup.nsh` — the belt-and-braces path — because the CD in the
+  replay is a stub, not an ISO.
+* The **anchor, against that real firmware's serial output**: the watcher was run
+  live with the real `serial.log` and a stubbed `sendKey`. First output was seen
+  at ~809 ms, so it pressed at **2316, 3118, 3919, 4719, 5520, 6321, 7123,
+  7924 ms** — the growth anchor plus 0.8 s retries through the ~8 s window, which
+  is exactly the behaviour the fixed schedule could not express (its last press
+  was at 5.5 s regardless of the firmware).
+* `node tools/check-cua-vm.mjs` → **569** assertions (checkout); flat-layout
+  replay from `cwd=/` (`--root` over a writable flat copy of the image tree,
+  because the image's own check dir is read-only) → **567**, with L5 + N3 `n/a`
+  as designed.
+* `node tools/check-cua-rea.mjs` → **67**.
+* `node tools/ci-gates.mjs` → **9 passed / 1 failed / 1 skipped**; the failure is
+  still `check-office.mjs` (the office bundle is not installed in this
+  environment), unchanged by this round.
+* `tests/{supervisor-smoke,modules-unit,windows-boot,qmp-shutdown}.mjs` → all
+  **PASS**. `node --check` clean on every changed file.
+
+**NOT RUN, with the reason.** A real Windows install from the pinned ISO is
+still not attempted here: it needs the 4.8 GB media, tens of minutes and a guest
+that reaches OOBE, none of which this sandbox provides. What IS proven is the
+defect class end to end at the level that was broken: the medium is a real MBR
++FAT32 disk, it is attached as **removable** USB mass storage (QMP and HMP both
+say so), and the key schedule is anchored on the firmware's actual serial
+timeline instead of on the spawn clock. Whether Setup then reads it is the one
+step only a live install can show — and it is now the only remaining unknown.
 
 ### 9.7 What is still open (TBC)
 

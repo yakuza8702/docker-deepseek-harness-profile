@@ -320,10 +320,28 @@ export function qemuBootWindowMs() {
  * a dead end with a firmware prompt no unattended install can leave.
  *
  * So the backend presses the key itself, over the same QMP input path the GUI
- * uses, at three points inside that window (1.5 s / 3.5 s / 5.5 s by default):
- * early enough to beat the timeout, late enough that the firmware has the
- * keyboard ready, and repeated so a dropped event is not fatal. The delay list
- * is overridable for tests and for a host whose firmware is slower.
+ * uses. The delay list below is the FALLBACK: three points inside that window
+ * (1.5 s / 3.5 s / 5.5 s by default), overridable for tests and for a host
+ * whose firmware is slower.
+ *
+ * F2: WHY A FIXED SCHEDULE WAS NOT ENOUGH (VERIFIED LIVE, inside the guest).
+ * The forensic child proved the FIRST boot missed the ~3 s window entirely: the
+ * presses at 1.5 / 3.5 / 5.5 s after spawn landed while OVMF was still
+ * enumerating devices, so `cdboot.efi` printed its prompt to a keyboard nobody
+ * had touched yet and timed out. Wall-clock delays are measured from SPAWN, but
+ * the window opens when the FIRMWARE reaches the CD — a variable ~2-6 s.
+ *
+ * So the schedule is anchored on SERIAL ACTIVITY (`serial.log`): the watcher
+ * polls the file's size (cheap stat) and its tail, and fires the presses when
+ * the log carries the cdboot prompt signature ("Press any key to boot from CD"
+ * or "BdsDxe: starting Boot0001"), or — for a firmware that prints neither —
+ * once output has appeared and `armDelayMs` (~1.5 s) has passed since it did.
+ * From that anchor the presses repeat every 0.8 s: a prompt anchor stops after
+ * `attempts` = 3, a growth anchor retries until the ~8 s window closes (a guess
+ * must not be the last press). The fixed-time list above is the fallback, and it
+ * runs in two cases only: the detection window closes with no anchor at all
+ * (console silent), replayed with its own relative gaps; or QEMU never created
+ * the serial log, where the offsets run exactly as before.
  *
  * NOT a keystroke into an installed guest: scheduling is gated on
  * `installPending`, so a normal boot of a finished disk never sees a key.
@@ -342,35 +360,229 @@ export function cdbootKeyScheduleMs() {
 }
 
 /**
- * R1 (the mechanism): run the key schedule sequentially, never in parallel.
+ * F2: THE SIGNATURE OF THE CDBOOT PROMPT, AS THE FIRMWARE PRINTS IT.
+ *
+ * Two spellings are accepted because two firmwares are in play on this path:
+ * the install CD's `cdboot.efi` prints "Press any key to boot from CD or DVD",
+ * and OVMF's BDS announces the same boot attempt as "BdsDxe: starting
+ * Boot0001" (the CD's boot entry while `installPending`). Matching either
+ * anchors the key schedule on real serial activity instead of on a spawn-
+ * relative timer that was measured against the wrong event.
+ */
+export const CDBOOT_PROMPT_PATTERN = /Press any key to boot from CD|BdsDxe:\s*starting Boot0001/iu
+
+/** True when a serial tail carries the cdboot prompt (or BDS naming the CD). */
+export function cdbootPromptSeen(text) {
+  return CDBOOT_PROMPT_PATTERN.test(String(text ?? ''))
+}
+
+/**
+ * F2: the last `bytes` bytes of a file, or '' when it is missing/empty/shorter.
+ *
+ * Deliberately small and allocation-light: the watcher calls it every poll on a
+ * file the guest is appending to, so it stats first and reads only the tail
+ * (the prompt is near the end of what cdboot writes, and the log can grow to
+ * megabytes once Setup starts).
+ */
+export function readSerialTail(file, bytes = 8192) {
+  const limit = Math.max(1, Math.min(262144, Number(bytes) || 8192))
+  try {
+    const { size } = statSync(file)
+    if (!(size > 0)) return ''
+    const start = Math.max(0, size - limit)
+    const fd = openSync(file, 'r')
+    try {
+      const buffer = Buffer.alloc(size - start)
+      readSync(fd, buffer, 0, buffer.length, start)
+      return buffer.toString('utf8')
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * R1/F2 (the mechanism): press Enter for the cdboot prompt, sequential only.
  *
  * `sendKey` is the backend's own `sendKeys`, `wait` is a sleep that can be
- * stubbed, and BOTH are injected so the suite can prove the schedule (which
- * delays, in which order, how many attempts) without a hypervisor or a clock.
+ * stubbed, `now` is the clock, and `readSerial` is the serial tail — ALL are
+ * injected so the suite can prove the schedule against a stubbed serial
+ * timeline (prompt at 4 s → presses at ~4.1/4.9/5.7 s; a silent console → the
+ * fixed-time fallback at exactly the configured offsets) without a hypervisor
+ * or a real clock.
+ *
+ * Modes:
+ *   * WITH a serial source (`readSerial` or `serialLog`): poll for the prompt
+ *     (or for first output + `armDelayMs`), then press at the anchor and every
+ *     `retryGapMs` up to `attempts` times. The detection window is bounded by
+ *     `maxWindowMs` (~8 s). The fixed-time list is NOT raced in parallel —
+ *     pressing at 1.5 s while a 4 s prompt is still coming is the bug itself.
+ *     It is replayed, with its own relative gaps, only when (a) the window
+ *     closes with no anchor at all, or (b) QEMU never created the serial log
+ *     (`serialLog` given but the file is still missing at the first offset —
+ *     the historical schedule, unchanged).
+ *   * WITHOUT one: the original fixed-time loop, unchanged.
+ *
  * A failed send is logged and SKIPPED — the firmware may simply not have the
  * keyboard up yet, and the next attempt covers it. This function never throws
  * and never rejects: it is background belt-and-braces, not a boot precondition.
  */
-export async function runCdbootKeys({ scheduleMs = cdbootKeyScheduleMs(), sendKey, wait, log = () => {}, key = 'enter', name = '<name>' } = {}) {
-  const delays = Array.isArray(scheduleMs) ? scheduleMs : []
+export async function runCdbootKeys({
+  scheduleMs = cdbootKeyScheduleMs(),
+  serialLog = null,
+  readSerial = null,
+  pollMs = 100,
+  armDelayMs = 1500,
+  retryGapMs = 800,
+  attempts = 3,
+  maxWindowMs = 8000,
+  now = null,
+  sendKey,
+  wait,
+  log = () => {},
+  key = 'enter',
+  name = '<name>'
+} = {}) {
+  const delays = (Array.isArray(scheduleMs) ? scheduleMs : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((a, b) => a - b)
   const sleep = typeof wait === 'function' ? wait : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const clock = typeof now === 'function' ? now : () => Date.now()
+  const startedAt = clock()
+  const elapsed = () => Math.max(0, Math.round(clock() - startedAt))
+  const reader = typeof readSerial === 'function'
+    ? readSerial
+    : (typeof serialLog === 'string' && serialLog !== '' ? () => readSerialTail(serialLog) : null)
+  const poll = Math.max(1, Math.min(2000, Number(pollMs) || 100))
+  const gap = Math.max(0, Math.min(120000, Number(retryGapMs) || 0))
+  const armAfter = Math.max(0, Math.min(120000, Number(armDelayMs) || 0))
+  const window = Math.max(0, Math.min(120000, Number(maxWindowMs) || 0))
+  const totalAttempts = Math.max(1, Math.min(20, Math.trunc(Number(attempts) || 1)))
   const sent = []
-  let previous = 0
-  for (const at of delays) {
-    const delay = Math.max(0, Number(at) - previous)
-    previous = Math.max(previous, Number(at))
+  const press = async (reason, at) => {
     try {
-      await sleep(delay)
+      await sendKey(key)
+      sent.push(Math.round(at))
+      log(`windows: ${name} pressed ${key} at ~${Math.round(at)} ms ${reason} to get past "Press any key to boot from CD or DVD"`)
+    } catch (error) {
+      log(`windows: ${name} could not press ${key} at ~${Math.round(at)} ms ${reason} (not fatal, the next attempt covers it): ${error?.message ?? error}`)
+    }
+  }
+
+  // NO SERIAL SOURCE: the historical behaviour, byte for byte.
+  if (reader === null) {
+    let previous = 0
+    for (const at of delays) {
+      const delay = Math.max(0, at - previous)
+      previous = Math.max(previous, at)
+      try {
+        await sleep(delay)
+      } catch {
+        return sent
+      }
+      await press('(fixed-time schedule)', at)
+    }
+    return sent
+  }
+
+  // SERIAL-ANCHORED. Wait for an ANCHOR (the prompt signature, or first output
+  // + `armDelayMs`) inside a bounded window. The fixed-time list is NOT raced in
+  // parallel: pressing at 1.5 s while a 4 s prompt is still coming is exactly the
+  // bug this replaces. It is replayed only when the window closes without an
+  // anchor — as the last resort it is — and, byte for byte, when there is no
+  // serial console at all (a log file QEMU never created, e.g. a stub).
+  const serialFile = typeof serialLog === 'string' && serialLog !== '' ? serialLog : null
+  const serialFilePresent = () => {
+    if (serialFile === null) return true
+    try {
+      statSync(serialFile)
+      return true
+    } catch {
+      return false
+    }
+  }
+  // REPLAY THE FIXED SCHEDULE WITH ITS OWN RELATIVE GAPS, starting now. The
+  // nominal offsets are kept in the log line so the fallback is never mistaken
+  // for an anchored press.
+  const replayFixed = async (reason) => {
+    let previousAt = null
+    for (const at of delays) {
+      const gapMs = previousAt === null ? 0 : Math.max(0, at - previousAt)
+      previousAt = at
+      if (gapMs > 0) {
+        try {
+          await sleep(gapMs)
+        } catch {
+          return sent
+        }
+      }
+      await press(reason, at)
+    }
+    return sent
+  }
+
+  let firstGrowthAt = null
+  let anchor = null
+  let anchorReason = ''
+  let noConsole = false
+  for (;;) {
+    const t = elapsed()
+    let text = ''
+    try {
+      text = String(reader() ?? '')
+    } catch {
+      text = ''
+    }
+    if (text.length > 0 && firstGrowthAt === null) firstGrowthAt = t
+    if (cdbootPromptSeen(text)) {
+      anchor = t
+      anchorReason = '(serial: cdboot prompt seen)'
+      break
+    }
+    if (firstGrowthAt !== null && t - firstGrowthAt >= armAfter) {
+      anchor = t
+      anchorReason = `(serial: boot output seen at ~${firstGrowthAt} ms)`
+      break
+    }
+    // NO CONSOLE AT ALL: QEMU was told `-serial file:` but never created the
+    // file (a stub, or a QEMU that never got that far). Nothing can ever be
+    // anchored, so the historical schedule takes over — its first offset is the
+    // grace period a real QEMU needs to open the file.
+    if (firstGrowthAt === null && !serialFilePresent() && t >= (delays[0] ?? 1500)) {
+      noConsole = true
+      break
+    }
+    if (t >= window) break
+    const step = Math.max(1, Math.min(poll, window - t))
+    try {
+      await sleep(step)
     } catch {
       return sent
     }
-    try {
-      await sendKey(key)
-      sent.push(Number(at))
-      log(`windows: ${name} pressed ${key} at ~${Number(at)} ms to get past "Press any key to boot from CD or DVD"`)
-    } catch (error) {
-      log(`windows: ${name} could not press ${key} at ~${Number(at)} ms (not fatal, the next attempt covers it): ${error?.message ?? error}`)
+  }
+
+  if (noConsole) return replayFixed('(fixed-time schedule: no serial console)')
+  if (anchor === null) return replayFixed('(fixed-time fallback: the prompt never appeared)')
+  // A PROMPT ANCHOR IS CERTAIN, so three presses cover a dropped event. A
+  // GROWTH anchor is only a guess ("the console woke up, the prompt should be
+  // near"), so it keeps retrying every `retryGapMs` until the window closes —
+  // the prompt may arrive later than the first output, and an early press must
+  // never be the last one.
+  const promptAnchored = anchorReason.startsWith('(serial: cdboot prompt')
+  for (let attempt = 0; ; attempt += 1) {
+    if (attempt > 0) {
+      try {
+        await sleep(gap)
+      } catch {
+        return sent
+      }
     }
+    await press(anchorReason, elapsed())
+    const finished = promptAnchored ? attempt + 1 >= totalAttempts : elapsed() + gap > window
+    if (finished) break
   }
   return sent
 }
@@ -643,11 +855,12 @@ export function windowsPaths(store, name) {
     tpmSocket: path.join(dir, 'swtpm.sock'),
     tpmPid: path.join(dir, 'swtpm.pid'),
     oemDir: path.join(dir, 'oem'),
-    // THE ANSWER-FILE MEDIUM. A FAT32 image, not the host directory: Windows
-    // Setup's WinPE enumerates DISKS for an answer file, and a directory-backed
-    // vvfat stick behind usb-storage was not reliably visible (the user had to
-    // click through Setup by hand). dockur builds the same thing with mtools and
-    // attaches it as a hard disk — see buildSetupImage().
+    // THE ANSWER-FILE MEDIUM. A partitioned FAT32 image, not the host
+    // directory: WinPE mounts a real disk and lists its root, while a
+    // directory-backed vvfat node was not reliably visible. Setup then reads
+    // Autounattend.xml only from REMOVABLE-media roots, so the image is
+    // delivered through usb-storage with removable=on — see buildQemuArgs()
+    // and buildSetupImage().
     setupImg: path.join(dir, 'setup.img'),
     credentials: path.join(dir, 'credentials.json'),
     sshKey: path.join(dir, 'id_ed25519'),
@@ -757,19 +970,23 @@ export function windowsRowName(spec, fallback = '') {
  *   * `swtpm` is a separate process listening on a unix socket; QEMU's chardev
  *     connects to it. Both are cleaned up by `stopSwtpm`.
  *   * The install medium is the untouched Microsoft ISO on a CD-ROM. The
- *     answer file and its scripts live on a SEPARATE HARD DISK (`setup.img`,
- *     built with mtools), attached WRITABLE after the system disk: MBR + one
- *     FAT32 partition at LBA 2048, with `Autounattend.xml` at the volume root.
- *     The old `fat:ro:` vvfat directory behind usb-storage was not seen by
- *     Setup at all, and neither is a PARTITIONLESS FAT32 image: the firmware
- *     mounts one, Windows never does (it enumerates fixed disks through their
- *     partition table), and the symptom is Setup silently showing its
- *     interactive language screen. That is why the MBR is part of the build
- *     and why it is asserted — see buildSetupImage(). **NOT a dockur/windows
+ *     answer file and its scripts live on a SEPARATE DISK (`setup.img`, built
+ *     with mtools), attached WRITABLE: MBR + one FAT32 partition at LBA 2048,
+ *     with `Autounattend.xml` at the volume root. It is delivered as a
+ *     **removable usb-storage stick** since the live forensic round: WinPE
+ *     mounts it, lists the answer file, and STILL ignored it as a fixed disk,
+ *     because Setup only scans removable-media roots (and the boot media) for
+ *     an answer file. The old `fat:ro:` vvfat directory behind usb-storage was
+ *     not seen by Setup at all, and neither is a PARTITIONLESS FAT32 image: the
+ *     firmware mounts one, Windows never does (it enumerates fixed disks through
+ *     their partition table), and the symptom is Setup silently showing its
+ *     interactive language screen. That is why the MBR is part of the build and
+ *     why it is asserted — see buildSetupImage(). **NOT a dockur/windows
  *     mirror**: their overlay is also FAT32 but partitionless, and it works in
  *     their flow, not in this one. The disk is writable because QEMU 10 refuses
- *     a read-only block node behind `ide-hd` (it would be legal on a CD-ROM or
- *     usb-storage) and because Setup may write logs/scratch to the medium.
+ *     a read-only block node behind `ide-hd` (it is legal on usb-storage, which
+ *     is verified both ways now) and because Setup may write logs/scratch to
+ *     the medium.
  *   * `bootindex` ORDERS THE BOOT, and the order follows the INTENT of each
  *     phase instead of the order the devices happen to be declared in:
  *
@@ -822,34 +1039,47 @@ export function buildQemuArgs(spec) {
     // OVMF create a Boot0002 HDD entry, try it, print "HDD Not Found" and only
     // then reach the DVD — one wasted boot cycle per install, and the reason the
     // CD's "Press any key to boot from CD or DVD" window was ever entered late.
-    // S1: THE ANSWER-FILE DISK, AFTER THE SYSTEM DISK. `ide.0` is the qcow2 and
-    // therefore Windows DISK 0 — which is what Autounattend.xml's
-    // <DiskID>0</DiskID> targets. On QEMU's q35 (ICH9 AHCI, six IDE/SATA ports,
-    // verified with `-device ide-hd,bus=ide.N` for N=0..5) the numbering is:
+    // S1/F1: THE ANSWER-FILE MEDIUM, AFTER THE SYSTEM DISK. `ide.0` is the
+    // qcow2 and therefore Windows DISK 0 — which is what Autounattend.xml's
+    // <DiskID>0</DiskID> targets. On QEMU's q35 (ICH9 AHCI) the slots are:
     //
     //   ide.0  system qcow2      -> Windows Disk 0  (EFI/MSR/Primary)
     //   ide.1  install CD-ROM    -> not a disk, but the boot device during install
-    //   ide.2  setup.img         -> Windows Disk 1  (answer medium, WRITABLE)
     //   ide.3  virtio-win CD-ROM -> not a disk (when a driver ISO is supplied)
     //
-    // The setup disk MUST be declared here, immediately after the system disk.
-    // ide.2 used to hold the optional driver CD; that moved to ide.3 so the
-    // answer disk keeps the first free slot after the system disk.
+    // F1: AND IT IS NO LONGER AN ide-hd. VERIFIED INSIDE THE GUEST, with the
+    // answer image mounted and byte-correct: WinPE mounted setup.img as C:,
+    // `dir C:\` listed Autounattend.xml, `more C:\Autounattend.xml` was byte-
+    // verified, there were NO Panther parse errors — and Setup STILL showed its
+    // interactive language page. The cause is the DELIVERY CLASS, not the file:
+    // WinPE/Setup searches for Autounattend.xml on REMOVABLE-media roots (and on
+    // the boot media), NOT on fixed-disk roots. An `ide-hd` is a fixed disk: the
+    // firmware mounted it, Windows mounted it, and Setup never scanned it. The
+    // same image on usb-storage with `removable=on` reports removable media and
+    // IS scanned. (Windows' documented search order: removable drives, the boot
+    // media, %WINDIR%\Panther\Unattend / $WINNT$.~BT, and the
+    // UnattendFile/HKLM\SYSTEM\Setup registry override — a fixed disk root is
+    // nowhere in it.)
     //
-    // F1: THE MEDIUM IS ATTACHED **WRITABLE**, AND THAT IS NOT NEGOTIABLE.
-    // QEMU 10 rejects a read-only block node on an IDE hard-disk device:
-    //   qemu-system-x86_64: -device ide-hd,drive=setup0,bus=ide.2:
-    //     Block node is read-only
-    // and the create cascades into "swtpm did not create its socket" because
-    // QEMU never reached device realize. `readonly=on` would be legal on a
-    // CD-ROM or usb-storage device, not on ide-hd. dockur/windows attaches its
-    // SETUP overlay as a writable hard disk for the same reason: Setup may
-    // write logs/scratch to the medium. The image is rebuilt fresh on every
-    // create anyway (see buildSetupImage), so guest writes never leak into the
-    // next install.
+    // The drive node stays declared here, right after the system disk, so the
+    // block graph keeps the same order and the image is attached BEFORE any
+    // device names it. The usb-storage device itself is declared AFTER the xHCI
+    // controller (below), because QEMU parses argv in order and a device that
+    // names `bus=xhci.0` before `-device qemu-xhci` dies with "Bus 'xhci.0' not
+    // found".
+    //
+    // THE NODE IS WRITABLE, AND THAT IS STILL NOT NEGOTIABLE: QEMU 10 refuses a
+    // read-only block node behind an IDE hard disk ("Block node is read-only",
+    // which used to cascade into "swtpm did not create its socket"), and Setup
+    // may write logs/scratch to the medium. It is now legal on BOTH shapes —
+    // verified on this container's QEMU 10.0.13: usb-storage accepts a writable
+    // node AND a read-only one, and `query-block` reports `removable: true` for
+    // `removable=on` (and `false` for `removable=off` or the property omitted,
+    // which is why the property is explicit). The image is rebuilt fresh on
+    // every create anyway (see buildSetupImage), so guest writes never leak into
+    // the next install.
     ...(boot
-      ? ['-drive', `file=${p.setupImg},format=raw,if=none,id=setup0`,
-        '-device', 'ide-hd,drive=setup0,bus=ide.2']
+      ? ['-drive', `file=${p.setupImg},format=raw,if=none,id=setup0`]
       : []),
     ...(boot
       ? ['-drive', `file=${spec.isoPath},media=cdrom,readonly=on,if=none,id=cd0`,
@@ -864,12 +1094,23 @@ export function buildQemuArgs(spec) {
     // "Bus 'xhci.0' not found" (verified on QEMU 10). Order is asserted by a
     // gate needle, because it is invisible in a diff.
     '-device', 'qemu-xhci,id=xhci',
-    // S1: THERE IS NO USB OEM STICK ANY MORE. The only removable-medium path
-    // that remained was the `fat:ro:` vvfat directory behind usb-storage, and
-    // Windows Setup did not see it reliably — which is why the user had to
-    // interact with Setup. The answer file now rides on setup0 (a real FAT32
-    // hard-disk image, attached above). The xHCI controller stays because the
-    // absolute pointer and keyboard are USB devices.
+    // F1: THE ANSWER MEDIUM IS A REMOVABLE USB STICK, NOT A FIXED IDE DISK.
+    // `removable=on` is the SEMANTIC that makes Windows classify the device as
+    // removable media, and removable media roots are what WinPE scans for
+    // Autounattend.xml — a fixed-disk root is never scanned, which is the whole
+    // reported bug. QEMU's usb-storage `removable` property is explicit here
+    // because QEMU 10 defaults it to OFF when omitted (verified with query-block
+    // on this container's 10.0.13: omitted → removable=false, `removable=on` →
+    // removable=true), and a default is not a contract.
+    //
+    // This is NOT a return of the old `fat:ro:` vvfat OEM stick: that was a
+    // directory-backed vvfat node (read-only, no partition table, unreliable
+    // even as removable media). setup.img stays a REAL MBR + FAT32 partitioned
+    // image, built by mtools, attached writable — only its delivery class
+    // changed.
+    ...(boot
+      ? ['-device', 'usb-storage,drive=setup0,removable=on,bus=xhci.0']
+      : []),
     // networking: SLIRP + the SSH forward
     '-netdev', `user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22`,
     '-device', spec.virtio ? 'virtio-net-pci,netdev=net0' : 'e1000e,netdev=net0',
@@ -1355,18 +1596,18 @@ export function answerFileDiskIds(xml) {
  * S2: THE ANSWER FILE MUST TARGET THE SYSTEM DISK, AND THE SYSTEM DISK MUST BE
  * THE QCOW2.
  *
- * The QEMU argv puts the qcow2 on `ide.0` (first) and setup.img on `ide.2`
- * (after it), so Windows sees the qcow2 as Disk 0. If a future argv change
- * reorders those, Setup would happily partition the READ-ONLY answer medium and
- * fail in a way that looks like a corrupt ISO. This is the check that makes the
- * ordering a contract instead of a comment.
+ * The QEMU argv puts the qcow2 on `ide.0` (first, a fixed disk) and setup.img on
+ * a REMOVABLE usb-storage stick (a second disk), so Windows sees the qcow2 as
+ * Disk 0. If a future argv change reorders those, Setup would install onto the
+ * answer medium and fail in a way that looks like a corrupt ISO. This is the
+ * check that makes the ordering a contract instead of a comment.
  */
 export function assertAnswerFileTargetsSystemDisk(xml, { expected = 0 } = {}) {
   const ids = answerFileDiskIds(xml)
   if (ids.length === 0) throw new Error('Autounattend.xml has no <DiskID> — Setup would ask which disk to use')
   const wrong = ids.filter((id) => id !== expected)
   if (wrong.length > 0) {
-    throw new Error(`Autounattend.xml targets DiskID ${wrong.join(', ')} but the system qcow2 is Disk ${expected} (QEMU: disk0 on ide.0, setup.img on ide.2). Fix the disk order in buildQemuArgs() or the XML together — never one alone.`)
+    throw new Error(`Autounattend.xml targets DiskID ${wrong.join(', ')} but the system qcow2 is Disk ${expected} (QEMU: disk0 on ide.0, setup.img on a removable usb-storage stick). Fix the disk order in buildQemuArgs() or the XML together — never one alone.`)
   }
   if (!/<InstallTo>\s*<DiskID>\s*0\s*<\/DiskID>/u.test(String(xml))) {
     throw new Error('Autounattend.xml has no <InstallTo><DiskID>0</DiskID> — Setup would not know where to install Windows')
@@ -1419,17 +1660,18 @@ export function assertAnswerFileSelectsImage(xml) {
  * S1: BUILD `$STORE/windows/<name>/setup.img` — a FAT32 hard-disk image whose
  * ROOT holds the answer file and whose `$OEM$` tree holds the Setup scripts.
  *
- * WHY A DISK IMAGE AND NOT A vvfat DIRECTORY: dockur/windows attaches a FAT32
- * hard disk for the same reason — WinPE reliably enumerates disks for
- * `Autounattend.xml`, while a directory-backed vvfat stick behind usb-storage
- * was not visible to Setup in practice.
+ * WHY A DISK IMAGE AND NOT A vvfat DIRECTORY: a directory-backed vvfat stick
+ * behind usb-storage was not visible to Setup in practice, while a real MBR +
+ * FAT32 image IS mounted by WinPE. The image is then delivered as REMOVABLE
+ * media (usb-storage, removable=on), because Setup only scans removable-media
+ * roots — and the boot media — for `Autounattend.xml`; see the argv comments.
  *
  * WHERE THIS DELIBERATELY DIFFERS FROM dockur/windows (CORRECTED VERDICT — the
  * old comment claimed the two were identical and that claim was the bug): their
  * overlay is a plain FAT32 image formatted as a *superfloppy* (no partition
  * table), and it works THERE because of how their run flow hands the medium to
- * QEMU. Here the identical superfloppy was attached on `ide.2` and the result
- * was the interactive language screen: the firmware mounted the raw FAT volume
+ * QEMU. Here the identical superfloppy was attached as a fixed disk and the
+ * result was the interactive language screen: the firmware mounted the raw FAT volume
  * (EDK2 wrote its NvVars into it — 114 KB, the only writes that block device
  * ever saw), but Windows does not mount a partitionless FIXED disk at all, so
  * WinPE's drive-root search had no drive to look at. `setup.img` must therefore
@@ -1447,8 +1689,8 @@ export function assertAnswerFileSelectsImage(xml) {
  *      asserted, not assumed).
  *
  * F1: REBUILD POLICY — ALWAYS FRESH, ON EVERY CREATE. The image is attached
- * WRITABLE (QEMU rejects `readonly=on` on an ide-hd device, and dockur's SETUP
- * overlay is a writable hard disk because Setup may write logs/scratch to it),
+ * WRITABLE (QEMU 10 rejects `readonly=on` behind an IDE hard disk; usb-storage
+ * accepts either, and Setup may write logs/scratch to the medium),
  * so the guest can legitimately leave bytes behind. There is deliberately no
  * "skip if it already exists" branch: a re-create of the same computer must
  * start from a byte-exact answer medium, never from a possibly-modified one.
@@ -2124,15 +2366,22 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
       })
       child.unref()
       log(`windows: ${spec.name} qemu started (pid ${child.pid}${installPending ? ', installing' : ''})`)
-      // R1: THE INSTALL CD'S "PRESS ANY KEY" WINDOW, PRESSED FOR THE USER.
+      // R1/F2: THE INSTALL CD'S "PRESS ANY KEY" WINDOW, PRESSED FOR THE USER.
       //
       // VERIFIED LIVE: OVMF reaches the DVD, `cdboot.efi 10.0.26100.1` prints
       // "Press any key to boot from CD or DVD", nobody presses a key within 5 s,
       // cdboot prints EFI_TIMEOUT and BDS falls into the EFI Internal Shell —
-      // where the install simply stops. This schedules three QMP key presses
-      // inside that window (1.5 s / 3.5 s / 5.5 s by default, see
-      // `cdbootKeyScheduleMs`) and deliberately does NOT await them: boot()'s
-      // pidfile window must not be extended by a keystroke.
+      // where the install simply stops. This schedules QMP key presses inside
+      // that window and deliberately does NOT await them: boot()'s pidfile
+      // window must not be extended by a keystroke.
+      //
+      // F2: THE ANCHOR IS THE SERIAL CONSOLE, NOT THE SPAWN CLOCK. The live
+      // forensic child proved the fixed 1.5/3.5/5.5 s presses land while OVMF is
+      // still enumerating, i.e. BEFORE cdboot prints its prompt, so the first
+      // boot missed the window entirely. `serial.log` is watched for the prompt
+      // signature (or for first output + ~1.5 s) and the presses fire from
+      // there, every 0.8 s; the fixed schedule survives only as the fallback
+      // for a console that stays silent. See runCdbootKeys().
       //
       // ONLY WHILE INSTALLING. A boot of an already-installed disk has no
       // prompt to dismiss, and typing into a live guest would be a keystroke
@@ -2145,6 +2394,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
         const keyedSpec = windowsBootSpec({ ...attemptSpec, paths: p })
         void runCdbootKeys({
           scheduleMs: cdbootKeyScheduleMs(),
+          serialLog: p.serialLog,
           log,
           name: spec.name,
           sendKey: (key) => {
