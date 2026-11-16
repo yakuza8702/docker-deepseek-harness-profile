@@ -886,26 +886,54 @@ key press is ever missed, the EFI Shell chain-loads the install media instead of
 stopping at a prompt. It is a fallback, not the mechanism — the key press is what
 gets an install onto the CD.
 
-**The answer file rides on a real disk (dockur/windows layout).** Setup no longer
-sees a `vvfat` USB stick: a FAT32 hard-disk image `$STORE/windows/<name>/setup.img`
-is built with `mtools` (`mformat -F` + `mcopy -s`) and attached READ-ONLY after
-the system disk. Its ordering is the contract:
+**The answer file rides on a real, PARTITIONED disk.** Setup no longer sees a
+`vvfat` USB stick: a 64 MiB image `$STORE/windows/<name>/setup.img` is built with
+`mtools` and attached **writable** after the system disk, and it is a real disk —
+an MBR with one active FAT32-LBA partition at LBA 2048 — not a partitionless
+superfloppy. That distinction is the difference between an install that runs and
+one that asks for a language: the firmware (EDK2) mounts a raw FAT volume from
+any block device, but **Windows does not mount a partitionless fixed disk at
+all**, so WinPE's drive-root search finds no drive. (dockur/windows' overlay is a
+superfloppy too; it works there because of how their flow hands the medium to
+QEMU, so "we mirror dockur" was never the guarantee — see `buildSetupImage()`.)
 
 | QEMU bus | Device | Windows sees |
 |---|---|---|
 | `ide.0` | `disk.qcow2` | **Disk 0** — what `Autounattend.xml`'s `<DiskID>0</DiskID>` targets |
 | `ide.1` | install CD-ROM | boot device during install |
-| `ide.2` | `setup.img` (FAT32, ro) | Disk 1 — the answer medium |
+| `ide.2` | `setup.img` (MBR + FAT32 partition, rw) | Disk 1 — the answer medium |
 | `ide.3` | virtio-win CD-ROM (optional) | not a disk |
 
-`buildSetupImage()` immediately reads the image back (`mdir` must list
-`Autounattend.xml` at the root; `mtype` must return bytes identical to the staged
-file) before QEMU starts. The root also holds `startup.nsh`, and
+The build is `mformat -F -H 2048 -i setup.img@@1048576` → write the MBR (type
+`0x0C`, start LBA 2048, CHS `0xFE/0xFF/0xFF`, signature `0x55AA`) → `mcopy -s -i
+setup.img@@1048576`. `@@` takes a **byte** offset (mtools 4.0.48), so 1 048 576 =
+LBA 2048. The MBR is generated in Node (16-byte entry, 512-byte sector) because
+mtools cannot write one and no partitioner is installed in the image — one fewer
+runtime dependency, and the bytes are assertable in a test.
+
+`buildSetupImage()` reads the image back before QEMU starts: the MBR signature
+and partition entry must be there, `mdir -i setup.img@@1048576` must list
+`Autounattend.xml` at the volume root, and `mtype` must return bytes identical to
+the staged file. The root also holds `startup.nsh`, and
 `$OEM$/$$/Setup/Scripts/` carries `setupcomplete.cmd`, `cua-firstboot.ps1` and
 `Unattend.vbs` (the hidden launcher both Setup passes use, with exit passthrough).
-A licensed operator ISO may pass `windowsKey`; it becomes a `<ProductKey>` block
-with `<WillShowUI>Never</WillShowUI>`. The pinned media are EVALUATION images and
-need no key (they ignore it).
+
+**The edition is named in the answer file.** `<ImageInstall><OSImage>` carries an
+`<InstallFrom>` block with exactly one `<MetaData>`, *before* `<InstallTo>` (the
+schema order). Without it Setup stops at "Select the operating system you want to
+install" — the second interactive page after the language page. Which image:
+
+| version | selector | value |
+|---|---|---|
+| `11ltsc` (pinned EVAL ISO) | `/IMAGE/NAME` | `Windows 11 IoT Enterprise LTSC 2024 Evaluation` — read from that ISO's own WIM XML (single image, `INDEX 1`) |
+| `2025` (pinned EVAL ISO) | `/IMAGE/INDEX` | `2` — Standard Evaluation (Desktop Experience); image 1 is Server Core and has no desktop |
+| any `windowsIso` (operator ISO) | `/IMAGE/INDEX` | `1` |
+
+Override with `windowsImageIndex` (1–999) or `windowsImageName` (exact, must match
+the media or Setup refuses the install). A licensed operator ISO may also pass
+`windowsKey`; it becomes a `<ProductKey>` block with
+`<WillShowUI>Never</WillShowUI>`. The pinned media are EVALUATION images and need
+no key (they ignore it).
 
 ### What the panel shows, and how you know a Windows install finished
 
@@ -962,10 +990,10 @@ container/QEMU, swtpm, websockify, disks, ports and registry row are all removed
 The unattended install is four data files that ship **inside the image** at
 `/usr/local/share/cua-vm/windows-oem/`: `Autounattend.xml`, `setupcomplete.cmd`,
 `cua-firstboot.ps1` and `Unattend.vbs`. The create path stages them into
-`/cua-vm/windows/<name>/oem/`, builds them into a FAT32 `setup.img` (mtools) and
-attaches that image as a **writable** hard disk before QEMU starts, so a missing
-file stops the computer before the first boot — it is an **image** problem, not a
-setting:
+`/cua-vm/windows/<name>/oem/`, builds them into `setup.img` — an MBR plus one
+FAT32 partition at LBA 2048 (mtools) — and attaches that image as a **writable**
+hard disk before QEMU starts, so a missing file stops the computer before the
+first boot — it is an **image** problem, not a setting:
 
 * your image was built **before the Windows backend existed** (a `main`-branch
   build: `main` has no Windows code at all), or
@@ -977,7 +1005,10 @@ Block node is read-only`) and the create dies before QEMU reaches device realize
 — which surfaced as the misleading *"swtpm did not create its socket"* cascade.
 `readonly=on` is legal on a CD-ROM or a usb-storage stick, not on `ide-hd`.
 dockur/windows attaches its SETUP overlay as a writable hard disk for the same
-reason: Setup may write logs/scratch to it. The image is rebuilt fresh on every
+reason: Setup may write logs/scratch to it. (Its overlay is a partitionless FAT32
+superfloppy; ours carries an MBR because Windows never enumerates a partitionless
+fixed disk — the firmware does, and that is exactly what made the bug look like
+"the answer file is not being read".) The image is rebuilt fresh on every
 create (and its answer file byte-verified), so writes left by one install never
 reach the next. The image needs **mtools in the image**; without it a create
 refuses with a message naming the package, not a QEMU that cannot boot.

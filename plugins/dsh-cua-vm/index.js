@@ -492,7 +492,9 @@ export function apply(ctx, config = {}) {
         android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating (Linux only).' },
         rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true. Linux only.' },
         windowsVersion: { type: 'string', enum: ['11', '11ltsc', '10', 'ltsc10', '2022', '2025'], description: 'Windows version. "2025" and "11ltsc" (Windows 11 IoT Enterprise LTSC 2024, alias "ltsc11") have pinned, probed public ISOs; 11/10/ltsc10/2022 require windowsIso (their evaluation media is behind a session-token page). Windows only.' },
-        windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL (downloaded once into $STORE/iso/) or a file path inside the VM store or the workspace (attached directly as a QEMU drive). Windows only; mutually exclusive with windowsVersion.' }
+        windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL (downloaded once into $STORE/iso/) or a file path inside the VM store or the workspace (attached directly as a QEMU drive). Windows only; mutually exclusive with windowsVersion.' },
+        windowsImageIndex: { type: 'integer', description: 'Windows only, optional: the /IMAGE/INDEX the answer file installs (1-based, as listed in the ISO sources/install.wim). Omit to use the version default: the pinned 11ltsc media names its edition explicitly (/IMAGE/NAME), Server 2025 installs image 2 (Standard Evaluation, Desktop Experience), any windowsIso installs image 1. Needed only for an unusual ISO where those are wrong.' },
+        windowsImageName: { type: 'string', description: 'Windows only, optional: the exact /IMAGE/NAME to install, e.g. "Windows 11 IoT Enterprise LTSC 2024 Evaluation". Wins over windowsImageIndex. Use it when the ISO carries several editions and the name is known exactly — a name that does not match the media fails the install.' }
       }
     },
     output: textOutput('The computer, its renderer, disk, Android and REA status.'),

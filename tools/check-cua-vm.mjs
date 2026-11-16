@@ -526,14 +526,49 @@ const NEEDLES = {
     ['export function answerFileDiskIds(xml)', 1],
     ['export function assertAnswerFileTargetsSystemDisk(', 1],
     ['export function normaliseProductKey(value)', 1],
-    ["['-i', p.setupImg, '-F', '-v', SETUP_IMAGE_LABEL, '::']", 1],
-    ["['-i', p.setupImg, '-b', spec]", 1],
+    // F1: THE ANSWER DISK IS A PARTITIONED DISK. A partitionless FAT32
+    // superfloppy is mounted by the FIRMWARE and by nothing else: Windows
+    // enumerates fixed disks through their partition table, so WinPE never
+    // mounted setup.img and the install fell back to the interactive language
+    // screen. These needles pin the MBR + the LBA-2048 partition, and pin every
+    // mtools call to the partition's BYTE OFFSET (`-i img@@offset`, mtools
+    // 4.0.48 syntax) instead of the whole image.
+    ['export const SETUP_PARTITION_START_LBA = 2048', 1],
+    ['export const SETUP_PARTITION_OFFSET_BYTES = SETUP_PARTITION_START_LBA * SETUP_SECTOR_BYTES', 1],
+    ['export const SETUP_PARTITION_TYPE = 0x0c', 1],
+    ['export function setupVolumeSpec(imagePath)', 1],
+    ['export function setupMbrSector({', 1],
+    ['export function writeSetupMbr(imagePath)', 1],
+    ['export function readSetupMbr(imagePath)', 1],
+    ["sector[entry + 4] = SETUP_PARTITION_TYPE", 1],
+    ['sector.writeUInt32LE(startLba, entry + 8)', 1],
+    ['sector[SETUP_MBR_SIGNATURE.offset] = SETUP_MBR_SIGNATURE.bytes[0]', 1],
+    ['const volume = setupVolumeSpec(p.setupImg)', 2],
+    ["run(MTOOLS.format, ['-i', volume, '-F', '-H', String(SETUP_PARTITION_START_LBA), '-v', SETUP_IMAGE_LABEL, '::'])", 1],
+    ["run(MTOOLS.copy, ['-i', volume, '-s', ...staged, oemTree, '::'])", 1],
+    ["execFileSync(MTOOLS.dir, ['-i', volume, '-b', spec]", 1],
+    ["if (mbr.signature !== '55aa')", 1],
+    ['const mbr = readSetupMbr(p.setupImg)', 1],
     ['mdir', 1],
     // S2: the byte compare is part of the build, not a comment.
     ['staged.equals(fromImage)', 1],
     // S3: optional product key, never shown by Setup.
     ['{{PRODUCT_KEY}}', 1],
     ['WillShowUI>Never', 1],
+    // F2: THE EDITION IS NAMED IN THE ANSWER FILE. Without <InstallFrom> Setup
+    // stops at "Select the operating system you want to install" — the second
+    // interactive stop after the language page. The name is pinned to the value
+    // VERIFIED from the pinned 11ltsc ISO's own WIM XML (single image,
+    // INDEX 1, NAME "Windows 11 IoT Enterprise LTSC 2024 Evaluation").
+    ['{{IMAGE_INSTALL}}', 2],
+    ['export const WINDOWS_IMAGE_SELECTIONS = Object.freeze({', 1],
+    ["    key: '/IMAGE/NAME',", 1],
+    ["    value: 'Windows 11 IoT Enterprise LTSC 2024 Evaluation',", 1],
+    ['export function resolveWindowsImageSelection({', 1],
+    ['export function imageInstallFromXml(selection)', 1],
+    ['export function assertAnswerFileSelectsImage(xml)', 1],
+    ['const selected = assertAnswerFileSelectsImage(stagedXml)', 1],
+    ["if (metadata !== 1)", 1],
     // S4: dockur's hidden launcher shape (the launcher itself is asserted in
     // oemLauncher / oemSetup; the writer must copy it into $OEM$).
     ['Unattend.vbs', 2],
@@ -692,6 +727,13 @@ const NEEDLES = {
     ['<AutoLogon>', 1],
     // S3: the key block is a placeholder; evaluation media leave it empty.
     ['{{PRODUCT_KEY}}', 1],
+    // F2: THE EDITION IS NAMED. The placeholder must stay INSIDE <OSImage> and
+    // BEFORE <InstallTo> (schema order), and writeOemPayload replaces it with
+    // the <InstallFrom> block (or the staged file is refused, see the F2
+    // semantic check).
+    ['<OSImage>\n          <!-- F2: WITHOUT THIS, SETUP ASKS WHICH EDITION.', 1],
+    ['{{IMAGE_INSTALL}}', 1],
+    ['<InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>', 1],
     // S4: FirstLogonCommands uses the hidden launcher, not a bare powershell.
     ['wscript //nologo C:\\Windows\\Setup\\Scripts\\Unattend.vbs', 1]
   ],
@@ -1090,6 +1132,61 @@ function sourceOf(label, name) {
       failures += 1
       missing.push('docker/cua-vm-windows-qemu.mjs: setup.img must attach WRITABLE (no readonly=on: QEMU 10 rejects a read-only node on ide-hd) on ide.2 AFTER disk0 on ide.0 (so the qcow2 is Windows Disk 0 / DiskID 0), and no usb-storage/file=fat:ro: OEM stick may remain (the stick Setup could not see)')
       console.log('  FAIL K1 answer-disk order / writability / no vvfat stick')
+    }
+  }
+  // F2: THE ANSWER FILE NAMES THE IMAGE, IN SCHEMA ORDER. A needle list can say
+  // "InstallFrom exists"; only an ORDER assertion says Setup reads it before the
+  // install target, and only a REAL staged file proves the placeholder was
+  // replaced. Both run here: the template's order, and (below, via the exported
+  // helpers) the staged shape.
+  {
+    const answer = sourceOf('F2', 'Autounattend.xml')
+    total += 1
+    if (answer === null) {
+      failures += 1
+      missing.push('docker/windows-oem/Autounattend.xml: file not found (F2 InstallFrom cannot be checked)')
+    } else {
+      // Comments are stripped first: the template EXPLAINS the ordering in an
+      // XML comment that names both elements, and a raw indexOf would find the
+      // prose instead of the elements. The placeholder is also named in the
+      // header's substitution table, so the one that matters is the first after
+      // <OSImage>.
+      const bare = answer.replace(/<!--[\s\S]*?-->/gu, '')
+      const osImage = bare.indexOf('<OSImage>')
+      const installFrom = osImage === -1 ? -1 : bare.indexOf('{{IMAGE_INSTALL}}', osImage)
+      const installTo = bare.indexOf('<InstallTo>')
+      const ok = osImage !== -1 && installFrom !== -1 && installTo !== -1 && osImage < installFrom && installFrom < installTo
+      if (ok) {
+        if (!quietMode) console.log('  ok   F2 the answer template names the edition (<InstallFrom>) inside <OSImage>, before <InstallTo>')
+      } else {
+        failures += 1
+        missing.push('docker/windows-oem/Autounattend.xml: {{IMAGE_INSTALL}} must sit inside <OSImage> BEFORE <InstallTo> (schema order) — without it Setup stops at "Select the operating system you want to install"')
+        console.log('  FAIL F2 InstallFrom placement in the answer template')
+      }
+    }
+  }
+  // F1: THE MEDIUM IS A DISK WINDOWS CAN ENUMERATE. The gate cannot build a
+  // 64 MiB image, but it can refuse the exact regression: any mtools call that
+  // addresses setup.img WITHOUT the partition offset is back to the
+  // partitionless superfloppy the firmware mounted and Windows ignored.
+  {
+    const windows = sourceOf('F1', 'cua-vm-windows-qemu.mjs')
+    total += 1
+    if (windows === null) {
+      failures += 1
+      missing.push('docker/cua-vm-windows-qemu.mjs: file not found (F1 partition checks cannot run)')
+    } else {
+      const direct = [...windows.matchAll(/execFileSync\(MTOOLS\.(?:dir|type), \['-i', ([^,]+),/gu)].map((m) => m[1].trim())
+      const bad = direct.filter((target) => target !== 'volume')
+      const mbr = /writeSetupMbr\(p\.setupImg\)/u.test(windows)
+        && /readSetupMbr\(p\.setupImg\)/u.test(windows)
+      if (bad.length === 0 && mbr) {
+        if (!quietMode) console.log('  ok   F1 every setup.img read goes through the partition offset and the MBR is written + read back')
+      } else {
+        failures += 1
+        missing.push(`docker/cua-vm-windows-qemu.mjs: setup.img mtools reads must use the partition volume (found ${bad.length} on ${bad.join(', ') || 'none'}) and the build must write AND read back the MBR — a partitionless image is never mounted by Windows`)
+        console.log('  FAIL F1 partitioned answer medium')
+      }
     }
   }
   // K2: THE OEM PATH AGREEMENT. The supervisor resolves the payload from one

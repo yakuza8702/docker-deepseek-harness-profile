@@ -13,6 +13,9 @@
     {{DSH_CUA_PIP}}   pip spec for the dsh-cua package
     {{PRODUCT_KEY}}   optional <ProductKey> block, or nothing for evaluation
                       media (see windowsKey in writeOemPayload)
+    {{IMAGE_INSTALL}} the <InstallFrom> block naming the edition to install
+                      (F2: /IMAGE/NAME for the pinned 11ltsc media, /IMAGE/INDEX
+                      otherwise — see resolveWindowsImageSelection)
 
   ELEMENT ORDER IS SCHEMA ORDER, not reading order: Setup validates the
   component children against the answer-file schema, and a RunSynchronous that
@@ -55,6 +58,11 @@
       </DiskConfiguration>
       <ImageInstall>
         <OSImage>
+          <!-- F2: WITHOUT THIS, SETUP ASKS WHICH EDITION. <InstallFrom> must
+               come BEFORE <InstallTo> (schema order). Exactly one <MetaData>
+               is allowed: a second one is ignored by Setup, so it would be a
+               green check on a page the user still has to answer. -->
+          {{IMAGE_INSTALL}}
           <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
         </OSImage>
       </ImageInstall>

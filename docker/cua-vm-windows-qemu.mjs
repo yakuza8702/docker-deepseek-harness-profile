@@ -23,9 +23,10 @@
  *              talked past with registry bypasses.
  *   disks      qcow2 under `$STORE/windows/<name>/disk.qcow2` — a plain qcow2,
  *              which is why `qemu-img convert` checkpointing keeps working.
- *   install    the pinned Microsoft ISO, a FAT `vvfat` directory holding
- *              `Autounattend.xml` + the OEM scripts (see docker/windows-oem/),
- *              and — when the operator provides it — the virtio-win drivers ISO.
+ *   install    the pinned Microsoft ISO, an MBR + FAT32 answer DISK built with
+ *              mtools from `Autounattend.xml` + the OEM scripts (see
+ *              docker/windows-oem/), and — when the operator provides it — the
+ *              virtio-win drivers ISO.
  *   control    QMP on loopback (screendump / input-send-event / query-status /
  *              system_powerdown / quit) and a VNC display on loopback that the
  *              proxy relays, so "Show VM" is a live stream the user drives.
@@ -39,7 +40,7 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process'
-import { closeSync, createWriteStream, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
+import { chmodSync, closeSync, copyFileSync, createWriteStream, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
 import path from 'node:path'
@@ -756,13 +757,18 @@ export function windowsRowName(spec, fallback = '') {
  *   * `swtpm` is a separate process listening on a unix socket; QEMU's chardev
  *     connects to it. Both are cleaned up by `stopSwtpm`.
  *   * The install medium is the untouched Microsoft ISO on a CD-ROM. The
- *     answer file and its scripts live on a SEPARATE FAT32 HARD DISK
- *     (`setup.img`, built with mtools), attached WRITABLE after the system
- *     disk. This mirrors dockur/windows: WinPE reliably finds
- *     `Autounattend.xml` on a disk at the root of a real filesystem, while the
- *     old `fat:ro:` vvfat directory behind usb-storage was evidently not seen
- *     by Setup at all. The disk is writable because QEMU 10 refuses a
- *     read-only block node behind `ide-hd` (it would be legal on a CD-ROM or
+ *     answer file and its scripts live on a SEPARATE HARD DISK (`setup.img`,
+ *     built with mtools), attached WRITABLE after the system disk: MBR + one
+ *     FAT32 partition at LBA 2048, with `Autounattend.xml` at the volume root.
+ *     The old `fat:ro:` vvfat directory behind usb-storage was not seen by
+ *     Setup at all, and neither is a PARTITIONLESS FAT32 image: the firmware
+ *     mounts one, Windows never does (it enumerates fixed disks through their
+ *     partition table), and the symptom is Setup silently showing its
+ *     interactive language screen. That is why the MBR is part of the build
+ *     and why it is asserted — see buildSetupImage(). **NOT a dockur/windows
+ *     mirror**: their overlay is also FAT32 but partitionless, and it works in
+ *     their flow, not in this one. The disk is writable because QEMU 10 refuses
+ *     a read-only block node behind `ide-hd` (it would be legal on a CD-ROM or
  *     usb-storage) and because Setup may write logs/scratch to the medium.
  *   * `bootindex` ORDERS THE BOOT, and the order follows the INTENT of each
  *     phase instead of the order the devices happen to be declared in:
@@ -1076,6 +1082,250 @@ export const SETUP_IMAGE_BYTES = 64 * 1024 * 1024
 /** The mtools commands, named once so a gate and the error text agree. */
 export const MTOOLS = Object.freeze({ format: 'mformat', copy: 'mcopy', dir: 'mdir', type: 'mtype' })
 
+/* ------------------------------------------------------------------ *
+ * F1: THE ANSWER DISK IS A REAL DISK WITH A REAL PARTITION TABLE
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHY THERE IS AN MBR HERE AT ALL — the live-verified root cause of the
+ * interactive language screen.
+ *
+ * This module used to hand `mformat`/`mcopy` a bare 64 MiB file: a FAT32
+ * "superfloppy", VBR at LBA 0, no MBR and no GPT. mtools' own VBR template puts
+ * bytes at 0x1BE that look like a partition entry but are not one.
+ *
+ * That medium is legal, and the FIRMWARE likes it: EDK2 mounts a raw FAT volume
+ * from any block device and even wrote its NvVars to it (the blockstats showed
+ * 114 KB of firmware writes on `setup0` and nothing else). WINDOWS IS NOT THE
+ * FIRMWARE: WinPE enumerates *fixed disks* through their partition table, so a
+ * partitionless fixed disk is never given a drive letter, never mounted, and
+ * Setup's drive-root search for `Autounattend.xml` had nothing to scan. The
+ * result was the interactive language screen on every install, with the answer
+ * file provably present in the image.
+ *
+ * So the build now writes an MBR with one active type-0x0C (FAT32 LBA) partition
+ * starting at LBA 2048 — the conventional 1 MiB alignment — and points EVERY
+ * mtools call at the volume through mtools' `@@<byte-offset>` syntax:
+ *
+ *     mformat -i /path/setup.img@@1048576 …
+ *     mcopy  -i /path/setup.img@@1048576 …
+ *
+ * `@@` takes a BYTE offset (verified against mtools 4.0.48: `@@2048` lands the
+ * volume at byte 2048 and mtools rejects the unaligned geometry as "non DOS
+ * media", while `@@4194304` = LBA 2048 formats cleanly and `mdir` reads it back).
+ *
+ * mtools cannot write an MBR, and no partitioner is installed in the image, so
+ * the 512-byte stub is generated here in Node and written with `writeSync`.
+ * That is deliberately one fewer runtime dependency rather than one more: no
+ * `sfdisk`/`parted` addition to the Dockerfile, nothing to keep in sync with
+ * util-linux, and the bytes are assertable in a test.
+ */
+export const SETUP_SECTOR_BYTES = 512
+
+/** First partition sector: 1 MiB of alignment, the universal convention. */
+export const SETUP_PARTITION_START_LBA = 2048
+
+/** Where the FAT32 volume actually begins inside setup.img (1 048 576). */
+export const SETUP_PARTITION_OFFSET_BYTES = SETUP_PARTITION_START_LBA * SETUP_SECTOR_BYTES
+
+/** MBR partition type 0x0C = FAT32 LBA (0x0B is FAT32 CHS; 0x0C is LBA-mapped). */
+export const SETUP_PARTITION_TYPE = 0x0c
+
+/** The boot signature every firmware and Windows' disk driver look for. */
+export const SETUP_MBR_SIGNATURE = Object.freeze({ offset: 510, bytes: Object.freeze([0x55, 0xaa]) })
+
+/**
+ * The `-i` argument for every mtools call on setup.img: the image PLUS the byte
+ * offset of its partition. One function so the build and the read-back can
+ * never disagree about where the volume starts.
+ */
+export function setupVolumeSpec(imagePath) {
+  return `${imagePath}@@${SETUP_PARTITION_OFFSET_BYTES}`
+}
+
+/**
+ * The 512-byte MBR sector: one active FAT32-LBA partition and the 0x55AA
+ * signature. Pure, so a test can assert the geometry without a disk.
+ *
+ * CHS fields are written as 0xFE/0xFF/0xFF — the "too big, use LBA" encoding
+ * mtools itself emits — because a 63 MiB partition does not fit the legacy
+ * 10/8/6-bit tuple in any meaningful way and every consumer that matters reads
+ * the LBA fields.
+ */
+export function setupMbrSector({ startLba = SETUP_PARTITION_START_LBA, sectorCount = 0, active = true } = {}) {
+  if (!Number.isInteger(startLba) || startLba <= 0) throw new Error(`setupMbrSector: startLba must be a positive integer (got ${startLba})`)
+  if (!Number.isInteger(sectorCount) || sectorCount <= 0) throw new Error(`setupMbrSector: sectorCount must be a positive integer (got ${sectorCount})`)
+  const sector = Buffer.alloc(SETUP_SECTOR_BYTES)
+  const entry = 0x1be
+  sector[entry] = active ? 0x80 : 0x00
+  sector[entry + 1] = 0xfe
+  sector[entry + 2] = 0xff
+  sector[entry + 3] = 0xff
+  sector[entry + 4] = SETUP_PARTITION_TYPE
+  sector[entry + 5] = 0xfe
+  sector[entry + 6] = 0xff
+  sector[entry + 7] = 0xff
+  sector.writeUInt32LE(startLba, entry + 8)
+  sector.writeUInt32LE(sectorCount, entry + 12)
+  sector[SETUP_MBR_SIGNATURE.offset] = SETUP_MBR_SIGNATURE.bytes[0]
+  sector[SETUP_MBR_SIGNATURE.offset + 1] = SETUP_MBR_SIGNATURE.bytes[1]
+  return sector
+}
+
+/** How many sectors the FAT32 volume mformat just laid down, or 0. */
+export function setupVolumeSectors(imagePath) {
+  const fd = openSync(imagePath, 'r')
+  try {
+    const bpb = Buffer.alloc(64)
+    if (readSync(fd, bpb, 0, 64, SETUP_PARTITION_OFFSET_BYTES) < 64) return 0
+    // A BPB only counts if its sector size is the one mtools formats with.
+    if (bpb.readUInt16LE(11) !== SETUP_SECTOR_BYTES) return 0
+    const total32 = bpb.readUInt32LE(32)
+    return total32 > 0 ? total32 : bpb.readUInt16LE(19)
+  } finally { closeSync(fd) }
+}
+
+/**
+ * Write the MBR over an image whose FAT32 volume is already formatted at
+ * SETUP_PARTITION_OFFSET_BYTES, and return the partition geometry.
+ *
+ * ORDER MATTERS: this runs AFTER mformat and BEFORE mcopy. mformat only touches
+ * the volume at the offset (verified: LBA 0 survives a `@@`-offset format), but
+ * writing the table last means the partition size can be the FAT's real length
+ * instead of a guess.
+ */
+export function writeSetupMbr(imagePath) {
+  const totalSectors = Math.floor(statSync(imagePath).size / SETUP_SECTOR_BYTES)
+  const available = totalSectors - SETUP_PARTITION_START_LBA
+  if (available <= 0) {
+    throw new Error(`setup.img is too small to hold a partition at LBA ${SETUP_PARTITION_START_LBA} (${totalSectors} sectors)`)
+  }
+  const fatSectors = setupVolumeSectors(imagePath)
+  // The partition covers the formatted volume (so Windows' idea of the volume
+  // length matches the BPB), never more than the disk.
+  const sectorCount = fatSectors > 0 ? Math.min(fatSectors, available) : available
+  const fd = openSync(imagePath, 'r+')
+  try {
+    writeSync(fd, setupMbrSector({ startLba: SETUP_PARTITION_START_LBA, sectorCount }), 0, SETUP_SECTOR_BYTES, 0)
+  } finally { closeSync(fd) }
+  return { startLba: SETUP_PARTITION_START_LBA, offsetBytes: SETUP_PARTITION_OFFSET_BYTES, sectorCount, type: SETUP_PARTITION_TYPE }
+}
+
+/** Read the MBR back: the structural assertion that the medium is a DISK. */
+export function readSetupMbr(imagePath) {
+  const fd = openSync(imagePath, 'r')
+  let mbr
+  try {
+    mbr = Buffer.alloc(SETUP_SECTOR_BYTES)
+    if (readSync(fd, mbr, 0, SETUP_SECTOR_BYTES, 0) < SETUP_SECTOR_BYTES) {
+      throw new Error(`setup.img has no MBR (shorter than one sector): ${imagePath}`)
+    }
+  } finally { closeSync(fd) }
+  const entry = 0x1be
+  return {
+    signature: mbr.toString('hex', SETUP_MBR_SIGNATURE.offset, SETUP_MBR_SIGNATURE.offset + 2),
+    active: mbr[entry] === 0x80,
+    type: mbr[entry + 4],
+    startLba: mbr.readUInt32LE(entry + 8),
+    sectorCount: mbr.readUInt32LE(entry + 12)
+  }
+}
+
+/**
+ * F2: THE EDITION — SETUP MUST NEVER BE ASKED *WHICH* IMAGE TO INSTALL.
+ *
+ * `<InstallFrom>` was missing from the answer file. Everything else could be
+ * right and Setup still stopped: with no image named, WinPE shows its "Select
+ * the operating system you want to install" list, and on a multi-edition
+ * evaluation medium (Server 2025 carries four images) that is a page no
+ * unattended install can skip.
+ *
+ * `/IMAGE/NAME` is preferred where the name is KNOWN AND VERIFIED, because it is
+ * stable across media revisions that add or reorder indexes. Verified by reading
+ * the WIM XML resource straight out of the pinned 11ltsc evaluation ISO
+ * (`26100.1742…CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso`, read on 2026-11-16):
+ *
+ *   <IMAGE INDEX="1"> … <NAME>Windows 11 IoT Enterprise LTSC 2024 Evaluation</NAME>
+ *                    … <DISPLAYNAME>Windows 11 IoT Enterprise LTSC Evaluation</DISPLAYNAME>
+ *
+ * Note the media's NAME is the LONG form with the year and the word
+ * "Evaluation" — the short label on Microsoft's download page does NOT match it,
+ * and a NAME that does not match fails Setup with "the image is not found".
+ *
+ * `/IMAGE/INDEX` is used where the exact name cannot be verified offline (the
+ * media is not on this host) or where the caller supplies an operator ISO. An
+ * index is coarser but cannot misspell a name, and index 1 exists on every
+ * Windows ISO Microsoft ships.
+ */
+
+/** The selection shape every caller sees: which key, which value, and why. */
+export const WINDOWS_IMAGE_SELECTIONS = Object.freeze({
+  // VERIFIED against the pinned ISO's own WIM metadata (see above).
+  '11ltsc': Object.freeze({
+    key: '/IMAGE/NAME',
+    value: 'Windows 11 IoT Enterprise LTSC 2024 Evaluation',
+    verified: true,
+    note: 'read from the pinned 11ltsc EVAL ISO WIM XML (single image, INDEX 1)'
+  }),
+  // Server eval media carry Standard / Standard-DE / Datacenter / Datacenter-DE
+  // in that order, Desktop Experience second. The ISO is not on this host, so the
+  // index is reasoned, not read: an index cannot be misspelled, and a Windows
+  // *computer* needs the Desktop Experience image to have a desktop at all
+  // (image 1 is Server Core). Override with windowsImageIndex if a future
+  // revision reorders them.
+  '2025': Object.freeze({
+    key: '/IMAGE/INDEX',
+    value: 2,
+    verified: false,
+    note: 'Server 2025 EVAL: image 2 is Standard Evaluation (Desktop Experience); image 1 is Server Core'
+  }),
+  // No pinned media: these versions REQUIRE windowsIso, so the medium is the
+  // operator's and the honest default is the first image.
+  '11': Object.freeze({ key: '/IMAGE/INDEX', value: 1, verified: false, note: 'operator ISO: first image' }),
+  '10': Object.freeze({ key: '/IMAGE/INDEX', value: 1, verified: false, note: 'operator ISO: first image' }),
+  ltsc10: Object.freeze({ key: '/IMAGE/INDEX', value: 1, verified: false, note: 'operator ISO: first image' }),
+  '2022': Object.freeze({ key: '/IMAGE/INDEX', value: 1, verified: false, note: 'operator ISO: first image' })
+})
+
+/**
+ * Decide the `<InstallFrom>` selection for one create.
+ *
+ * Precedence: explicit `imageName` → explicit `imageIndex` → the version table →
+ * `/IMAGE/INDEX 1`. Explicit values win because an operator with an unusual ISO
+ * is the one caller who knows better than the table.
+ */
+export function resolveWindowsImageSelection({ version = '', imageIndex = 0, imageName = '' } = {}) {
+  const name = String(imageName ?? '').trim()
+  const indexText = String(imageIndex ?? '').trim()
+  const index = Number(indexText === '' ? 0 : indexText)
+  if (indexText !== '' && index !== 0) {
+    if (!Number.isInteger(index) || index < 1 || index > 999) {
+      throw new Error(`windowsImageIndex "${imageIndex}" is not a Windows image index: expected a whole number 1-999 (see /sources/install.wim in the ISO)`)
+    }
+  }
+  if (name !== '') {
+    if (/[<>]/u.test(name)) throw new Error(`windowsImageName "${name}" contains XML delimiters; give the plain edition name, e.g. "Windows 11 IoT Enterprise LTSC 2024 Evaluation"`)
+    return { key: '/IMAGE/NAME', value: name, verified: true, source: 'caller' }
+  }
+  if (index !== 0) return { key: '/IMAGE/INDEX', value: index, verified: true, source: 'caller' }
+  const canonical = canonicalWindowsVersion(version)
+  const known = WINDOWS_IMAGE_SELECTIONS[canonical]
+  if (known !== undefined) return { ...known, source: 'version' }
+  return { key: '/IMAGE/INDEX', value: 1, verified: false, source: 'default' }
+}
+
+/** The `<InstallFrom>` element for a selection, escaped and schema-ordered. */
+export function imageInstallFromXml(selection) {
+  const escape = (text) => String(text)
+    .replace(/&/gu, '&amp;')
+    .replace(/</gu, '&lt;')
+    .replace(/>/gu, '&gt;')
+    .replace(/"/gu, '&quot;')
+  return '<InstallFrom><MetaData wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">'
+    + `<Key>${escape(selection.key)}</Key><Value>${escape(selection.value)}</Value>`
+    + '</MetaData></InstallFrom>'
+}
+
 /**
  * S3: PRODUCT KEYS ARE OPTIONAL, AND VALIDATED BEFORE THEY REACH XML.
  *
@@ -1125,20 +1375,76 @@ export function assertAnswerFileTargetsSystemDisk(xml, { expected = 0 } = {}) {
 }
 
 /**
+ * F2: THE STAGED ANSWER FILE MUST NAME THE IMAGE IT WANTS.
+ *
+ * Setup's "Select the operating system you want to install" page is the second
+ * interactive stop after the language page, and it appears whenever
+ * `<ImageInstall><OSImage>` carries no `<InstallFrom>`. This asserts the exact
+ * shape Setup requires — one `<MetaData>` with `/IMAGE/NAME` or `/IMAGE/INDEX`
+ * INSIDE `<InstallFrom>`, and `<InstallFrom>` BEFORE `<InstallTo>` (schema
+ * order; the reverse is rejected as an unparseable answer file on some media).
+ */
+export function assertAnswerFileSelectsImage(xml) {
+  const text = String(xml)
+  const installFrom = /<InstallFrom>([\s\S]*?)<\/InstallFrom>/u.exec(text)
+  if (installFrom === null) {
+    throw new Error('Autounattend.xml has no <ImageInstall><OSImage><InstallFrom> — Setup would stop at "Select the operating system you want to install"')
+  }
+  // Comments are prose: the template explains the shape in an XML comment that
+  // names <MetaData>, so counting raw occurrences would fail on our own advice.
+  const body = installFrom[1].replace(/<!--[\s\S]*?-->/gu, '')
+  const key = /<Key>\s*(\/IMAGE\/(?:NAME|INDEX))\s*<\/Key>/u.exec(body)
+  const value = /<Value>\s*([^<]+?)\s*<\/Value>/u.exec(body)
+  if (key === null || value === null) {
+    throw new Error(`Autounattend.xml's <InstallFrom> has no <Key>/IMAGE/NAME|/IMAGE/INDEX + <Value> (found ${body.trim().slice(0, 120) || 'nothing'})`)
+  }
+  const metadata = (body.match(/<MetaData\b/gu) ?? []).length
+  if (metadata !== 1) {
+    throw new Error(`Autounattend.xml's <InstallFrom> must carry exactly ONE <MetaData> (found ${metadata}); Setup honours the first and ignores the rest, so a second one is a silent lie`)
+  }
+  if (key[1] === '/IMAGE/INDEX' && !/^\d+$/u.test(value[1])) {
+    throw new Error(`Autounattend.xml selects ${key[1]} but its <Value> "${value[1]}" is not a number`)
+  }
+  if (key[1] === '/IMAGE/NAME' && /^(Microsoft )?Windows$/iu.test(value[1])) {
+    throw new Error(`Autounattend.xml selects ${key[1]} "${value[1]}", which is not an edition name`)
+  }
+  const installTo = text.indexOf('<InstallTo>')
+  if (installTo !== -1 && installTo < text.indexOf('<InstallFrom>')) {
+    throw new Error('Autounattend.xml puts <InstallTo> before <InstallFrom>; the answer-file schema requires InstallFrom first')
+  }
+  return { key: key[1], value: value[1] }
+}
+
+/**
  * S1: BUILD `$STORE/windows/<name>/setup.img` — a FAT32 hard-disk image whose
  * ROOT holds the answer file and whose `$OEM$` tree holds the Setup scripts.
  *
- * WHY A DISK IMAGE AND NOT A vvfat DIRECTORY: this is exactly dockur/windows'
- * mechanism. WinPE reliably enumerates hard disks for `Autounattend.xml`; a
- * directory-backed vvfat stick behind usb-storage was not visible to Setup in
- * practice, so the user had to answer the interactive installer.
+ * WHY A DISK IMAGE AND NOT A vvfat DIRECTORY: dockur/windows attaches a FAT32
+ * hard disk for the same reason — WinPE reliably enumerates disks for
+ * `Autounattend.xml`, while a directory-backed vvfat stick behind usb-storage
+ * was not visible to Setup in practice.
+ *
+ * WHERE THIS DELIBERATELY DIFFERS FROM dockur/windows (CORRECTED VERDICT — the
+ * old comment claimed the two were identical and that claim was the bug): their
+ * overlay is a plain FAT32 image formatted as a *superfloppy* (no partition
+ * table), and it works THERE because of how their run flow hands the medium to
+ * QEMU. Here the identical superfloppy was attached on `ide.2` and the result
+ * was the interactive language screen: the firmware mounted the raw FAT volume
+ * (EDK2 wrote its NvVars into it — 114 KB, the only writes that block device
+ * ever saw), but Windows does not mount a partitionless FIXED disk at all, so
+ * WinPE's drive-root search had no drive to look at. `setup.img` must therefore
+ * carry an MBR with one FAT32 partition; see the F1 block above. Both media are
+ * FAT32 — only one of them is a disk Windows will ever enumerate.
  *
  * The build is deterministic and verified in the same call:
  *   1. truncate a 64 MiB raw image (sparse);
- *   2. `mformat -F -v SETUP` (FAT32);
- *   3. `mcopy -s` the root files and `$OEM$` tree;
- *   4. `mdir` must list Autounattend.xml at the root, and `mtype` must return
- *      bytes IDENTICAL to the staged file (dockur's own verification shape).
+ *   2. `mformat -F -H 2048 -v SETUP` on the volume at byte offset 1 MiB;
+ *   3. write the MBR partition table (type 0x0C, start LBA 2048) over sector 0;
+ *   4. `mcopy -s` the root files and `$OEM$` tree INTO that partition;
+ *   5. `mdir` must list Autounattend.xml at the volume root, `mtype` must return
+ *      bytes IDENTICAL to the staged file, and the MBR must read back as a
+ *      signature + partition entry (so "a disk Windows can enumerate" is
+ *      asserted, not assumed).
  *
  * F1: REBUILD POLICY — ALWAYS FRESH, ON EVERY CREATE. The image is attached
  * WRITABLE (QEMU rejects `readonly=on` on an ide-hd device, and dockur's SETUP
@@ -1177,17 +1483,25 @@ export function buildSetupImage({ paths: p, log = () => {}, expectedDiskId = 0 }
   const fd = openSync(p.setupImg, 'w')
   try { ftruncateSync(fd, SETUP_IMAGE_BYTES) } finally { closeSync(fd) }
   const run = (command, args) => execFileSync(command, args, { stdio: 'pipe', timeout: 120000 })
-  run(MTOOLS.format, ['-i', p.setupImg, '-F', '-v', SETUP_IMAGE_LABEL, '::'])
+  // F1: THE VOLUME LIVES AT LBA 2048, NOT AT BYTE 0. Every mtools call names
+  // the partition through `@@<byte-offset>`; `-H 2048` writes the matching
+  // "hidden sectors" value into the BPB, which is what Windows compares against
+  // the partition table when it mounts the volume.
+  const volume = setupVolumeSpec(p.setupImg)
+  run(MTOOLS.format, ['-i', volume, '-F', '-H', String(SETUP_PARTITION_START_LBA), '-v', SETUP_IMAGE_LABEL, '::'])
+  // The table goes on AFTER the format (mformat only touches its own volume, but
+  // the partition length is read from the BPB it just wrote).
+  const partition = writeSetupMbr(p.setupImg)
   // `-s` recurses into $OEM$; the explicit root list keeps startup.nsh and the
   // scripts visible at the medium's root where a human (and the EFI Shell for
   // startup.nsh) expects them.
-  run(MTOOLS.copy, ['-i', p.setupImg, '-s', ...staged, oemTree, '::'])
+  run(MTOOLS.copy, ['-i', volume, '-s', ...staged, oemTree, '::'])
   // F1: the medium is WRITABLE by the user that runs QEMU (uid 1000). mkstemp's
   // default mode is already owner-writable, but pinning it makes the contract
   // explicit and survives a restrictive umask / a copied store.
   chmodSync(p.setupImg, 0o600)
   const verified = verifySetupImage({ paths: p })
-  log(`windows: setup.img built (${(SETUP_IMAGE_BYTES / 1024 ** 2).toFixed(0)} MB FAT32, ${verified.entries.length} root entries, Autounattend.xml byte-verified)`)
+  log(`windows: setup.img built (${(SETUP_IMAGE_BYTES / 1024 ** 2).toFixed(0)} MB MBR + FAT32 partition at LBA ${partition.startLba}, ${verified.entries.length} root entries, Autounattend.xml byte-verified)`)
   return p.setupImg
 }
 
@@ -1197,10 +1511,25 @@ export function buildSetupImage({ paths: p, log = () => {}, expectedDiskId = 0 }
  * `$OEM$` script path must exist, and `mtype` must return the SAME BYTES that
  * were staged (a FAT write that silently truncates is a Setup that asks
  * questions).
+ *
+ * F1: AND IT READS THROUGH THE PARTITION. The MBR is verified first — 0x55AA at
+ * 510, one active type-0x0C entry at 0x1BE starting at LBA 2048 — because a
+ * perfectly populated FAT32 volume that Windows never enumerates is exactly the
+ * bug this replaced. The listing then goes through `@@<offset>`, the same
+ * volume spec the build used.
  */
 export function verifySetupImage({ paths: p } = {}) {
+  const mbr = readSetupMbr(p.setupImg)
+  if (mbr.signature !== '55aa') {
+    throw new Error(`setup.img has no valid MBR signature at 510 (found ${mbr.signature || 'nothing'}) — Windows never mounts a partitionless fixed disk, so Setup would show the interactive language screen`)
+  }
+  if (mbr.type !== SETUP_PARTITION_TYPE || mbr.startLba !== SETUP_PARTITION_START_LBA) {
+    throw new Error(`setup.img's first partition is type 0x${mbr.type.toString(16)} at LBA ${mbr.startLba}; the answer volume must be type 0x${SETUP_PARTITION_TYPE.toString(16)} at LBA ${SETUP_PARTITION_START_LBA}`)
+  }
+  if (mbr.sectorCount <= 0) throw new Error('setup.img\'s MBR partition has zero sectors')
+  const volume = setupVolumeSpec(p.setupImg)
   const readDir = (spec) => {
-    const listing = execFileSync(MTOOLS.dir, ['-i', p.setupImg, '-b', spec], { encoding: 'utf8', timeout: 30000 })
+    const listing = execFileSync(MTOOLS.dir, ['-i', volume, '-b', spec], { encoding: 'utf8', timeout: 30000 })
     return listing
       .split(/\r?\n/u)
       .map((line) => line.trim().replace(/^::[\\/]?/u, '').replace(/\\/gu, '/'))
@@ -1227,16 +1556,16 @@ export function verifySetupImage({ paths: p } = {}) {
   // indistinguishable. mtype emits the raw file.
   for (const name of ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs']) {
     const staged = readFileSync(path.join(p.oemDir, name))
-    const fromImage = execFileSync(MTOOLS.type, ['-i', p.setupImg, `::/${name}`], { timeout: 30000 })
+    const fromImage = execFileSync(MTOOLS.type, ['-i', volume, `::/${name}`], { timeout: 30000 })
     if (!staged.equals(fromImage)) {
       throw new Error(`setup.img's ${name} differs from the staged copy (${fromImage.length} vs ${staged.length} bytes) — the answer medium is corrupt`)
     }
   }
-  const startup = execFileSync(MTOOLS.type, ['-i', p.setupImg, '::/startup.nsh'], { timeout: 30000 })
+  const startup = execFileSync(MTOOLS.type, ['-i', volume, '::/startup.nsh'], { timeout: 30000 })
   if (!startup.equals(readFileSync(path.join(p.oemDir, 'startup.nsh')))) {
     throw new Error('setup.img\'s startup.nsh differs from the staged copy — the EFI Shell fallback would not run')
   }
-  return { entries: root, oemScripts, image: p.setupImg }
+  return { entries: root, oemScripts, image: p.setupImg, mbr, partition: { startLba: mbr.startLba, offsetBytes: SETUP_PARTITION_OFFSET_BYTES, sectorCount: mbr.sectorCount } }
 }
 
 /**
@@ -1459,6 +1788,9 @@ export function oemPayloadMissingError({ sourceDir, fallbackDirs }) {
  *   {{DSH_CUA_PIP}}   the dsh-cua package spec
  *   {{PRODUCT_KEY}}   empty for evaluation media, or a <ProductKey> block when
  *                     the operator passed a licensed-ISO windowsKey
+ *   {{IMAGE_INSTALL}} the <InstallFrom> block naming the edition (F2). Resolved
+ *                     from windowsImageName / windowsImageIndex / the version
+ *                     table — see resolveWindowsImageSelection().
  *
  * SELF-HEALING: `sourceDir` is the image path the supervisor resolves; the
  * `fallbackDirs` are the other places the SAME files are known to exist
@@ -1466,9 +1798,12 @@ export function oemPayloadMissingError({ sourceDir, fallbackDirs }) {
  * or two missing from `sourceDir` therefore costs a log line, not a failed
  * computer create — as long as ONE candidate directory is complete.
  */
-export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir, fallbackDirs = [], pythonUrl, dshCuaSpec, windowsKey = '', log = () => {} }) {
+export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir, fallbackDirs = [], pythonUrl, dshCuaSpec, windowsKey = '', windowsVersion = '', windowsImageIndex = 0, windowsImageName = '', log = () => {} }) {
   mkdirSync(p.oemDir, { recursive: true })
   const productKey = normaliseProductKey(windowsKey)
+  // F2: the edition, decided BEFORE a byte of XML is written and asserted after,
+  // so "Setup asks which image" cannot come back as a surprise at the console.
+  const imageSelection = resolveWindowsImageSelection({ version: windowsVersion, imageIndex: windowsImageIndex, imageName: windowsImageName })
   const substitutions = {
     '{{COMPUTERNAME}}': `cua-${name}`.slice(0, 15).toUpperCase(),
     '{{PASSWORD}}': password,
@@ -1479,7 +1814,8 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
     // Setup never shows a product-key page (WillShowUI Never).
     '{{PRODUCT_KEY}}': productKey === ''
       ? ''
-      : `<ProductKey><Key>${productKey}</Key><WillShowUI>Never</WillShowUI></ProductKey>`
+      : `<ProductKey><Key>${productKey}</Key><WillShowUI>Never</WillShowUI></ProductKey>`,
+    '{{IMAGE_INSTALL}}': imageInstallFromXml(imageSelection)
   }
   const files = OEM_PAYLOAD_FILES
   const candidates = [sourceDir, ...fallbackDirs, path.join(MODULE_DIR, 'windows-oem'), path.resolve(MODULE_DIR, '..', 'docker', 'windows-oem')]
@@ -1504,8 +1840,18 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
     for (const [needle, value] of Object.entries(substitutions)) text = text.split(needle).join(value)
     writeFileSync(path.join(p.oemDir, file), text)
   }
-  // The media is a vvfat directory: Setup reads Autounattend.xml from its root,
-  // and the scripts arrive under $OEM$ so Setup copies them into the image.
+  // F2: the staged answer file must actually name the edition, in the schema
+  // position Setup reads. A placeholder left unreplaced is caught here, not on
+  // the install console.
+  const stagedXml = readFileSync(path.join(p.oemDir, 'Autounattend.xml'), 'utf8')
+  if (stagedXml.includes('{{')) {
+    const leftover = [...stagedXml.matchAll(/\{\{[A-Z_]+\}\}/gu)].map((match) => match[0])
+    throw new Error(`the staged Autounattend.xml still contains ${[...new Set(leftover)].join(', ')} — Setup would read a literal placeholder`)
+  }
+  const selected = assertAnswerFileSelectsImage(stagedXml)
+  // The staged payload is a DIRECTORY on the host; buildSetupImage() copies it
+  // into the FAT32 partition at the ROOT (where Setup reads Autounattend.xml)
+  // and into $OEM$ (so Setup copies the scripts into C:\Windows\Setup\Scripts).
   const setupDir = path.join(p.oemDir, '$OEM$', '$$', 'Setup', 'Scripts')
   mkdirSync(setupDir, { recursive: true })
   // S4: the SAME scripts Setup copies into C:\Windows\Setup\Scripts.
@@ -1518,7 +1864,7 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
   // firmware Shell looks for `startup.nsh`), not under $OEM$. buildSetupImage()
   // copies it into setup.img's root beside Autounattend.xml.
   writeFileSync(path.join(p.oemDir, 'startup.nsh'), startupNshText())
-  log(`windows: ${name} OEM payload written (${files.length} files + $OEM$ scripts + startup.nsh fallback)`)
+  log(`windows: ${name} OEM payload written (${files.length} files + $OEM$ scripts + startup.nsh fallback; ${selected.key}=${selected.value} from ${imageSelection.source}${imageSelection.verified === false ? ', UNVERIFIED' : ''})`)
   return p.oemDir
 }
 

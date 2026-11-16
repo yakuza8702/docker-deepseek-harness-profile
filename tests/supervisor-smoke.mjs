@@ -176,7 +176,14 @@ const STUB_BIN = path.dirname(QEMU_IMG_STUB)
  *
  * so a create exercises the REAL build/verify contract (mdir must list
  * Autounattend.xml at the root, mtype must return the staged bytes) without a
- * 64 MiB FAT32 write per case. The real mtools build is covered by
+ * 64 MiB FAT32 write per case.
+ *
+ * F1: EVERY CALL ARRIVES AS `-i <image>@@<byte-offset>`, the real mtools
+ * partition syntax. The stubs strip the `@@…` suffix exactly like mtools does
+ * and then work on the image file — that difference is not cosmetic: if a future
+ * change goes back to addressing the whole file, these stubs would still pass
+ * while the real build produced a partitionless disk Windows never mounts, so
+ * the suffix is also asserted as PRESENT below. The real mtools build is covered by
  * tests/modules-unit.mjs when the host has mtools, and by the image itself.
  */
 // NOT under STORE: the main suite removes STORE before the F3 case runs, and
@@ -188,7 +195,12 @@ case "$1" in --version) exit 0 ;; esac
 IMG=""; prev=""
 for a in "$@"; do [ "$prev" = "-i" ] && IMG="$a"; prev="$a"; done
 [ -n "$IMG" ] || exit 1
-: > "$IMG"
+case "$IMG" in *@@*) ;; *) echo "mformat stub: expected <image>@@<offset>, got $IMG" >&2; exit 9 ;; esac
+IMG="\${IMG%%@@*}"
+# F1: real mformat formats IN PLACE and never resizes; buildSetupImage has
+# already truncated the 64 MiB image, so the stub must not empty it either
+# (writeSetupMbr needs a disk of known length to compute the partition).
+[ -e "$IMG" ] || : > "$IMG"
 : > "$IMG.manifest"
 exit 0
 `, { mode: 0o755 })
@@ -200,6 +212,7 @@ for a in "$@"; do
   prev="$a"
 done
 [ -n "$IMG" ] || exit 1
+IMG="\${IMG%%@@*}"
 for src in "$@"; do
   case "$src" in -*) continue ;; ::*) continue ;; esac
   [ "$src" = "$IMG" ] && continue
@@ -220,6 +233,8 @@ const mdir = path.join(MTOOLS_STUB, 'mdir')
 writeFileSync(mdir, `#!/bin/sh
 IMG=""; prev=""
 for a in "$@"; do [ "$prev" = "-i" ] && IMG="$a"; prev="$a"; done
+[ -n "$IMG" ] || exit 1
+IMG="\${IMG%%@@*}"
 [ -f "$IMG.manifest" ] || exit 1
 cut -f1 "$IMG.manifest" | sort -u
 exit 0
@@ -232,6 +247,8 @@ for a in "$@"; do
   case "$a" in ::*) VIRT="$a" ;; esac
   prev="$a"
 done
+[ -n "$IMG" ] || exit 1
+IMG="\${IMG%%@@*}"
 [ -f "$IMG.manifest" ] || exit 1
 HOST="$(awk -F '\\t' -v key="$VIRT" '$1 == key { print $2; exit }' "$IMG.manifest")"
 [ -n "$HOST" ] || exit 1
@@ -907,6 +924,38 @@ try {
     check('S1: ...after the system disk, and with no usb-storage OEM stick',
       installArgv.indexOf('id=setup0') > installArgv.indexOf('id=disk0')
       && !/usb-storage|fat:ro:/u.test(installArgv))
+    // F1: THE MEDIUM IS A PARTITIONED DISK BEFORE QEMU EVER SEES IT. The create
+    // calls buildSetupImage() (stubs here), which writes the MBR with a real
+    // file write — so this reads bytes the production code wrote, not a stub
+    // artefact. A partitionless image is the live-verified bug: the firmware
+    // mounts it, Windows does not, and Setup asks for a language.
+    {
+      const setupPath = path.join(STORE, 'windows', bootName, 'setup.img')
+      const raw = existsSync(setupPath) ? readFileSync(setupPath) : Buffer.alloc(0)
+      const signature = raw.length >= 512 ? raw.toString('hex', 510, 512) : 'missing'
+      const startLba = raw.length >= 512 ? raw.readUInt32LE(0x1be + 8) : -1
+      const type = raw.length >= 512 ? raw[0x1be + 4] : -1
+      check('F1: setup.img is PARTITIONED before boot (MBR 0x55AA, FAT32-LBA entry at LBA 2048)',
+        signature === '55aa' && startLba === 2048 && type === 0x0c,
+        `sig=${signature} startLba=${startLba} type=0x${Number(type).toString(16)}`)
+    }
+    // F2: the staged answer file names the edition, inside <OSImage> and before
+    // <InstallTo>, so Setup has no "Select the operating system" page left.
+    {
+      const staged = readFileSync(path.join(STORE, 'windows', bootName, 'oem', 'Autounattend.xml'), 'utf8')
+      // Comments are stripped: the template explains this very ordering in an
+      // XML comment that names both elements and <MetaData>.
+      const bare = staged.replace(/<!--[\s\S]*?-->/gu, '')
+      const from = bare.indexOf('<InstallFrom>')
+      const to = bare.indexOf('<InstallTo>')
+      check('F2: the staged Autounattend.xml carries <InstallFrom> (/IMAGE/NAME or /IMAGE/INDEX) before <InstallTo>',
+        from !== -1 && to !== -1 && from < to
+        && /<Key>\/IMAGE\/(NAME|INDEX)<\/Key>/u.test(bare)
+        && (bare.match(/<MetaData\b/gu) ?? []).length === 1,
+        `installFrom@${from} installTo@${to}`)
+      check('F2: ...and no placeholder survived into the image copy',
+        !staged.includes('{{IMAGE_INSTALL}}') && !staged.includes('{{PRODUCT_KEY}}'))
+    }
 
     // R1: the cdboot presses were SCHEDULED for the install boot. The stub serves
     // no QMP, so each one fails and is logged — never fatal, never a failed

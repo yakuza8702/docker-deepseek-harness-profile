@@ -903,6 +903,73 @@ the same boundary as the N1/N2 replay.
 OOBE) is still not attempted here. This host reproduces the argv rejection and
 proves the fixed argv initializes, which is the defect class reported.
 
+### 9.6.13 The next live-verified blocker: a PARTITIONLESS answer disk, and a missing `<InstallFrom>` (F1–F4)
+
+Reproduced on the user's container with the previous round's image. WinPE reached
+the **interactive language screen** on every create, i.e. the answer file was
+never read. What blockstats showed:
+
+* `setup0` had been written to **only by the firmware** (114 KB of EDK2 `NvVars`)
+  and `disk0` had been touched for 512 B once — **zero install activity**;
+* `setup.img` was attached (`ide.2`, writable, in the live argv), well-formed
+  FAT32, with a root-level `Autounattend.xml` that was byte-identical, correct
+  casing, and schema-valid (DiskID 0, InstallTo partition 3, Extend,
+  RunSynchronous bypasses, AutoLogon, FirstLogonCommands).
+
+The structural bug: `setup.img` was a **partitionless FAT32 superfloppy** — VBR at
+LBA 0, no MBR and no GPT. (The bytes mtools leaves at 0x1BE in its VBR template
+look like a partition entry and are not one.) EDK2 mounts a raw FAT volume from
+any block device, which is why the firmware happily wrote its NvVars; **Windows
+enumerates fixed disks through their partition table**, so a partitionless fixed
+disk is never given a drive letter and WinPE's drive-root search had nothing to
+scan. The medium was visible, correct, and unmountable — which is exactly why it
+read as "the answer file is ignored".
+
+| # | Defect / work item | Fix |
+|---|---|---|
+| F1 | the answer medium was a partitionless FAT32 superfloppy: firmware-mountable, never Windows-mountable | `buildSetupImage()` now writes an **MBR** (16-byte entry at `0x1BE`, active flag, type **0x0C** FAT32-LBA, CHS `0xFE/0xFF/0xFF`, LBA start **2048**, length read back from the BPB, signature `0x55AA` at 510) and formats/copies through mtools' partition syntax `-i <img>@@<byte-offset>`, i.e. `@@1048576`, with `-H 2048` so the BPB's hidden-sectors field matches the table. `verifySetupImage()` reads the MBR back first, then lists and byte-compares **through the partition**. The MBR stub is generated in Node (`setupMbrSector()`) because mtools cannot write one — so **no new package** was added to the Dockerfile: no `sfdisk`/`parted` dependency, no util-linux coupling, and the 512 bytes are assertable in a unit test |
+| F2 | `<ImageInstall><OSImage>` had **no `<InstallFrom>`**, so even a mounted answer file would have stopped at "Select the operating system you want to install" (the very next page after the language page) | the template carries `{{IMAGE_INSTALL}}` inside `<OSImage>`, **before** `<InstallTo>` (schema order); `writeOemPayload()` resolves it via `resolveWindowsImageSelection()` and refuses to write a file with a surviving placeholder. The selector is resolved **at create time** and validated before the 5 GB download. Which image: `11ltsc` → `/IMAGE/NAME` = `Windows 11 IoT Enterprise LTSC 2024 Evaluation` **read from the pinned ISO's own WIM XML** (single image, `INDEX 1`; note the media's NAME carries the year and "Evaluation", so the download page's label would NOT have matched); `2025` → `/IMAGE/INDEX 2` (Standard Evaluation, Desktop Experience — image 1 is Server Core, no desktop); operator ISO → `/IMAGE/INDEX 1`. Overrides: `windowsImageIndex` (1–999) and `windowsImageName` (wins) |
+| F3 | the source comment claimed this "mirrors dockur/windows", which is what made the superfloppy look safe | corrected in `buildSetupImage()`'s doc comment, the argv comment, `README.md` and this report: dockur's overlay is **also** FAT32 but it is a superfloppy, and that works *there* because of how their flow hands the medium to QEMU. The guarantee here is not "same as dockur"; it is "a disk Windows will enumerate", proven by the MBR assertions |
+| F4 | nothing asserted the medium's structure, and nothing asserted the edition | `tests/modules-unit.mjs`: the real-mtools build asserts the `0x55AA` signature at 510, the entry at `0x1BE` (type `0x0C`, LBA 2048, non-zero length that fits the image), the BPB hidden-sectors field = 2048, no VBR magic left at byte 0, `mdir -i img@@1048576` listing `Autounattend.xml`, the MBR read-back, and that `verifySetupImage()` **refuses** a partitionless image. F2 asserts the resolved selector per version, the explicit overrides, the single `<MetaData>`, the schema order, and that `writeOemPayload(windowsVersion: '11ltsc')` stages `/IMAGE/NAME`. `tests/supervisor-smoke.mjs`: the mtools stubs now **require** the `@@<offset>` suffix (a regression to whole-file addressing fails them) and the create asserts the medium is partitioned **before boot** and that the staged XML carries `<InstallFrom>` with no placeholder left. `tools/check-cua-vm.mjs`: needle counts retargeted to the partition-offset calls, plus two semantic checks (F1: every `-i` read of setup.img goes through the volume and the MBR is written *and* read back; F2: the template's `<InstallFrom>` sits inside `<OSImage>` before `<InstallTo>`) |
+
+**Verified live in this container (mtools 4.0.48, `file` from libmagic, the real pinned 11ltsc ISO on disk).**
+
+* The 11ltsc edition name was **not guessed**: the pinned evaluation ISO
+  `26100.1742…CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso` (4.8 GB, present at
+  `/cua-vm/iso/`) was read directly. No 7z/wiminfo/pycdlib exists here, so the
+  WIM resource header was parsed by hand and the XML resource decoded:
+  `<IMAGE INDEX="1"> … <NAME>Windows 11 IoT Enterprise LTSC 2024 Evaluation</NAME>
+  … <EDITIONID>IoTEnterpriseSEval</EDITIONID>` — one image, so `INDEX 1` and that
+  NAME agree, and the NAME is what the answer file carries.
+* A real `writeOemPayload()` + `buildSetupImage()` run in `/tmp/verify-setup`:
+  `file setup.img` →
+  `DOS/MBR boot sector; partition 1 : ID=0xc, active, start-CHS (0x3ff,254,63), end-CHS (0x3ff,254,63), startsector 2048, 129024 sectors`;
+  `mdir -i setup.img@@1048576 ::/` lists 6 entries (`Autounattend.xml`,
+  `setupcomplete.cmd`, `cua-firstboot.ps1`, `Unattend.vbs`, `startup.nsh`,
+  `$OEM$`); BPB `hidden=2048 total32=129024 sectors/cluster=1`;
+  `mtype -i setup.img@@1048576 ::/Autounattend.xml` is SHA-256-identical to the
+  staged file.
+* `node tools/check-cua-vm.mjs` → **544** assertions (checkout); flat-layout
+  replay from `cwd=/` (a writable copy of the image's flat tree, because
+  `/opt/seek-harness` is a read-only image layer here) → **542**, with L5 + N3
+  `n/a` as designed.
+* `node tools/check-cua-rea.mjs` → **67**.
+* `node tools/ci-gates.mjs` → **9 passed / 1 failed / 1 skipped**; the failure is
+  `check-office.mjs` (`@deepseek-ai/dsh-skill-office is not installed`), the
+  pre-existing environment failure, unchanged by this round.
+* `tests/{supervisor-smoke,modules-unit,windows-boot,qmp-shutdown}.mjs` → all
+  **PASS**.
+* `node --check` clean on every changed file.
+
+**NOT RUN, with the reason.** A full Windows install is still not attempted here:
+`/dev/kvm` VMs do not boot in this sandbox, there is no OVMF/swtpm guest budget,
+and the ISO install is tens of minutes. What IS proven is the defect class: the
+medium is now a disk with a partition table (asserted at the byte level and by
+`file`), and the answer file names its edition in schema order. The `2025` index
+(2) is the one reasoned rather than read value — the media is not on this host —
+and is documented as such in `WINDOWS_IMAGE_SELECTIONS` (with the
+`windowsImageIndex` override as the escape hatch).
+
 ### 9.7 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),

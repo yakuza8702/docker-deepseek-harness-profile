@@ -59,7 +59,7 @@ import {
   WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
   WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
-  buildSetupImage, normaliseProductKey,
+  buildSetupImage, normaliseProductKey, resolveWindowsImageSelection,
   windowsKvmPreflight, windowsPortsOf, windowsTailLines, formatWindowsInstallDetail, windowsReadinessSignals,
   // R3-adjacent: `qmpStateLabel` / `endpointLabel` are used by the windowsStatus
   // sentences. They were never imported, so every status call that REACHED those
@@ -2245,6 +2245,10 @@ const SPEC_DEFAULTS = {
   windowsIso: '',
   // S3: optional product key for a licensed (non-evaluation) operator ISO.
   windowsKey: '',
+  // F2: which edition to install. 0 / '' = resolve from windowsVersion (see
+  // WINDOWS_IMAGE_SELECTIONS); a number/year pair wins for an operator ISO.
+  windowsImageIndex: 0,
+  windowsImageName: '',
   waitDesktop: false,
   workspace: WORKSPACE_ROOT
 }
@@ -2293,6 +2297,9 @@ function normaliseSpec(input = {}) {
     windowsIso: String(raw.windowsIso || ''),
     // S3: only non-evaluation media need it; validated in windowsCreateManaged.
     windowsKey: String(raw.windowsKey || '').trim(),
+    // F2: the edition selector. `0` means "use the version table".
+    windowsImageIndex: Number(raw.windowsImageIndex) > 0 ? Math.trunc(Number(raw.windowsImageIndex)) : 0,
+    windowsImageName: String(raw.windowsImageName || '').trim(),
     waitDesktop: raw.waitDesktop === true,
     workspace: String(raw.workspace || WORKSPACE_ROOT)
   }
@@ -3241,6 +3248,15 @@ async function windowsCreateManaged(spec) {
   // S3: refuse a malformed key BEFORE the 5 GB download and before setup.img is
   // built. Empty is valid: every pinned ISO is an EVALUATION image.
   spec.windowsKey = normaliseProductKey(spec.windowsKey)
+  // F2: resolve (and thus VALIDATE) the edition selector here — before the
+  // 5 GB download and before setup.img is built. A bad windowsImageIndex is a
+  // sentence about the answer file, not an install page the user has to click.
+  const imageSelection = resolveWindowsImageSelection({
+    version: spec.windowsVersion,
+    imageIndex: spec.windowsImageIndex,
+    imageName: spec.windowsImageName
+  })
+  log(`windows: ${spec.name} will install ${imageSelection.key}=${imageSelection.value} (${imageSelection.source}${imageSelection.verified === false ? ', UNVERIFIED' : ''})`)
   if (spec.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer (create the Windows computer without it, or use a Linux computer)')
   if (spec.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest')
   const caps = windowsHostCaps()
@@ -3378,6 +3394,10 @@ async function windowsCreateManaged(spec) {
       pythonUrl: WINDOWS_PYTHON_URL,
       dshCuaSpec: WINDOWS_DSH_CUA_SPEC,
       windowsKey: spec.windowsKey,
+      // F2: the edition, so Setup never shows "Select the operating system".
+      windowsVersion: spec.windowsVersion,
+      windowsImageIndex: spec.windowsImageIndex,
+      windowsImageName: spec.windowsImageName,
       log
     })
     // S1: build the FAT32 answer-file disk and PROVE it (mdir listing + byte
@@ -3425,6 +3445,9 @@ async function windowsCreateManaged(spec) {
       backend: 'qemu',
       windowsVersion: spec.windowsIso === '' ? spec.windowsVersion : '',
       windowsIso: spec.windowsIso,
+      // F2: what the answer file names, recorded so the panel / a later support
+      // question can tell WHICH edition this computer was installed from.
+      windowsImage: `${imageSelection.key}=${imageSelection.value}`,
       isoPath,
       ports: portTriple,
       ssh: true,
