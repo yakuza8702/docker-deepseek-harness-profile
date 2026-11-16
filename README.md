@@ -775,7 +775,15 @@ emulator, which this image no longer ships:
 docker compose -f compose.yaml -f compose.emulator.yaml up -d
 ```
 
-That is the only requirement. The panel is **Plugins → Personal VM (CUA)**; the
+That is the only requirement for *mounting* the device — but mounting is not
+access. The container runs as uid 1000, and the host node is normally
+`root:kvm 0660`, so the `kvm` group's gid has to be passed as well
+(`KVM_GID` in `.env`, `group_add` in the compose service — both overrides already
+carry it). Without it the device is visible and every open fails EACCES; see
+[`the Windows backend needs /dev/kvm` — but `/dev/kvm` **is** mounted](#the-windows-backend-needs-devkvm--but-devkvm-is-mounted)
+for the exact commands.
+
+The panel is **Plugins → Personal VM (CUA)**; the
 model drives the same computer through `cua_vm_*`. Disks live in the `cua-vm`
 volume, never in the workspace.
 
@@ -908,6 +916,74 @@ The proper fix is the image change: the parent is created 0755, the copy carries
 `--chown=1000:1000`, the copied modes are normalised with `chmod -R a+rX`, and the
 build re-reads all three files as uid 1000 before it can succeed.
 
+### `the Windows backend needs /dev/kvm` — but `/dev/kvm` **is** mounted
+
+Two different defects used to print that one sentence, and the fix is different for
+each. The error now names the case it found, with the device's observed mode,
+owner and this process's supplementary groups.
+
+```bash
+# which case is it? run inside the container
+docker compose exec seek-harness sh -c 'ls -l /dev/kvm; id; test -r /dev/kvm && test -w /dev/kvm && echo RW-OK'
+```
+
+**(a) the node is not in the container (`ENOENT`).** The `devices:` entry is
+missing from the compose command line that actually created the container. An
+override only counts if it is on the *same* `docker compose` invocation:
+
+```bash
+docker compose -f compose.yaml -f compose.emulator.yaml up -d --force-recreate
+```
+
+**(b) the node is there and this uid may not open it (`EACCES`) — the reported
+bug.** `devices: - /dev/kvm` mounts the node but does not grant access: Docker
+passes it through with the host's own `uid:gid`, normally `root:kvm 0660`, while
+the container runs as **uid 1000** (`USER node`). QEMU opens `/dev/kvm` `O_RDWR`,
+so it fails with `EACCES` — and because the old probe asked
+`statSync('/dev/kvm').isFile()`, which is **false for a character device**, the
+capability check reported "absent" and the message told you to mount a device
+that was already mounted. `group_add` listing only the render/video GIDs is the
+tell: there is no `kvm` entry.
+
+The fix is the device's **group**, and it applies at *container create* time:
+
+```bash
+# 1. on the HOST — the gid of /dev/kvm (the kvm group is resolved on the host,
+#    never inside the image, so a NAME cannot be trusted)
+stat -c %g /dev/kvm          # e.g. 107   (or: getent group kvm | cut -d: -f3)
+
+# 2. record it in .env
+echo "KVM_GID=$(stat -c %g /dev/kvm)" >> .env
+
+# 3. the compose service passes it (already present in compose.emulator.yaml
+#    and compose.windows.yaml; add the same two lines to a hand-written override)
+#      group_add:
+#        - "${KVM_GID:-107}"
+
+# 4. recreate — a restart inherits the OLD groups
+docker compose -f compose.yaml -f compose.windows.yaml up -d --force-recreate
+
+# 5. verify: the gid must appear in id's group list, and the device must open RW
+docker compose exec seek-harness sh -c 'id; ls -l /dev/kvm; exec 3<>/dev/kvm && echo KVM_OK'
+```
+
+Alternative when the compose file cannot be changed — make the node
+world-accessible **on the host** (Docker passes the node with the mode it has):
+
+```
+# /etc/udev/rules.d/99-kvm.rules
+KERNEL=="kvm", GROUP="kvm", MODE="0666"
+```
+```bash
+sudo udevadm control --reload-rules && sudo udevadm trigger /dev/kvm   # or chmod 0666 for this boot
+```
+
+`cua_vm_doctor` distinguishes the two cases (`kvm: 0660 ...` vs
+`kvm: DENIED (mode 0660 owner 0:107, not openable by uid 1000)` vs
+`kvm: absent (device not mounted)`), and the same device split applies to the
+**Linux** path (`cua sb create`): its failure now carries the same diagnosis when
+the supervisor can see that the device is mounted and refused.
+
 ### Shutdown, suspend, and why Start cold-boots
 
 `cua sb suspend` pauses QEMU and keeps its sandbox: fast, and it resumes exactly
@@ -958,8 +1034,9 @@ rows and their child processes, viewer row, trajectory and QEMU directories, the
 Windows container and its storage, and the registry row — reporting each item,
 and finishing even when `sb rm` fails.
 
-`cua_vm_doctor` reports what only the supervisor can see: `/dev/kvm` and its
-mode, the render node, whether the installed QEMU has `virtio-gpu-gl-pci`,
+`cua_vm_doctor` reports what only the supervisor can see: `/dev/kvm` — and
+whether **this uid can open it**, which is a different fact from whether the node
+is mounted — the render node, whether the installed QEMU has `virtio-gpu-gl-pci`,
 whether `DOCKER_HOST` answers, and the itemised store usage.
 
 ## Auto-update workflow

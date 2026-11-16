@@ -46,6 +46,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
 import { pngSize } from './cua-vm-space.mjs'
+import { KVM_DEVICE, deviceNodePresent, kvmPreflightError, kvmStatus, regularFilePresent } from './cua-vm-kvm.mjs'
 
 /* ------------------------------------------------------------------ *
  * The pinned images
@@ -201,27 +202,62 @@ export function windowsCapacityWarnings({ diskGb, memory, cpu }) {
   return warnings
 }
 
-/** Is this host able to boot a Windows computer at all? */
+/**
+ * Is this host able to boot a Windows computer at all?
+ *
+ * `kvm` used to be `statSync('/dev/kvm').isFile()`, which is FALSE for a device
+ * node: a container with the device mounted, mode 0666, answered "kvm: false"
+ * and the create said "needs /dev/kvm (compose.emulator.yaml)". Two facts are
+ * now reported separately, because they have two different fixes:
+ *
+ *   kvm         the device node is present (a CHARACTER device, not a file)
+ *   kvmUsable   access(R_OK|W_OK) SUCCEEDS for this uid — a present-but-denied
+ *               node is `kvm: true, kvmUsable: false`, and its error names the
+ *               gid/group_add fix instead of telling the user to mount it again
+ *
+ * `kvmStatus` is exported too, so the doctor and the create path quote the same
+ * observation (mode, usr:grp, this process's groups) instead of re-deriving it.
+ */
 export function windowsHostCaps() {
-  const exists = (file) => {
-    try { return statSync(file).isFile() } catch { return false }
-  }
   // SELF-TEST HOOK. The create path (quota → ports → ISO → OEM payload → boot) is
   // the part worth testing, and it cannot run on a host without qemu/OVMF/swtpm.
   // This makes the capability check report "present" so the smoke suite can drive
   // the real code. It is never set in compose/.env, and a gate forbids that.
   if (String(process.env.DSH_CUA_WINDOWS_FAKE_HOST_CAPS ?? '') === '1') {
-    return { qemu: true, ovmfCode: true, ovmfVars: true, swtpm: true, virtioWin: false, kvm: true, render: true, faked: true }
+    return { qemu: true, ovmfCode: true, ovmfVars: true, swtpm: true, virtioWin: false, kvm: true, kvmUsable: true, render: true, faked: true }
   }
+  const kvm = kvmStatus()
   return {
-    qemu: exists(WINDOWS_QEMU),
-    ovmfCode: exists(OVMF_CODE),
-    ovmfVars: exists(OVMF_VARS_TEMPLATE),
-    swtpm: exists(SWTPM),
-    virtioWin: VIRTIO_WIN_ISO !== '' && exists(VIRTIO_WIN_ISO),
-    kvm: exists('/dev/kvm'),
-    render: exists('/dev/dri/renderD128')
+    qemu: regularFilePresent(WINDOWS_QEMU),
+    ovmfCode: regularFilePresent(OVMF_CODE),
+    ovmfVars: regularFilePresent(OVMF_VARS_TEMPLATE),
+    swtpm: regularFilePresent(SWTPM),
+    virtioWin: VIRTIO_WIN_ISO !== '' && regularFilePresent(VIRTIO_WIN_ISO),
+    // A device node is presence; whether THIS uid may open it is `kvmUsable`.
+    kvm: deviceNodePresent(KVM_DEVICE) || kvm.exists,
+    kvmUsable: kvm.state === 'ok',
+    kvmMode: kvm.info === null ? null : kvm.info.modeText,
+    kvmOwner: kvm.info === null ? null : `${kvm.info.uid}:${kvm.info.gid}`,
+    kvmGroups: kvm.identity.groups,
+    kvmReason: kvm.reason,
+    render: deviceNodePresent('/dev/dri/renderD128')
   }
+}
+
+/**
+ * The Windows backend's KVM preflight, as one exported value.
+ *
+ * Both the supervisor (before a single byte of ISO is downloaded) and `boot()`
+ * (before swtpm is spawned) ask THIS, so the two refusals cannot drift apart —
+ * and neither can fall back to the old "needs /dev/kvm (compose.emulator.yaml)"
+ * sentence, which was wrong for a mounted-but-denied device.
+ */
+export function windowsKvmPreflight() {
+  // The documented self-test hook reports the capabilities present; the device
+  // refusal must honour it too, or the smoke suite would pass on this host and
+  // fail on a CI runner that has no /dev/kvm.
+  if (String(process.env.DSH_CUA_WINDOWS_FAKE_HOST_CAPS ?? '') === '1') return null
+  return kvmPreflightError(kvmStatus(), { purpose: 'the Windows backend' })
 }
 
 /* ------------------------------------------------------------------ *
@@ -842,7 +878,13 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     mkdirSync(p.dir, { recursive: true })
     const caps = windowsHostCaps()
     if (!caps.qemu) throw new Error(`the Windows backend needs ${WINDOWS_QEMU} (install qemu-system-x86 in the image)`)
-    if (!caps.kvm) throw new Error('the Windows backend needs /dev/kvm (compose.emulator.yaml)')
+    // THE DEVICE SPLIT. A missing node and a mounted-but-denied node are two
+    // different defects with two different fixes, and the old single sentence
+    // ("needs /dev/kvm (compose.emulator.yaml)") was wrong for both of the new
+    // cases: wrong for a char device (isFile() is false) and wrong advice for a
+    // GID problem. `kvmPreflightError` quotes the observed mode/owner/groups.
+    const kvmError = windowsKvmPreflight()
+    if (kvmError !== null) throw kvmError
     if (!caps.ovmfCode || !caps.ovmfVars) {
       throw new Error(`the Windows backend needs OVMF (${OVMF_CODE} + ${OVMF_VARS_TEMPLATE}); install the ovmf package in the image`)
     }

@@ -67,6 +67,7 @@ function needlePattern(needle) {
 const FILES = {
   supervisor: { label: 'docker/cua-vm-supervisor.mjs', name: 'cua-vm-supervisor.mjs' },
   space: { label: 'docker/cua-vm-space.mjs', name: 'cua-vm-space.mjs' },
+  kvm: { label: 'docker/cua-vm-kvm.mjs', name: 'cua-vm-kvm.mjs' },
   windows: { label: 'docker/cua-vm-windows-qemu.mjs', name: 'cua-vm-windows-qemu.mjs' },
   winMcp: { label: 'plugins/dsh-cua-vm/win-mcp.js', name: 'win-mcp.js' },
   oemAnswer: { label: 'docker/windows-oem/Autounattend.xml', name: 'Autounattend.xml' },
@@ -299,6 +300,14 @@ const NEEDLES = {
     ['reserveStoreBytes(`${spec.name}/iso`, expectedBytes)', 1],
     // X7: resume rebuilds the preview.
     ["await ensureWindowsConsoleRelay(name)\n    return ok({ name, state: 'ready', kind: 'windows' })", 1],
+    // K8: the Linux path keeps its behaviour (no new refusal) but a failed
+    // create carries the SAME diagnosis when the device is mounted and denied.
+    ['function linuxKvmFailureHint()', 1],
+    ['${linuxKvmFailureHint()}', 1],
+    ['const kvmError = windowsKvmPreflight()', 1],
+    // K9: the doctor reads the probe instead of parsing its own text.
+    ['const kvmFacts = kvmDoctorFacts(kvmStatus())', 1],
+    ['kvmUsable: kvmFacts.kvmUsable,', 1],
     // The floors produce warnings, and the requested sizes are not clamped.
     ['const warnings = windowsCapacityWarnings({ diskGb, memory, cpu })', 1],
     ['warnings,', 2],
@@ -348,10 +357,50 @@ const NEEDLES = {
    * `-device usb-tablet` (absolute pointer) or a published QMP socket is a
    * computer that boots and cannot be driven.
    */
+  /**
+   * THE DEVICE SPLIT. `/dev/kvm` mounted is not `/dev/kvm` usable: the container
+   * runs as uid 1000 while the host node is normally root:kvm 0660, and the old
+   * probe (`statSync(...).isFile()`, false for a character device) reported a
+   * MOUNTED device as absent. These needles pin the two cases apart, because
+   * collapsing them again re-creates the user's bug: one sentence, wrong advice.
+   */
+  kvm: [
+    // one module, one implementation, imported by both backends
+    ["export const KVM_DEVICE = process.env.DSH_CUA_KVM_DEVICE || '/dev/kvm'", 1],
+    ['export function kvmStatus(options = {})', 1],
+    ['export function kvmPreflightError(status, { purpose', 1],
+    ['export function deviceNodePresent(file, stat = statSync)', 1],
+    ['export function regularFilePresent(file, stat = statSync)', 1],
+    // the states are named, not inferred
+    ["['ok', 'missing', 'denied', 'not-device']", 1],
+    // presence is a CHARACTER DEVICE, and access is a real syscall
+    ['isCharacterDevice()', 1],
+    ['accessSync', 1],
+    ['fsConstants.R_OK', 1],
+    // the denial message quotes the observation and the fix
+    ['(uid:gid)', 1],
+    ['this process is ', 1],
+    ['supplementary groups ', 1],
+    ['GROUP/GID problem, not a missing device', 1],
+    ['stat -c %g /dev/kvm', 1],
+    ['group_add:', 1],
+    ['KVM_GID', 1],
+    // the missing message keeps the old instruction (never delete a needle)
+    ['needs /dev/kvm (compose.emulator.yaml)', 1],
+    ['does not exist in this container (ENOENT)', 1],
+    // the doctor cannot say "usable" about a denied device
+    ['export function formatKvmStatus(status)', 1],
+    ['export function kvmDoctorFacts(status)', 1]
+  ],
   windows: [
     // direct qemu, no container runtime
     ["export const WINDOWS_QEMU = process.env.DSH_CUA_WINDOWS_QEMU || '/usr/bin/qemu-system-x86_64'", 1],
     ['export function windowsHostCaps()', 1],
+    // K7: a device node is not a file, and presence is not access.
+    ['kvmUsable: kvm.state === \'ok\'', 1],
+    ['kvm: deviceNodePresent(KVM_DEVICE) || kvm.exists', 1],
+    ['export function windowsKvmPreflight()', 1],
+    ['const kvmError = windowsKvmPreflight()', 1],
     // firmware: shared OVMF code + a per-computer vars store
     ["export const OVMF_CODE = process.env.DSH_CUA_WINDOWS_OVMF_CODE || '/usr/share/OVMF/OVMF_CODE_4M.fd'", 1],
     ['if=pflash,format=raw,readonly=on,file=${OVMF_CODE}', 1],
@@ -497,6 +546,8 @@ const NEEDLES = {
     ['--no-install-recommends', 1],
     ['docker/cua-vm-space.mjs', 1],
     ['docker/cua-vm-windows-qemu.mjs', 1],
+    // the KVM probe ships in BOTH trees (runtime + flat gate tree)
+    ['docker/cua-vm-kvm.mjs', 2],
     ['docker/windows-oem/', 1],
     // K2: THE DESTINATION, not just the source. `docker/windows-oem/` alone is
     // satisfied by a COPY anywhere, including the flat gate tree at
@@ -595,6 +646,9 @@ const NEEDLES = {
   composeWindows: [
     // The overlay hands over devices and switches; it does NOT add an engine.
     ['- /dev/kvm', 1],
+    // K10: the DEVICE is not the ACCESS. The overlay must pass the gid too, or
+    // the node is mounted and uid 1000 still cannot open it.
+    ['- "${KVM_GID:-kvm}"', 1],
     ['- /dev/dri', 1],
     ['DSH_CUA_VM_WINDOWS: "${DSH_CUA_VM_WINDOWS:-1}"', 1],
     ['DSH_CUA_WINDOWS_QEMU:', 1],
@@ -608,6 +662,10 @@ const NEEDLES = {
   ],
   env: [
     ['DSH_CUA_VM_WINDOWS=0', 1],
+    // K10: the mounted-but-denied fix, with the host command that produces it.
+    ['KVM_GID', 1],
+    ['stat -c %g /dev/kvm', 1],
+    ['group_add: ["${KVM_GID:-kvm}"]', 1],
     ['DSH_CUA_VM_GPU=', 1],
     ['DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=', 1],
     ['DSH_CUA_VM_LEGACY_STOP=', 1]
@@ -663,6 +721,16 @@ const FORBIDDEN = [
     key: 'supervisor',
     pattern: 'Math.sqrt(900000',
     reason: 'the capture scale is MEASURED from the PNG (space.measure); a budget guess is the 6%-off click'
+  },
+  {
+    key: 'windows',
+    pattern: "kvm: exists('/dev/kvm')",
+    reason: 'isFile() is FALSE for a character device: that probe reported a mounted /dev/kvm as absent and sent the user to add a device they already had (the GID is the real fix)'
+  },
+  {
+    key: 'supervisor',
+    pattern: 'kvmUsable: kvm.startsWith',
+    reason: 'the doctor derived "usable" from the mode STRING, so a device uid 1000 cannot open read as usable; kvmDoctorFacts reports the probe\'s own observation'
   },
   {
     key: 'supervisor',

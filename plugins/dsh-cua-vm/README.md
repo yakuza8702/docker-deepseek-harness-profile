@@ -475,14 +475,52 @@ report.
 
 * Linux: `/dev/kvm` in the container (`compose.emulator.yaml`), nested virt on
   the host; network egress for the first image pull (base disk ~1.3 GB).
-* Windows: a Docker engine at `DOCKER_HOST` (`compose.windows.yaml`), `~80 GB`,
-  `/dev/kvm` for the Windows VM itself.
+* Windows: `~80 GB`, `/dev/kvm` for the Windows VM itself, and **the device's
+  gid**: a Windows computer is direct QEMU, so there is no container runtime to
+  ask. `compose.windows.yaml` passes `devices: [/dev/kvm, /dev/dri]` and
+  `group_add: ["${KVM_GID:-kvm}", …]`.
+* **Mounting the device is not access to it.** The container runs as uid 1000
+  (`USER node`), while a host's `/dev/kvm` is normally `root:kvm 0660`. Pass the
+  gid — `KVM_GID=$(stat -c %g /dev/kvm)` on the host, then
+  `group_add: ["${KVM_GID:-…}"]` in the service and `--force-recreate` (groups
+  are fixed at container create; a restart keeps the old ones). Without it QEMU's
+  `open(O_RDWR)` fails `EACCES` and the create says so explicitly — the error
+  quotes `mode`, `owner`, this process's supplementary groups and the exact
+  `group_add` snippet. `cua_vm_doctor` distinguishes `kvm: DENIED (…)` from
+  `kvm: absent (device not mounted)`.
 
 QEMU is **not** in the image: the supervisor runs `cua runtime setup qemu` into
 `$CUA_HOME/.cua` on first use, then repairs the release bundle's missing seabios
 symlinks (QEMU otherwise dies with `could not load PC BIOS 'bios-256k.bin'`) and
 writes the PATH shim that adds the 9p share. That keeps ~200 MB out of every
 image layer.
+
+## Troubleshooting: `the Windows backend needs /dev/kvm` while it is mounted
+
+The sentence is only correct for one of three cases; the error text now names
+which one it found (`docker/cua-vm-kvm.mjs`):
+
+| `cua_vm_doctor` says | Meaning | Fix |
+|---|---|---|
+| `kvm: absent (device not mounted)` | the node is not in the container | `docker compose -f compose.yaml -f compose.windows.yaml up -d --force-recreate` |
+| `kvm: DENIED (mode 0660 owner 0:107, not openable by uid 1000)` | mounted, but this uid is not in the device's group | `KVM_GID` + `group_add` + recreate (below) |
+| `kvm: NOT a device` | something else sits at `/dev/kvm` | pass the real character device |
+
+The gid fix (membership is set when the container is **created**, so recreate):
+
+```bash
+stat -c %g /dev/kvm                                  # on the HOST — e.g. 107
+echo "KVM_GID=$(stat -c %g /dev/kvm)" >> .env
+# the compose service already reads it:
+#   group_add: ["${KVM_GID:-kvm}"]
+docker compose -f compose.yaml -f compose.windows.yaml up -d --force-recreate
+docker compose exec seek-harness sh -c 'id; ls -l /dev/kvm; exec 3<>/dev/kvm && echo KVM_OK'
+```
+
+Alternative (no compose change): a host udev rule with `MODE="0666"` for
+`KERNEL=="kvm"`, then reload the rules. The Linux path (`cua sb create`) carries
+the same diagnosis when an existing sandbox create fails on a denied device; it
+does not refuse up front on purpose.
 
 ## Notes on cua 0.7.0
 

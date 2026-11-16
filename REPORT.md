@@ -713,6 +713,87 @@ real-bytes refusal text. Gate totals: **325** assertions in the checkout
 (**324** in the flat image tree, where the checkout-only assertion is reported
 `n/a`), **67** REA needles, `ci-gates` **8 passed / 0 failed / 3 skipped**.
 
+### 9.6.10 `/dev/kvm` mounted but not openable — two defects, one sentence
+
+**Reported:** "Windows create fails with `the Windows backend needs /dev/kvm
+(compose.emulator.yaml)`", on the latest branch image, with
+`devices: [- /dev/kvm]` demonstrably in the user's compose and the node visible
+inside the container, `group_add` listing only the render/video GIDs.
+
+Two independent defects produced that one sentence:
+
+1. **The probe was wrong for device nodes.** `windowsHostCaps()` asked
+   `statSync('/dev/kvm').isFile()`. `/dev/kvm` is a **character device**
+   (`crw-rw-rw-`), for which `isFile()` is `false` — measured on this host:
+   `isFile('/dev/kvm') === false`, `isCharacterDevice() === true`, mode `0666`.
+   So the capability was reported *absent* on a host where the device was
+   present, readable and writable. `access(2)` was never consulted, so a DENIED
+   node and a MISSING node were indistinguishable.
+2. **Even with a correct presence probe, access is separate.** The container runs
+   as **uid 1000** (`USER node`); the host's node is normally `root:kvm 0660`,
+   and Docker passes it through with that gid. `open(O_RDWR)` then fails
+   `EACCES`, and "add `devices: - /dev/kvm`" is exactly the wrong advice: the
+   device is already there. Note the image's `USER node` (not `node:node`) keeps
+   the image's supplementary groups (`104(kvm)`), which is the mechanism that can
+   rescue this without a compose change — but only if the host's gid happens to
+   match, which is luck, not a contract.
+
+**The split.** The check and the message now come from one module,
+`docker/cua-vm-kvm.mjs`, used by both backends:
+
+| State | Detected by | Message |
+|---|---|---|
+| `missing` | `stat()` → ENOENT | keeps `add devices: - /dev/kvm (compose.emulator.yaml)`, plus `--force-recreate` and the host-side check |
+| `denied` | `stat()` OK, `access(R_OK\|W_OK)` → EACCES/EPERM | names the REAL problem: `mode 0660 owner 0:107`, `uid 1000, gid 1000, supplementary groups 44,105,1000`, the permission class it was refused by, then `stat -c %g /dev/kvm` → `KVM_GID` → `group_add` → `--force-recreate`, and the udev `MODE=0666` alternative |
+| `not-device` | `stat()` OK, not a character device | "a regular file at that path means a bind mount / `devices:` entry is wrong" |
+
+The gid is quoted from the device itself (`st_gid`), so the message always
+carries the number the user must put in `.env`. Both paths also gained the
+preflight: `windowsCreateManaged` refuses **before** the 5.5 GB ISO download and
+the qcow2, and `boot()` refuses before swtpm is spawned.
+
+**Linux path.** `cua sb create` is not preflighted here on purpose (that would
+change behaviour). Instead a failed create now appends the same diagnosis when
+the supervisor can see the device: `linuxKvmFailureHint()` returns `''` when the
+device is openable, so a healthy host sees byte-identical output, and a denied
+device stops relaying cua's opaque "qemu exited" alone.
+
+**Doctor.** `cua_vm_doctor` reported `kvmUsable` from the *string*
+`"666 (writable)"` (`startsWith('6')`), which is true for a device this uid
+cannot open. It now reports the probe's own facts: `kvmState`, `kvmMode`,
+`kvmOwner`, `kvmGroups`, `kvmReason`, so "present but DENIED" can never read as
+"not usable".
+
+**Docs.** README gains `### the Windows backend needs /dev/kvm — but /dev/kvm is
+mounted` (the ENOENT/EACCES split, the 5-step gid fix, the udev alternative, the
+verification command), the overview says mounting ≠ access, `.env.example` gains
+commented `KVM_GID` with `stat -c %g /dev/kvm` instructions, and the plugin
+README states the gid requirement for both kinds.
+
+**Verification (run).** `node tools/check-cua-vm.mjs` **382** assertions in the
+checkout / **381** in the flat tree (the checkout-only L5 is reported `n/a`);
+`node tools/check-cua-rea.mjs` **67**; `node tools/ci-gates.mjs` **9 passed / 1
+failed / 1 skipped** — the failure is `check-office.mjs`
+(`@deepseek-ai/dsh-skill-office is not installed`), **pre-existing and unrelated**
+(reproduced on the stashed tree); `tests/{supervisor-smoke,modules-unit,qmp-shutdown}.mjs`
+all PASS; `node --check` clean on every changed `.mjs`. `tests/modules-unit.mjs` exercises both branches with stubbed
+`stat`/`access` (no device needed): a 0660 root:107 node refused for uid 1000 →
+`EACCES` + `KVM_GID` + `group_add`; the same node granted via supplementary group
+`107` → `ok`; ENOENT → the `devices:` message and **no** GID text; a regular file
+→ `not-device`. A host with `/dev/kvm` additionally runs the live probe. Gate
+needles pin the split texts and `KVM_GID`; `tools/check-cua-vm.mjs` asserts the
+new module is in both the runtime path and the flat gate tree.
+
+**NOT RUN, with the reason.** The *denied* branch was not reproduced against a
+real device: this host's `/dev/kvm` is `0666` and openable by uid 1000
+(`state: ok`), and changing the device's mode needs root on the host. It is
+covered exactly — one 0660 `root:107` node with uid 1000 / groups 44,105 →
+EACCES + `KVM_GID` + `group_add`; the same node with gid 107 in the group list →
+`ok` — with stubbed `stat`/`access`, plus a LIVE `not-device` probe against a real
+regular file and a LIVE `missing` create through the real supervisor
+(`DSH_CUA_KVM_DEVICE=/dev/dsh-no-such-kvm`). A live Windows install (ISO,
+OVMF/swtpm, OOBE) stays NOT RUN as before.
+
 ### 9.7 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),

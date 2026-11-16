@@ -31,8 +31,13 @@
 #             # /etc/udev/rules.d/99-kvm.rules
 #             KERNEL=="kvm", GROUP="kvm", MODE="0666"
 #       (b) pin the host's gid explicitly (compose cannot run `getent`):
-#             echo "KVM_GID=$(getent group kvm | cut -d: -f3)" >> .env
+#             echo "KVM_GID=$(stat -c %g /dev/kvm)" >> .env
 #           and use: group_add: ["${KVM_GID}"]
+#
+#   (b) is the one the create error names when the device is present and
+#   `access(2)` fails EACCES: the gid quoted in the message is that host
+#   `stat -c %g /dev/kvm`. Group membership is fixed at container CREATE, so a
+#   restart does not apply it — `up -d --force-recreate` does.
 #
 # VERIFY INSIDE THE CONTAINER
 #   ls -l /dev/kvm && id            # the user must be in the owning group

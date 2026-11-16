@@ -58,8 +58,10 @@ import {
   WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
   WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
   WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
-  windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso
+  windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
+  windowsKvmPreflight
 } from './cua-vm-windows-qemu.mjs'
+import { kvmDoctorFacts, kvmPreflightError, kvmStatus } from './cua-vm-kvm.mjs'
 
 const SOCK = process.env.CUA_SUPERVISOR_SOCK || '/tmp/cua-vm/supervisor.sock'
 const CUA_BIN = process.env.CUA_BIN || 'cua'
@@ -2228,6 +2230,23 @@ async function createManaged(spec) {
   }
 }
 
+/**
+ * WHY THE LINUX PATH DOES NOT REFUSE UP FRONT.
+ *
+ * `cua sb create` is the only thing that knows whether it can use the device,
+ * and this branch shipped without a preflight of its own — adding a refusal
+ * would change behaviour. What it CAN do is stop relaying cua's opaque failure
+ * ("qemu exited" / "KVM is not available") when the supervisor already knows
+ * the device is present but denied: that is the user's reported symptom, and the
+ * gid/group_add fix is the only thing that resolves it.
+ */
+function linuxKvmFailureHint() {
+  const kvm = kvmStatus()
+  if (kvm.state === 'ok') return ''
+  const error = kvmPreflightError(kvm, { purpose: 'the Linux VM (cua sb create)' })
+  return error === null ? '' : `\n\n${error.message}`
+}
+
 /** The create itself, with the store quota already reserved for this name. */
 async function createLinuxNow(spec, warnings = []) {
   const { name, rea } = spec
@@ -2239,7 +2258,7 @@ async function createLinuxNow(spec, warnings = []) {
   await ensureRuntime()
   installQemuShim()
   const created = await runCua(createArgs(name, spec.tier, spec.cpu, spec.memory, spec.waitDesktop, spec.image, spec.gpu), { timeoutMs: 1500000 })
-  if (created.code !== 0) return fail((created.stderr || created.stdout).trim().slice(-1500))
+  if (created.code !== 0) return fail(`${(created.stderr || created.stdout).trim().slice(-1500)}${linuxKvmFailureHint()}`)
   await mutateRegistry((fresh) => {
     fresh.vms[name] = {
       workspace: spec.workspace,
@@ -3001,6 +3020,13 @@ async function windowsCreateManaged(spec) {
   if (missing.length > 0) {
     throw new Error(`the Windows backend needs ${missing.join(', ')} on the host (install qemu-system-x86, ovmf and swtpm in the image: ${WINDOWS_QEMU})`)
   }
+  // THE DEVICE, BEFORE 5.5 GB OF ISO. `boot()` refuses too, but by then the
+  // download and the qcow2 have already happened. This is the SAME preflight
+  // (one implementation, `cua-vm-kvm.mjs`) so the sentence cannot drift: missing
+  // → add `devices:`; present-but-denied → the gid/group_add fix, quoting the
+  // observed mode, owner and this process's supplementary groups.
+  const kvmError = windowsKvmPreflight()
+  if (kvmError !== null) throw kvmError
   if (spec.windowsIso !== '' && !/^https?:\/\//iu.test(spec.windowsIso)) {
     // A local ISO is used DIRECTLY as a QEMU drive, so it must be a host path
     // this process can read: the store, or the workspace (which is a bind).
@@ -3701,7 +3727,12 @@ async function doctorReport() {
       return 'absent'
     }
   }
-  const kvm = mode('/dev/kvm')
+  // THE DEVICE IS NOT A FILE. `mode('/dev/kvm')` described a character device
+  // as "666 (writable)" and then `kvmUsable` was derived from the STRING
+  // ("starts with 6 or 2"), which is true for a device this uid cannot open.
+  // The observation now comes from the same probe the create path refuses on.
+  const kvmFacts = kvmDoctorFacts(kvmStatus())
+  const kvm = kvmFacts.kvm
   const render = mode('/dev/dri/renderD128')
   // No Docker Engine any more: the Windows backend IS qemu, so its health is
   // the host tools it needs (qemu, OVMF, swtpm, /dev/kvm).
@@ -3712,7 +3743,12 @@ async function doctorReport() {
   return ok({
     hostCaps: {
       kvm,
-      kvmUsable: kvm.startsWith('6') || kvm.startsWith('2') ? !kvm.includes('read-only') : false,
+      kvmUsable: kvmFacts.kvmUsable,
+      kvmState: kvmFacts.kvmState,
+      kvmMode: kvmFacts.kvmMode,
+      kvmOwner: kvmFacts.kvmOwner,
+      kvmGroups: kvmFacts.kvmGroups,
+      kvmReason: kvmFacts.kvmReason,
       renderNode: render,
       systemQemu: existsSync(SYSTEM_QEMU) ? SYSTEM_QEMU : 'absent (cua\'s own QEMU is used)',
       virtioGpuGl: systemQemuSupportsVirgl(),

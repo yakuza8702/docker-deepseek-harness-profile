@@ -843,7 +843,11 @@ export function apply(ctx, config = {}) {
       const store = answer.store ?? {}
       return {
         text: [
-          `kvm: ${caps.kvm}${caps.kvmUsable ? '' : ' (NOT usable — the computer cannot start)'}`,
+          // The device and its ACCESS are two facts: "present but DENIED" is
+          // the group/gid bug (uid 1000 is not in the device's group), and it
+          // used to read as "NOT usable" with no way to tell it from a missing
+          // node. Never collapse them.
+          `kvm: ${caps.kvm}${caps.kvmUsable ? '' : (caps.kvmState === 'denied' ? ` (mounted but NOT openable by this uid — ${caps.kvmMode ?? '?'} owner ${caps.kvmOwner ?? '?'}, groups ${Array.isArray(caps.kvmGroups) && caps.kvmGroups.length > 0 ? caps.kvmGroups.join(',') : 'none'}: add KVM_GID to group_add, see the README)` : ' (NOT usable — the computer cannot start)')}`,
           `render node: ${caps.renderNode}`,
           `system qemu: ${caps.systemQemu}`,
           `virtio-gpu-gl-pci: ${caps.virtioGpuGl ? 'yes' : 'no'} (DSH_CUA_VM_GPU=${caps.gpuMode}; default gpu=${caps.gpuDefault})`,
@@ -851,7 +855,7 @@ export function apply(ctx, config = {}) {
           `workspace share: ${caps.share}`,
           `docker engine: ${caps.docker}`,
           `windows: ${windows.enabled
-            ? `enabled (direct qemu: ${windows.hostCaps?.qemu ? 'present' : 'MISSING'}, OVMF ${windows.hostCaps?.ovmfCode ? 'present' : 'MISSING'}, swtpm ${windows.hostCaps?.swtpm ? 'present' : 'MISSING'}, KVM ${windows.hostCaps?.kvm ? 'present' : 'MISSING'})`
+            ? `enabled (direct qemu: ${windows.hostCaps?.qemu ? 'present' : 'MISSING'}, OVMF ${windows.hostCaps?.ovmfCode ? 'present' : 'MISSING'}, swtpm ${windows.hostCaps?.swtpm ? 'present' : 'MISSING'}, KVM ${windows.hostCaps?.kvm ? (windows.hostCaps?.kvmUsable ? 'present' : 'present but NOT openable by this uid (gid/group_add)') : 'MISSING'})`
             : `disabled (${windows.reason})`}`,
           `store: ${(store.usedBytes / 1024 ** 3).toFixed(1)} GB of ${(store.quotaBytes / 1024 ** 3).toFixed(0)} GB`,
           `policy: shutdownTimeoutSec=${answer.shutdownTimeoutSec} checkpointPolicy=${answer.checkpointPolicy} computers=${answer.vms}`

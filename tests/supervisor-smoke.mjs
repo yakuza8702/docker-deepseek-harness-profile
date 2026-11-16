@@ -241,6 +241,21 @@ try {
   const doctor = await call({ op: 'vmDoctor' })
   check('doctor reports hostCaps', doctor.ok && typeof doctor.hostCaps.kvm === 'string' && typeof doctor.hostCaps.docker === 'string', JSON.stringify(doctor.hostCaps ?? {}).slice(0, 120))
   check('doctor reports the windows switch', doctor.windows?.enabled === true)
+  // THE DEVICE AND ITS ACCESS ARE TWO FACTS. `kvmUsable` used to be derived from
+  // the STRING "666 (writable)" (`startsWith('6')`), which is true for a device
+  // this uid cannot open — so a mounted-but-denied node read as usable.
+  check('doctor separates the device from its access',
+    typeof doctor.hostCaps.kvmState === 'string' && ['ok', 'missing', 'denied', 'not-device'].includes(doctor.hostCaps.kvmState)
+    && typeof doctor.hostCaps.kvmUsable === 'boolean',
+    JSON.stringify({ state: doctor.hostCaps.kvmState, usable: doctor.hostCaps.kvmUsable, kvm: doctor.hostCaps.kvm }))
+  check('doctor quotes the mode/owner/groups it actually observed',
+    (doctor.hostCaps.kvmState === 'missing' && doctor.hostCaps.kvmMode === null)
+    || (typeof doctor.hostCaps.kvmMode === 'string' && /^[0-7]{4}$/u.test(doctor.hostCaps.kvmMode)
+        && /^\d+:\d+$/u.test(doctor.hostCaps.kvmOwner ?? '') && Array.isArray(doctor.hostCaps.kvmGroups)),
+    `${doctor.hostCaps.kvmMode} ${doctor.hostCaps.kvmOwner} [${doctor.hostCaps.kvmGroups}]`)
+  check('doctor\'s kvmUsable agrees with its own state (never "DENIED but usable")',
+    doctor.hostCaps.kvmUsable === (doctor.hostCaps.kvmState === 'ok'),
+    `state=${doctor.hostCaps.kvmState} usable=${doctor.hostCaps.kvmUsable}`)
 
   // ---- W3: shutdown of a computer whose QEMU is already gone ----
   // F1 regression guard: the LINUX call site must read the cua vmm disk.
@@ -786,6 +801,80 @@ try {
   check('a corrupt registry does not kill the supervisor at boot', up && corrupt.exitCode === null, corruptErr.trim().split('\n').slice(-1)[0] ?? '')
   check('it still answers ping', ping !== null && ping.ok === true, JSON.stringify(ping).slice(0, 100))
   try { corrupt.kill('SIGKILL') } catch {}
+}
+
+
+// ---- KVM DEVICE: the two cases the user's report could not tell apart ----
+//
+// A second supervisor with `DSH_CUA_KVM_DEVICE` pointing at a path that does not
+// exist proves the MISSING case end to end, through the real create handler —
+// and proves the message is the ENOENT one, not the group/gid one. The DENIED
+// case cannot be produced on a host whose /dev/kvm is 0666 (nor on one without
+// it), so it is covered with stubbed stat/access in tests/modules-unit.mjs; that
+// split is reported NOT RUN live, with the reason.
+{
+  const kvmStore = path.join(STORE, 'kvm-device')
+  mkdirSync(kvmStore, { recursive: true })
+  const kvmSock = path.join(kvmStore, 's.sock')
+  const kvmSup = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')], {
+    env: {
+      ...process.env,
+      CUA_VM_STORE: kvmStore,
+      CUA_VM_HOME: path.join(kvmStore, 'home'),
+      CUA_SUPERVISOR_SOCK: kvmSock,
+      CUA_BIN: STUB,
+      CUA_WORKSPACE_ROOT: '/workspace',
+      DSH_CUA_VM_WINDOWS: '1',
+      // NO fake caps: the probe must answer honestly.
+      DSH_CUA_WINDOWS_FAKE_HOST_CAPS: '',
+      // The device the probe is pointed at does not exist on any host.
+      DSH_CUA_KVM_DEVICE: '/dev/dsh-no-such-kvm',
+      DSH_CUA_WINDOWS_OEM_DIR: path.join(REPO, 'docker', 'windows-oem'),
+      // The REAL system tools this host has: the point of this block is the
+      // DEVICE, so qemu/OVMF/swtpm must not be the first thing to fail.
+      PATH: `${STUB_BIN}:${process.env.PATH ?? ''}`,
+      PNG_SOURCE
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  let kvmErr = ''
+  kvmSup.stderr.on('data', (chunk) => { kvmErr += chunk })
+  let kvmUp = false
+  for (let i = 0; i < 100; i += 1) {
+    if (existsSync(kvmSock)) { kvmUp = true; break }
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  const askKvm = (payload) => new Promise((resolve) => {
+    const socket = net.connect(kvmSock)
+    let buffer = ''
+    socket.setEncoding('utf8')
+    socket.on('connect', () => socket.write(`${JSON.stringify(payload)}\n`))
+    socket.on('data', (chunk) => { buffer += chunk })
+    socket.on('close', () => { try { resolve(JSON.parse(buffer.split('\n')[0])) } catch { resolve(null) } })
+    socket.on('error', () => resolve(null))
+  })
+  check('a supervisor with a missing KVM device still starts', kvmUp, kvmErr.trim().split('\n').slice(-1)[0] ?? '')
+  if (kvmUp) {
+    const doctorMissing = await askKvm({ op: 'vmDoctor' })
+    check('doctor says the device is ABSENT (not "DENIED")',
+      doctorMissing?.hostCaps?.kvmState === 'missing' && /absent \(device not mounted\)/u.test(doctorMissing?.hostCaps?.kvm ?? ''),
+      `${doctorMissing?.hostCaps?.kvmState} ${doctorMissing?.hostCaps?.kvm}`)
+    check('doctor never reports a missing device as usable', doctorMissing?.hostCaps?.kvmUsable === false)
+    const refusedKvm = await askKvm({ op: 'vmWindowsCreate', name: 'win-nokvm', kind: 'windows' })
+    check('a Windows create on a missing device is refused', refusedKvm?.ok === false)
+    const text = String(refusedKvm?.error ?? '')
+    check('the refusal is the ENOENT split, naming the device it probed',
+      /needs \/dev\/dev\/dsh-no-such-kvm/.test(text) || /\/dev\/dsh-no-such-kvm does not exist in this container \(ENOENT\)/u.test(text),
+      text.split('\n')[0])
+    check('the missing-device refusal keeps the devices:/compose.emulator.yaml instruction',
+      /compose\.emulator\.yaml/u.test(text) && /- \/dev\/kvm/u.test(text) && /--force-recreate/u.test(text))
+    check('the missing-device refusal does NOT give the gid advice (the device is not there)',
+      !/group_add/u.test(text) && !/KVM_GID/u.test(text))
+    check('a missing device creates no row and downloads nothing',
+      !existsSync(path.join(kvmStore, 'windows', 'win-nokvm', 'disk.qcow2'))
+      && !existsSync(path.join(kvmStore, 'iso')))
+  }
+  try { kvmSup.kill('SIGKILL') } catch {}
 }
 
 console.log(failures === 0 ? '\nsmoke: PASS' : `\nsmoke: ${failures} FAILURE(S)`)
