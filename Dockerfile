@@ -661,7 +661,15 @@ RUN set -eux; \
       --cache /tmp/office-cache \
       --version "dsh-$dsh_version"; \
     rm -rf /tmp/office /tmp/office-cache
-COPY --chmod=0644 office-skills /opt/dsh-office/office-skills
+# Same directory-mode trap as windows-oem (see the CUA section): a
+# `--chmod=0644` on a DIRECTORY source leaves `office-skills/` non-traversable,
+# and the entrypoint exports DSH_BUNDLED_SKILL_DIR to it — a skill tree that
+# exists and cannot be opened. Create it 0755 first, copy the files in.
+RUN install -d -m 0755 /opt/dsh-office/office-skills
+COPY --chown=1000:1000 --chmod=0644 office-skills /opt/dsh-office/office-skills
+# The tree has SUBDIRECTORIES (pdf-documents/), which the COPY above also stamps
+# 0644 — non-traversable, so the skill would be found and unreadable.
+RUN chmod -R a+rX /opt/dsh-office/office-skills
 # The gate needs the four declarations, not the whole repository.
 COPY --chmod=0644 plugins/dsh-office/cordis.patch.yml /tmp/office-repo/dsh-office.cordis.patch.yml
 COPY --chmod=0644 plugins/dsh-plugins-page-extras/index.js /tmp/office-repo/plugins-page-extras.index.js
@@ -755,6 +763,11 @@ RUN node /tmp/check-connector.mjs --repo /tmp/connector-repo /opt/dsh/node_modul
 # in trixie fails the build loudly at install time, and the wrappers' behaviour
 # is exercised by whoever first runs them against a real file.
 # ---------------------------------------------------------------------
+# Same directory-mode trap (see windows-oem): the COPY below is what CREATES
+# /opt/office-native, so `--chmod=0644` would leave that directory non-traversable
+# for uid 1000 — the office-swap-pages wrapper execs a file inside it. Create it
+# 0755 first; the file itself stays 0644 (it is run through an interpreter).
+RUN install -d -m 0755 /opt/office-native
 COPY --chmod=0644 tools/office-swap-pages.py /opt/office-native/office-swap-pages.py
 RUN set -eux; \
     apt-get update; \
@@ -827,6 +840,10 @@ ARG OCR_TESSDATA_TIER=best
 
 COPY --chmod=0755 docker/ocr-toolchain.sh /tmp/ocr-toolchain.sh
 COPY --chmod=0755 docker/ocr-tools.sh /usr/local/bin/ocr-tools
+# /opt/ocr-tools is created by THIS copy when the toolchain script has not made it
+# yet, and a `--chmod=0644`-created directory is not traversable by uid 1000 —
+# `ocr-tools --check` would open nothing. Explicit 0755 here, files 0644.
+RUN install -d -m 0755 /opt/ocr-tools
 COPY --chmod=0644 tools/ocr-pdf.py /opt/ocr-tools/ocr-pdf.py
 RUN set -eux; \
     OCR_TESSDATA_TIER="${OCR_TESSDATA_TIER}" \
@@ -915,7 +932,30 @@ COPY --chmod=0755 docker/cua-vm-supervisor.mjs /usr/local/bin/cua-vm-supervisor
 COPY --chmod=0644 docker/cua-vm-space.mjs docker/cua-vm-windows-qemu.mjs /usr/local/bin/
 # The unattended answer file and the first-boot script the supervisor copies into
 # $STORE/windows/<name>/oem/ — data files, so they live outside the JS.
-COPY --chmod=0644 docker/windows-oem/ /usr/local/share/cua-vm/windows-oem/
+#
+# THE DIRECTORY MODE IS NOT WHAT `--chmod` SAYS, AND THAT WAS THE BUG.
+# `COPY --chmod=0644 src/ dest/` applies 0644 to EVERY entry it copies, the
+# directories it creates included — measured on this base image: the destination
+# arrived as `drw-r--r-- root:root`, and so did the `/usr/local/share/cua-vm`
+# parent that the same COPY invented. A directory without an execute bit cannot
+# be traversed, so uid 1000 (the runtime user, see the final `USER node`) got
+# `ls: Permission denied` on a payload that WAS in the image, and every Windows
+# create failed in writeOemPayload on readFileSync. Worse, `existsSync` answers
+# false on EACCES, so the failure even read as "the OEM payload is missing".
+#
+# So: create the parent with an explicit 0755, copy with the runtime uid/gid, and
+# then normalise the copy's own directory modes with `chmod -R a+rX` (a+rX adds
+# execute ONLY where it is needed to traverse). Files stay 0644 — the payload is
+# data, never exec. The proof that this holds is the uid-1000 RUN below, which
+# drops privileges and reads these exact paths.
+RUN install -d -m 0755 /usr/local/share/cua-vm
+COPY --chown=1000:1000 --chmod=0644 docker/windows-oem/ /usr/local/share/cua-vm/windows-oem/
+# --chmod=0644 also lands on the destination DIRECTORY above (and on any
+# subdirectory a future payload file adds), so the copy's own directory modes are
+# normalised right after it: a+rX = readable everywhere, executable only on
+# directories (and on files that already were). This is the same `chmod -R a+rX`
+# the plugin staging above uses, and it is idempotent.
+RUN chmod -R a+rX /usr/local/share/cua-vm/windows-oem
 # Guest provisioning runs INSIDE the VM, piped through `sudo bash` by the
 # supervisor. Kept as real files (not a base64 blob in the supervisor) so
 # they can be read, diffed and run by hand to debug a guest. rea is its own
@@ -955,11 +995,39 @@ RUN set -eux; \
 # short). When a needle class is added to either gate, its file is added here in
 # the same commit; `node tools/check-cua-vm.mjs --root <tree>` is the check that
 # the two lists still agree.
+#
+# THIS TREE IS ALSO A RUNTIME FALLBACK (WINDOWS_OEM_FALLBACK_DIRS in the
+# supervisor), so it has the same directory-mode trap as windows-oem: a
+# `--chmod=0644` COPY would leave /opt/seek-harness/cua-check non-traversable
+# and turn the self-healing path into a second EACCES. The directory is created
+# 0755 first; the files stay 0644 and world-readable, which is what uid 1000
+# needs (and root, which runs the gate below, is unaffected either way).
 # ---------------------------------------------------------------------
+RUN install -d -m 0755 /opt/seek-harness/cua-check
 COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-guest-android.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-windows-qemu.mjs docker/cua-guest-provision.sh Dockerfile /opt/seek-harness/cua-check/
 COPY --chmod=0644 docker/windows-oem/Autounattend.xml docker/windows-oem/setupcomplete.cmd docker/windows-oem/cua-firstboot.ps1 /opt/seek-harness/cua-check/
 COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js plugins/dsh-cua-vm/win-mcp.js /opt/seek-harness/cua-check/
 COPY --chmod=0644 docker/proxy.mjs compose.yaml compose.windows.yaml .env.example /opt/seek-harness/cua-check/
+# THE PERMISSION PROOF, AS THE RUNTIME USER. This is what the needle list cannot
+# say: that a DIRECTORY is traversable and a FILE is readable by uid 1000 after
+# the COPY layers above. It runs as root (the build user) and DROPS to 1000 for
+# the checks, so a `--chmod=0644` on a directory — the exact defect that made
+# `ls /usr/local/share/cua-vm/windows-oem/` answer "Permission denied" on a
+# hardened container while the files were demonstrably in the image — fails the
+# BUILD here instead of the first Windows create. Both the runtime path and the
+# fallback tree are read, because the supervisor uses either.
+RUN set -eux; \
+    for dir in /usr/local/share/cua-vm/windows-oem /opt/seek-harness/cua-check; do \
+      setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -x '$dir' && test -r '$dir'" \
+        || { echo "EACCES: $dir is not traversable by uid 1000 (dir mode $(stat -c '%a %U:%G' "$dir"))"; exit 1; }; \
+    done; \
+    for f in Autounattend.xml setupcomplete.cmd cua-firstboot.ps1; do \
+      setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/usr/local/share/cua-vm/windows-oem/$f' && test -s '/usr/local/share/cua-vm/windows-oem/$f'" \
+        || { echo "EACCES: /usr/local/share/cua-vm/windows-oem/$f is unreadable by uid 1000"; exit 1; }; \
+      setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/opt/seek-harness/cua-check/$f'" \
+        || { echo "EACCES: the fallback copy /opt/seek-harness/cua-check/$f is unreadable by uid 1000"; exit 1; }; \
+    done; \
+    stat -c '%a %U:%G %n' /usr/local/share/cua-vm /usr/local/share/cua-vm/windows-oem /opt/seek-harness/cua-check
 RUN node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check \
  && node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check \
  && rm -f /opt/seek-harness/cua-check/Dockerfile

@@ -868,6 +868,46 @@ the primary directory is incomplete, and `tools/check-cua-vm.mjs` pins the
 Dockerfile's `COPY` **destination** to the supervisor's runtime default, so a
 drift fails the build instead of the first create.
 
+### `Permission denied` on that directory — the files are there, the mode is wrong
+
+If step 3 above answers **`ls: /usr/local/share/cua-vm/windows-oem/: Permission
+denied`** (or `docker compose exec seek-harness ls -ld …` shows `drw-r--r--`
+instead of `drwxr-xr-x`), the payload is in the image and the **directory** cannot
+be traversed. That was a real defect and it is fixed here: `COPY --chmod=0644
+docker/windows-oem/ …` applies `--chmod` to every entry it copies, the
+directories it creates included, so a hardened container running as uid 1000
+(`USER node`) got EACCES on a directory of data files — and because `existsSync`
+answers `false` on EACCES, the panel reported it as a *missing* payload. The
+image now creates the parent 0755, copies with `--chown=1000:1000`, normalises the
+copied modes with `chmod -R a+rX`, and **proves it at build time** by re-reading
+all three files as uid 1000 (`setpriv`).
+
+The runtime error for this case is its own message (`present but NOT READABLE by
+uid … — EACCES …`, with the mode/owner of the first readable ancestor and the
+fix) rather than the pull-a-newer-image text.
+
+On a container that predates the fix, **rebuild** — `chmod` cannot help there,
+because `read_only: true` makes the image filesystem read-only (`chmod: …
+Read-only file system`). If a rebuild is not possible right now, shadow the
+directory with a read-only bind mount from a checkout (the mount's own modes are
+used, so the image's `drw-r--r--` no longer applies):
+
+```yaml
+services:
+  seek-harness:
+    volumes:
+      - ./docker/windows-oem:/usr/local/share/cua-vm/windows-oem:ro
+```
+
+```bash
+docker compose -f compose.yaml -f compose.windows.yaml up -d
+docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/
+```
+
+The proper fix is the image change: the parent is created 0755, the copy carries
+`--chown=1000:1000`, the copied modes are normalised with `chmod -R a+rX`, and the
+build re-reads all three files as uid 1000 before it can succeed.
+
 ### Shutdown, suspend, and why Start cold-boots
 
 `cua sb suspend` pauses QEMU and keeps its sandbox: fast, and it resumes exactly

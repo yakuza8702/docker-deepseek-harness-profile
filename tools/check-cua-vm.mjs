@@ -507,6 +507,23 @@ const NEEDLES = {
     // supervisor's runtime constant in the K2 assertion below.
     ['docker/windows-oem/ /usr/local/share/cua-vm/windows-oem/', 1],
     ['--chmod=0644 docker/windows-oem/', 1],
+    // K3: THE DIRECTORY MODE. `--chmod=0644` applies to the directories the COPY
+    // CREATES, so the destination arrived `drw-r--r--` and uid 1000 could not
+    // traverse a payload that was provably in the image: `ls` said "Permission
+    // denied" and writeOemPayload failed on readFileSync (or worse, existsSync
+    // reported "missing"). The fix is an explicit 0755 directory created for the
+    // runtime uid BEFORE the copy, and the copy itself carrying that ownership.
+    // These three needles are the fix; the uid-1000 proof RUN is pinned by K4.
+    ['install -d -m 0755 /usr/local/share/cua-vm', 1],
+    ['chmod -R a+rX /usr/local/share/cua-vm/windows-oem', 1],
+    ['--chown=1000:1000 --chmod=0644 docker/windows-oem/', 1],
+    ['install -d -m 0755 /opt/seek-harness/cua-check', 1],
+    // K4: THE PROOF RUNS AS THE RUNTIME USER. A needle list cannot say "and a
+    // uid-1000 process can traverse it"; this RUN does, for both the runtime path
+    // and the fallback tree, and fails the BUILD instead of the first create.
+    ['setpriv --reuid=1000 --regid=1000 --clear-groups', 3],
+    ['is not traversable by uid 1000', 1],
+    ['unreadable by uid 1000', 2],
     ['ovmf swtpm', 1],
     ['tools/check-cua-vm.mjs /opt/seek-harness/check-cua-vm.mjs', 1],
     ['node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check', 1]
@@ -778,6 +795,34 @@ function sourceOf(label, name) {
         missing.push(`K2: no COPY writes the OEM payload to the supervisor's DSH_CUA_WINDOWS_OEM_DIR default (${runtime ?? 'constant not found'}); destinations found: ${destinations.join(', ') || 'none'} — otherwise the image builds green and every Windows create fails with "the OEM payload is missing from this image"`)
         console.log('  FAIL K2 OEM path agreement')
       }
+    }
+  }
+  // K6: EACCES IS NOT "MISSING". The module must classify a denied directory as
+  // a PERMISSION defect (its own error, naming the mode/owner and the fix) rather
+  // than falling through to the pull-a-newer-image text — the two are
+  // indistinguishable to existsSync, which is exactly how a permissions bug
+  // shipped reading like a missing-payload bug.
+  {
+    const windows = sourceOf('K6', 'cua-vm-windows-qemu.mjs')
+    total += 1
+    if (windows === null) {
+      failures += 1
+      missing.push('K6: docker/cua-vm-windows-qemu.mjs is needed to check the EACCES classification')
+      console.log('  FAIL K6 OEM permission classification (missing file)')
+    } else if (
+      /export function oemPayloadDirStatus\(dir\)/u.test(windows)
+      && /export function oemPayloadDeniedDir\(candidates\)/u.test(windows)
+      && /export function oemPayloadDeniedError\(\{ sourceDir, denied, deniedDir, fallbackDirs \}\)/u.test(windows)
+      && /code === 'EACCES' \|\| code === 'EPERM'/u.test(windows)
+      && /const deniedDir = oemPayloadDeniedDir\(candidates\)/u.test(windows)
+      && /IMAGE PERMISSIONS defect/u.test(windows)
+      && /EACCES traversing \$\{dir\}/u.test(windows)
+    ) {
+      if (!quietMode) console.log('  ok   K6 a denied OEM directory is reported as a permission defect, not as a missing payload')
+    } else {
+      failures += 1
+      missing.push('K6: the OEM payload resolver must classify EACCES separately (oemPayloadDirStatus / oemPayloadDeniedDir / oemPayloadDeniedError) — a permission bug that reads as "pull a newer image" is the bug this branch fixes')
+      console.log('  FAIL K6 OEM permission classification')
     }
   }
   // L5: the runtime suite ships IN the repository (it used to live outside it,

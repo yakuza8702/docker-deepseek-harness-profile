@@ -3,7 +3,7 @@
  * modules-unit.mjs — the pure parts of the two new modules, and the Windows
  * container spec, asserted without a VM, a container or a daemon.
  */
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, existsSync, chmodSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import zlib from 'node:zlib'
@@ -14,7 +14,8 @@ import {
   WINDOWS_VERSIONS, WINDOWS_ISO_SOURCES, resolveWindowsIso, canonicalWindowsVersion, windowsCapacityWarnings,
   charToKey, parseKeySpec, generatePassword, windowsEnabled,
   buildQemuArgs, vncDisplayFor, vncPortFor, windowsPaths, frameSpace,
-  OEM_PAYLOAD_FILES, oemPayloadDir, resolveOemSourceDir, writeOemPayload, oemPayloadMissingError
+  OEM_PAYLOAD_FILES, oemPayloadDir, oemPayloadDirStatus, oemPayloadDeniedDir, resolveOemSourceDir, writeOemPayload,
+  oemPayloadMissingError, oemPayloadDeniedError
 } from '../docker/cua-vm-windows-qemu.mjs'
 
 /** The checkout root — the source of `docker/windows-oem/` in these tests. */
@@ -241,6 +242,74 @@ check('the Windows store paths are all under $STORE', Object.values(paths).every
       && message.includes('docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/')
       && message.includes('DSH_CUA_WINDOWS_OEM_DIR')
   })())
+  // K6: A PERMISSION BUG MUST NOT READ AS A MISSING PAYLOAD. The shipped defect
+  // was `COPY --chmod=0644 docker/windows-oem/ <dest>/`: the flag applies to the
+  // directories the COPY creates, so the destination arrived `drw-r--r--` and a
+  // uid-1000 process could not traverse it. `existsSync` answers FALSE on EACCES,
+  // so the image said "the OEM payload is missing" while the files sat in the
+  // pushed layer — and the advice (pull a newer image) was the wrong fix.
+  {
+    const root = typeof process.getuid === 'function' ? process.getuid() : -1
+    const locked = mkdtempSync(path.join(os.tmpdir(), 'oem-eacces-'))
+    // `0o644` on a directory removes the traverse bit for every class; POSIX
+    // denies the chmod'd owner itself, so this reproduces the image defect
+    // exactly without needing a second uid. Root bypasses DAC, so it cannot be
+    // simulated there — that is reported as NOT RUN, never as a pass.
+    const simulated = root !== 0
+    if (!simulated) {
+      console.log('  n/a  EACCES classification: running as uid 0, which bypasses DAC — not simulated')
+    }
+    try {
+      for (const file of OEM_PAYLOAD_FILES) writeFileSync(path.join(locked, file), 'x')
+      if (simulated) chmodSync(locked, 0o644)
+
+      const status = oemPayloadDirStatus(locked)
+      check('a non-traversable directory is reported as DENIED, not as empty/missing', simulated
+        ? status.denied !== null && String(status.denied.code) === 'EACCES' && oemPayloadDir(locked) === null
+        : status.denied === null && oemPayloadDir(locked) === locked,
+      simulated ? `code=${status.denied?.code ?? 'none'}` : 'root: DAC bypassed, directory stays readable')
+
+      check('the denied directory is NAMED by oemPayloadDeniedDir (so the error picks the right text)',
+        simulated ? oemPayloadDeniedDir(['/no/such/dir', locked]) === locked : oemPayloadDeniedDir(['/no/such/dir', locked]) === null)
+
+      const message = oemPayloadDeniedError({ sourceDir: locked, denied: path.join(locked, 'Autounattend.xml'), fallbackDirs: ['/opt/seek-harness/cua-check'] }).message
+      check('the permission error names the mode/owner, the defect and the fix — not "pull a newer image"', (() => {
+        const has = (needle) => message.includes(needle)
+        return has('NOT READABLE')
+          && has('IMAGE PERMISSIONS defect')
+          && has('install -d -m 0755 /usr/local/share/cua-vm')
+          && has('chmod -R a+rX /usr/local/share/cua-vm/windows-oem')
+          && has('--chown=1000:1000 --chmod=0644')
+          && has('read_only, so `chmod` inside the')
+          && has('docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/')
+          && !has('build it from branch cua-vm-improve')
+      })())
+
+      check('a denied source is never mistaken for a missing payload (self-heal or EACCES, never "pull an image")', (() => {
+        if (!simulated) return true
+        const store = mkdtempSync(path.join(os.tmpdir(), 'oem-denied-write-'))
+        try {
+          writeOemPayload({
+            paths: { oemDir: path.join(store, 'oem') },
+            name: 'win-1', password: 'p', sshPubKey: 'k',
+            // The checkout's own docker/windows-oem/ is a legitimate last resort,
+            // so this either self-heals from it or throws the PERMISSION error.
+            // What must never happen: the "missing from this image" text, whose
+            // advice (pull a newer image) does not fix a mode bits problem.
+            sourceDir: locked, fallbackDirs: [], pythonUrl: 'u', dshCuaSpec: 's'
+          })
+          return existsSync(path.join(store, 'oem', 'Autounattend.xml'))
+        } catch (error) {
+          return error.code === 'EACCES' && /IMAGE PERMISSIONS defect/u.test(error.message)
+        } finally {
+          rmSync(store, { recursive: true, force: true })
+        }
+      })())
+    } finally {
+      if (simulated) chmodSync(locked, 0o755)
+      rmSync(locked, { recursive: true, force: true })
+    }
+  }
   check('the writer throws THAT error when a directory holds only part of the payload', (() => {
     const store = mkdtempSync(path.join(os.tmpdir(), 'oem-nopayload-'))
     const partial = mkdtempSync(path.join(os.tmpdir(), 'oem-onlyxml-'))

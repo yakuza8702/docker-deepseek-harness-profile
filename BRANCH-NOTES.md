@@ -894,3 +894,77 @@ checkout (**324** in the flat image tree), and `tests/supervisor-smoke.mjs`
 carries the reported case end to end: quota 15 + real usage low + default 64 GB
 → created with `disk-over-policy`; real usage over the quota → refused without
 creating a row.
+
+### 15.11 `--chmod=0644` on a directory: the Windows OEM permission bug
+
+User report, on a freshly pulled and recreated hardened container
+(`cap_drop ALL`, `read_only` rootfs, `USER node`): `ls
+/usr/local/share/cua-vm/windows-oem/` answered **Permission denied**, and every
+Windows computer create failed — while the three files were verifiably present
+in the pushed layers.
+
+**Who runs the supervisor.** `docker/entrypoint.sh` starts
+`node /usr/local/bin/cua-vm-supervisor` **as the container user**, and the
+Dockerfile ends with `USER node` (uid/gid 1000; `USER node`, not `node:node`, so
+the supplementary `kvm` group survives). There is no uid-0 supervisor and no
+`group_add` that could help here: the payload is read by uid 1000.
+
+**The defect.** `COPY --chmod=0644 docker/windows-oem/ <dest>/` does not only
+mode the FILES — Docker applies `--chmod` to **every** entry it copies, the
+directories it creates included, and to the intermediate `/usr/local/share/cua-vm`
+parents it invents. Measured against this base image the destination arrived as
+`drw-r--r-- root:root`: files 0644 (fine), **directories 0644 (not traversable)**.
+A 0644 directory denies `openat`/`getdents` to every non-root process, so `ls`
+said "Permission denied" and `writeOemPayload` died in `readFileSync`.
+`existsSync()` answers **false** on EACCES, so `resolveOemSourceDir()` also
+concluded the payload was *missing* and the user was told to pull a newer image —
+the wrong fix for a mode-bits defect, and the reason this looked like a missing
+layer rather than a permission bug. The same trap existed on the `/opt/seek-harness/cua-check`
+COPY (the supervisor's runtime OEM fallback), on `COPY --chmod=0644 office-skills`
+(`DSH_BUNDLED_SKILL_DIR`, including its `pdf-documents/` subdirectory), and on the
+single-file COPYs whose destination directory they create themselves
+(`/opt/office-native`, `/opt/ocr-tools`).
+
+**The fix (no extra capability, no root, read-only rootfs untouched).**
+
+* `RUN install -d -m 0755 /usr/local/share/cua-vm` before the copy;
+* `COPY --chown=1000:1000 --chmod=0644 docker/windows-oem/ …` — files stay data
+  files (0644) and are owned by the runtime uid;
+* `RUN chmod -R a+rX /usr/local/share/cua-vm/windows-oem` — `a+rX` is the exact
+  semantics needed: read for all, execute only where traversal requires it
+  (directories, plus files that already were executable). `COPY` into the tree
+  and this normalisation are what make it correct for subdirectories a future
+  payload file adds;
+* the same three-part treatment for `/opt/seek-harness/cua-check`,
+  `/opt/dsh-office/office-skills`, `/opt/office-native` and `/opt/ocr-tools`;
+* `COPY --chmod=0644 office-skills` also had to lose its directory stamp — the
+  entrypoint exports that tree as `DSH_BUNDLED_SKILL_DIR`, so an untraversable
+  `office-skills/` silently hid the PDF skill.
+
+**The error text was part of the bug.** `oemPayloadDirStatus()` now separates
+"absent" (ENOENT/ENOTDIR) from "denied" (EACCES/EPERM), `oemPayloadDeniedDir()`
+picks the candidate to blame, and `writeOemPayload()` throws
+`oemPayloadDeniedError` — naming the uid, the path, the mode/owner of the first
+entry it *can* describe (walking up past an untraversable parent), the
+`install -d` / `--chown` / `chmod -R a+rX` fix, and the honest no-rebuild
+workaround (a read-only bind mount from a checkout — `chmod` cannot work under
+`read_only: true`) — instead of the pull-a-newer-image advice. `existsSync` is gone from that decision path for exactly this reason.
+
+**Verification.** A uid-1000 proof runs at the end of the stage, so this can never
+ship again:
+
+```dockerfile
+RUN set -eux; for dir in /usr/local/share/cua-vm/windows-oem /opt/seek-harness/cua-check; do
+      setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -x '$dir' && test -r '$dir'" …
+```
+
+It reads all three files in both the runtime path and the fallback tree.
+Replaying the old COPY line through the same RUN reproduces
+`EACCES: /usr/local/share/cua-vm/windows-oem is not traversable by uid 1000 (dir mode 644 root:root)`
+and fails the build; with the fix the same image answers `drwxr-xr-x node node`
+and `writeOemPayload` succeeds as uid 1000 (`OEM payload written (3 files + $OEM$ scripts)`).
+New gate needles (338 → **346** assertions in the checkout, **345** in the flat image tree) pin the `install -d`,
+the `--chown`, the `a+rX` normalisation, the `setpriv` proof and its two failure
+strings; **K6** asserts the EACCES classification exists at all, and
+`tests/modules-unit.mjs` reproduces the defect with a `chmod 0o644` directory
+(root is skipped as NOT RUN, since it bypasses DAC).

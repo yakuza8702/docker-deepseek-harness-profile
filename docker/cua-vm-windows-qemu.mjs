@@ -515,18 +515,36 @@ const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url))
  * A directory is enough — the flat image check tree (`/opt/seek-harness/
  * cua-check/`) keeps the same three files at its root, so the same predicate
  * answers "is this a payload directory?" for both layouts.
+ *
+ * EACCES IS NOT "MISSING". `existsSync` answers false for BOTH, which is how a
+ * permission bug shipped reading like a missing-payload bug: the files were in
+ * the image, but the directory arrived `drw-r--r--` from `COPY --chmod=0644`
+ * (that flag applies to the directories it creates too), so a uid-1000 process
+ * could not traverse it and the user was told to pull a newer image. Anything
+ * other than ENOENT/ENOTDIR is reported as a PERMISSION problem by name.
  */
-export function oemPayloadDir(dir) {
-  if (typeof dir !== 'string' || dir.length === 0) return null
-  return OEM_PAYLOAD_FILES.every((file) => {
+export function oemPayloadDirStatus(dir) {
+  if (typeof dir !== 'string' || dir.length === 0) {
+    return { dir: String(dir ?? ''), ok: false, missing: [], denied: null }
+  }
+  const missing = []
+  for (const file of OEM_PAYLOAD_FILES) {
+    const target = path.join(dir, file)
     try {
-      return existsSync(path.join(dir, file))
-    } catch {
-      return false
+      statSync(target)
+    } catch (error) {
+      const code = error?.code
+      if (code === 'EACCES' || code === 'EPERM') {
+        return { dir, ok: false, missing, denied: { path: target, code, cause: error } }
+      }
+      missing.push(file)
     }
-  })
-    ? dir
-    : null
+  }
+  return { dir, ok: missing.length === 0, missing, denied: null }
+}
+
+export function oemPayloadDir(dir) {
+  return oemPayloadDirStatus(dir).ok ? dir : null
 }
 
 /**
@@ -542,6 +560,20 @@ export function resolveOemSourceDir(candidates) {
 }
 
 /**
+ * The first candidate whose TRAVERSAL was denied (EACCES), or null.
+ *
+ * Used only to choose the error text: a denied directory is an image PERMISSION
+ * defect, and telling that user to rebuild with newer media is wrong advice.
+ */
+export function oemPayloadDeniedDir(candidates) {
+  for (const candidate of candidates) {
+    const status = oemPayloadDirStatus(candidate)
+    if (status.denied !== null) return candidate
+  }
+  return null
+}
+
+/**
  * WHAT THE USER SEES WHEN THE IMAGE HAS NO WINDOWS BACKEND.
  *
  * The old one-liner ("the OEM payload is missing from this image: <path>") named
@@ -549,6 +581,80 @@ export function resolveOemSourceDir(candidates) {
  * image from a broken mount. It is a failure of the IMAGE, not of the computer
  * spec, so the message says so in that order and ends with a command to run.
  */
+/**
+ * THE OTHER IMAGE FAILURE: THE FILES ARE THERE, THE PROCESS MAY NOT READ THEM.
+ *
+ * `COPY --chmod=0644 docker/windows-oem/ <dest>/` applies 0644 to EVERY copied
+ * entry, the destination DIRECTORY included, so a hardened container that runs
+ * as uid 1000 could not traverse it while the files were verifiably in the
+ * pushed layer. The symptom is identical to the missing-payload one (`ls:
+ * Permission denied`, `existsSync === false`), and the old advice — pull a newer
+ * image — is exactly wrong. Say which mode/owner is wrong and what the fix is.
+ */
+export function oemPayloadDeniedError({ sourceDir, denied, deniedDir, fallbackDirs }) {
+  const looked = [sourceDir, ...fallbackDirs].filter(Boolean)
+  const describe = (target) => {
+    try {
+      const s = statSync(target)
+      return `${(s.mode & 0o777).toString(8).padStart(4, '0')} ${s.uid}:${s.gid}`
+    } catch {
+      return null
+    }
+  }
+  // The mode that decides whether the payload is reachable is the DIRECTORY's:
+  // a 0644 directory denies traversal before any file's own mode is consulted,
+  // so `stat`-ing the file itself is the one thing guaranteed to fail here.
+  const dir = deniedDir ?? path.dirname(denied)
+  const dirMode = describe(dir)
+  const fileMode = describe(denied)
+  // Neither the file nor the directory may be stat'ed at all when a PARENT is
+  // the non-traversable one (the same COPY creates /usr/local/share/cua-vm), so
+  // the message walks up to the first ancestor that can still be described.
+  const firstReachable = (() => {
+    let current = dir
+    for (let hop = 0; hop < 4; hop += 1) {
+      const mode = describe(current)
+      if (mode !== null) return { path: current, mode }
+      const parent = path.dirname(current)
+      if (parent === current) break
+      current = parent
+    }
+    return null
+  })()
+  const where = fileMode !== null
+    ? `EACCES on ${denied} (mode/owner: ${fileMode})`
+    : dirMode !== null
+      ? `EACCES traversing ${dir} (dir mode/owner: ${dirMode})`
+      : `EACCES reaching ${denied} — neither the file nor its directory could be opened, so an ANCESTOR is not traversable (last readable: ${firstReachable === null ? 'none' : `${firstReachable.path} ${firstReachable.mode}`})`
+  return Object.assign(new Error([
+    `the Windows OEM payload is present but NOT READABLE by uid ${typeof process.getuid === 'function' ? process.getuid() : '?'} — ${where}`,
+    `(searched ${looked.join(' or ')})`,
+    '',
+    'This is an IMAGE PERMISSIONS defect, not a missing payload and not a computer setting.',
+    'A directory needs its execute bit to be traversed, and `COPY --chmod=0644` sets 0644 on',
+    'the directories it CREATES as well as on the files, which leaves',
+    '`/usr/local/share/cua-vm/windows-oem` as `drw-r--r--` — the three files are in the image',
+    'and no non-root process can open them.',
+    '',
+    'FIXED IN THE IMAGE by creating the parent 0755, copying as the runtime uid, and',
+    'normalising the copied directory modes afterwards:',
+    '  RUN install -d -m 0755 /usr/local/share/cua-vm',
+    '  COPY --chown=1000:1000 --chmod=0644 docker/windows-oem/ /usr/local/share/cua-vm/windows-oem/',
+    '  RUN chmod -R a+rX /usr/local/share/cua-vm/windows-oem',
+    'Pull or rebuild an image that carries it, then recreate the container:',
+    '  docker compose -f compose.windows.yaml up -d --force-recreate',
+    '',
+    'To work around it without rebuilding (the rootfs is read_only, so `chmod` inside the',
+    'container answers "Read-only file system"), shadow the directory with a read-only mount',
+    'from a checkout — the mount\'s own modes replace the image\'s:',
+    '  # compose override',
+    '  volumes: [./docker/windows-oem:/usr/local/share/cua-vm/windows-oem:ro]',
+    '  docker compose -f compose.yaml -f compose.windows.yaml up -d',
+    'then verify as the runtime user:',
+    '  docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/',
+  ].join('\n')), { code: 'EACCES', deniedPath: denied, deniedDir: dir })
+}
+
 export function oemPayloadMissingError({ sourceDir, fallbackDirs }) {
   const looked = [sourceDir, ...fallbackDirs].filter(Boolean)
   return new Error([
@@ -608,7 +714,17 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
   const files = OEM_PAYLOAD_FILES
   const candidates = [sourceDir, ...fallbackDirs, path.join(MODULE_DIR, 'windows-oem'), path.resolve(MODULE_DIR, '..', 'docker', 'windows-oem')]
   const resolved = resolveOemSourceDir(candidates)
-  if (resolved === null) throw oemPayloadMissingError({ sourceDir, fallbackDirs })
+  if (resolved === null) {
+    // EACCES before ENOENT: a denied directory is an image permission defect and
+    // must not be reported as "the payload is missing" (they were the same
+    // symptom for `existsSync`, and the wrong advice sent users to re-pull).
+    const deniedDir = oemPayloadDeniedDir(candidates)
+    if (deniedDir !== null) {
+      const deniedPath = oemPayloadDirStatus(deniedDir).denied?.path ?? deniedDir
+      throw oemPayloadDeniedError({ sourceDir, denied: deniedPath, deniedDir, fallbackDirs })
+    }
+    throw oemPayloadMissingError({ sourceDir, fallbackDirs })
+  }
   if (path.resolve(resolved) !== path.resolve(sourceDir)) {
     log(`windows: OEM payload not found at ${sourceDir}; using the copy at ${resolved}`)
   }
