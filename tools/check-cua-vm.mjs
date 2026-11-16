@@ -337,6 +337,25 @@ const NEEDLES = {
     // R3: the boot/timer paths cannot die on a corrupt registry.
     ['windows: install watches were NOT resumed', 1],
     ['idle: registry unreadable', 1],
+    // F1/F2: QEMU'S STDERR REACHES THE ROW, THE LOG AND THE ERROR — and the
+    // early-death watchdog flips the row to `error` on its FIRST short tick
+    // instead of waiting out the 60-minute install timeout.
+    ['function windowsQemuStderrTail(name, lines = 20)', 1],
+    ['function windowsEarlyDeathWindowMs()', 1],
+    ["DSH_CUA_WINDOWS_EARLY_CHECK_MS", 1],
+    ['first ? windowsEarlyDeathWindowMs() : 15000', 1],
+    ["const errorText = `${why}", 1],
+    ['the Windows computer did not start:', 1],
+    ['row.errorLog = errorLog', 1],
+    ['died before it could install', 1],
+    ['const stderrTail = windowsQemuStderrTail(name, 20)', 2],
+    ['row.errorLog = stderrTail.slice(-4000)', 1],
+    // F3: the row records the degraded display, and the create answer carries it.
+    ['const gpuFallback = booted?.gpuFallback === true', 1],
+    ['virgl: gpuFallback ? false : virgl,', 1],
+    // F4: a row that never got an install sentence still answers with one.
+    ['the last start attempt did not reach a guest', 1],
+    ['meta.state === \'error\' && typeof meta.error === \'string\'', 1],
     // B1: THE ROW STORES THE REQUESTED SPEC. `vmCreate` (the panel's path, not
     // `vmWindowsCreate`) used to lose the "was this given?" flags, so a Windows
     // create read "nothing was given" and wrote 64 GB / 6 GB over a 20 GB / 4 GB
@@ -523,6 +542,46 @@ const NEEDLES = {
     // M8: virgl when the build has it, plain virtio-gpu otherwise.
     ['virtio-gpu-gl-pci', 1],
     ['egl-headless,rendernode=', 1],
+    // F1: QEMU'S OWN STDERR IS CAPTURED. `-serial file:` is the GUEST console;
+    // a QEMU that dies during init explains itself on stderr, which used to be
+    // `stdio: 'ignore'` — the user's dead create then left no diagnosis on the
+    // host at all. The fd goes to the child, and the path is a store file.
+    ["qemuStderr: path.join(dir, 'qemu-stderr.log')", 1],
+    ["const stderrFd = openSync(stderrFile, 'w')", 1],
+    ["spawn(WINDOWS_QEMU, argv, { stdio: ['ignore', stderrFd, stderrFd], detached: true })", 1],
+    ['export function qemuStderrExcerpt(stderr, lines = 20)', 1],
+    ['export function qemuStderrReason(stderr)', 1],
+    // F2: A DEAD INIT IS A FAILED START, DECIDED INSIDE THE SHORT WINDOW.
+    ['export async function waitForQemuBoot({ child, pidFile, isAlive, windowMs = 15000, pollMs = 50 } = {})', 1],
+    ['export function qemuBootWindowMs()', 1],
+    ["DSH_CUA_WINDOWS_BOOT_SETTLE_MS", 1],
+    ["if (pid > 0) {", 1],
+    ["reason: pidFileInvalid ? 'pidfile-invalid' : 'timeout'", 1],
+    ['export function qemuInitError(', 1],
+    ["code: 'QEMU_INIT_FAILED'", 1],
+    // F3: THE DISPLAY MAY DEGRADE; THE ACCELERATOR MAY NOT. The retry is the
+    // gpu:false argv shape (plain VGA + -display none), it happens ONCE, and
+    // the warning is a row-carried object with a stable code.
+    ['export function classifyQemuInitFailure(stderr)', 1],
+    ['hardware acceleration is not supported', 1],
+    ["const canFallback = allowGpuFallback && first.display !== 'none' && kind !== 'kvm' && kind !== 'none'", 1],
+    ['await attempt({ ...spec, gpu: false, virgl: false }', 1],
+    ["code: 'gpu-fallback'", 1],
+    ['virgl/EGL display unavailable on this host', 1],
+    ['emulated VGA/WARP', 1],
+    ['gpuFallback: true', 1],
+    // The retry needs a LIVE TPM: the cleanup stopped swtpm when the first QEMU
+    // exited, so a retry without restarting it dies on "Failed to connect to
+    // socket" — a second failure that would look like the fallback itself.
+    ['swtpm did not restart for the GPU-less retry', 1],
+    // The watchdog asks the CHILD whether it exited, so "pidfile not written
+    // YET" is never mistaken for "never".
+    ['function childState(name)', 1],
+    // F4: THE SENTENCE HAS TWO HONEST HEADLINES AND NO RAW FIELD.
+    ['export function formatWindowsInstallDetail(', 1],
+    ['QEMU not alive (see qemu-stderr.log tail)', 1],
+    ['waiting for SSH on 127.0.0.1:', 1],
+    ["return text.replace(/\\bundefined\\b/gu, 'unknown')", 1],
     // B2: the readiness probe resolves the ROW's port shape, and QMP has three
     // named states instead of an empty string that the panel read as "not
     // running". A live install must never be reported as dead.
@@ -814,6 +873,16 @@ const FORBIDDEN = [
     reason: 'the doctor derived "usable" from the mode STRING, so a device uid 1000 cannot open read as usable; kvmDoctorFacts reports the probe\'s own observation'
   },
   {
+    key: 'windows',
+    pattern: "stdio: 'ignore', detached: true })\n      children.set(`qemu:",
+    reason: 'QEMU stderr must go to $STORE/windows/<name>/qemu-stderr.log: `stdio: ignore` discarded the only diagnosis an init failure produces (the reported dead create left nothing on the host)'
+  },
+  {
+    key: 'supervisor',
+    pattern: "${verdict.endpoint === 'none' ? 'no SSH yet' : `${verdict.endpoint} answering`}",
+    reason: 'the raw endpoint interpolated as "undefined answering": the progress sentence is built by formatWindowsInstallDetail, which never prints a raw field'
+  },
+  {
     key: 'supervisor',
     pattern: 'does not fit the VM store quota',
     reason: 'the create-time quota counts REAL bytes: a sparse virtual disk is never refused, it carries a disk-over-policy warning (the offending sentence refused every Windows create on a 15 GB policy)'
@@ -979,7 +1048,9 @@ function sourceOf(label, name) {
   // open). It is a statement about the CHECKOUT: the image does not ship tests/
   // (and must not pay for them in a layer), so in the flat layout this assertion
   // is out of scope and says so out loud — it is never silently dropped.
-  const suite = ['supervisor-smoke.mjs', 'modules-unit.mjs', 'qmp-shutdown.mjs']
+  // F1/F2/F3/F4: the boot path has its own suite now (stub QEMU: a dead init, an
+  // EGL failure that must degrade once, the watchdog and the sentence).
+  const suite = ['supervisor-smoke.mjs', 'modules-unit.mjs', 'qmp-shutdown.mjs', 'windows-boot.mjs']
   if (!REPO_LAYOUT) {
     if (!quietMode) console.log('  n/a  L5 the runtime suite lives in the checkout, not in the flat image check tree')
   } else {
@@ -988,7 +1059,7 @@ function sourceOf(label, name) {
       if (!quietMode) console.log('  ok   L5 the runtime suite is committed under tests/')
     } else {
       failures += 1
-      missing.push('tests/: supervisor-smoke.mjs, modules-unit.mjs and qmp-shutdown.mjs must be committed')
+      missing.push('tests/: supervisor-smoke.mjs, modules-unit.mjs, qmp-shutdown.mjs and windows-boot.mjs must be committed')
       console.log('  FAIL L5 runtime suite')
     }
   }

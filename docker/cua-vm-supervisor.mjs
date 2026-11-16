@@ -59,7 +59,8 @@ import {
   WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
   WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
-  windowsKvmPreflight, windowsPortsOf, windowsTailLines, formatWindowsInstallDetail, windowsReadinessSignals
+  windowsKvmPreflight, windowsPortsOf, windowsTailLines, formatWindowsInstallDetail, windowsReadinessSignals,
+  qemuStderrExcerpt, qemuStderrReason
 } from './cua-vm-windows-qemu.mjs'
 import { kvmDoctorFacts, kvmPreflightError, kvmStatus } from './cua-vm-kvm.mjs'
 
@@ -2988,6 +2989,23 @@ function windowsLogTail(name, lines = 40) {
 }
 
 /**
+ * QEMU'S OWN STDERR TAIL — the half of the story `windowsLogTail` cannot tell.
+ *
+ * `serial.log` is the GUEST console. A QEMU that dies during init (a display
+ * backend this host cannot provide, a firmware file it cannot open) says so on
+ * its OWN stderr, which now goes to `$STORE/windows/<name>/qemu-stderr.log`.
+ * This is the reader every failure path (and the panel's errorLog) uses, so the
+ * discarded diagnosis the user reported can never happen again.
+ */
+function windowsQemuStderrTail(name, lines = 20) {
+  try {
+    return qemuStderrExcerpt(readFileSync(windowsPaths(STORE, name).qemuStderr, 'utf8'), lines)
+  } catch {
+    return ''
+  }
+}
+
+/**
  * The cheap progress tail the PANEL reads: the last handful of non-empty serial
  * lines. `windowsLogTail` with a small number is one bounded read of the tail
  * region — not a full-file read, and never a second process.
@@ -3006,14 +3024,32 @@ const WINDOWS_WATCHING = new Set()
  * elapsed time and the last serial lines while it installs, so the panel can
  * show progress without a second call.
  */
+/**
+ * F2: HOW LONG THE FIRST TICK WAITS BEFORE IT DEMANDS A PIDFILE.
+ *
+ * The user's create died during QEMU's init: the supervisor logged "qemu started
+ * (pid 906, installing)" and then watched a dead computer for the FULL 60-minute
+ * install timeout, only to flip to `error` with an empty serial tail. boot() now
+ * refuses to return a dead start, but a QEMU can also die a second later (OOM,
+ * a disk that filled up) — so the watcher's FIRST tick happens inside a short
+ * window and treats "no pidfile / no live pid" as DEATH, not as progress.
+ */
+function windowsEarlyDeathWindowMs() {
+  const raw = Number(process.env.DSH_CUA_WINDOWS_EARLY_CHECK_MS ?? '')
+  if (Number.isFinite(raw) && raw >= 0) return Math.min(60000, Math.max(0, Math.trunc(raw)))
+  return 5000
+}
+
 function watchWindowsInstall(name) {
   assertVmName(name)
   if (WINDOWS_WATCHING.has(name)) return
   WINDOWS_WATCHING.add(name)
   void (async () => {
     try {
+      let first = true
       for (;;) {
-        await new Promise((resolve) => setTimeout(resolve, 15000))
+        await new Promise((resolve) => setTimeout(resolve, first ? windowsEarlyDeathWindowMs() : 15000))
+        first = false
         // THE TICK BELONGS INSIDE THE LOCK. This loop used to write the row from
         // outside it, so a tick that started before a shutdown could land after
         // it and clobber `powered-off` with `installing` (and the same for
@@ -3033,6 +3069,57 @@ function watchWindowsInstall(name) {
             verdict = await windowsBackend.ready(meta, { ssh: meta.ssh !== false, phase: 'install' })
           } catch (error) {
             verdict = { ready: false, endpoint: 'none', alive: false, qmp: 'not answering', error: error?.message ?? String(error) }
+          }
+          // THE PORT THE SENTENCE NAMES comes from the ROW (the only place it is
+          // authoritative after a reconcile); the formatter reads it from the
+          // verdict so its call site stays one expression.
+          verdict = { ...verdict, sshPort: Number(meta.ports?.ssh ?? 0) }
+          // F2: A DEAD QEMU IS AN ERROR NOW, NOT A 60-MINUTE INSTALL.
+          //
+          // Everything the reported failure looked like from the outside is
+          // checked here, and the FIRST tick is the important one: a start whose
+          // pidfile never appeared (or whose pid is already gone) has no guest,
+          // no serial output and no future — waiting for the timeout just delays
+          // the same answer by an hour. The captured QEMU stderr is attached, so
+          // the row explains itself without anyone reading the host.
+          if (verdict.alive !== true && verdict.ready !== true) {
+            // "alive: false" during an install means the QEMU process is gone —
+            // it is never a transient state of a healthy guest, because the
+            // pidfile is written before the guest runs. The ONLY question left is
+            // whether it died at init (no pidfile/pid) or exited later (a clean
+            // shutdown would have been a state change, and a guest that dies
+            // mid-install is a failure either way).
+            const pid = windowsBackend.qemuPid(name)
+            const pidFileExists = existsSync(windowsPaths(STORE, name).qemuPid)
+            // A MISSING PIDFILE IS NOT PROOF OF DEATH when the child we spawned
+            // has not exited: QEMU writes the pidfile during its init, and a
+            // watchdog that cannot tell "not yet" from "never" would flip a
+            // healthy start to error. The child's own exit state settles it.
+            const child = windowsBackend.childState(name)
+            const notYet = !pidFileExists && child.known && child.exited !== true
+            const exitedEarly = !notYet && (!pidFileExists || !windowsBackend.pidAlive(pid))
+            if (exitedEarly) {
+              const stderrTail = windowsQemuStderrTail(name, 20)
+              const serialTail = windowsLogTail(name, 40)
+              const why = pidFileExists
+                ? `QEMU (pid ${pid}) is gone`
+                : 'QEMU exited during init before writing its pidfile'
+              const errorText = `${why}${stderrTail === '' ? '; it wrote nothing to qemu-stderr.log (killed or could not exec)' : ''}`
+              const errorLog = stderrTail === ''
+                ? (serialTail === '' ? '(no QEMU stderr and an empty serial log: the guest never spoke)' : serialTail.slice(-4000))
+                : stderrTail.slice(-4000)
+              await mutateRegistry((fresh) => {
+                const row = fresh.vms[name]
+                if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
+                row.state = 'error'
+                row.error = `the Windows computer did not start: ${errorText}`
+                row.errorLog = errorLog
+                row.installDetail = `error: ${errorText} (see $STORE/windows/${name}/qemu-stderr.log)`
+              })
+              log(`windows: ${name} died before it could install: ${errorText}`)
+              if (stderrTail !== '') log(`windows: ${name} qemu-stderr.log tail:\n${stderrTail}`)
+              return { stop: true, died: true }
+            }
           }
           if (verdict.ready) {
             await mutateRegistry((fresh) => {
@@ -3084,6 +3171,7 @@ function watchWindowsInstall(name) {
           if (decision.ready) await ensureWindowsConsoleRelay(name)
           if (decision.reason !== undefined) log(`windows: install watch for ${name} stopped (${decision.reason})`)
           if (decision.ready) log(`windows: ${name} ready`)
+          if (decision.died) log(`windows: install watch for ${name} ended: QEMU died (the row is 'error' with the captured stderr)`)
           return
         }
       }
@@ -3264,7 +3352,18 @@ async function windowsCreateManaged(spec) {
     // capability probe the Linux guest uses, plus a render node.
     const virgl = spec.gpu === true && systemQemuSupportsVirgl() && existsSync('/dev/dri/renderD128')
     qemuSpec.virgl = virgl
+    // F3: THE BOOT MAY COME BACK DEGRADED. A host whose EGL/render-node path
+    // cannot initialize retries ONCE with `-display none` + VGA and reports a
+    // `gpu-fallback` warning; the row must then describe the computer that
+    // actually runs (no virgl, no accelerated display) and keep the warning, so
+    // the panel, the create answer and cua_vm_doctor agree.
     booted = await windowsBackend.boot(qemuSpec, { installPending: true })
+    const gpuFallback = booted?.gpuFallback === true
+    if (gpuFallback) {
+      for (const warning of booted.warnings ?? []) {
+        if (!warnings.some((existing) => existing.code === warning.code)) warnings.push(warning)
+      }
+    }
     const row = {
       workspace: spec.workspace,
       kind: 'windows',
@@ -3275,8 +3374,11 @@ async function windowsCreateManaged(spec) {
       ports: portTriple,
       ssh: true,
       qemu: WINDOWS_QEMU,
+      // THE REQUESTED GPU FLAG, and whether the running display is the virgl
+      // one. After a `gpu-fallback` retry the answer must not claim virgl.
       gpu: spec.gpu,
-      virgl,
+      virgl: gpuFallback ? false : virgl,
+      ...(gpuFallback ? { gpuFallback: true } : {}),
       android: false,
       rea: false,
       diskGb,
@@ -3292,7 +3394,7 @@ async function windowsCreateManaged(spec) {
       // B3: the first sentence already names what is watched and how the user
       // will know it finished (the same formatter the watcher uses, with an
       // empty tail because Setup has not printed yet).
-      installDetail: formatWindowsInstallDetail({ phase: 'install', verdict: { endpoint: 'none', qmp: 'starting' }, elapsedMinutes: 0, serialTail: '' }),
+      installDetail: formatWindowsInstallDetail({ phase: 'install', verdict: { endpoint: 'none', qmp: 'starting' }, elapsedMinutes: 0, serialTail: '', sshPort: portTriple.ssh }),
       serialTail: [],
       readiness: windowsReadinessSignals(spec.name)
     }
@@ -3680,12 +3782,18 @@ async function windowsStart(name, meta) {
         sshPort: reconciled.ports.ssh
       }, { installPending })
     } catch (error) {
+      // THE CAPTURED STDERR BELONGS ON THE ROW, not only in the exception: the
+      // panel renders `errorLog`, and a start that died at init is exactly the
+      // case where the log is the whole story.
+      const stderrTail = windowsQemuStderrTail(name, 20)
       await mutateRegistry((fresh) => {
         const row = fresh.vms[name]
         if (!row) return
         row.state = 'error'
         row.error = `could not start the Windows computer: ${error?.message ?? error}`
+        if (stderrTail !== '') row.errorLog = stderrTail.slice(-4000)
       })
+      if (stderrTail !== '') log(`windows: ${name} qemu-stderr.log tail:\n${stderrTail}`)
       // `portsChanged` is diagnostic gold: a failed boot that also moved the
       // port triple is a different bug from one that kept it.
       return fail(`could not start ${name}: ${error?.message ?? error}`, { ports: reconciled.ports, portsChanged: reconciled.changed })
@@ -3693,6 +3801,9 @@ async function windowsStart(name, meta) {
     // H5: PROVE IT IS RUNNING BEFORE TRUSTING IT. The old code deleted
     // `restoreFrom` and reported a state captured BEFORE the boot, so a QEMU
     // that died on a bad argv looked started and lost its restore point.
+    // F2: the pidfile + a live pid are part of that proof — `probe()` alone asks
+    // QMP, and a QEMU that exits between spawn and the first probe answers
+    // nothing, which used to read as "still booting".
     let running = false
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const state = await windowsBackend.probe({ ...current, ports: reconciled.ports })
@@ -3700,6 +3811,7 @@ async function windowsStart(name, meta) {
       if (!state.alive && attempt > 2) break
       await new Promise((resolve) => setTimeout(resolve, 500))
     }
+    const earlyStderr = running ? '' : windowsQemuStderrTail(name, 20)
     const bootState = !running ? 'error' : (installPending ? 'installing' : 'booting')
     await mutateRegistry((fresh) => {
       const row = fresh.vms[name]
@@ -3713,7 +3825,8 @@ async function windowsStart(name, meta) {
         delete row.mayBeTorn
         row.installDetail = installPending ? 'Windows Setup is running' : 'the guest is booting'
       } else {
-        row.error = 'QEMU started but did not reach `running` (see its serial log)'
+        row.error = 'QEMU started but did not reach `running` (see its serial log and qemu-stderr.log)'
+        if (earlyStderr !== '') row.errorLog = earlyStderr.slice(-4000)
       }
     })
     if (!running) {
@@ -4411,8 +4524,16 @@ const handlers = {
     const installDetail = state === 'ready'
       ? `ready (${endpointLabel(ready)} accepting, QMP ${qmpStateLabel(verdict)})`
       : showInstall
-        ? `${formatWindowsInstallDetail({ phase: 'install', verdict: { ...verdict, endpoint: ready.endpoint }, elapsedMinutes, serialTail })}${stuck ? ' No QEMU process is running for this row: the install is stuck — Force delete removes it.' : ''}`
-        : meta.installDetail
+        ? `${formatWindowsInstallDetail({ phase: 'install', verdict: { ...verdict, endpoint: ready.endpoint }, elapsedMinutes, serialTail, sshPort: meta.ports?.ssh ?? 0 })}${stuck ? ' No QEMU process is running for this row: the install is stuck — Force delete removes it.' : ''}`
+        // F4: A FINISHED (OR FAILED) ROW STILL GETS A SENTENCE. `meta.installDetail`
+        // is the LAST install sentence, and a row that never got one (a start
+        // that died before the first watcher tick) used to answer `undefined` —
+        // the same blank the user reported, one state later.
+        : (typeof meta.installDetail === 'string' && meta.installDetail.trim() !== ''
+            ? meta.installDetail
+            : meta.state === 'error' && typeof meta.error === 'string'
+              ? `error: ${meta.error}`
+              : `not running (${meta.state}): the last start attempt did not reach a guest, so there is no install progress to show`)
     // THE SENTENCE GOES BACK TO THE ROW, not just into this answer: the list the
     // panel renders comes from `state.vms`, so a status poll is also what keeps
     // the row's progress picture fresh between watcher ticks (the watcher runs

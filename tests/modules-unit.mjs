@@ -543,6 +543,31 @@ check('windowsKvmPreflight is the shared module (no second message)',
     windowsTailLines('a\n\nb\nc\nd\ne\nf\n', 5).join(',') === 'b,c,d,e,f'
     && windowsTailLines('   \n\n', 5).length === 0)
 
+  // ---- F4: THE FORMATTER'S TWO HONEST HEADLINES ----
+  // `ready()` early-returns WITHOUT an endpoint when the QEMU process is not
+  // alive, and the reported panel line interpolated that missing field:
+  // "installing (N min): undefined answering, QMP not running". Neither half of
+  // that sentence may come back.
+  const deadLine = formatWindowsInstallDetail({
+    phase: 'install',
+    verdict: { alive: false, status: '', qmp: 'no qemu', endpoint: undefined },
+    elapsedMinutes: 4,
+    serialTail: ''
+  })
+  check('a dead QEMU gets its own headline (never "undefined answering")',
+    !/undefined/u.test(deadLine) && /QEMU not alive/u.test(deadLine) && /qemu-stderr\.log/u.test(deadLine), deadLine.slice(0, 160))
+  const waitingLine = formatWindowsInstallDetail({
+    phase: 'install',
+    verdict: { alive: true, status: 'running', qmp: 'running', endpoint: 'none', sshPort: 47444 },
+    elapsedMinutes: 6,
+    serialTail: '  12%'
+  })
+  check('an ALIVE guest with no endpoint yet says it is waiting for SSH on the port',
+    !/undefined/u.test(waitingLine) && /waiting for SSH on 127\.0\.0\.1:47444/u.test(waitingLine),
+    waitingLine.slice(0, 200))
+  check('...and still carries the serial tail',
+    /12%/u.test(waitingLine), waitingLine.slice(-60))
+
   // ---- B2: THE ROW AND THE BOOT SPEC SHARE ONE PORT RESOLVER ----
   // The registry row stores `ports: { qmp, ssh, vnc }`; `buildQemuArgs` reads
   // flat fields. Resolving the row's shape to `undefined` is what made every

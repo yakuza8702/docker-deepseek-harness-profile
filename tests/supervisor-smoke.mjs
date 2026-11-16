@@ -163,11 +163,60 @@ writeFileSync(SSH_KEYGEN_STUB, [
 ].join('\n'))
 chmodSync(SSH_KEYGEN_STUB, 0o755)
 const STUB_BIN = path.dirname(QEMU_IMG_STUB)
-// The supervisor spawns this and only needs a pid; it exits at once, which is
-// exactly the "install died" case the state machine has to survive.
+/**
+ * THE WINDOWS QEMU STUB, AND THE THREE STARTS IT CAN SIMULATE.
+ *
+ * It parses the argv it was handed (`-pidfile`, `-display`) and records it, so
+ * the suite can assert WHICH command line produced which outcome — that is how
+ * the GPU fallback is proved to retry with `-display none` rather than merely
+ * printing a warning.
+ *
+ *   (no marker)                 write the pidfile, then stay alive: a start that
+ *                               came up (QMP is never served, so readiness stays
+ *                               false — exactly a machine mid-install)
+ *   $STORE/stub-qemu-die        print a QEMU-style init error and exit WITHOUT a
+ *                               pidfile: the reported "died during init" start
+ *   $STORE/stub-qemu-egl        fail ONLY on `-display egl-headless...`, succeed
+ *                               without it: the EGL/render-node host
+ *   $STORE/stub-qemu-die-late   write the pidfile, print an stderr line, exit a
+ *                               moment later: a start that passes boot() and
+ *                               dies under the INSTALL WATCHDOG
+ */
 const FAKE_QEMU = path.join(STUB_BIN, 'qemu-system-x86_64')
-writeFileSync(FAKE_QEMU, '#!/bin/sh\nexit 0\n')
-chmodSync(FAKE_QEMU, 0o755)
+writeFileSync(FAKE_QEMU, `#!/bin/sh
+PIDFILE=""
+DISPLAY=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    -pidfile) PIDFILE="$a" ;;
+    -display) DISPLAY="$a" ;;
+  esac
+  prev="$a"
+done
+printf '%s\\n' "$*" >> "${STUB_BIN}/qemu-argv.log"
+if [ -f "${STORE}/stub-qemu-die" ]; then
+  echo "qemu-system-x86_64: -machine q35,accel=kvm: cannot access memory" >&2
+  echo "qemu-system-x86_64: kvm_init_vcpu: failed to initialize vcpu" >&2
+  exit 1
+fi
+case "$DISPLAY" in
+  egl-headless*)
+    if [ -f "${STORE}/stub-qemu-egl" ]; then
+      echo "qemu-system-x86_64: egl: no drm render node available" >&2
+      echo "qemu-system-x86_64: egl: render node init failed" >&2
+      exit 1
+    fi
+    ;;
+esac
+if [ -n "$PIDFILE" ]; then printf '%s\\n' "$$" > "$PIDFILE"; fi
+if [ -f "${STORE}/stub-qemu-die-late" ]; then
+  echo "qemu-system-x86_64: qemu: could not open disk image: No space left on device" >&2
+  sleep 0.4
+  exit 1
+fi
+exec sleep 120
+`, { mode: 0o755 })
 
 const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')], {
   env: {
@@ -187,6 +236,11 @@ const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervi
     DSH_CUA_WINDOWS_QEMU: path.join(STUB_BIN, 'qemu-system-x86_64'),
     PATH: `${STUB_BIN}:${process.env.PATH ?? ''}`,
     DSH_CUA_VM_WINDOWS: '1',
+    // SHORT WINDOWS: the same code runs, without the suite paying 15 s + 5 s per
+    // case. The numbers are the production defaults in `qemuBootWindowMs` /
+    // `windowsEarlyDeathWindowMs`; only the DURATION is overridden here.
+    DSH_CUA_WINDOWS_BOOT_SETTLE_MS: '2000',
+    DSH_CUA_WINDOWS_EARLY_CHECK_MS: '600',
     PNG_SOURCE
   },
   stdio: ['ignore', 'pipe', 'pipe']
@@ -717,6 +771,58 @@ try {
       && !existsSync(stuckDir), `complete=${forced.complete} dir=${existsSync(stuckDir)}`)
     check('the ports it owned are no longer reserved by its row',
       (JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[stuckName]?.ports ?? null) === null)
+  }
+
+  // ---- F1/F2: A DEAD QEMU IS AN ERROR NOW, WITH ITS OWN STDERR ----
+  // The user's create "win-test" died inside QEMU's init: the supervisor logged
+  // "qemu started (pid 906, installing)", the serial log stayed 0 bytes, the
+  // pidfile was never written, and the row sat at "installing" for the whole
+  // 60-minute timeout before flipping to `error` with an empty tail. QEMU's own
+  // diagnosis went to /dev/null, so nothing on the host explained it.
+  {
+    // (a) A CREATE THAT DIES AT INIT: answered as a failure, with the captured
+    // stderr inline — and no row, so nothing waits for a computer that is not
+    // there. The stub QEMU prints a KVM-style init error and exits before
+    // writing its pidfile.
+    writeFileSync(path.join(STORE, 'stub-qemu-die'), '1')
+    const died = await call({ op: 'vmWindowsCreate', name: 'ws-win-die', kind: 'windows', windowsIso: 'iso/tiny.iso' })
+    check('a create whose QEMU dies at init FAILS instead of reporting "installing"',
+      died.ok === false, JSON.stringify(died).slice(0, 200))
+    check('F1: the failure carries QEMU\'s own stderr lines',
+      /cannot access memory|kvm_init_vcpu/u.test(died.error ?? ''), String(died.error).split('\n').slice(0, 2).join(' / '))
+    check('F1: ...and names qemu-stderr.log as the place to look',
+      /qemu-stderr\.log/u.test(died.error ?? ''), String(died.error).slice(0, 160))
+    check('F2: no row is left behind for a QEMU that never started',
+      JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms['ws-win-die'] === undefined)
+    rmSync(path.join(STORE, 'stub-qemu-die'), { force: true })
+
+    // (b) A START THAT PASSES boot() AND DIES A MOMENT LATER: the row must carry
+    // the stderr excerpt, not "did not reach running (see its serial log)".
+    const lateName = 'ws-win-late'
+    const lateDir = path.join(STORE, 'windows', lateName)
+    mkdirSync(lateDir, { recursive: true })
+    writeFileSync(path.join(lateDir, 'disk.qcow2'), 'a Windows disk')
+    writeFileSync(path.join(lateDir, 'serial.log'), '')
+    const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    reg.vms[lateName] = {
+      workspace: '/workspace', kind: 'windows', backend: 'qemu', state: 'powered-off',
+      ports: { qmp: 46903, ssh: 47903, vnc: 5903 }, diskGb: 20, cpu: 2, memory: 4,
+      isoPath: path.join(STORE, 'iso', 'tiny.iso'), installComplete: false,
+      createdAt: new Date().toISOString()
+    }
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(reg, null, 2)}\n`)
+    writeFileSync(path.join(STORE, 'stub-qemu-die-late'), '1')
+    const lateStart = await call({ op: 'vmStart', name: lateName })
+    rmSync(path.join(STORE, 'stub-qemu-die-late'), { force: true })
+    const lateRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[lateName]
+    check('a start whose QEMU dies immediately ends in state error, not booting',
+      lateStart.ok === false && lateRow?.state === 'error', `${lateStart.ok} ${lateRow?.state}`)
+    check('F1: the row keeps the captured QEMU stderr for the panel',
+      /No space left on device/u.test(lateRow?.errorLog ?? ''), String(lateRow?.errorLog).slice(0, 120))
+    const lateStatus = await call({ op: 'vmWindowsStatus', name: lateName })
+    check('F4: the status sentence of a dead row is not blank and not "undefined"',
+      typeof lateStatus.installDetail === 'string' && !/undefined/u.test(lateStatus.installDetail), String(lateStatus.installDetail).slice(0, 120))
+    await call({ op: 'vmDelete', name: lateName, force: true })
   }
 
   // ---- Z1/Z2: a cold start keeps a free port triple, and the claim is released ----

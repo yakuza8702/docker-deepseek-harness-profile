@@ -968,3 +968,86 @@ the `--chown`, the `a+rX` normalisation, the `setpriv` proof and its two failure
 strings; **K6** asserts the EACCES classification exists at all, and
 `tests/modules-unit.mjs` reproduces the defect with a `chmod 0o644` directory
 (root is skipped as NOT RUN, since it bypasses DAC).
+
+## 16. Branch `cua-vm-improve` — a Windows create that dies must say why
+
+**The report (live, read-only forensics on the user's container).** A
+`cua_vm_create` with `kvm: true, cpu: 4, memory: 8, diskGb: 40` for
+`kind: "windows"` produced a row that never moved: `supervisor.log` ended at
+`windows: win-test qemu started (pid 906, installing)`, pid 906 was gone,
+`$STORE/windows/win-test/serial.log` was **0 bytes**, `disk.qcow2` stayed a
+193 KiB empty header for 21+ minutes, `qemu.pid` was **never written** and
+`swtpm.log` said `Data client disconnected` ~60 ms after the serial device was
+opened. The row then sat at `installing (N min): undefined answering, QMP not
+running` — a sentence that was wrong **twice** — for the full 60-minute timeout
+and flipped to `error` with an empty serial tail.
+
+**Why nothing on the host explained it.** Two independent bugs and one
+misleading reporter:
+
+1. **QEMU's stderr went to `/dev/null`.** `spawn(WINDOWS_QEMU, argv, { stdio:
+   'ignore' })` — and `-serial file:` records the **guest** console, not QEMU.
+   A QEMU that rejects its own argv (an unusable `-display egl-headless,
+   rendernode=…`, a `/dev/kvm` this uid cannot open, a missing firmware file)
+   explains itself on **stderr**, so the diagnosis was discarded at the source.
+2. **"spawn returned a pid" was treated as "it is installing".** `boot()`
+   returned `{ pid }` and the watcher waited 15 s at a time for 60 minutes,
+   never asking whether the pidfile QEMU writes **after init** existed.
+3. **The progress formatter interpolated a raw field.** `ready()` early-returns
+   `{ ready: false, phase, ...state }` — **without** `endpoint` — when
+   `state.alive` is false, and the watch loop printed
+   ``${verdict.endpoint} answering`` → `undefined answering`; `status: ''`
+   became `QMP not running` through `||`.
+
+**The fixes.**
+
+* **F1 — capture.** `qemu-stderr.log` (and `qemu-stderr-retry.log` for the
+  degraded retry) under `$STORE/windows/<name>/`, opened per attempt with
+  `openSync(…, 'w')` and handed to the child as **both** stdout and stderr. Every
+  failure path (create, start, watchdog) puts the last ~20 lines into the row
+  (`error`/`errorLog`), the supervisor log and the thrown error, and names the
+  file.
+* **F2 — a short boot window, then the truth.** `waitForQemuBoot()` requires the
+  **pidfile** to exist *and* its pid to be alive within `qemuBootWindowMs()`
+  (15 s, `DSH_CUA_WINDOWS_BOOT_SETTLE_MS` for tests), resolving **early** when
+  the child exits. `boot()` now **throws** `QEMU_INIT_FAILED` for a dead init
+  instead of returning a pid. The install watcher takes its **first** tick after
+  `windowsEarlyDeathWindowMs()` (5 s) and flips the row to `state: 'error'` with
+  the captured stderr immediately — no 60-minute wait. It distinguishes "not yet"
+  from "never" via the child's own exit state (`childState`), so a QEMU that has
+  not written its pidfile yet is not declared dead.
+* **F3 — the display may degrade, the accelerator may not.** A start that fails
+  with an EGL/render-node/virgl error retries **once** with the `gpu: false` argv
+  shape (`-display none` + `VGA,vgamem_mb=32`) and records
+  `warnings[{ code: 'gpu-fallback', message: 'virgl/EGL display unavailable on
+  this host (<captured line>); continuing without GPU display — Windows renders on
+  emulated VGA/WARP as documented' }]`; the row stores `virgl: false` and
+  `gpuFallback: true`. A **KVM** failure (classified first, so a mixed
+  EGL+KVM message still counts as KVM) is **never** degraded — the preflight owns
+  that fix and the captured stderr is surfaced.
+* **F4 — a sentence with two honest headlines.** `formatWindowsInstallDetail()`
+  is the only place the progress line is built: `QEMU not alive (see
+  qemu-stderr.log tail)` when the pid is gone, and, when the guest is alive but
+  no endpoint answers, `waiting for SSH on 127.0.0.1:<port>` plus the serial tail
+  and the readiness signals. A last-line `.replace(/\bundefined\b/g, 'unknown')`
+  makes the reported artifact impossible. `vmWindowsStatus` also answers a
+  sentence for a row that never got one (the old `meta.installDetail` path could
+  return `undefined` for a start that died before the first tick).
+* **F5** was already fixed on this branch: `vmCreate` carries the
+  `diskGiven/memoryGiven/cpuGiven` flags (`normaliseSpec` fills the LINUX
+  defaults, so the panel's `create` used to look like "nothing was given") and
+  the row stores the requested `diskGb/cpu/memory`; this round keeps those
+  needles and adds the `requested: { diskGb, memory, cpu }` echo.
+
+**Verification.** `tests/windows-boot.mjs` (new) drives `boot()` against a stub
+QEMU and pins F1–F3 directly: a clean start, an EGL failure that retries with
+`display=none` (argv log proves **one** retry and the exact shape), the warning
+text, the captured `qemu-stderr.log`, a KVM failure that throws with the excerpt
+and is **not** retried, plus `waitForQemuBoot`/`classifyQemuInitFailure` units.
+`tests/supervisor-smoke.mjs` adds a create that dies at init (fails with the
+stderr inline, no row left) and a start that dies just after boot (row `error`
+with `errorLog` = the captured line), and `tests/modules-unit.mjs` pins the two
+formatter headlines. Gate needles: `check-cua-vm` 428 → **470** assertions in the
+checkout (469 flat), including three new **FORBIDDEN** rules — `stdio: 'ignore'`
+for the Windows QEMU spawn, the `undefined answering` template, and (existing)
+the virtual-disk quota sentence.

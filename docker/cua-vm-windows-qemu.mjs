@@ -200,24 +200,40 @@ export function windowsEnabled() {
  * @param {number} [input.elapsedMinutes]            minutes since this attempt started
  * @param {string|string[]} [input.serialTail]       the last serial-log lines (already read)
  */
-export function formatWindowsInstallDetail({ phase = 'install', verdict = {}, elapsedMinutes = 0, serialTail = '' } = {}) {
+export function formatWindowsInstallDetail({ phase = 'install', verdict = {}, elapsedMinutes = 0, serialTail = '', sshPort = 0 } = {}) {
   const minutes = Number(elapsedMinutes) > 0 ? Math.round(Number(elapsedMinutes)) : 0
   const qmp = qmpStateLabel(verdict)
   const endpoint = endpointLabel(verdict)
   const tail = windowsTailLines(serialTail, 5)
+  const port = Number(sshPort) > 0 ? Number(sshPort) : (Number(verdict?.sshPort) > 0 ? Number(verdict.sshPort) : 0)
+  // F4: THE TWO HONEST HEADLINES. `ready()` early-returns WITHOUT an endpoint
+  // when the QEMU process is not alive (or is not `running`), and the old
+  // template then interpolated the missing field straight into the panel:
+  // "installing (10 min): undefined answering, QMP not running" — a sentence
+  // that was wrong twice (there was no endpoint, and the empty QMP status became
+  // "not running" even for a live guest). Each state now gets its own words.
+  const dead = verdict?.alive === false
+  const waiting = !dead && qmp !== 'running'
   const watched = phase === 'install'
     // SSH IS NOT EXPECTED YET during Setup — saying "no SSH yet" (or worse,
     // interpolating a missing endpoint) reads like a failure, when the guest is
     // simply still inside Windows Setup.
     ? 'watching the serial-log tail + QMP (the SSH banner cannot answer until the answer file has installed OpenSSH)'
     : 'watching QMP + the SSH banner'
+  const headline = dead
+    ? `QEMU not alive (see qemu-stderr.log tail)`
+    : `QMP ${qmp}${waiting ? '' : ', guest running'}`
   const signals = `ready when the SSH banner answers AND QMP says running (now: ${endpoint}, QMP ${qmp})`
+  const where = !dead && endpoint === 'no endpoint yet' && port > 0
+    ? ` waiting for SSH on 127.0.0.1:${port}`
+    : ''
   const beyond = 'then the badge flips to Ready and /vm/port/<name>/ becomes the noVNC stream you can drive'
-  const head = `installing (${minutes} min): ${watched}. ${signals}; ${beyond}.`
-  if (tail.length === 0) {
-    return `${head} Serial log: no lines yet (Windows Setup has not printed to the serial console).`
-  }
-  return `${head} Serial log (last ${tail.length}): ${tail.join(' | ')}`
+  const head = `installing (${minutes} min): ${headline}. ${watched}. ${signals};${where} ${beyond}.`
+  // LAST LINE OF DEFENCE: no raw field can put the word in the sentence.
+  const text = tail.length === 0
+    ? `${head} Serial log: no lines yet (Windows Setup has not printed to the serial console).`
+    : `${head} Serial log (last ${tail.length}): ${tail.join(' | ')}`
+  return text.replace(/\bundefined\b/gu, 'unknown')
 }
 
 /** `running` / `paused` / `not answering` / `no qemu` — never an empty string. */
@@ -257,6 +273,169 @@ export function windowsReadinessSignals(name = '<name>') {
     onReady: `the panel badge flips to Ready, and /vm/port/${name}/ becomes the noVNC stream you can drive`,
     watchedDuringInstall: ['serial-log tail', 'QMP query-status', 'SSH banner (not expected until the answer file has installed OpenSSH)']
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * QEMU's OWN DIAGNOSTICS: capture, classify, and degrade honestly
+ * ------------------------------------------------------------------ */
+
+/**
+ * HOW LONG A START MUST SURVIVE BEFORE IT COUNTS.
+ *
+ * A QEMU that dies during init leaves exactly the fingerprint the user reported:
+ * the spawn succeeded (a pid existed for a moment), `qemu.pid` was NEVER written
+ * (QEMU writes it after its init), the serial log stayed 0 bytes (the guest never
+ * spoke) and the supervisor watched a dead computer for the full 60-minute
+ * install timeout. Fifteen seconds is the honest window: a QEMU that is going to
+ * boot writes its pidfile in well under a second, so waiting the whole window is
+ * only ever paid by a start that is already dead.
+ *
+ * Overridable so the smoke suite can exercise the SAME code without spending 15 s
+ * per case (a test that stubs the timer would not be testing this code).
+ */
+export function qemuBootWindowMs() {
+  const raw = Number(process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS ?? '')
+  if (Number.isFinite(raw) && raw >= 0) return Math.min(120000, Math.max(0, Math.trunc(raw)))
+  return 15000
+}
+
+/** The last `lines` NON-EMPTY lines of a stderr capture, or '' when empty. */
+export function qemuStderrExcerpt(stderr, lines = 20) {
+  const limit = Math.max(1, Math.min(200, Number(lines) || 20))
+  return String(stderr ?? '')
+    .split('\n')
+    .map((line) => line.replace(/[\r\t]+$/u, '').trimEnd())
+    .filter((line) => line.trim() !== '')
+    .slice(-limit)
+    .join('\n')
+}
+
+/** The first non-empty line that looks like the CAUSE (QEMU prefixes errors). */
+export function qemuStderrReason(stderr) {
+  const lines = qemuStderrExcerpt(stderr, 40).split('\n').filter((line) => line.trim() !== '')
+  const chosen = lines.find((line) => /error|failed|cannot|unable|no .*available|unsupported/iu.test(line)) ?? lines[0] ?? ''
+  return chosen.replace(/^.*?qemu-system-x86_64:\s*/u, '').trim().slice(0, 300)
+}
+
+/**
+ * WHICH KIND OF INIT FAILURE IS THIS? The answer decides whether boot() may
+ * degrade (a display/GPU backend that the host cannot provide) or must refuse
+ * loudly (the accelerator: the kvmStatus preflight owns that fix, and quietly
+ * booting a Windows guest on TCG would be a 30-minute lie).
+ *
+ *   'kvm'     the accelerator could not be used — NEVER degrade
+ *   'display' the EGL/render-node/virgl path could not initialize — degrade once
+ *   'init'    anything else QEMU said — the caller may still retry a GPU attempt
+ *   'none'    QEMU said nothing at all (killed, OOM, an exec problem)
+ */
+export function classifyQemuInitFailure(stderr) {
+  const text = String(stderr ?? '')
+  if (text.trim() === '') return 'none'
+  // KVM FIRST: an EGL message and a KVM message can appear together, and the
+  // accelerator is the one that must not be papered over.
+  if (/(\/dev\/kvm|kvm_init|kvm[_ ]?init|cannot access memory|KVM_CREATE|accel=kvm|accel 'kvm'|kvm: |hardware acceleration is not supported|Failed to initialize KVM)/iu.test(text)) return 'kvm'
+  if (/(egl|render node|rendernode|virgl|virtio-gpu|drm|opengl|glx|display|gtk|sdl)/iu.test(text)) return 'display'
+  return 'init'
+}
+
+/**
+ * DID THIS QEMU ACTUALLY COME UP?
+ *
+ * "spawn() returned a pid" is not "QEMU is running": a QEMU that rejects its own
+ * argv exits a few milliseconds later, and the supervisor then watched a dead
+ * computer for the whole install timeout (the user report: "installing (N min):
+ * undefined answering, QMP not running" for 60 minutes on a store whose
+ * serial.log was 0 bytes and whose qemu.pid was never written).
+ *
+ * Two facts are required, in this order, within `windowMs`:
+ *
+ *   1. the PIDFILE exists — QEMU writes it AFTER its init, so its absence after
+ *      the window is the cleanest "never started" signal there is;
+ *   2. the pid in it is ALIVE (not a zombie from this very child).
+ *
+ * It resolves EARLY when the child exits, so a dead start is reported in
+ * milliseconds rather than after the full window. It never throws: the answer is
+ * a value, and `boot()` decides what to do with it.
+ */
+export async function waitForQemuBoot({ child, pidFile, isAlive, windowMs = 15000, pollMs = 50 } = {}) {
+  const window = Math.max(0, Number(windowMs) || 0)
+  const step = Math.max(10, Number(pollMs) || 50)
+  const deadline = Date.now() + window
+  let exited = false
+  let pidFileInvalid = false
+  let exitCode = null
+  let exitSignal = null
+  const noteExit = (code, signal) => { exited = true; exitCode = code ?? null; exitSignal = signal ?? null }
+  try { child?.once?.('exit', noteExit) } catch {}
+  for (;;) {
+    const pid = (() => {
+      try {
+        const value = Number(readFileSync(pidFile, 'utf8').trim())
+        if (Number.isFinite(value) && value > 0) return value
+        // A file that exists but names nothing is noted (and reported at the
+        // deadline, never immediately: QEMU may be mid-write).
+        pidFileInvalid = true
+        return 0
+      } catch {
+        return 0
+      }
+    })()
+    if (pid > 0) {
+      const alive = typeof isAlive === 'function' ? isAlive(pid) : pid > 0
+      if (alive) return { ok: true, pid, pidFile: true, exited }
+      // The pidfile names a pid nobody owns: an init that wrote it and died.
+      return { ok: false, pid, pidFile: true, exited: true, exitCode, exitSignal, reason: 'pidfile' }
+    }
+    if (exited) {
+      // The child is reaped and the pidfile never appeared — the init failure the
+      // user reported, now with a cause instead of a 60-minute wait.
+      return { ok: false, pid: 0, pidFile: false, exited: true, exitCode, exitSignal, reason: 'exited' }
+    }
+    if (Date.now() >= deadline) {
+      return {
+        ok: false,
+        pid: 0,
+        pidFile: pidFileInvalid,
+        exited: false,
+        exitCode,
+        exitSignal,
+        reason: pidFileInvalid ? 'pidfile-invalid' : 'timeout'
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, step))
+  }
+}
+
+/**
+ * THE ERROR A DEAD INIT DESERVES: the captured stderr, the classification, and
+ * the next step — never a bare "QEMU exited".
+ *
+ * The text is what reaches the row's `error`/`errorLog`, the supervisor log and
+ * the panel, so it carries the file it read (`qemu-stderr.log`, named because
+ * that is where a human looks next) and the QEMU lines verbatim.
+ */
+export function qemuInitError({ name = '<name>', kind = 'none', reason = '', excerpt = '', stderrPath = '', retriedWithoutGpu = false } = {}) {
+  const what = kind === 'kvm'
+    ? 'QEMU could not use the KVM accelerator'
+    : kind === 'display'
+      ? 'QEMU could not initialize the display/GPU backend'
+      : 'QEMU exited during init before writing its pidfile'
+  const head = retriedWithoutGpu
+    ? `${what} (the GPU-less retry failed too)`
+    : what
+  const lines = [`windows: ${name}: ${head}${reason === '' ? '' : ` — ${reason}`}`]
+  if (excerpt !== '') lines.push('', `QEMU stderr (last lines of ${path.basename(stderrPath || 'qemu-stderr.log')}):`, excerpt)
+  else lines.push('', `QEMU wrote nothing to ${path.basename(stderrPath || 'qemu-stderr.log')} — it was killed or could not exec (check the supervisor log and \`dmesg\` for an OOM kill).`)
+  if (kind === 'kvm') {
+    // NEVER DEGRADED. The preflight said the device is usable; if QEMU still
+    // cannot use it, the fix is the device/gid one, and this module must not
+    // quietly boot Windows on TCG.
+    lines.push('', 'This is a KVM/accelerator failure, not a display failure: the create is NOT retried without the GPU, because a Windows guest on emulated TCG is not the computer that was asked for.', 'Run `cua_vm_doctor` and check /dev/kvm (device present, gid usable by this uid).')
+  } else if (kind === 'display') {
+    lines.push('', 'The GPU display backend could not initialize on this host; a create retries once with `-display none` and an emulated VGA framebuffer. If this text appeared after that retry, the host cannot give this guest any display.')
+  }
+  lines.push('', `Full QEMU output: ${stderrPath || '<store>/windows/<name>/qemu-stderr.log'}`)
+  return Object.assign(new Error(lines.join('\n')), { code: 'QEMU_INIT_FAILED', kind, stderrExcerpt: excerpt, stderrPath })
 }
 
 /**
@@ -384,6 +563,9 @@ export function windowsPaths(store, name) {
     // discarded, which is why a user-reported dead create left one line
     // ("qemu started (pid 906, installing)") and no reason anywhere.
     qemuStderr: path.join(dir, 'qemu-stderr.log'),
+    // The GPU-less retry writes its own file, so the reason the first attempt
+    // died (the EGL/render-node line the panel quotes) is never overwritten.
+    qemuStderrRetry: path.join(dir, 'qemu-stderr-retry.log'),
     qemuPid: path.join(dir, 'qemu.pid'),
     qmp: path.join(dir, 'qmp.json'),
     isoDir: path.join(store, 'iso')
@@ -966,6 +1148,19 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     }
   }
 
+  /**
+   * WHAT THE SPAWNED CHILD ITSELF SAYS: `exited` is true only when the child has
+   * been reaped. It exists because "no pidfile" has two very different causes —
+   * QEMU never started, or QEMU has not WRITTEN the pidfile yet — and only this
+   * distinguishes them. Without it the install watchdog would call a QEMU that
+   * is one millisecond away from writing its pidfile dead.
+   */
+  function childState(name) {
+    const child = children.get(`qemu:${name}`)
+    if (child === undefined) return { known: false, exited: false }
+    return { known: true, exited: child.exitCode !== null || child.signalCode !== null }
+  }
+
   /** The ports one computer uses: QMP, VNC and the SSH forward. */
   function portsFor(spec) {
     return windowsPortsOf(spec)
@@ -1016,7 +1211,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    * `installPending` is decided by the caller from the disk's existence: a fresh
    * create boots the install ISO; every later start boots the disk.
    */
-  async function boot(rawSpec, { installPending = false } = {}) {
+  async function boot(rawSpec, { installPending = false, allowGpuFallback = true } = {}) {
     // ACCEPT EITHER SHAPE: the create path hands in flat fields, a start path
     // could hand in a registry row. buildQemuArgs only reads the flat ones.
     const spec = windowsBootSpec(rawSpec)
@@ -1046,15 +1241,35 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     // leaked swtpm keeps the TPM state directory open and the next boot fails
     // with "TPM is already in use" — the kind of failure that only appears on
     // the SECOND attempt, long after the first error was read.
-    try {
+    const attempt = async (attemptSpec, { stderrFile = p.qemuStderr } = {}) => {
+      // A STALE PIDFILE IS NOT THIS BOOT. `qemuPid()` is how the watchdog below
+      // (and every other helper) decides "alive"; a pidfile left by a previous
+      // boot names a pid that is gone or, worse, recycled. QEMU rewrites it
+      // after init, but the WINDOW between spawn and that write must not be
+      // filled by last night's answer.
+      try { unlinkSync(p.qemuPid) } catch {}
       const argv = buildQemuArgs({
-        ...spec,
+        ...attemptSpec,
         paths: p,
         installPending,
         virtio: Boolean(caps.virtioWin),
         driverIso: caps.virtioWin ? VIRTIO_WIN_ISO : null
       })
-      const child = spawn(WINDOWS_QEMU, argv, { stdio: 'ignore', detached: true })
+      // QEMU'S STDERR IS THE ONLY PLACE AN INIT FAILURE IS EXPLAINED, and it
+      // used to go to /dev/null: the reported create left one supervisor line
+      // ("qemu started (pid 906, installing)"), an EMPTY serial.log and no QEMU
+      // diagnosis anywhere on the host. `-serial file:` records the GUEST;
+      // this records QEMU itself, on both streams, truncated per attempt so the
+      // excerpt read after a failure belongs to the attempt that failed.
+      const stderrFd = openSync(stderrFile, 'w')
+      let child
+      try {
+        child = spawn(WINDOWS_QEMU, argv, { stdio: ['ignore', stderrFd, stderrFd], detached: true })
+      } finally {
+        // The child holds its own copy; keeping ours open would leak an fd per
+        // restart and delay nothing.
+        try { closeSync(stderrFd) } catch {}
+      }
       children.set(`qemu:${spec.name}`, child)
       // A SPAWN ERROR IS AN EVENT, NOT A THROW: without this listener, a missing
       // qemu binary (or E2BIG on a bad argv) raises an unhandled 'error' and takes
@@ -1065,11 +1280,88 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
       })
       child.unref()
       log(`windows: ${spec.name} qemu started (pid ${child.pid}${installPending ? ', installing' : ''})`)
-      return { pid: child.pid, installPending }
-    } catch (error) {
-      stopSwtpm(spec.name)
-      throw error
+      const settled = await waitForQemuBoot({
+        child,
+        pidFile: p.qemuPid,
+        isAlive: (pid) => pidAlive(pid),
+        windowMs: qemuBootWindowMs()
+      })
+      return { child, display: attemptSpec.gpu && attemptSpec.virgl ? 'egl-headless' : 'none', ...settled }
     }
+
+    const readStderr = (file = p.qemuStderr) => {
+      try { return readFileSync(file, 'utf8') } catch { return '' }
+    }
+
+    const first = await attempt(spec)
+    if (first.ok) return { pid: first.pid, installPending, display: spec.gpu && spec.virgl ? 'egl-headless' : 'none', gpuFallback: false, warnings: [] }
+
+    const stderr = readStderr()
+    const excerpt = qemuStderrExcerpt(stderr, 20)
+    const reason = qemuStderrReason(stderr)
+    const kind = classifyQemuInitFailure(stderr)
+    // NOTHING OF THE DEAD ATTEMPT MAY SURVIVE: its child has exited (or is
+    // about to), and its swtpm socket belongs to a TPM the next QEMU must be
+    // able to claim.
+    try { children.delete(`qemu:${spec.name}`) } catch {}
+    try { first.child?.kill('SIGKILL') } catch {}
+    stopSwtpm(spec.name)
+    log(`windows: ${spec.name} qemu died during init (${kind}): ${reason || 'no stderr output'}`)
+    if (excerpt !== '') log(`windows: ${spec.name} qemu-stderr.log tail:\n${excerpt}`)
+
+    // F3: THE DISPLAY PATH MAY DEGRADE, THE ACCELERATOR MAY NOT.
+    //
+    // A host whose EGL/render-node/virgl stack cannot initialize is a host that
+    // cannot give Windows an accelerated display — but Windows renders on an
+    // emulated VGA/WARP framebuffer perfectly well, which is the documented
+    // behaviour of this backend. Retrying ONCE with `-display none` + VGA turns
+    // a dead create into a working computer WITH a warning naming the captured
+    // reason.
+    //
+    // KVM is the opposite: the preflight already proved the device is usable, so
+    // a KVM failure here is news (a host that lost the device, a nested-VM
+    // restriction) and booting on TCG would be a 30-minute silent lie. It is
+    // surfaced with the captured stderr and NEVER degraded.
+    const canFallback = allowGpuFallback && first.display !== 'none' && kind !== 'kvm' && kind !== 'none' && (kind === 'display' || kind === 'init')
+    if (canFallback) {
+      // THE TPM MUST BE BACK BEFORE THE RETRY. The cleanup above stopped swtpm
+      // (a QEMU that has exited leaves the emulator with a dead data client, and
+      // the next QEMU would die on "Failed to connect to socket"), so the retry
+      // gets a FRESH emulator on the SAME per-computer state directory — the TPM
+      // therefore keeps its state and the reinstall does not re-measure it.
+      if (!startSwtpm(spec.name)) throw new Error('swtpm did not restart for the GPU-less retry (see swtpm.log)')
+      log(`windows: ${spec.name} retrying once without the GPU display (-display none, plain VGA)`)
+      // THE RETRY WRITES ITS OWN FILE: `qemu-stderr.log` keeps the FIRST
+      // attempt's diagnosis (the EGL line the warning quotes), and a second
+      // failure has its own evidence at `qemu-stderr-retry.log`.
+      const retry = await attempt({ ...spec, gpu: false, virgl: false }, { stderrFile: p.qemuStderrRetry })
+      if (retry.ok) {
+        const warning = {
+          code: 'gpu-fallback',
+          message: `virgl/EGL display unavailable on this host (${reason || 'QEMU could not initialize the egl-headless display'}); continuing without GPU display — Windows renders on emulated VGA/WARP as documented`
+        }
+        log(`windows: ${spec.name} ${warning.message}`)
+        return { pid: retry.pid, installPending, display: 'none', gpuFallback: true, warnings: [warning], stderrExcerpt: excerpt }
+      }
+      const retryStderr = readStderr(p.qemuStderrRetry)
+      const retryExcerpt = qemuStderrExcerpt(retryStderr, 20) || excerpt
+      const retryReason = qemuStderrReason(retryStderr) || reason
+      const retryKind = classifyQemuInitFailure(retryStderr)
+      try { children.delete(`qemu:${spec.name}`) } catch {}
+      try { retry.child?.kill('SIGKILL') } catch {}
+      stopSwtpm(spec.name)
+      log(`windows: ${spec.name} the GPU-less retry ALSO failed (${retryKind}): ${retryReason || 'no stderr output'}`)
+      throw qemuInitError({
+        name: spec.name,
+        kind: retryKind === 'none' ? kind : retryKind,
+        reason: retryReason,
+        excerpt: retryExcerpt,
+        stderrPath: p.qemuStderrRetry,
+        retriedWithoutGpu: true
+      })
+    }
+
+    throw qemuInitError({ name: spec.name, kind, reason, excerpt, stderrPath: p.qemuStderr, retriedWithoutGpu: false })
   }
 
   /** QMP to this computer's loopback socket, with the supervisor's client. */
@@ -1344,6 +1636,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     portsFor,
     qemuPid,
     pidAlive,
+    childState,
     boot,
     probe,
     ready,
