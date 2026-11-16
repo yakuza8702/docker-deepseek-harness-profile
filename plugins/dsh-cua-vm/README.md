@@ -269,6 +269,89 @@ runs `cua-firstboot.ps1` at first logon. That script installs:
 
 It writes `C:\cua-provision.json` as its marker.
 
+#### Two firstboot layers, because one copy step can silently fail
+
+The install is unattended and lands on the desktop, but the provisioning that
+makes the computer *usable* (`cua_vm_exec`, and therefore the Windows MCP) rides
+on two different mechanisms now:
+
+1. **`$OEM$` + `<UseConfigurationSet>true</UseConfigurationSet>`.** Windows Setup
+   copies `<answer medium>\$OEM$\$$\Setup\Scripts\*` into
+   `C:\Windows\Setup\Scripts` **only** when the windowsPE
+   `Microsoft-Windows-Setup` component sets `UseConfigurationSet` ([MS Learn:
+   UseConfigurationSet]; dockur/windows' `answer.sh` inserts the same element in
+   the same place). Without it the `$OEM$` tree is inert and the oobeSystem
+   `FirstLogonCommand` runs against a directory Setup never populated — the
+   reported desktop error was exactly
+   `Windows Script Host — Can not find script file
+   "C:\Windows\Setup\Scripts\Unattend.vbs"`, which meant **no OpenSSH, no
+   python, no dsh-cua**. `assertAnswerFileUsesConfigurationSet()` refuses a
+   staged answer file without it, so this fails at create time with the reason
+   instead of on the guest's desktop.
+2. **A drive-scanning fallback.** The same `FirstLogonCommands` block carries a
+   second command that looks for `cua-firstboot.ps1` on the roots of `C:`–`H:` and
+   runs it straight off the SETUP medium:
+
+   ```bat
+   cmd /c for %d in (c d e f g h) do @if exist "%d:\cua-firstboot.ps1" powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%d:\cua-firstboot.ps1"
+   ```
+
+   The SETUP volume's letter is assigned by Windows (it was `C:` in WinPE and is
+   usually `D:`/`E:` after installation), so it cannot be hardcoded on the host.
+   The script is idempotent through `C:\cua-provision.json`: whichever layer runs
+   first wins and the other is a no-op. **This layer does not depend on the
+   `$OEM$` copy at all** — that is the point of having it.
+
+`assertAnswerFileFirstbootLayers()` requires both layers in the staged file, and
+`tests/windows-boot.mjs` asserts them against the template (plus a negative
+control: a file with either layer removed is refused).
+
+#### When is the install really done?
+
+Three signals, in order, all visible in the panel:
+
+| Stage | Proof | Badge / sentence |
+|---|---|---|
+| Setup | serial log shows the install CD / `Windows Setup is starting` | `installing (N min): QMP running…` |
+| **booted** | serial log shows `Boot0004 "Windows Boot Manager"` from `HD(…,GPT` — i.e. the **installed disk** booted | *"Windows booted from the installed disk; waiting for OpenSSH (installed by firstboot) — if this never answers, firstboot failed (see the Unattend.vbs error on the desktop)"* |
+| **ready** | QMP `running` **and** the SSH banner answers | `ready` |
+
+* The boot-from-disk signal is `windowsBootedFromDisk()` (pure, unit-tested). It
+  is why a successful install can never be mistaken for "still installing": the
+  row keeps the `installing` state (so the panel still offers Force delete) but
+  its sentence changes, and `installStage: "booted"` + `bootedMinutes` appear in
+  `cua_vm_status`.
+* **The deadline follows the stage.** Before the disk boots the 60-minute
+  `windowsInstallTimeoutMinutes` window applies. After it boots, OpenSSH gets its
+  own window (`DSH_CUA_WINDOWS_SSH_GRACE_MIN`, default 15 min) measured from the
+  boot, so a slow install that booted at minute 55 is not marked `error` five
+  minutes later while firstboot is still downloading python.
+* After five minutes past the boot with no SSH banner the sentence becomes
+  *"OpenSSH did not answer — the firstboot script likely failed; use the noVNC
+  view to check, and Force delete + recreate to retry"*, and the eventual
+  `error` distinguishes **"installed but SSH missing"** from **"never installed"**.
+  When firstboot is the failure, the Windows MCP cannot attach (it needs SSH) —
+  the fix is the guidance above, not a different MCP configuration.
+
+#### The install media leave when the install is done
+
+An install-phase QEMU boots the Microsoft ISO (`cd0`) and the answer medium
+(`setup0`, a removable usb-storage stick), and that **same process** keeps
+running after Setup finishes. Without cleanup a freshly `ready` computer still
+showed the Windows DVD and the **SETUP (D:)** volume. At the ready transition the
+supervisor now calls `detachInstallMedia()`:
+
+1. `query-block` (so an already-clean session is silent),
+2. QMP `eject` on `cd0` with `force: true`,
+3. QMP `device_del` on the stick's qdev id (`id=setupusb` in the argv — the
+   reason the id is explicit).
+
+It is **non-fatal by contract**: an already-ejected tray or an old QEMU without
+the id is logged, never fatal, and `installMediaDetached` makes it once-only
+(the watcher and the status poll both trigger it). Every later start builds its
+argv from `installPending: false`, which attaches **neither** the CD nor
+`setup.img`, so the computer comes back with only its system disk.
+
 **Why the interactive task matters:** SSH lands in **Session 0**, where there is
 no desktop. pywinauto can only drive windows in the user's own session, so the
 SSH side proxies to the interactive `dsh-cua-server` instead of driving the UI
@@ -326,6 +409,12 @@ receipt (`action_sent`, `effect_verified`) in a few hundred bytes, where the
 screenshot loop costs a PNG per attempt. The cost is the schema: **~3-8k tokens
 while attached**, zero when no Windows computer is active.
 
+**It attaches only when the row is `ready` over SSH**, so it needs D1 fixed: a
+computer whose firstboot never ran has no `sshd`, never answers the banner, never
+becomes ready, and the MCP stays detached by design (the tool call says the guest
+SSH server is not answering). Fixing `$OEM$`/`UseConfigurationSet` is what makes
+this surface appear — it is not an MCP configuration problem.
+
 Kill switch: `DSH_CUA_VM_WIN_MCP=0` disables the whole path (no SSH bridge, no
 tools, no tokens). The same bridge can also be used as a plain MCP stdio server
 (`node plugins/dsh-cua-vm/win-mcp.js --stdio --port <sshPort> --key <path>`) if
@@ -337,6 +426,14 @@ you prefer a `dsh-mcp-client` row.
 `shutting-down` and `error` (with `errorLog`, the last 40 serial lines).
 `ready` = QMP says `running` **and** an endpoint answers — SSH banner first, VNC
 accept as the fallback. A paused guest is not ready.
+
+A row that is still `installing` also carries **`installStage`**: `installing`
+while Setup runs, `booted` once the installed disk has booted and OpenSSH has not
+answered yet (`bootedAt`/`bootedMinutes` say how long). `booted` is a stage, not
+a state: the computer stays `installing` until the SSH banner answers, so the
+panel keeps offering the action that actually resolves a failed firstboot (Force
+delete). A booted computer that never gets SSH is reported as **"installed but
+firstboot failed"**, not as a failed install.
 
 ## REA in the computer
 

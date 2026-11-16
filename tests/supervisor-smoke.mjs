@@ -972,6 +972,12 @@ try {
       check('F1/F4: setup.img exists before boot, owner-writable, owned by this uid',
         st !== null && (st.mode & 0o200) !== 0 && st.uid === process.getuid(), st === null ? 'missing' : `mode=${(st.mode & 0o777).toString(8)} uid=${st.uid}`)
     }
+    // D2: THE STICK HAS AN EXPLICIT QDEV ID, which is what makes
+    // `device_del` possible at the ready transition (the CD is ejected by its
+    // block node). Without it the medium could only be removed by restarting
+    // the computer.
+    check('D2: the install argv gives the answer stick an explicit device id (hot-unpluggable)',
+      /usb-storage,drive=setup0,removable=on,bus=xhci\.0,id=setupusb/u.test(installArgv), installArgv.slice(0, 200))
     check('S1: ...declared after the system disk, and with no vvfat OEM stick',
       installArgv.indexOf('id=setup0') > installArgv.indexOf('id=disk0')
       && !/fat:ro:|id=oem0/u.test(installArgv)
@@ -1008,6 +1014,31 @@ try {
         `installFrom@${from} installTo@${to}`)
       check('F2: ...and no placeholder survived into the image copy',
         !staged.includes('{{IMAGE_INSTALL}}') && !staged.includes('{{PRODUCT_KEY}}'))
+      // D1 (H1): THE REAL DONE-DETECTION START. Without <UseConfigurationSet>
+      // Setup never copies $OEM$ into C:\Windows\Setup\Scripts, so the
+      // FirstLogonCommand launched a script that was not there (the reported
+      // "Windows Script Host — Can not find script file ...Unattend.vbs") and
+      // OpenSSH was never installed. Asserted on the STAGED bytes, which is what
+      // the guest actually reads.
+      const stagedBare = staged.replace(/<!--[\s\S]*?-->/gu, '')
+      const peStart = stagedBare.indexOf('<settings pass="windowsPE">')
+      const peEnd = peStart === -1 ? -1 : stagedBare.indexOf('</settings>', peStart)
+      const pe = peStart === -1 || peEnd === -1 ? '' : stagedBare.slice(peStart, peEnd)
+      const setupStart = pe.indexOf('<component name="Microsoft-Windows-Setup"')
+      const setupEnd = setupStart === -1 ? -1 : pe.indexOf('</component>', setupStart)
+      const setupComponent = setupStart === -1 || setupEnd === -1 ? '' : pe.slice(setupStart, setupEnd)
+      check('D1: the staged answer file switches on UseConfigurationSet (so $OEM$ is copied)',
+        /<UseConfigurationSet>true<\/UseConfigurationSet>/u.test(setupComponent)
+        && (setupComponent.match(/<UseConfigurationSet\b/gu) ?? []).length === 1,
+        setupComponent.includes('<UseConfigurationSet>') ? 'present' : 'MISSING')
+      // D1 (H2): THE BELT. Both layers must be in the file the guest reads: the
+      // $OEM$ launcher AND the drive-scanning fallback that does not depend on
+      // the copy at all.
+      check('D1: ...and BOTH firstboot layers are FirstLogonCommands',
+        /wscript \/\/nologo C:\\Windows\\Setup\\Scripts\\Unattend\.vbs/u.test(stagedBare)
+        && /for %d in \(c d e f g h\) do @if exist "%d:\\cua-firstboot\.ps1"/u.test(stagedBare)
+        && /powershell\.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%d:\\cua-firstboot\.ps1"/u.test(stagedBare),
+        'launcher + fallback')
     }
 
     // R1: the cdboot presses were SCHEDULED for the install boot. The stub serves

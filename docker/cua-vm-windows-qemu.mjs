@@ -172,6 +172,83 @@ export function windowsEnabled() {
   return String(process.env.DSH_CUA_VM_WINDOWS ?? '1') !== '0'
 }
 
+/* ------------------------------------------------------------------ *
+ * D3: DID THE INSTALLED DISK ACTUALLY BOOT?
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE POST-INSTALL BOOT, AS THE FIRMWARE PRINTS IT.
+ *
+ * A Windows guest writes NOTHING to the serial console (its EMS/SPCR output is
+ * off — we never run `bcdedit /ems`), so the serial log is OVMF's own boot
+ * narration. That is still enough to know which disk booted: OVMF prints the
+ * boot option it is about to use, and the user-reported line was
+ *
+ *   Boot0004 "Windows Boot Manager" ... HD(1,GPT,...)
+ *
+ * `Windows Boot Manager` is an entry that only exists after Setup wrote a BCD to
+ * the system disk's ESP — the install CD is described as a DVD-ROM. So the
+ * presence of that description is the "the installed disk is booting" signal,
+ * and it is the SAME signal the user read off the console.
+ *
+ * WHY THIS MATTERS (D3): the watcher used to complete on the SSH banner ONLY, so
+ * a successful install that never got OpenSSH looked identical to Setup still
+ * running — the panel said "installing (35 min)" next to a booted desktop and
+ * the 60-minute timeout would have marked it `error`. With this signal the row
+ * can say "booted, waiting for OpenSSH", which is both true and actionable.
+ */
+export const WINDOWS_HD_BOOT_PATTERN = /Boot[0-9A-F]{4}[^\n]*Windows Boot Manager/iu
+
+/**
+ * The BDS "loading BootNNNN" line, used as a weaker second signal when the
+ * description and the device are on different lines. It only counts together
+ * with a HARD DISK hint (`HD(1,GPT`, `HD(2,MBR`, QEMU's own disk model), so a
+ * CD/DVD boot can never be read as an installed-disk boot.
+ */
+export const WINDOWS_HD_LOADING_PATTERN = /loading Boot[0-9A-F]{4}/iu
+export const WINDOWS_HD_DEVICE_PATTERN = /HD\([0-9]+,(?:GPT|MBR)|QEMU HARDDISK/iu
+
+/**
+ * True when the serial log shows the INSTALLED disk booting.
+ *
+ * Pure and exported: the watcher's done-detection is the thing that regressed,
+ * so it must be unit-testable without a Windows install.
+ */
+export function windowsBootedFromDisk(serialText) {
+  const text = String(serialText ?? '')
+  if (text === '') return false
+  if (WINDOWS_HD_BOOT_PATTERN.test(text)) return true
+  return WINDOWS_HD_LOADING_PATTERN.test(text) && WINDOWS_HD_DEVICE_PATTERN.test(text)
+}
+
+/** The stage of a Windows install, from its serial log. */
+export function windowsInstallStageFromSerial(serialText) {
+  return windowsBootedFromDisk(serialText) ? 'booted' : 'installing'
+}
+
+/**
+ * D3/D5: THE TWO SENTENCES THE PANEL MUST PRINT VERBATIM.
+ *
+ * They are constants, not template text, because the user asked for the exact
+ * words and a future edit must not paraphrase them by accident. Both say what is
+ * TRUE and what to DO — the old "still installing" line next to a running
+ * desktop said neither.
+ */
+export const WINDOWS_BOOTED_DETAIL = 'Windows booted from the installed disk; waiting for OpenSSH (installed by firstboot) — if this never answers, firstboot failed (see the Unattend.vbs error on the desktop)'
+export const WINDOWS_SSH_MISSING_DETAIL = 'OpenSSH did not answer — the firstboot script likely failed; use the noVNC view to check, and Force delete + recreate to retry'
+
+/**
+ * AFTER THE DISK BOOTS, HOW LONG OPENSSH GETS BEFORE THE ROW SAYS SO.
+ *
+ * The 60-minute install window is measured from the START of Setup and is about
+ * DISK WORK. Once the installed disk boots, the remaining work is firstboot
+ * (OpenSSH, a python installer download, pip) — a different clock, and one the
+ * old elapsed-minutes check would have cut short: a slow install that booted at
+ * minute 55 had five minutes left to finish provisioning. Five minutes is long
+ * enough to call it missing, short enough to tell the user before the hard stop.
+ */
+export const WINDOWS_SSH_MISSING_MINUTES = 5
+
 /**
  * THE INSTALL PROGRESS SENTENCE — pure, so it can be asserted without a VM.
  *
@@ -200,8 +277,25 @@ export function windowsEnabled() {
  * @param {object} [input.verdict]                   windowsBackend.ready()'s answer
  * @param {number} [input.elapsedMinutes]            minutes since this attempt started
  * @param {string|string[]} [input.serialTail]       the last serial-log lines (already read)
+ * @param {'installing'|'booted'} [input.installStage] D3: Setup running, or the installed disk booted
+ * @param {number} [input.bootedMinutes]             minutes since the installed disk booted
  */
-export function formatWindowsInstallDetail({ phase = 'install', verdict = {}, elapsedMinutes = 0, serialTail = '', sshPort = 0 } = {}) {
+export function formatWindowsInstallDetail({ phase = 'install', verdict = {}, elapsedMinutes = 0, serialTail = '', sshPort = 0, installStage = 'installing', bootedMinutes = 0 } = {}) {
+  // D3/D5: ONCE THE INSTALLED DISK BOOTS, THE SENTENCE IS ABOUT FIRSTBOOT, NOT
+  // ABOUT SETUP. It is the exact text the user asked for (see the constants),
+  // and it has its own 5-minute threshold: past it the honest answer is "the
+  // firstboot script failed", with the two things a human can do about it.
+  // THE STAGE MAY ARRIVE INSIDE THE VERDICT. The watcher passes ONE object
+  // (`{ phase: 'install', verdict, elapsedMinutes, serialTail }`) and keeps the
+  // stage on `verdict.installStage`, so its call site stays one line and the
+  // deadline it computed is the stage this sentence describes.
+  const stage = installStage === 'booted' || verdict?.installStage === 'booted' ? 'booted' : 'installing'
+  const sinceBoot = Number(bootedMinutes) > 0 ? Math.round(Number(bootedMinutes)) : (Number(verdict?.bootedMinutes) > 0 ? Math.round(Number(verdict.bootedMinutes)) : 0)
+  if (stage === 'booted') {
+    return sinceBoot >= WINDOWS_SSH_MISSING_MINUTES
+      ? WINDOWS_SSH_MISSING_DETAIL
+      : WINDOWS_BOOTED_DETAIL
+  }
   const minutes = Number(elapsedMinutes) > 0 ? Math.round(Number(elapsedMinutes)) : 0
   const qmp = qmpStateLabel(verdict)
   const endpoint = endpointLabel(verdict)
@@ -958,6 +1052,16 @@ export function windowsRowName(spec, fallback = '') {
  * ------------------------------------------------------------------ */
 
 /**
+ * D2: THE THREE DEVICE NAMES THE INSTALL MEDIA HAVE, IN ONE PLACE.
+ *
+ * `cd` and `setup` are BLOCK-node ids (`-drive ...,id=cd0|setup0`); `setupDevice`
+ * is the QDEV id of the usb-storage frontend. QMP `eject` takes the block node,
+ * `device_del` takes the qdev id — two different namespaces, and mixing them up
+ * produces a `DeviceNotFound` that looks like "the media are already gone".
+ */
+export const INSTALL_MEDIA_DEVICE_IDS = Object.freeze({ cd: 'cd0', setup: 'setup0', setupDevice: 'setupusb' })
+
+/**
  * The QEMU argv for one Windows computer.
  *
  * DESIGN NOTES THAT MATTER WHEN SOMETHING DOES NOT BOOT:
@@ -999,8 +1103,13 @@ export function windowsRowName(spec, fallback = '') {
  *                              "HDD Not Found", and only then fell through to
  *                              the DVD. Pinning the CD first removes a full
  *                              failed-start cycle from every install.
- *       installPending: false  disk bootindex=1, no CD attached — after Setup
- *                              the disk owns the boot order.
+ *       installPending: false  disk bootindex=1, NO CD and NO setup.img — after
+ *                              Setup the disk owns the boot order and the
+ *                              session must see only its system disk. The
+ *                              INSTALLING session cannot rebuild its argv, so
+ *                              the same end state is reached at the ready
+ *                              transition with QMP (`eject` + `device_del`, see
+ *                              detachInstallMedia()).
  *   * Networking is SLIRP: outbound internet, the host reachable at 10.0.2.2,
  *     and SSH forwarded from 127.0.0.1:<port> to guest :22. No bridge, no tap,
  *     no CAP_NET_ADMIN — the harness keeps `cap_drop ALL`.
@@ -1108,8 +1217,17 @@ export function buildQemuArgs(spec) {
     // even as removable media). setup.img stays a REAL MBR + FAT32 partitioned
     // image, built by mtools, attached writable — only its delivery class
     // changed.
+    // D2: THE DEVICE HAS AN EXPLICIT ID (`id=setupusb`) SO IT CAN BE HOT-UNPLUGGED.
+    // The install media are attached for the INSTALL ONLY (this whole block is
+    // gated on `installPending`), but the QEMU process that installed the
+    // computer keeps running with that argv — so the CD and this stick stayed
+    // visible to a Windows that had long since booted from its own disk (the
+    // user's D2: "SETUP (D:) and the CD drive stay attached"). `detachInstallMedia()`
+    // fixes the RUNNING session: QMP `eject` for the CD and `device_del` for this
+    // frontend. `device_del` needs the device's qdev id, which is why the id is
+    // explicit here instead of left to QEMU's generated one.
     ...(boot
-      ? ['-device', 'usb-storage,drive=setup0,removable=on,bus=xhci.0']
+      ? ['-device', `usb-storage,drive=setup0,removable=on,bus=xhci.0,id=${INSTALL_MEDIA_DEVICE_IDS.setupDevice}`]
       : []),
     // networking: SLIRP + the SSH forward
     '-netdev', `user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22`,
@@ -1657,6 +1775,84 @@ export function assertAnswerFileSelectsImage(xml) {
 }
 
 /**
+ * D1 (H1): `$OEM$` IS IGNORED UNLESS THE ANSWER FILE ASKS FOR IT.
+ *
+ * THE REPORTED DEFECT: after a fully automatic install the desktop showed
+ *
+ *   Windows Script Host — Can not find script file
+ *   "C:\Windows\Setup\Scripts\Unattend.vbs"
+ *
+ * That is the oobeSystem FirstLogonCommand running against a directory Setup
+ * never populated. The cause is not the XML's FirstLogonCommands: it is that
+ * Windows Setup only copies `<answer>\$OEM$\$$\…` into `C:\Windows\Setup\Scripts`
+ * when the answer file sets `<UseConfigurationSet>true</UseConfigurationSet>` in
+ * its windowsPE `Microsoft-Windows-Setup` component ([MS Learn: UseConfigurationSet];
+ * dockur/windows' `setConfigurationXML` inserts exactly this element before
+ * `<UserData>`). Without it `$OEM$` is inert — the media carry it, Setup walks
+ * past it, and every script it was supposed to stage is missing.
+ *
+ * This is asserted on the STAGED file (writeOemPayload calls it), so a template
+ * edit that drops the element fails the create instead of the desktop.
+ */
+export function assertAnswerFileUsesConfigurationSet(xml) {
+  const text = String(xml ?? '').replace(/<!--[\s\S]*?-->/gu, '')
+  const windowsPe = /<settings pass="windowsPE">([\s\S]*?)<\/settings>/u.exec(text)
+  if (windowsPe === null) throw new Error('Autounattend.xml has no <settings pass="windowsPE"> — Setup would never read an answer file at all')
+  const component = /<component name="Microsoft-Windows-Setup"[\s\S]*?<\/component>/u.exec(windowsPe[1])
+  if (component === null) {
+    throw new Error('Autounattend.xml\'s windowsPE pass has no Microsoft-Windows-Setup component — <UseConfigurationSet> has nowhere to live and $OEM$ would never be copied')
+  }
+  const hits = (component[0].match(/<UseConfigurationSet\b/gu) ?? []).length
+  if (hits !== 1) {
+    throw new Error(`Autounattend.xml has ${hits} <UseConfigurationSet> element(s) in Microsoft-Windows-Setup; exactly one <UseConfigurationSet>true</UseConfigurationSet> is required or Windows Setup NEVER copies $OEM$\\$$\\Setup\\Scripts into C:\\Windows\\Setup\\Scripts (the reported "Can not find script file C:\\Windows\\Setup\\Scripts\\Unattend.vbs")`)
+  }
+  if (!/<UseConfigurationSet>\s*true\s*<\/UseConfigurationSet>/iu.test(component[0])) {
+    throw new Error('Autounattend.xml sets <UseConfigurationSet> to something other than true — the $OEM$ tree would be ignored and firstboot would never run')
+  }
+  return true
+}
+
+/**
+ * D1 (H2): THE FIRSTBOOT FALLBACK COMMAND, SHARED BY THE XML AND THE GATE.
+ *
+ * The primary launcher is dockur's: Setup copies `$OEM$` into
+ * `C:\Windows\Setup\Scripts` and the FirstLogonCommand runs `Unattend.vbs` from
+ * there. With H1 fixed that is the intended path — but it has ONE dependency
+ * (the copy) and the failure mode is invisible (a WSH dialog on a desktop nobody
+ * is looking at). This second FirstLogonCommand is the belt:
+ *
+ *   * it looks for `cua-firstboot.ps1` on the ROOTS of drives C:..H: — the
+ *     SETUP volume's drive letter is assigned by Windows at boot and is not
+ *     knowable on the host (in WinPE it was C:, after installation the image is
+ *     usually D:/E:);
+ *   * it runs the script FROM THE MEDIUM with `powershell -File`, so it needs
+ *     neither the `$OEM$` copy nor `Unattend.vbs` to exist;
+ *   * the script is idempotent (`C:\cua-provision.json`), so if the primary
+ *     launcher already succeeded this pass is a no-op.
+ *
+ * It is a plain `cmd /c` one-liner because FirstLogonCommands run through
+ * CreateProcess: a batch FILE on the medium would be a third thing that can be
+ * missing, and `for %d` (single percent) is the command-line form.
+ */
+export const FIRSTBOOT_FALLBACK_COMMAND = 'cmd /c for %d in (c d e f g h) do @if exist "%d:\\cua-firstboot.ps1" powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%d:\\cua-firstboot.ps1"'
+
+/**
+ * Both firstboot layers must be present in the staged answer file: the hidden
+ * `$OEM$` launcher AND the drive-scanning fallback. Deleting either turns one
+ * copy failure into a computer without OpenSSH (and therefore without cua_vm_exec).
+ */
+export function assertAnswerFileFirstbootLayers(xml) {
+  const text = String(xml ?? '').replace(/<!--[\s\S]*?-->/gu, '')
+  if (!/wscript \/\/nologo C:\\Windows\\Setup\\Scripts\\Unattend\.vbs/u.test(text)) {
+    throw new Error('Autounattend.xml has no FirstLogonCommand running C:\\Windows\\Setup\\Scripts\\Unattend.vbs — the $OEM$ layer of firstboot is gone')
+  }
+  if (!text.includes(FIRSTBOOT_FALLBACK_COMMAND)) {
+    throw new Error(`Autounattend.xml has no drive-scanning firstboot fallback (expected: ${FIRSTBOOT_FALLBACK_COMMAND}) — if Setup fails to copy $OEM$, nothing would install OpenSSH and cua_vm_exec would never work`)
+  }
+  return true
+}
+
+/**
  * S1: BUILD `$STORE/windows/<name>/setup.img` — a FAT32 hard-disk image whose
  * ROOT holds the answer file and whose `$OEM$` tree holds the Setup scripts.
  *
@@ -2091,6 +2287,13 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
     throw new Error(`the staged Autounattend.xml still contains ${[...new Set(leftover)].join(', ')} — Setup would read a literal placeholder`)
   }
   const selected = assertAnswerFileSelectsImage(stagedXml)
+  // D1: THE TWO FAILURES THAT MADE A FULLY AUTOMATIC INSTALL LAND WITHOUT
+  // OpenSSH. `$OEM$` is inert without UseConfigurationSet/L (H1), and the
+  // firstboot layers must both be in the file (H2) — asserted here, on the
+  // STAGED bytes, so a template regression fails the create with the reason
+  // instead of a WSH dialog on the guest's desktop.
+  assertAnswerFileUsesConfigurationSet(stagedXml)
+  assertAnswerFileFirstbootLayers(stagedXml)
   // The staged payload is a DIRECTORY on the host; buildSetupImage() copies it
   // into the FAT32 partition at the ROOT (where Setup reads Autounattend.xml)
   // and into $OEM$ (so Setup copies the scripts into C:\Windows\Setup\Scripts).
@@ -2811,6 +3014,82 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     }
   }
 
+  /**
+   * D2: EJECT THE INSTALL MEDIA FROM THE RUNNING SESSION.
+   *
+   * The argv for an INSTALL boot carries the Microsoft ISO (`cd0`) and the
+   * answer medium (`setup0` behind usb-storage) because Setup needs both. That
+   * QEMU process keeps running after Setup finishes — it is the same process
+   * that boots the installed disk — so a freshly ready computer still listed the
+   * Windows DVD and the SETUP volume (D:) in Explorer, and its next reboot could
+   * boot the DVD again. The user's report (D2) asked for both to go away once the
+   * install is done.
+   *
+   * The supervisor calls this at the READY transition (not at "the disk booted" —
+   * the firstboot fallback layer may still want the medium at first logon).
+   *
+   * WHY QMP AND NOT A RESTART: a restart just to change the device list throws
+   * away the booted desktop the user is looking at. `eject` opens the DVD tray
+   * (the guest sees the medium go away), and `device_del` unplugs the USB stick
+   * (usb-storage is hot-unpluggable). The block nodes stay allocated but with no
+   * frontend — nothing presents them to the guest.
+   *
+   * NON-FATAL BY CONTRACT: an already-ejected tray, a QEMU that does not answer,
+   * a device id the running argv never had (an older row started before the id
+   * was added) — none of these may fail the transition to ready. Everything is
+   * attempted, everything is logged, and the result says what happened.
+   */
+  async function detachInstallMedia(rawSpec) {
+    const spec = namedSpec(rawSpec)
+    const result = { attempted: [], commands: [], errors: [], skipped: [] }
+    // QUERY FIRST: it tells an already-detached session apart from one that
+    // needs the work, so a second call is silent instead of a wall of
+    // DeviceNotFound errors.
+    let blocks = []
+    try {
+      const answer = await qmpFor(spec, [{ execute: 'query-block' }], { timeoutMs: 5000 })
+      if (Array.isArray(answer) && Array.isArray(answer[0]?.return)) blocks = answer[0].return
+    } catch (error) {
+      // No QMP is not a reason to skip the attempts: an older QMP may not
+      // answer query-block, and the eject/device_del below are what actually
+      // matter.
+      result.errors.push({ command: 'query-block', error: String(error?.message ?? error) })
+    }
+    const present = (name) => blocks.some((entry) => entry?.device === name || entry?.qdev === name)
+    const plan = []
+    if (blocks.length === 0 || present(INSTALL_MEDIA_DEVICE_IDS.cd)) {
+      plan.push({ execute: 'eject', arguments: { device: INSTALL_MEDIA_DEVICE_IDS.cd, force: true } })
+    } else {
+      result.skipped.push(INSTALL_MEDIA_DEVICE_IDS.cd)
+    }
+    if (blocks.length === 0 || present(INSTALL_MEDIA_DEVICE_IDS.setup) || present(INSTALL_MEDIA_DEVICE_IDS.setupDevice)) {
+      // THE QDEV ID: `device_del` addresses the frontend by its QOM id, which is
+      // why buildQemuArgs() names it (`id=setupusb`). Fall back to the constant
+      // for a session started before that id existed; QMP answers
+      // DeviceNotFound and the row keeps working.
+      const qdev = blocks.find((entry) => entry?.device === INSTALL_MEDIA_DEVICE_IDS.setup && typeof entry?.qdev === 'string' && entry.qdev !== '')?.qdev
+      plan.push({ execute: 'device_del', arguments: { id: qdev || INSTALL_MEDIA_DEVICE_IDS.setupDevice } })
+    } else {
+      result.skipped.push(INSTALL_MEDIA_DEVICE_IDS.setup)
+    }
+    for (const command of plan) {
+      result.attempted.push(command)
+      try {
+        await qmpFor(spec, [command], { timeoutMs: 5000 })
+        result.commands.push(command)
+      } catch (error) {
+        result.errors.push({ command: command.execute, error: String(error?.message ?? error) })
+      }
+    }
+    const failed = result.errors.filter((entry) => entry.command !== 'query-block')
+    if (failed.length > 0) {
+      log(`windows: ${spec.name} could not detach every install medium (non-fatal): ${failed.map((entry) => `${entry.command}: ${entry.error}`).join('; ')}`)
+    } else if (result.commands.length > 0) {
+      log(`windows: ${spec.name} install media detached (${result.commands.map((command) => command.execute).join(', ')})`)
+    }
+    return result
+  }
+
   return {
     enabled: windowsEnabled,
     hostCaps: windowsHostCaps,
@@ -2832,6 +3111,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     unpause,
     shutdown,
     installShutdownWindowMs,
+    detachInstallMedia,
     kill,
     forceKill,
     stopSwtpm

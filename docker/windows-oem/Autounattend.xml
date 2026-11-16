@@ -80,6 +80,24 @@
           <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
         </RunSynchronousCommand>
       </RunSynchronous>
+      <!-- D1 (H1): THE $OEM$ SWITCH. Without this element Windows Setup walks
+           straight past the `$OEM$` directory on the answer medium and never
+           copies `$OEM$\$$\Setup\Scripts\*` into `C:\Windows\Setup\Scripts`.
+           The reported symptom was exactly that: a fully automatic install that
+           landed on the desktop with
+
+             Windows Script Host — Can not find script file
+             "C:\Windows\Setup\Scripts\Unattend.vbs"
+
+           because the oobeSystem FirstLogonCommand below points at a directory
+           Setup had never populated — so OpenSSH, python and dsh-cua were never
+           installed. `UseConfigurationSet` makes Setup look for `$OEM$` in the
+           root of the drive that carries this answer file (see [MS Learn:
+           UseConfigurationSet], windowsPE / Microsoft-Windows-Setup); dockur's
+           answer.sh inserts it at this exact position, before <UserData>.
+           Setup validates ONE occurrence: a duplicate is rejected, a missing one
+           is silent. assertAnswerFileUsesConfigurationSet() enforces both. -->
+      <UseConfigurationSet>true</UseConfigurationSet>
       <UserData>
         <AcceptEula>true</AcceptEula>
         <!-- S3: EVALUATION MEDIA (11ltsc, 2025) IGNORE THIS, and the pinned
@@ -123,6 +141,23 @@
                C:\cua-provision.json, so whichever pass runs first wins. -->
           <CommandLine>wscript //nologo C:\Windows\Setup\Scripts\Unattend.vbs</CommandLine>
           <Description>cua first-boot provisioning, hidden (OpenSSH, python, dsh-cua)</Description>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Order>2</Order>
+          <!-- D1 (H2): THE BELT TO THE $OEM$ BRACES. The command above is the
+               intended path, but it depends on Setup having copied $OEM$ into
+               C:\Windows\Setup\Scripts — the exact step that failed on the
+               reported install. This one does not: it scans the roots of C:-H:
+               for cua-firstboot.ps1 (the SETUP volume's letter is assigned by
+               Windows and cannot be known on the host — it was C: in WinPE and
+               is usually D:/E: after installation) and runs the script straight
+               off the medium. cua-firstboot.ps1 is idempotent through
+               C:\cua-provision.json, so when the primary launcher already ran
+               this is a no-op. Single `%d` is deliberate: FirstLogonCommands are
+               COMMAND LINES (cmd /c), not a batch file, where the form would be
+               `%%d`. assertAnswerFileFirstbootLayers() pins both layers. -->
+          <CommandLine>cmd /c for %d in (c d e f g h) do @if exist "%d:\cua-firstboot.ps1" powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%d:\cua-firstboot.ps1"</CommandLine>
+          <Description>cua first-boot fallback: run cua-firstboot.ps1 from the SETUP medium when $OEM$ was not copied</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
       <OOBE>

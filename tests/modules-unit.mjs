@@ -198,13 +198,20 @@ check('kvm + host cpu are the acceleration', has('q35,accel=kvm,smm=off') && has
 // makes Windows classify it as removable media.
 // F1: WRITABLE, NOT READ-ONLY. QEMU 10 rejects a read-only block node behind
 // ide-hd ("Block node is read-only") and the create died before swtpm's socket.
+// D2: THE DEVICE IS NAMED (`id=setupusb`) SO IT CAN BE HOT-UNPLUGGED. The
+// install session keeps running after Setup, so the ready transition ejects the
+// CD and `device_del`s this frontend; QMP addresses a qdev by id, so an argv
+// without one could only be cleaned by restarting the computer.
+const USB_STICK = 'usb-storage,drive=setup0,removable=on,bus=xhci.0,id=setupusb'
 check('F1: the answer medium is setup.img as a WRITABLE removable usb-storage stick',
   argv.join(' ').includes(`file=${paths.setupImg},format=raw,if=none,id=setup0`)
   && !argv.join(' ').includes('id=setup0,readonly=on')
-  && has('usb-storage,drive=setup0,removable=on,bus=xhci.0')
+  && has(USB_STICK)
   && !has('ide-hd,drive=setup0,bus=ide.2'))
 check('F1: ...and the usb-storage device follows the xHCI controller it names (argv order)',
-  argv.indexOf('usb-storage,drive=setup0,removable=on,bus=xhci.0') > argv.indexOf('qemu-xhci,id=xhci'))
+  argv.indexOf(USB_STICK) > argv.indexOf('qemu-xhci,id=xhci'))
+check('D2: ...and carries the explicit qdev id the ready transition unplugs',
+  USB_STICK.endsWith(',id=setupusb') && argv.includes(USB_STICK))
 check('F1/F2: no ide-hd device in the argv sits behind a read-only block node', (() => {
   // Map each ide-hd device to its drive id, then look up the -drive line that
   // declares that id: `readonly=on` on a hard-disk backend is what QEMU 10
@@ -233,7 +240,7 @@ check('S1: the setup disk is only attached while installing (no stale answer dis
 check('S1: a driver ISO keeps its own CD slot (ide.3), away from the answer medium', (() => {
   const withDrivers = buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: '/drv.iso', sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: false })
   return withDrivers.includes('ide-cd,drive=cd1,bus=ide.3')
-    && withDrivers.includes('usb-storage,drive=setup0,removable=on,bus=xhci.0')
+    && withDrivers.includes(USB_STICK)
     && !withDrivers.join(' ').includes('ide-cd,drive=cd1,bus=ide.2')
 })())
 check('the USB controller is declared before the USB input devices',

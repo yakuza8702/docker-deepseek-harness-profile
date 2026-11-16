@@ -61,6 +61,10 @@ import {
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
   buildSetupImage, normaliseProductKey, resolveWindowsImageSelection,
   windowsKvmPreflight, windowsPortsOf, windowsTailLines, formatWindowsInstallDetail, windowsReadinessSignals,
+  // D3/D5: the post-install boot signal and the two exact sentences. The watcher
+  // derives its deadline from windowsBootedFromDisk()'s answer, so the probe and
+  // the sentence can never disagree about the stage.
+  windowsBootedFromDisk, WINDOWS_SSH_MISSING_DETAIL,
   // R3-adjacent: `qmpStateLabel` / `endpointLabel` are used by the windowsStatus
   // sentences. They were never imported, so every status call that REACHED those
   // lines threw `qmpStateLabel is not defined` — a latent bug that stayed hidden
@@ -3090,6 +3094,73 @@ function windowsEarlyDeathWindowMs() {
   return 5000
 }
 
+/**
+ * D3: HOW LONG OPENSSH GETS AFTER THE INSTALLED DISK BOOTS.
+ *
+ * The main install window (`windowsInstallTimeoutMinutes`, 60) is about Setup:
+ * partitioning, applying the image, OOBE. Once the disk boots, firstboot is a
+ * different job — install OpenSSH, download python.org's installer, pip-install
+ * dsh-cua — and it deserves its own bounded window measured from the BOOT, not
+ * from the start of the attempt. 15 minutes is generous for three downloads and
+ * short enough that a failed firstboot is reported the same afternoon.
+ *
+ * Overridable so a lab can shorten it (`DSH_CUA_WINDOWS_SSH_GRACE_MIN`). Unset
+ * is not zero (the read-once-the-raw-string rule this module uses everywhere).
+ */
+function windowsInstallSshGraceMinutes() {
+  const raw = process.env.DSH_CUA_WINDOWS_SSH_GRACE_MIN
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed) && parsed >= 1) return Math.min(240, Math.trunc(parsed))
+  }
+  return 15
+}
+
+/**
+ * D2: TAKE THE INSTALL MEDIA OUT OF THE SESSION THAT FINISHED INSTALLING.
+ *
+ * Called at the READY transition from the watcher and from the status poll (a
+ * panel can observe ready before the watcher's next 15 s tick, and the watcher
+ * may have been restarted). `installMediaDetached` makes it a once-only action,
+ * so a poll every 5 s does not issue QMP commands for ever.
+ *
+ * It NEVER throws: the transition to ready is worth more than a tidy device
+ * list, and every failure is logged with the device it concerned.
+ */
+async function detachWindowsInstallMedia(name) {
+  try {
+    const row = readRegistry().vms[name]
+    if (!row || row.kind !== 'windows') return null
+    if (row.installMediaDetached === true) return null
+    // A FAILED attempt is retried, but not every 5 s: one QMP failure is worth
+    // repeating a minute later, not 12 times per minute in the log.
+    const lastAttempt = Date.parse(row.installMedia?.at || '') || 0
+    if (lastAttempt > 0 && Date.now() - lastAttempt < 60000) return null
+    const result = await windowsBackend.detachInstallMedia(row)
+    // ONCE-ONLY IS EARNED, NOT ASSUMED. A QMP that did not answer must be
+    // retried on the next ready observation (the panel polls every 5 s); marking
+    // the row detached after a failure would leave the media attached for the
+    // life of the session.
+    const failed = result.errors.filter((error) => error.command !== 'query-block')
+    await mutateRegistry((fresh) => {
+      const freshRow = fresh.vms[name]
+      if (!freshRow) return
+      freshRow.installMediaDetached = failed.length === 0
+      freshRow.installMedia = {
+        ejected: result.commands.filter((command) => command.execute === 'eject').map((command) => command.arguments?.device).filter(Boolean),
+        detached: result.commands.filter((command) => command.execute === 'device_del').map((command) => command.arguments?.id).filter(Boolean),
+        skipped: result.skipped,
+        errors: failed.length > 0 ? failed.slice(0, 4) : undefined,
+        at: new Date().toISOString()
+      }
+    })
+    return result
+  } catch (error) {
+    log(`windows: ${name} could not detach the install media (non-fatal): ${error?.message ?? error}`)
+    return null
+  }
+}
+
 function watchWindowsInstall(name) {
   assertVmName(name)
   if (WINDOWS_WATCHING.has(name)) return
@@ -3114,6 +3185,16 @@ function watchWindowsInstall(name) {
           const started = Date.parse(meta.startedAt || meta.createdAt || '') || Date.now()
           const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
           const elapsedMinutes = Math.round((Date.now() - started) / 60000)
+          // D3: THE STAGE THE SERIAL LOG PROVES. Read once per tick (a bounded
+          // tail read) and used by BOTH the deadline and the sentence, so the
+          // panel and the timeout can never disagree about whether Setup or
+          // firstboot is the thing being waited on.
+          const serialHead = windowsLogTail(name, 200)
+          const bootedNow = windowsBootedFromDisk(serialHead)
+          const bootedAtMs = Date.parse(meta.bootedAt || '') || (bootedNow ? Date.now() : 0)
+          const bootedStage = bootedAtMs > 0
+          const bootedMinutes = bootedStage ? Math.round((Date.now() - bootedAtMs) / 60000) : 0
+          const sshGraceMinutes = windowsInstallSshGraceMinutes()
           let verdict
           try {
             verdict = await windowsBackend.ready(meta, { ssh: meta.ssh !== false, phase: 'install' })
@@ -3123,7 +3204,14 @@ function watchWindowsInstall(name) {
           // THE PORT THE SENTENCE NAMES comes from the ROW (the only place it is
           // authoritative after a reconcile); the formatter reads it from the
           // verdict so its call site stays one expression.
-          verdict = { ...verdict, sshPort: Number(meta.ports?.ssh ?? 0) }
+          // D3: the stage rides WITH the verdict so the one-line formatter call
+          // below describes the same clock the deadline above used.
+          verdict = {
+            ...verdict,
+            sshPort: Number(meta.ports?.ssh ?? 0),
+            installStage: bootedStage ? 'booted' : 'installing',
+            bootedMinutes
+          }
           // F2: A DEAD QEMU IS AN ERROR NOW, NOT A 60-MINUTE INSTALL.
           //
           // Everything the reported failure looked like from the outside is
@@ -3185,16 +3273,39 @@ function watchWindowsInstall(name) {
               delete row.startedAt
               delete row.serialTail
               delete row.installTailAt
+              // D3: the install is over; a stale 'booted' stage would keep
+              // answering a finished row with an install sentence.
+              delete row.installStage
+              delete row.bootedAt
             })
             return { stop: true, ready: true }
           }
-          if (elapsedMinutes > timeoutMinutes) {
+          // D3: THE DEADLINE FOLLOWS THE STAGE.
+          //
+          // Before the installed disk boots, the 60-minute window is about
+          // DISK WORK (partition, apply image, OOBE) and is compared against the
+          // START of this attempt. After it boots, the remaining work is
+          // firstboot (OpenSSH, python, pip) and gets its OWN window measured
+          // from the boot — otherwise a slow install that booted at minute 55
+          // would be marked `error` five minutes later while firstboot was still
+          // legitimately downloading python.
+          const overDeadline = bootedStage ? bootedMinutes > sshGraceMinutes : elapsedMinutes > timeoutMinutes
+          if (overDeadline) {
             const tail = windowsLogTail(name, 40)
             await mutateRegistry((fresh) => {
               const row = fresh.vms[name]
               if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
               row.state = 'error'
-              row.error = `the Windows install did not become ready within ${timeoutMinutes} minutes (${verdict.error ?? 'SSH did not answer'})`
+              if (bootedStage) {
+                // D5: "INSTALLED BUT SSH MISSING" IS NOT "THE INSTALL FAILED".
+                // The disk booted; what did not happen is firstboot. Say that,
+                // name the log a human can open, and point at the one action
+                // that resolves it.
+                row.error = `the Windows disk booted, but OpenSSH did not answer within ${sshGraceMinutes} minutes after the boot (${verdict.error ?? 'the SSH banner never came'}); the firstboot script likely failed — check the noVNC view and C:\\Windows\\Setup\\Scripts\\cua-setup.log, then Force delete + recreate`
+                row.installDetail = WINDOWS_SSH_MISSING_DETAIL
+              } else {
+                row.error = `the Windows install did not become ready within ${timeoutMinutes} minutes and the installed disk never booted (${verdict.error ?? 'SSH did not answer'}); Windows Setup did not finish — see the serial log tail and the noVNC view`
+              }
               row.errorLog = tail.slice(-4000)
             })
             return { stop: true, timedOut: true }
@@ -3208,7 +3319,17 @@ function watchWindowsInstall(name) {
             const row = fresh.vms[name]
             if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
             row.state = 'installing'
+            // D3: 'booted' is an INSTALL STAGE, not a state — the row keeps
+            // saying `installing` (so the panel still offers Force delete) but
+            // the sentence changes from "Setup is running" to the truth: the
+            // installed disk booted and OpenSSH has not answered yet.
             row.installDetail = formatWindowsInstallDetail({ phase: 'install', verdict, elapsedMinutes, serialTail })
+            if (bootedStage) {
+              row.installStage = 'booted'
+              // STAMP ONCE: the grace window must not restart on every 15 s
+              // tick (that would wait for ever instead of telling the user).
+              if (!row.bootedAt) row.bootedAt = new Date().toISOString()
+            }
             // The tail travels with the row so the panel shows Setup progress
             // without a second call, and an agent reading `status` sees it too.
             row.serialTail = serialTail
@@ -3219,6 +3340,12 @@ function watchWindowsInstall(name) {
         })
         if (decision.stop) {
           if (decision.ready) await ensureWindowsConsoleRelay(name)
+          // D2: THE MEDIA LEAVE WITH THE INSTALL. This is the READY transition:
+          // the desktop is up, the SSH banner answered, firstboot has finished.
+          // Ejecting here (and not at "the disk booted") matters because the
+          // drive-scanning firstboot fallback may still need the medium at the
+          // first logon.
+          if (decision.ready) await detachWindowsInstallMedia(name)
           if (decision.reason !== undefined) log(`windows: install watch for ${name} stopped (${decision.reason})`)
           if (decision.ready) log(`windows: ${name} ready`)
           if (decision.died) log(`windows: install watch for ${name} ended: QEMU died (the row is 'error' with the captured stderr)`)
@@ -3910,6 +4037,17 @@ async function windowsStart(name, meta) {
       row.state = bootState
       row.startedAt = new Date().toISOString()
       row.lastUsed = new Date().toISOString()
+      // D2/D3: A NEW INSTALL STARTS WITH A CLEAN MEDIA/STAGE HISTORY. The argv
+      // of an install boot re-attaches the CD and setup.img, so a row that once
+      // reached ready must not keep `installMediaDetached` (the ready transition
+      // would then never eject the NEW session's media) or a stale `booted`
+      // stage.
+      if (installPending) {
+        delete row.installMediaDetached
+        delete row.installMedia
+        delete row.installStage
+        delete row.bootedAt
+      }
       if (running) {
         delete row.restoreFrom
         delete row.mayBeTorn
@@ -4588,6 +4726,16 @@ const handlers = {
     // A row that is installing/booting is in SETUP: only SSH counts, exactly
     // like the watcher's own call.
     const installPhase = meta.state === 'installing' || meta.state === 'booting'
+    // D3: THE SAME BOOT-FROM-DISK SIGNAL THE WATCHER USES. The panel polls every
+    // 5 s and the watcher every 15 s, so without this the badge would keep
+    // saying "Setup is running" for up to a quarter of a minute after the serial
+    // log proved otherwise — and a watcher that was restarted would never say it
+    // at all.
+    const serialHead = windowsLogTail(name, 200)
+    const bootedNow = installPhase && windowsBootedFromDisk(serialHead)
+    const bootedAtMs = Date.parse(meta.bootedAt || '') || (bootedNow ? Date.now() : 0)
+    const bootedStage = installPhase && bootedAtMs > 0
+    const bootedMinutes = bootedStage ? Math.round((Date.now() - bootedAtMs) / 60000) : 0
     const ready = verdict.alive && verdict.status === 'running'
       ? await windowsBackend.ready(meta, { ssh: meta.ssh !== false, ...(installPhase ? { phase: 'install' } : {}) })
       : { ready: false, endpoint: 'none' }
@@ -4612,10 +4760,17 @@ const handlers = {
           row.endpoint = ready.endpoint
           row.installComplete = true
           delete row.error
+          // D3: a finished row must not keep answering with an install stage.
+          delete row.installStage
+          delete row.bootedAt
         }
       })
     }
     if (state === 'ready') await ensureWindowsConsoleRelay(name)
+    // D2: the transition to ready also happens HERE when the panel polls faster
+    // than the watcher ticks (or after a supervisor restart). Once-only is
+    // enforced by `installMediaDetached` inside the helper.
+    if (state === 'ready') await detachWindowsInstallMedia(name)
     // X8: per START ATTEMPT, the same clock the watcher's deadline uses; a
     // legacy row without startedAt still falls back to createdAt.
     const elapsedMinutes = Math.round((Date.now() - (Date.parse(meta.startedAt || meta.createdAt || '') || Date.now())) / 60000)
@@ -4633,7 +4788,7 @@ const handlers = {
     const installDetail = state === 'ready'
       ? `ready (${endpointLabel(ready)} accepting, QMP ${qmpStateLabel(verdict)})`
       : showInstall
-        ? `${formatWindowsInstallDetail({ phase: 'install', verdict: { ...verdict, endpoint: ready.endpoint }, elapsedMinutes, serialTail, sshPort: meta.ports?.ssh ?? 0 })}${stuck ? ' No QEMU process is running for this row: the install is stuck — Force delete removes it.' : ''}`
+        ? `${formatWindowsInstallDetail({ phase: 'install', verdict: { ...verdict, endpoint: ready.endpoint }, elapsedMinutes, serialTail, sshPort: meta.ports?.ssh ?? 0, installStage: bootedStage ? 'booted' : 'installing', bootedMinutes })}${stuck ? ' No QEMU process is running for this row: the install is stuck — Force delete removes it.' : ''}`
         // F4: A FINISHED (OR FAILED) ROW STILL GETS A SENTENCE. `meta.installDetail`
         // is the LAST install sentence, and a row that never got one (a start
         // that died before the first watcher tick) used to answer `undefined` —
@@ -4660,6 +4815,13 @@ const handlers = {
         row.serialTail = serialTail
         row.installTailAt = new Date().toISOString()
         row.readiness = windowsReadinessSignals(name)
+        // D3: keep the stage on the row, stamped once, so the deadline and the
+        // sentence survive a supervisor restart and a slow install that only
+        // booted near the end of the 60-minute window.
+        if (bootedStage) {
+          row.installStage = 'booted'
+          if (!row.bootedAt) row.bootedAt = new Date().toISOString()
+        }
       })
     }
     return ok({
@@ -4685,10 +4847,17 @@ const handlers = {
       installDetail,
       serialTail: showInstall ? serialTail : [],
       elapsedMinutes,
+      // D3: WHICH HALF OF THE INSTALL IS BEING WAITED ON. 'booted' means the
+      // installed disk is up and OpenSSH is what has not answered yet — the
+      // distinction the user needed and the old payload could not make.
+      installStage: showInstall ? (bootedStage ? 'booted' : 'installing') : undefined,
+      bootedMinutes: showInstall && bootedStage ? bootedMinutes : undefined,
       readiness: windowsReadinessSignals(name),
       // ONE LINE A MODEL CAN ACT ON without composing its own readiness rules.
       operationalNote: state === 'installing'
-        ? 'poll this call until state is "ready" (or call cua_vm_status): readiness answers when the SSH banner answers AND QMP says running; a timeout past installTimeoutMinutes marks the row error with the serial tail'
+        ? (bootedStage
+          ? 'the installed disk has booted; OpenSSH is installed by firstboot, so if this never answers the firstboot script failed — check the noVNC view, then Force delete + recreate'
+          : 'poll this call until state is "ready" (or call cua_vm_status): readiness answers when the SSH banner answers AND QMP says running; a timeout past installTimeoutMinutes marks the row error with the serial tail')
         : state === 'ready' ? `exec/put/get work over SSH; the desktop is cua_vm_gui over QMP, or the live view at /vm/port/${name}/` : undefined,
       installTimeoutMinutes: timeoutMinutes,
       console: state === 'ready' ? `/vm/port/${name}/` : undefined,

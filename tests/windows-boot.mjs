@@ -34,6 +34,14 @@ mkdirSync(STORE, { recursive: true })
 mkdirSync(BIN, { recursive: true })
 
 const ARGV_LOG = path.join(ROOT, 'argv.log')
+/**
+ * D2: THE COMPLETE ARGV OF EVERY ATTEMPT, one line each.
+ *
+ * `ARGV_LOG` is display-only (it exists for the GPU-fallback assertions and
+ * their exact line count). The post-install-shape assertion needs the WHOLE
+ * command line, so it gets its own file and cannot disturb those counts.
+ */
+const ARGV_FULL = path.join(ROOT, 'argv-full.log')
 const FAIL_MARKER = path.join(ROOT, 'fail-mode')
 
 /** The stub QEMU: parses the argv, records it, and behaves per `fail-mode`. */
@@ -50,6 +58,7 @@ for a in "$@"; do
   prev="$a"
 done
 printf 'display=%s\\n' "$DISPLAY" >> "${ARGV_LOG}"
+printf '%s\\n' "$*" >> "${ARGV_FULL}"
 MODE="$(cat "${FAIL_MARKER}" 2>/dev/null || echo ok)"
 case "$MODE" in
   slow)
@@ -99,8 +108,12 @@ process.env.DSH_CUA_WINDOWS_QEMU = QEMU
 process.env.DSH_CUA_WINDOWS_SWTPM = SWTPM
 process.env.DSH_CUA_WINDOWS_BOOT_SETTLE_MS = '1500'
 
-const { createWindowsBackend, windowsPaths, waitForQemuBoot, qemuStderrExcerpt, classifyQemuInitFailure, qemuBootWindowMs } =
-  await import('../docker/cua-vm-windows-qemu.mjs')
+const {
+  createWindowsBackend, windowsPaths, waitForQemuBoot, qemuStderrExcerpt, classifyQemuInitFailure, qemuBootWindowMs,
+  windowsBootedFromDisk, windowsInstallStageFromSerial, formatWindowsInstallDetail,
+  WINDOWS_BOOTED_DETAIL, WINDOWS_SSH_MISSING_DETAIL, WINDOWS_SSH_MISSING_MINUTES,
+  assertAnswerFileUsesConfigurationSet, assertAnswerFileFirstbootLayers, FIRSTBOOT_FALLBACK_COMMAND
+} = await import('../docker/cua-vm-windows-qemu.mjs')
 
 let failures = 0
 const check = (label, ok, detail = '') => {
@@ -123,13 +136,22 @@ const qmpCalls = []
  * stub in the backend's shape would hide the R3 mismatch instead of proving the
  * adapter. `opts.host` and `opts.timeoutMs` are what the adapter adds.
  */
+const BLOCK_TABLE = [
+  { device: 'disk0', qdev: 'disk0', removable: false },
+  { device: 'cd0', qdev: '#block-cd', removable: true, inserted: { file: 'windows.iso' } },
+  { device: 'setup0', qdev: 'setupusb', removable: true, inserted: { file: 'setup.img' } }
+]
+let blockTable = BLOCK_TABLE
 const recordingQmp = async (port, commands, opts = {}) => {
   qmpCalls.push({ port, host: opts.host, opts, commands, at: Date.now() })
-  return (Array.isArray(commands) ? commands : []).map((command) =>
-    command?.execute === 'query-status' ? { return: { status: 'running', running: true } } : { return: {} })
+  return (Array.isArray(commands) ? commands : []).map((command) => {
+    if (command?.execute === 'query-status') return { return: { status: 'running', running: true } }
+    if (command?.execute === 'query-block') return { return: blockTable }
+    return { return: {} }
+  })
 }
 const backend = createWindowsBackend({ store: STORE, qmp: recordingQmp, log: () => {} })
-const NAMES = ['win-egl', 'win-kvm', 'win-clean', 'win-slow', 'win-keys', 'win-nokeys']
+const NAMES = ['win-egl', 'win-kvm', 'win-clean', 'win-slow', 'win-keys', 'win-nokeys', 'win-nocd', 'win-detach', 'win-detach-none']
 
 /** A bootable-enough windows directory: the vars file must already exist. */
 function prepare(name) {
@@ -343,6 +365,168 @@ try {
     writeFileSync(pidFile, `${process.pid}\n`)
     const good = await waitForQemuBoot({ child: fakeChild, pidFile, isAlive: (pid) => pid === process.pid, windowMs: 200, pollMs: 10 })
     check('waitForQemuBoot accepts a pidfile whose pid is alive', good.ok === true && good.pid === process.pid, JSON.stringify(good))
+  }
+
+  // ---- D3: THE POST-INSTALL BOOT IS DETECTED FROM THE SERIAL LOG ----
+  //
+  // THE REPORTED DEFECT: after the install the panel still said "installing
+  // (35 min)" while Windows was already on the desktop, and the 60-minute
+  // timeout would have marked that SUCCESSFUL install as `error`. The signal is
+  // the firmware's own boot narration — a "Windows Boot Manager" boot option
+  // exists only after Setup wrote a BCD to the system disk's ESP.
+  {
+    const userReported = [
+      'BdsDxe: loading Boot0004 "Windows Boot Manager" from HD(1,GPT,0F2A...)/\\EFI\\Microsoft\\Boot\\bootmgfw.efi',
+      'BdsDxe: starting Boot0004 "Windows Boot Manager"'
+    ].join('\n')
+    check('D3: the user-reported "Boot0004 Windows Boot Manager from HD(1,GPT...)" counts as booted',
+      windowsBootedFromDisk(userReported) === true, 'user-reported serial shape')
+    check('D3: ...and a DVD/Setup boot does NOT',
+      windowsBootedFromDisk('BdsDxe: loading Boot0002 "UEFI QEMU DVD-ROM QM00003" from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x1,0x0,0x0)') === false
+      && windowsBootedFromDisk('') === false
+      && windowsBootedFromDisk(null) === false)
+    check('D3: ...a bare "loading Boot0004" only counts together with a HARD DISK hint',
+      windowsBootedFromDisk('BdsDxe: loading Boot0004 from PciRoot(0x0)') === false
+      && windowsBootedFromDisk('BdsDxe: loading Boot0004 from HD(1,GPT,abc)') === true)
+    check('D3: windowsInstallStageFromSerial names both stages',
+      windowsInstallStageFromSerial('Windows Setup is starting') === 'installing'
+      && windowsInstallStageFromSerial(userReported) === 'booted')
+  }
+
+  // ---- D3/D5: THE TWO SENTENCES ARE EXACT, AND THE 5-MINUTE THRESHOLD ----
+  {
+    const booted = formatWindowsInstallDetail({ phase: 'install', verdict: {}, elapsedMinutes: 35, serialTail: '', installStage: 'booted', bootedMinutes: 1 })
+    check('D3: a booted disk with no SSH says exactly what the user asked for',
+      booted === 'Windows booted from the installed disk; waiting for OpenSSH (installed by firstboot) — if this never answers, firstboot failed (see the Unattend.vbs error on the desktop)',
+      JSON.stringify(booted))
+    const missing = formatWindowsInstallDetail({ phase: 'install', verdict: {}, elapsedMinutes: 40, serialTail: '', installStage: 'booted', bootedMinutes: WINDOWS_SSH_MISSING_MINUTES + 1 })
+    check('D5: past five minutes the sentence is the exact firstboot-failed guidance',
+      missing === 'OpenSSH did not answer — the firstboot script likely failed; use the noVNC view to check, and Force delete + recreate to retry',
+      JSON.stringify(missing))
+    check('D3: ...and the constants are those strings (no template can paraphrase them)',
+      WINDOWS_BOOTED_DETAIL === booted && WINDOWS_SSH_MISSING_DETAIL === missing && WINDOWS_SSH_MISSING_MINUTES === 5)
+    // THE STAGE MAY ARRIVE ON THE VERDICT (the watcher's one-line call site).
+    const viaVerdict = formatWindowsInstallDetail({ phase: 'install', verdict: { installStage: 'booted', bootedMinutes: 0 }, elapsedMinutes: 35, serialTail: '' })
+    check('D3: ...the watcher\'s one-line call gets the same sentence via verdict.installStage',
+      viaVerdict === WINDOWS_BOOTED_DETAIL, JSON.stringify(viaVerdict).slice(0, 80))
+    const stillInstalling = formatWindowsInstallDetail({ phase: 'install', verdict: { alive: true, status: 'running', endpoint: 'none' }, elapsedMinutes: 10, serialTail: 'Windows Setup is starting' })
+    check('D3: a guest still in Setup keeps the Setup sentence', /^installing \(10 min\)/u.test(stillInstalling), stillInstalling.slice(0, 80))
+  }
+
+  // ---- D1: THE ANSWER FILE ASKS FOR $OEM$ AND CARRIES BOTH FIRSTBOOT LAYERS ----
+  {
+    const template = readFileSync(new URL('../docker/windows-oem/Autounattend.xml', import.meta.url), 'utf8')
+    let ok = true
+    let detail = ''
+    try {
+      ok = assertAnswerFileUsesConfigurationSet(template) === true
+    } catch (error) {
+      ok = false
+      detail = String(error?.message)
+    }
+    check('D1: the answer template sets UseConfigurationSet inside windowsPE/Microsoft-Windows-Setup', ok, detail)
+    // NEGATIVE CONTROL: this is the exact shape the reported image shipped — a
+    // $OEM$ tree with nothing asking Setup to use it. It must be REFUSED, or the
+    // assertion is decoration.
+    let refused = false
+    try {
+      assertAnswerFileUsesConfigurationSet(template.replace('<UseConfigurationSet>true</UseConfigurationSet>', ''))
+    } catch {
+      refused = true
+    }
+    check('D1: ...and a template WITHOUT it is refused (the reported D1 shape)', refused)
+    let layers = true
+    let layerDetail = ''
+    try {
+      layers = assertAnswerFileFirstbootLayers(template) === true
+    } catch (error) {
+      layers = false
+      layerDetail = String(error?.message)
+    }
+    check('D1: both firstboot layers are present (hidden launcher + drive-scan fallback)', layers, layerDetail)
+    check('D1: the fallback command is the shared constant, single-%d command-line form',
+      template.includes(FIRSTBOOT_FALLBACK_COMMAND)
+      && /^cmd \/c for %d in \(c d e f g h\) do @if exist "%d:\\cua-firstboot\.ps1" powershell\.exe /u.test(FIRSTBOOT_FALLBACK_COMMAND),
+      FIRSTBOOT_FALLBACK_COMMAND.slice(0, 60))
+    let bareRefused = false
+    try {
+      assertAnswerFileFirstbootLayers(template.replace(FIRSTBOOT_FALLBACK_COMMAND, 'rem removed'))
+    } catch {
+      bareRefused = true
+    }
+    check('D1: ...and a file missing the fallback is refused', bareRefused)
+  }
+
+  // ---- D2: THE INSTALL MEDIA ARE EJECTED, IN ORDER, AND NON-FATALLY ----
+  {
+    blockTable = BLOCK_TABLE
+    qmpCalls.length = 0
+    const spec = specFor('win-detach')
+    const result = await backend.detachInstallMedia(spec)
+    const sent = qmpCalls.flatMap((entry) => (entry.commands ?? []).map((command) => ({ command, port: entry.port, opts: entry.opts })))
+    const order = sent.map((entry) => entry.command.execute)
+    check('D2: detach asks query-block first, then ejects the CD, then unplugs the stick',
+      order.join('>') === 'query-block>eject>device_del', order.join('>'))
+    check('D2: ...the eject names the CD block node with force',
+      order[1] === 'eject'
+      && sent[1]?.command?.arguments?.device === 'cd0'
+      && sent[1]?.command?.arguments?.force === true,
+      JSON.stringify(sent[1]?.command))
+    check('D2: ...and device_del addresses the qdev id from query-block (not the block node)',
+      sent[2]?.command?.arguments?.id === 'setupusb', JSON.stringify(sent[2]?.command))
+    check('D2: ...every command went to the row\'s QMP port on loopback',
+      sent.every((entry) => entry.port === spec.qmpPort && entry.opts?.host === '127.0.0.1'))
+    check('D2: the result reports both commands and no errors',
+      result.commands.length === 2 && result.errors.length === 0 && result.skipped.length === 0,
+      JSON.stringify(result))
+
+    // ALREADY DETACHED: a second call must be silent, not a wall of
+    // DeviceNotFound. This is what makes the status poll safe.
+    blockTable = [{ device: 'disk0', qdev: 'disk0', removable: false }]
+    qmpCalls.length = 0
+    const again = await backend.detachInstallMedia(spec)
+    check('D2: an already-detached session sends no eject/device_del',
+      again.commands.length === 0 && again.skipped.join(',') === 'cd0,setup0'
+      && qmpCalls.every((entry) => (entry.commands ?? []).every((command) => command.execute === 'query-block')),
+      JSON.stringify(again))
+
+    // THE CONTRACT IS NON-FATAL: no QMP, no exception, and the fields say why.
+    const deadBackend = createWindowsBackend({
+      store: STORE,
+      qmp: async () => { throw new Error('ECONNREFUSED 127.0.0.1') },
+      log: () => {}
+    })
+    const deadSpec = specFor('win-detach-none')
+    let threw = null
+    let deadResult = null
+    try {
+      deadResult = await deadBackend.detachInstallMedia(deadSpec)
+    } catch (error) {
+      threw = error
+    }
+    check('D2: a dead QMP cannot fail the ready transition (attempted, logged, non-fatal)',
+      threw === null && deadResult?.attempted?.length === 2 && deadResult.errors.length >= 2,
+      threw === null ? JSON.stringify(deadResult) : String(threw?.message))
+  }
+
+  // ---- D2/argv: THE POST-INSTALL BOOT CARRIES NO INSTALL MEDIA ----
+  //
+  // The running install session is fixed by QMP above; every LATER start builds
+  // its argv from `installPending: false`, which must attach neither the CD nor
+  // setup.img — otherwise the computer would keep a DVD drive and the SETUP
+  // volume after a reboot, and could boot the DVD again.
+  {
+    writeFileSync(ARGV_FULL, '')
+    writeFileSync(FAIL_MARKER, 'ok')
+    const spec = specFor('win-nocd')
+    await backend.boot(spec, { installPending: false })
+    const lines = readFileSync(ARGV_FULL, 'utf8').trim().split('\n').filter((line) => line !== '')
+    const argv = lines.at(-1) ?? ''
+    check('D2: a post-install boot attaches NO CD and NO setup.img',
+      !/id=cd0|drive=cd0|id=setup0|drive=setup0|setup\.img/u.test(argv), argv.slice(0, 240))
+    check('D2: ...while the system disk still boots first',
+      /ide-hd,drive=disk0,bus=ide\.0,bootindex=1/u.test(argv), argv.slice(0, 200))
+    backend.kill(spec.name)
   }
 
   // ---- the pure helpers ----

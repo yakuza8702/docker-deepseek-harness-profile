@@ -399,7 +399,28 @@ const NEEDLES = {
     ['const serialTail = windowsProgressTail(name, Math.max(1, Math.min(5, Number(tail) || 20)))', 1],
     ['function windowsProgressTail(name, lines = 5)', 1],
     ['readiness: windowsReadinessSignals(name),', 1],
-    ['row.serialTail = serialTail', 1],
+    ['row.serialTail = serialTail', 2],
+    // D3/D5: DONE-DETECTION HAS A SECOND SIGNAL, AND THE DEADLINE FOLLOWS THE
+    // STAGE. A booted disk with no SSH is "firstboot failed", not "the install
+    // did not finish" — and the panel says so in the exact words the user asked
+    // for. Both calls (watcher + status poll) read the same serial signal.
+    ['function windowsInstallSshGraceMinutes()', 1],
+    ['const bootedAtMs = Date.parse(meta.bootedAt || \'\')', 2],
+    ['windowsBootedFromDisk(', 3],
+    ['const overDeadline = bootedStage ? bootedMinutes > sshGraceMinutes : elapsedMinutes > timeoutMinutes', 1],
+    ['the installed disk never booted', 1],
+    ["row.installStage = 'booted'", 2],
+    ['installStage: bootedStage ? \'booted\' : \'installing\',', 2],
+    ['WINDOWS_SSH_MISSING_DETAIL', 2],
+    // D2: THE READY TRANSITION EJECTS. One helper, called from the watcher AND
+    // from the status poll (a panel can see ready first), guarded by
+    // `installMediaDetached` so it is a once-only action.
+    ['async function detachWindowsInstallMedia(name)', 1],
+    ['await detachWindowsInstallMedia(name)', 2],
+    ['freshRow.installMediaDetached = failed.length === 0', 1],
+    // ...and only when nothing failed, so a QMP that did not answer is retried
+    // (rate-limited) instead of leaving the media attached for the session.
+    ['const lastAttempt = Date.parse(row.installMedia?.at || \'\') || 0', 1],
     // A row that says `installing` with no process is STUCK: the state is not
     // rewritten to `stopped`, so the panel keeps offering the one action that
     // resolves it (Force delete).
@@ -734,7 +755,34 @@ const NEEDLES = {
     ['return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 30000) : 5000', 1],
     ['const waitMs = installInProgress ? installShutdownWindowMs() : Math.max(1000, timeoutMs)', 1],
     ['...(installInProgress ? { forced: true } : {})', 1],
-    ['forced: true, installInProgress', 1]
+    ['forced: true, installInProgress', 1],
+    // D2: THE INSTALL MEDIA LEAVE THE RUNNING SESSION. The CD is `eject`ed and
+    // the usb-storage stick is `device_del`ed at the READY transition, so a
+    // finished computer shows only its system disk. The device id is explicit in
+    // the argv because `device_del` addresses the QOM frontend, not the block
+    // node; both names share one constant so the two namespaces cannot drift.
+    ['export const INSTALL_MEDIA_DEVICE_IDS = Object.freeze({ cd: \'cd0\', setup: \'setup0\', setupDevice: \'setupusb\' })', 1],
+    ['async function detachInstallMedia(rawSpec)', 1],
+    ['await qmpFor(spec, [command], { timeoutMs: 5000 })', 1],
+    ["execute: 'eject'", 1],
+    ["execute: 'device_del'", 1],
+    ['detachInstallMedia,', 1],
+    // D3/D5: THE BOOT-FROM-HD SIGNAL AND THE TWO EXACT SENTENCES. The watcher's
+    // deadline follows the stage, so "installed but SSH missing" can no longer
+    // be reported as "the install did not finish".
+    ['export const WINDOWS_HD_BOOT_PATTERN', 1],
+    ['export function windowsBootedFromDisk(serialText)', 1],
+    ['export function windowsInstallStageFromSerial(serialText)', 1],
+    ['export const WINDOWS_BOOTED_DETAIL', 1],
+    ['export const WINDOWS_SSH_MISSING_DETAIL', 1],
+    ['export const WINDOWS_SSH_MISSING_MINUTES = 5', 1],
+    // D1/H1: $OEM$ IS INERT WITHOUT THIS. Both the element and the assertion
+    // that refuses a staged answer file without it (the reported WSH dialog).
+    ['export function assertAnswerFileUsesConfigurationSet(xml)', 1],
+    ['assertAnswerFileUsesConfigurationSet(stagedXml)', 1],
+    ['export function assertAnswerFileFirstbootLayers(xml)', 1],
+    ['assertAnswerFileFirstbootLayers(stagedXml)', 1],
+    ['export const FIRSTBOOT_FALLBACK_COMMAND', 1]
   ],
   winMcp: [
     ['export function windowsMcpEnabled()', 1],
@@ -770,7 +818,16 @@ const NEEDLES = {
     ['{{IMAGE_INSTALL}}', 1],
     ['<InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>', 1],
     // S4: FirstLogonCommands uses the hidden launcher, not a bare powershell.
-    ['wscript //nologo C:\\Windows\\Setup\\Scripts\\Unattend.vbs', 1]
+    ['wscript //nologo C:\\Windows\\Setup\\Scripts\\Unattend.vbs', 1],
+    // D1/H1: THE SWITCH THAT MAKES $OEM$ MEAN SOMETHING. Without it Setup never
+    // copies $OEM$\$$\Setup\Scripts into C:\Windows\Setup\Scripts, the
+    // FirstLogonCommand above points at a missing Unattend.vbs, and the desktop
+    // shows "Windows Script Host — Can not find script file".
+    ['<UseConfigurationSet>true</UseConfigurationSet>', 1],
+    // D1/H2: THE BELT. A first-logon fallback that scans drive roots for the
+    // script, so a failed $OEM$ copy does not cost the computer its OpenSSH.
+    ['for %d in (c d e f g h) do @if exist "%d:\\cua-firstboot.ps1"', 1],
+    ['powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%d:\\cua-firstboot.ps1"', 1]
   ],
   oemSetup: [
     ['cua-firstboot.ps1', 1],
@@ -1290,6 +1347,98 @@ function sourceOf(label, name) {
         failures += 1
         missing.push('docker/windows-oem/Autounattend.xml: {{IMAGE_INSTALL}} must sit inside <OSImage> BEFORE <InstallTo> (schema order) — without it Setup stops at "Select the operating system you want to install"')
         console.log('  FAIL F2 InstallFrom placement in the answer template')
+      }
+    }
+  }
+  // D2/D3: THE CALLS MUST BE ON THE READY PATH, NOT MERELY PRESENT. A needle
+  // cannot say "this runs when the row becomes ready"; only the surrounding
+  // text can. Both the watcher's stop branch and the status poll's transition
+  // are checked, because either can be the first to observe `ready`.
+  {
+    const supervisor = sourceOf('D2', 'cua-vm-supervisor.mjs')
+    total += 1
+    if (supervisor === null) {
+      failures += 1
+      missing.push('docker/cua-vm-supervisor.mjs: file not found (D2 ready-transition wiring cannot be checked)')
+    } else {
+      const watcherStart = supervisor.indexOf('function watchWindowsInstall(name)')
+      const watcherEnd = watcherStart === -1 ? -1 : supervisor.indexOf('\n}\n', supervisor.indexOf('WINDOWS_WATCHING.delete(name)', watcherStart))
+      const watcher = watcherStart === -1 || watcherEnd === -1 ? '' : supervisor.slice(watcherStart, watcherEnd)
+      const watcherWired = /if \(decision\.ready\) await detachWindowsInstallMedia\(name\)/u.test(watcher)
+        && /const overDeadline = bootedStage \? bootedMinutes > sshGraceMinutes : elapsedMinutes > timeoutMinutes/u.test(watcher)
+      const statusStart = supervisor.indexOf('async vmWindowsStatus(')
+      const statusEnd = statusStart === -1 ? -1 : supervisor.indexOf('  async vmWindowsLogs(', statusStart)
+      const status = statusStart === -1 || statusEnd === -1 ? '' : supervisor.slice(statusStart, statusEnd)
+      const statusWired = /if \(state === 'ready'\) await detachWindowsInstallMedia\(name\)/u.test(status)
+      const ok = watcherWired && statusWired
+      if (ok) {
+        if (!quietMode) console.log('  ok   D2/D3 the ready transition ejects the media (watcher + status) and the deadline follows the boot stage')
+      } else {
+        failures += 1
+        missing.push(`docker/cua-vm-supervisor.mjs: detachWindowsInstallMedia() must run on the READY transition in BOTH the watcher and vmWindowsStatus, and the watcher's deadline must be 'bootedStage ? bootedMinutes > sshGraceMinutes : elapsedMinutes > timeoutMinutes' (watcher=${watcherWired} status=${statusWired}) — otherwise a desktop stays attached to D: and a successful install still times out at 60 minutes`)
+        console.log('  FAIL D2/D3 ready-transition wiring')
+      }
+    }
+  }
+  // D1/H1: $OEM$ IS ONLY COPIED WHEN THE ANSWER FILE ASKS FOR IT, AND THE ASK
+  // MUST BE IN THE RIGHT COMPONENT. A needle can prove the element exists; only
+  // a POSITION assertion proves Setup will read it as part of
+  // Microsoft-Windows-Setup in the windowsPE pass. Without it Windows ignores
+  // C:\$OEM$ and the desktop shows "Windows Script Host — Can not find script
+  // file C:\Windows\Setup\Scripts\Unattend.vbs" (the reported D1).
+  {
+    const answer = sourceOf('D1', 'Autounattend.xml')
+    total += 1
+    if (answer === null) {
+      failures += 1
+      missing.push('docker/windows-oem/Autounattend.xml: file not found (D1 UseConfigurationSet cannot be checked)')
+    } else {
+      // Comments are stripped: the template EXPLAINS the switch in a comment
+      // that names the element, so a raw search would match our own prose.
+      const bare = answer.replace(/<!--[\s\S]*?-->/gu, '')
+      const peStart = bare.indexOf('<settings pass="windowsPE">')
+      const peEnd = peStart === -1 ? -1 : bare.indexOf('</settings>', peStart)
+      const pe = peStart === -1 || peEnd === -1 ? '' : bare.slice(peStart, peEnd)
+      const setupStart = pe.indexOf('<component name="Microsoft-Windows-Setup"')
+      const setupEnd = setupStart === -1 ? -1 : pe.indexOf('</component>', setupStart)
+      const component = setupStart === -1 || setupEnd === -1 ? '' : pe.slice(setupStart, setupEnd)
+      const switchAt = component.indexOf('<UseConfigurationSet>true</UseConfigurationSet>')
+      const userDataAt = component.indexOf('<UserData>')
+      const count = (component.match(/<UseConfigurationSet\b/gu) ?? []).length
+      const ok = switchAt !== -1 && count === 1 && (userDataAt === -1 || switchAt < userDataAt)
+      if (ok) {
+        if (!quietMode) console.log('  ok   D1 <UseConfigurationSet>true</UseConfigurationSet> sits in the windowsPE Microsoft-Windows-Setup component (exactly once, before <UserData>)')
+      } else {
+        failures += 1
+        missing.push(`docker/windows-oem/Autounattend.xml: <UseConfigurationSet>true</UseConfigurationSet> must appear EXACTLY ONCE inside the windowsPE Microsoft-Windows-Setup component and before <UserData> (found at ${switchAt}, count ${count}) — without it Setup never copies $OEM$ into C:\\Windows\\Setup\\Scripts and firstboot never runs, which is the reported "Can not find script file ...Unattend.vbs"`)
+        console.log('  FAIL D1 UseConfigurationSet placement')
+      }
+    }
+  }
+  // D1/H2: THE FIRSTBOOT FALLBACK. The primary launcher depends on the $OEM$
+  // copy; the fallback scans drive roots for cua-firstboot.ps1. Only a position
+  // assertion can prove BOTH live under FirstLogonCommands as separate commands.
+  {
+    const answer = sourceOf('D1', 'Autounattend.xml')
+    total += 1
+    if (answer === null) {
+      failures += 1
+      missing.push('docker/windows-oem/Autounattend.xml: file not found (D1 firstboot fallback cannot be checked)')
+    } else {
+      const bare = answer.replace(/<!--[\s\S]*?-->/gu, '')
+      const start = bare.indexOf('<FirstLogonCommands>')
+      const end = start === -1 ? -1 : bare.indexOf('</FirstLogonCommands>', start)
+      const block = start === -1 || end === -1 ? '' : bare.slice(start, end)
+      const launcher = /wscript \/\/nologo C:\\Windows\\Setup\\Scripts\\Unattend\.vbs/u.test(block)
+      const fallback = /for %d in \(c d e f g h\) do @if exist "%d:\\cua-firstboot\.ps1"/u.test(block)
+      const orders = [...block.matchAll(/<Order>(\d+)<\/Order>/gu)].map((match) => Number(match[1]))
+      const ok = launcher && fallback && orders.length >= 2 && orders[0] < orders[1]
+      if (ok) {
+        if (!quietMode) console.log('  ok   D1 both firstboot layers are FirstLogonCommands: the $OEM$ Unattend.vbs launcher AND the drive-scanning fallback')
+      } else {
+        failures += 1
+        missing.push('docker/windows-oem/Autounattend.xml: FirstLogonCommands must carry BOTH the $OEM$ launcher (wscript ... Unattend.vbs) and the drive-scanning fallback (`for %d in (c d e f g h) do @if exist "%d:\\cua-firstboot.ps1" powershell.exe ...`) as ordered commands — one copy failure must not cost the computer its OpenSSH')
+        console.log('  FAIL D1 firstboot fallback layer')
       }
     }
   }
