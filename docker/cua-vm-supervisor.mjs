@@ -54,12 +54,17 @@ import {
 import path from 'node:path'
 import { createSpace, formatSpace, formatSpaceWarning, pngSize, relativeToPixels, resolutionProblem, toDisplayPixels, SPACE_CACHE_MS } from './cua-vm-space.mjs'
 import {
-  createWindowsBackend, windowsEnabled, windowsHostCaps,
+  createWindowsBackend, windowsEnabled, windowsHostCaps, windowsQmpAdapter,
   WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
   WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
   WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
   windowsKvmPreflight, windowsPortsOf, windowsTailLines, formatWindowsInstallDetail, windowsReadinessSignals,
+  // R3-adjacent: `qmpStateLabel` / `endpointLabel` are used by the windowsStatus
+  // sentences. They were never imported, so every status call that REACHED those
+  // lines threw `qmpStateLabel is not defined` — a latent bug that stayed hidden
+  // only because the QMP signature mismatch made `probe()` fail earlier.
+  qmpStateLabel, endpointLabel,
   qemuStderrExcerpt, qemuStderrReason
 } from './cua-vm-windows-qemu.mjs'
 import { kvmDoctorFacts, kvmPreflightError, kvmStatus } from './cua-vm-kvm.mjs'
@@ -574,12 +579,19 @@ const VM_KINDS = new Set(['linux', 'windows'])
  * (`ws-…`: workspace/tier/cpu/memory/rea/state, no image), so this is a real
  * migration, not a hypothetical one.
  */
-function migrateRegistryRow(row) {
+function migrateRegistryRow(row, mapKey = '') {
   const record = row && typeof row === 'object' ? row : {}
   const windows = record.kind === 'windows' || record.backend === 'windows' || record.backend === 'qemu'
   const kind = windows ? 'windows' : (VM_KINDS.has(record.kind) ? record.kind : 'linux')
   return {
     ...record,
+    // R2: A ROW'S NAME IS THE MAP KEY. Rows used to be written WITHOUT a `name`
+    // field while every backend helper read `spec.name`, so the Windows pidfile
+    // path became `/cua-vm/windows/undefined/qemu.pid`, nothing was ever alive
+    // there, and the install watch printed "QEMU not alive (see
+    // qemu-stderr.log tail)" forever while QMP answered `running`. Injecting it
+    // here upgrades every row already on disk, not just the ones written next.
+    name: String(record.name || mapKey || ''),
     kind,
     // L2: ONE canonical value per kind. A created row writes `qemu`; a migrated
     // v1 row used to keep `windows`, so `vmList` and the doctor could disagree
@@ -599,7 +611,7 @@ function migrateRegistry(parsed) {
   const out = {}
   for (const [name, row] of Object.entries(vms)) {
     if (!row || typeof row !== 'object') continue
-    out[name] = migrateRegistryRow(row)
+    out[name] = migrateRegistryRow(row, name)
   }
   return { version: REGISTRY_VERSION, vms: out }
 }
@@ -1225,7 +1237,21 @@ const space = createSpace({
  * monitor protocol has exactly one implementation. No Docker Engine, no DinD —
  * the same /dev/kvm, the same store, the same locks as the Linux computer.
  */
-const windowsBackend = createWindowsBackend({ store: STORE, qmp: qmpCommands, log })
+const windowsBackend = createWindowsBackend({
+  store: STORE,
+  // R3: THE TWO QMP SIGNATURES ARE JOINED HERE, ONCE.
+  //
+  // The backend calls `qmp(host, port, commands, opts)`; this process's one QMP
+  // implementation is `qmpCommands(port, commands, { timeoutMs, host })`. The
+  // raw primitive used to be passed through, so `'127.0.0.1'` arrived as the
+  // PORT, the dial threw, `probe()` reported `qmp: 'not answering'`, and a
+  // running QEMU never reached `ready` — the "probe always yields not answering"
+  // half of the reported bug. `windowsQmpAdapter` accepts the backend's shape
+  // and forwards this one's, so neither contract moves and a unit test can
+  // prove the join with a faithful stub.
+  qmp: windowsQmpAdapter(qmpCommands),
+  log
+})
 
 /**
  * THE OEM PAYLOAD'S TWO ENDS.
@@ -2334,6 +2360,10 @@ async function createLinuxNow(spec, warnings = []) {
   if (created.code !== 0) return fail(`${(created.stderr || created.stdout).trim().slice(-1500)}${linuxKvmFailureHint()}`)
   await mutateRegistry((fresh) => {
     fresh.vms[name] = {
+      // R2: the same `name` field the Windows rows carry; a row IS reachable by
+      // its map key either way, but every reader that takes a row (rather than
+      // a name) needs the field to survive `...row` copies.
+      name: spec.name,
       workspace: spec.workspace,
       kind: 'linux',
       backend: 'linux',
@@ -3373,6 +3403,10 @@ async function windowsCreateManaged(spec) {
       }
     }
     const row = {
+      // R2: THE ROW CARRIES ITS NAME. `vms` is keyed by it, but every backend
+      // helper resolves `spec.name`, and a row without one gave every pidfile
+      // path the segment "undefined" (see migrateRegistryRow).
+      name: spec.name,
       workspace: spec.workspace,
       kind: 'windows',
       backend: 'qemu',
@@ -3753,7 +3787,19 @@ async function windowsStart(name, meta) {
       }
       watchWindowsInstall(name)
       await ensureWindowsConsoleRelay(name)
-      return ok({ name, state: 'booting', kind: 'windows', detail: `QMP running, ${ready.endpoint === 'none' ? 'no endpoint answers yet' : `${ready.endpoint} answering`}` })
+      // R2 SIDE EFFECT: NOW THAT `probe(row)` ACTUALLY FINDS THE PIDFILE, this
+      // branch is reachable for a live QEMU whose guest is still booting (it used
+      // to be skipped because the pidfile path said "undefined"). The answer
+      // carries the SAME port diagnostics as the cold-start path, so a caller
+      // cannot tell "ports kept" from "field missing".
+      return ok({
+        name,
+        state: 'booting',
+        kind: 'windows',
+        ports: current.ports,
+        portsChanged: false,
+        detail: `QMP running, ${ready.endpoint === 'none' ? 'no endpoint answers yet' : `${ready.endpoint} answering`}`
+      })
     }
 
     // ---- the process is gone: reconcile ports, restore a checkpoint, boot ----

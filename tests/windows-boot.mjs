@@ -108,8 +108,28 @@ const check = (label, ok, detail = '') => {
   if (!ok) failures += 1
 }
 
-const backend = createWindowsBackend({ store: STORE, qmp: async () => [{ return: {} }], log: () => {} })
-const NAMES = ['win-egl', 'win-kvm', 'win-clean', 'win-slow']
+/**
+ * R1: A QMP STUB THAT RECORDS WHAT WAS SENT.
+ *
+ * The key schedule is only meaningful if the keystrokes actually reach QMP
+ * during the install window, so this stub keeps every command and the test
+ * asserts the `input-send-event` presses (and their count) rather than trusting
+ * that the scheduling code ran.
+ */
+const qmpCalls = []
+/**
+ * THE STUB SPEAKS THE SUPERVISOR'S SIGNATURE — `(port, commands, opts)` — on
+ * purpose: `createWindowsBackend` adapts whatever primitive it is given, so a
+ * stub in the backend's shape would hide the R3 mismatch instead of proving the
+ * adapter. `opts.host` and `opts.timeoutMs` are what the adapter adds.
+ */
+const recordingQmp = async (port, commands, opts = {}) => {
+  qmpCalls.push({ port, host: opts.host, opts, commands, at: Date.now() })
+  return (Array.isArray(commands) ? commands : []).map((command) =>
+    command?.execute === 'query-status' ? { return: { status: 'running', running: true } } : { return: {} })
+}
+const backend = createWindowsBackend({ store: STORE, qmp: recordingQmp, log: () => {} })
+const NAMES = ['win-egl', 'win-kvm', 'win-clean', 'win-slow', 'win-keys', 'win-nokeys']
 
 /** A bootable-enough windows directory: the vars file must already exist. */
 function prepare(name) {
@@ -243,6 +263,70 @@ try {
     check('F3: ...the boot really waited for the late pidfile (>= 90 ms) and the pidfile is on disk',
       elapsed >= 90 && existsSync(p.qemuPid), `${elapsed}ms pidfile=${existsSync(p.qemuPid)}`)
     backend.kill(spec.name)
+  }
+
+  // ---- R1: THE CDBOOT "PRESS ANY KEY" WINDOW IS PRESSED, AND ONLY WHILE
+  //      INSTALLING ----
+  //
+  // VERIFIED LIVE: OVMF reached the install CD, `cdboot.efi 10.0.26100.1`
+  // printed "Press any key to boot from CD or DVD", nothing pressed a key, and
+  // after 5 s the firmware printed EFI_TIMEOUT and dropped into the EFI Internal
+  // Shell. boot() now presses Enter through the SAME QMP input path the GUI
+  // uses, three times inside that window, gated on `installPending`.
+  {
+    const savedSchedule = process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS
+    process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS = '20,60,120'
+    try {
+      writeFileSync(FAIL_MARKER, 'ok')
+      qmpCalls.length = 0
+      const spec = specFor('win-keys')
+      const booted = await backend.boot(spec, { installPending: true })
+      check('R1: an install boot reports a live pid', typeof booted.pid === 'number' && booted.pid > 0, JSON.stringify(booted))
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      const keyPresses = qmpCalls.filter((entry) => (entry.commands ?? []).some((command) => command.execute === 'input-send-event'))
+      check('R1: an install boot sends the cdboot key presses over QMP',
+        keyPresses.length === 3, `${keyPresses.length} input-send-event call(s)`)
+      const events = (keyPresses[0]?.commands?.[0]?.arguments?.events ?? [])
+      check('R1: ...as a real Enter make/break pair (qcode ret)',
+        events.length === 2
+        && events.every((event) => event.data?.key?.data === 'ret')
+        && events[0].data.down === true && events[1].data.down === false,
+        JSON.stringify(events))
+      check('R1: ...addressed to the row\'s QMP port on loopback',
+        keyPresses.every((entry) => entry.port === spec.qmpPort && entry.opts?.host === '127.0.0.1'),
+        JSON.stringify({ port: keyPresses[0]?.port, expect: spec.qmpPort, opts: keyPresses[0]?.opts }))
+      backend.kill(spec.name)
+
+      // THE OTHER HALF OF THE GATE: a normal boot of an INSTALLED disk must not
+      // type into the guest.
+      qmpCalls.length = 0
+      const installed = specFor('win-nokeys')
+      await backend.boot(installed, { installPending: false })
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      const strayKeys = qmpCalls.filter((entry) => (entry.commands ?? []).some((command) => command.execute === 'input-send-event'))
+      check('R1: a boot of an ALREADY-INSTALLED disk sends no keys', strayKeys.length === 0, `${strayKeys.length} call(s)`)
+      backend.kill(installed.name)
+    } finally {
+      if (savedSchedule === undefined) delete process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS
+      else process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS = savedSchedule
+      try { writeFileSync(FAIL_MARKER, 'ok') } catch {}
+    }
+  }
+
+  // ---- R2: a boot of a row WITHOUT `name` still owns its own pidfile ----
+  {
+    const spec = specFor('win-rowshape')
+    const booted = await backend.boot(spec, { installPending: false })
+    const row = { kind: 'windows', backend: 'qemu', ports: { qmp: spec.qmpPort, ssh: spec.sshPort, vnc: spec.vncPort } }
+    check('R2: a nameless registry row finds no pidfile (the "undefined" path)',
+      backend.qemuPid(row) === 0, String(backend.qemuPid(row)))
+    check('R2: ...but the same row resolved by its map key does',
+      backend.qemuPid({ ...row, name: 'win-rowshape' }) === booted.pid,
+      `${backend.qemuPid({ ...row, name: 'win-rowshape' })} vs ${booted.pid}`)
+    const state = await backend.probe(row, { name: 'win-rowshape' })
+    check('R2: probe(row, { name }) is alive and QMP running — not the fake "not alive"',
+      state.alive === true && state.qmp === 'running', JSON.stringify(state))
+    backend.kill('win-rowshape')
   }
 
   // ---- F2 unit: waitForQemuBoot answers fast for a dead child ----

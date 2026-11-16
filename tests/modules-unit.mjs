@@ -3,7 +3,7 @@
  * modules-unit.mjs — the pure parts of the two new modules, and the Windows
  * container spec, asserted without a VM, a container or a daemon.
  */
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import zlib from 'node:zlib'
@@ -17,7 +17,9 @@ import {
   OEM_PAYLOAD_FILES, oemPayloadDir, oemPayloadDirStatus, oemPayloadDeniedDir, resolveOemSourceDir, writeOemPayload,
   oemPayloadMissingError, oemPayloadDeniedError, windowsKvmPreflight,
   formatWindowsInstallDetail, qmpStateLabel, endpointLabel, windowsTailLines, windowsPortsOf, windowsBootSpec,
-  windowsReadinessSignals, qemuBootWindowMs, waitForQemuBoot
+  windowsReadinessSignals, qemuBootWindowMs, waitForQemuBoot,
+  windowsRowName, windowsQmpAdapter, cdbootKeyScheduleMs, cdbootKeysEnabled, runCdbootKeys, startupNshText,
+  createWindowsBackend
 } from '../docker/cua-vm-windows-qemu.mjs'
 import {
   KVM_GID_COMMAND, deviceNodePresent, formatKvmStatus, kvmDoctorFacts, kvmPreflightError, kvmStatus
@@ -153,7 +155,29 @@ check('the firmware is OVMF code + per-computer vars', argv.join(' ').includes('
 check('the TPM2 chardev points at the swtpm socket', argv.join(' ').includes(`socket,id=chrtpm,path=${paths.tpmSocket}`))
 check('the system disk is a plain qcow2 (checkpointable)', argv.join(' ').includes(`file=${paths.disk},if=none,id=disk0,format=qcow2`) )
 check('kvm + host cpu are the acceleration', has('q35,accel=kvm,smm=off') && has('host'))
-check('the install ISO gets bootindex 2 only while installing', argv.join(' ').includes('if=none,id=cd0') && argv.join(' ').includes('bootindex=2'))
+// R4: THE BOOT ORDER FOLLOWS THE PHASE. The install CD is FIRST while the disk
+// is empty (the disk is second), and the disk is FIRST once it is installed.
+// The old argv put the disk at 1 and the CD at 2 and a comment claimed the
+// opposite: OVMF created a Boot0002 HDD entry, tried it, printed "HDD Not
+// Found", and only then reached the DVD.
+{
+  const cdIndex = argv.indexOf('ide-cd,drive=cd0,bus=ide.1,bootindex=1')
+  const diskInstall = argv.filter((item) => /^ide-hd,drive=disk0,bus=ide\.0,bootindex=\d+$/u.test(item))
+  check('R4: while installing the CD boots FIRST (bootindex=1) and the disk second (2)',
+    cdIndex !== -1 && diskInstall.length === 1 && diskInstall[0].endsWith('bootindex=2'),
+    `${cdIndex} ${diskInstall.join(',')}`)
+  const postInstall = buildQemuArgs({
+    name: 'win-1', cpu: 4, memory: 8, gpu: false, paths,
+    isoPath: '/cua-vm/iso/w11.iso', driverIso: null, sshPort: 47100, vncPort: 5931, qmpPort: 46100,
+    installPending: false, virtio: false
+  })
+  check('R4: after install the disk boots FIRST (bootindex=1) and no CD is attached',
+    postInstall.filter((item) => /drive=disk0.*bootindex=1$/u.test(item)).length === 1
+    && !postInstall.join(' ').includes('id=cd0'), postInstall.filter((item) => item.includes('disk0')).join(','))
+  check('R4: the virtio disk follows the same phase rule',
+    buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: true })
+      .includes('virtio-blk-pci,drive=disk0,bootindex=2'))
+}
 // M9 + M10: the OEM medium is READ-ONLY **and** its block node is attached
 // with `read-only=on`. Without that token usb-storage attaches a writable SCSI
 // disk to a read-only vvfat BlockBackend and QEMU 10.0.13 refuses it:
@@ -676,6 +700,172 @@ check('windowsKvmPreflight is the shared module (no second message)',
   const seen = await waitForQemuBoot({ child: { once: () => {} }, pidFile, isAlive: (pid) => pid === process.pid, windowMs: 0, pollMs: 40 })
   check('F3: ...so a pidfile that appears within it is accepted', seen.ok === true, JSON.stringify(seen))
   try { rmSync(pidFile, { force: true }) } catch {}
+}
+
+// ---- R1/R2/R3/R5: THE FOUR LIVE-VERIFIED ROOT CAUSES ----
+//
+// R1  cdboot's "Press any key to boot from CD or DVD" window (5 s) was never
+//     pressed: EFI_TIMEOUT, then the EFI Internal Shell. The schedule is asserted
+//     with a stubbed clock and a recording `sendKey`.
+// R2  a row has no `name` of its own — its name is the MAP KEY — so every
+//     pidfile path carried "undefined" and a running QEMU read as dead.
+// R3  the backend dials (host, port, cmds, opts) while the supervisor's
+//     primitive is (port, cmds, { timeoutMs, host }): the HOST arrived as the
+//     PORT and every probe threw. The adapter is the join.
+// R5  the EFI Shell fallback script (belt and braces).
+{
+  // ---- R2: name resolution ----
+  check('R2: windowsRowName reads a row\'s name', windowsRowName({ name: 'win-a' }) === 'win-a')
+  check('R2: windowsRowName falls back to the map key when the row has none',
+    windowsRowName({ kind: 'windows' }, 'win-key') === 'win-key')
+  check('R2: windowsRowName accepts a bare name', windowsRowName('win-b') === 'win-b')
+  check('R2: ...and never invents "undefined" from an empty row',
+    windowsRowName({}, '') === '' && windowsRowName(null) === '' && windowsRowName(undefined, 'x') === 'x')
+
+  // ---- R2 + R3 end to end: a row WITHOUT `name`, a faithful stub, and a real
+  //      pidfile on disk under the map key. This is the exact live shape. ----
+  const store = mkdtempSync(path.join(os.tmpdir(), 'cua-r2-'))
+  try {
+    const rowName = 'win-nameless'
+    const p = windowsPaths(store, rowName)
+    mkdirSync(p.dir, { recursive: true })
+    writeFileSync(p.qemuPid, `${process.pid}\n`)
+    // THE STUB SPEAKS THE SUPERVISOR'S SIGNATURE: (port, commands, { timeoutMs }).
+    const calls = []
+    const supervisorShaped = async (port, commands, opts = {}) => {
+      calls.push({ port, commands, opts })
+      if (!Number.isFinite(Number(port)) || Number(port) <= 0) {
+        throw new TypeError('The "options" or "port" or "path" argument must be specified')
+      }
+      return [{ return: { status: 'running' } }]
+    }
+    // `name` here so the ALIVENESS half is observable; the nameless-row case is
+    // asserted separately below (R2).
+    const rawRow = { name: rowName, kind: 'windows', ports: { qmp: 46911, ssh: 47911, vnc: 5911 } }
+    // THE LIVE BUG, REPLAYED: the backend calls `qmp(host, port, cmds, opts)`,
+    // so a primitive that takes `(port, cmds, opts)` receives the HOST string as
+    // its port and throws before a byte reaches the monitor.
+    const mismatch = await supervisorShaped('127.0.0.1', 46911, [{ execute: 'query-status' }], { timeoutMs: 5000 })
+      .then(() => 'answered', (error) => String(error?.message ?? error))
+    check('R3 (the live bug): the supervisor primitive called with the backend\'s argument ORDER throws',
+      /port.*must be specified|options/u.test(mismatch), mismatch)
+    // THE FIX: the adapter joins the two signatures.
+    const joined = await windowsQmpAdapter(supervisorShaped)('127.0.0.1', 46911, [{ execute: 'query-status' }], { timeoutMs: 5000 })
+    check('R3: windowsQmpAdapter turns the backend shape into a running answer',
+      joined?.[0]?.return?.status === 'running', JSON.stringify(joined))
+    // ...and the backend adapts ANY primitive it is handed, so a raw stub still
+    // works, and wrapping an adapter twice is a no-op rather than a new bug.
+    const backend = createWindowsBackend({ store, qmp: windowsQmpAdapter(supervisorShaped), log: () => {} })
+    const state = await backend.probe(rawRow)
+    check('R3: with windowsQmpAdapter the SAME stub answers alive + QMP running',
+      state.alive === true && state.status === 'running' && state.qmp === 'running', JSON.stringify(state))
+    check('R3: ...the port reached the primitive as a PORT and the host in opts',
+      calls.length > 0 && calls.at(-1).port === 46911 && calls.at(-1).opts.host === '127.0.0.1',
+      JSON.stringify(calls.at(-1)))
+    // R2: the row has no `name`, so only the map key can lead to that pidfile.
+    const nameless = { kind: 'windows', ports: { qmp: 46911, ssh: 47911, vnc: 5911 } }
+    check('R2: a row WITHOUT `name` finds NO pidfile (the live shape: path had "undefined")',
+      backend.qemuPid(nameless) === 0 && backend.qemuPid({ ...nameless, name: rowName }) === process.pid,
+      `nameless=${backend.qemuPid(nameless)} keyed=${backend.qemuPid({ ...nameless, name: rowName })}`)
+    check('R2: ...and probe() takes the MAP KEY explicitly, so that row is not called dead',
+      (await backend.probe(nameless, { name: rowName })).alive === true)
+    check('R3: the adapter also accepts the supervisor shape as-is (port first)',
+      await windowsQmpAdapter(supervisorShaped)(46911, [{ execute: 'query-status' }]) instanceof Array)
+
+    // ---- R1: the cdboot key schedule ----
+    const savedKeys = process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS
+    const savedSwitch = process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS
+    try {
+      delete process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS
+      check('R1: the default schedule covers the 5 s cdboot window',
+        cdbootKeyScheduleMs().join(',') === '1500,3500,5500', cdbootKeyScheduleMs().join(','))
+      check('R1: ...with three attempts inside it',
+        cdbootKeyScheduleMs().length === 3 && cdbootKeyScheduleMs().at(-1) <= 6000)
+      process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS = '200,400'
+      check('R1: the schedule is configurable', cdbootKeyScheduleMs().join(',') === '200,400')
+      process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS = 'nonsense'
+      check('R1: an unparsable schedule falls back to the default', cdbootKeyScheduleMs().join(',') === '1500,3500,5500')
+      delete process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS
+      delete process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS
+      check('R1: the keys are ON by default', cdbootKeysEnabled() === true)
+      process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS = '0'
+      check('R1: ...and can be switched off', cdbootKeysEnabled() === false)
+    } finally {
+      if (savedKeys === undefined) delete process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS
+      else process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS = savedKeys
+      if (savedSwitch === undefined) delete process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS
+      else process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS = savedSwitch
+    }
+
+    // R1 mechanism: the delays are RELATIVE waits summing to the absolute
+    // offsets, the key is Enter, and every attempt is logged.
+    {
+      const waits = []
+      const keys = []
+      const lines = []
+      const sent = await runCdbootKeys({
+        scheduleMs: [1500, 3500, 5500],
+        key: 'enter',
+        log: (line) => lines.push(line),
+        wait: async (ms) => { waits.push(ms) },
+        sendKey: async (key) => { keys.push(key) }
+      })
+      check('R1: three key presses are sent, at offsets 1.5 s / 3.5 s / 5.5 s',
+        keys.length === 3 && keys.every((key) => key === 'enter') && waits.join(',') === '1500,2000,2000' && sent.join(',') === '1500,3500,5500',
+        `keys=${keys.join(',')} waits=${waits.join(',')} sent=${sent.join(',')}`)
+      check('R1: each press is logged with its offset',
+        lines.length === 3 && lines.every((line) => /pressed enter/u.test(line) && /boot from CD or DVD/u.test(line)),
+        lines.join(' | ').slice(0, 200))
+    }
+    // R1: a send that FAILS is logged and skipped — never fatal, the next one runs.
+    {
+      const keys = []
+      const lines = []
+      let attempt = 0
+      const sent = await runCdbootKeys({
+        scheduleMs: [100, 200, 300],
+        log: (line) => lines.push(line),
+        wait: async () => {},
+        sendKey: async () => {
+          attempt += 1
+          if (attempt === 1) throw new Error('QMP not ready')
+          keys.push(attempt)
+        }
+      })
+      check('R1: a failed send is NOT fatal and does not stop the schedule',
+        keys.join(',') === '2,3' && sent.join(',') === '200,300', `keys=${keys.join(',')} sent=${sent.join(',')}`)
+      check('R1: ...and it says so without throwing', lines.some((line) => /could not press/u.test(line)), lines.join(' | ').slice(0, 160))
+    }
+
+    // ---- R5: the EFI Shell fallback script ----
+    const nsh = startupNshText()
+    check('R5: startup.nsh tries every mapped filesystem\'s bootx64.efi',
+      /for %f in fs0 fs1 fs2 fs3 fs4 fs5/u.test(nsh) && (nsh.match(/%f:\\efi\\boot\\bootx64\.efi/gu) ?? []).length >= 2)
+    check('R5: ...guarded by `if exist`, and it names the failure when nothing boots',
+      /if exist %f:\\efi\\boot\\bootx64\.efi then/u.test(nsh) && /Windows Setup did not start/u.test(nsh))
+    check('R5: the script is EFI Shell dialect, not batch (no @echo off / goto)',
+      nsh.startsWith('@echo -off') && !/goto|@echo off/u.test(nsh))
+    // ...and writeOemPayload really writes it into the stick's ROOT.
+    {
+      const oemStore = mkdtempSync(path.join(os.tmpdir(), 'cua-r5-'))
+      try {
+        const oemPaths = windowsPaths(oemStore, 'win-nsh')
+        const dir = writeOemPayload({
+          paths: oemPaths, name: 'win-nsh', password: 'pw', sshPubKey: 'ssh-ed25519 AAAA x',
+          sourceDir: path.join(REPO, 'docker', 'windows-oem'), pythonUrl: 'https://python', dshCuaSpec: 'dsh-cua==1'
+        })
+        const nshPath = path.join(dir, 'startup.nsh')
+        check('R5: writeOemPayload puts startup.nsh in the stick ROOT (where the Shell looks)',
+          existsSync(nshPath) && readFileSync(nshPath, 'utf8').includes('bootx64.efi'), nshPath)
+        check('R5: ...next to Autounattend.xml, which Setup reads from the same root',
+          existsSync(path.join(dir, 'Autounattend.xml')))
+      } finally {
+        rmSync(oemStore, { recursive: true, force: true })
+      }
+    }
+  } finally {
+    rmSync(store, { recursive: true, force: true })
+  }
 }
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)

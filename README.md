@@ -838,6 +838,54 @@ same ACPI → checkpoint → `powered-off` path as Linux. The dsh-cua element to
 attach lazily over SSH only while a Windows computer is ready (~3-8k tokens), and
 `DSH_CUA_VM_WIN_MCP=0` removes them.
 
+### A Windows install that never boots, or reads "not alive" while QMP says running
+
+Four separate defects were verified live on a real container and are fixed here.
+They are documented together because from the panel they all looked like "the
+install is stuck".
+
+**1. The install CD's "Press any key to boot from CD or DVD" is now pressed for
+you.** OVMF reached the DVD, `cdboot.efi 10.0.26100.1` printed that prompt,
+nobody pressed a key within its 5 s window, and the firmware printed
+`EFI_TIMEOUT` and fell into the **EFI Internal Shell** — a dead end no answer
+file can leave. `boot()` now sends **Enter over QMP** (`input-send-event`, the
+same path the GUI uses) at **1.5 s / 3.5 s / 5.5 s** after an *install* start, so
+a dropped event costs nothing. The schedule is configurable
+(`DSH_CUA_WINDOWS_CDBOOT_KEYS_MS=1500,3500,5500`) and can be switched off
+(`DSH_CUA_WINDOWS_CDBOOT_KEYS=0`). It is **gated on the install phase**: booting
+an already-installed disk never types into the guest. A failed send is logged and
+skipped, never fatal.
+
+**2. The boot order now follows the phase.** The argv used to put the disk at
+`bootindex=1` and the CD at `bootindex=2` while a comment claimed the ISO booted
+first — so OVMF created a `Boot0002` HDD entry, tried it, printed *HDD Not
+Found*, and only then reached the DVD. While installing the **CD is
+`bootindex=1`** and the disk second; after install the **disk is first** and no
+CD is attached.
+
+**3. Rows now carry their `name`.** The registry is keyed by name and its rows
+had no `name` field, while every backend helper read `spec.name` — so the pidfile
+path was `/cua-vm/windows/undefined/qemu.pid`, nothing was ever alive there, and
+the install watch printed **`QEMU not alive (see qemu-stderr.log tail)`** forever
+while QMP answered `running`. New rows are written with `name`, and
+`migrateRegistryRow` injects the map key into every row already on disk, so an
+existing store is repaired on the next read.
+
+**4. The QMP call signatures are joined.** The backend dials
+`qmp(host, port, commands, opts)`; the supervisor's one implementation is
+`qmpCommands(port, commands, { timeoutMs, host })`. Passing the raw primitive in
+put the **host string in the port argument**, the dial threw before a byte
+reached the monitor, and every probe answered *"not answering"* — so even with 3
+fixed, the computer never became ready. `windowsQmpAdapter` joins the two, and
+`tools/check-cua-vm.mjs` + `tests/modules-unit.mjs` prove it with a faithful stub
+(the test first reproduces the throw, then shows the adapter fixing it).
+
+**Belt and braces (5):** the OEM stick's root now also gets a `startup.nsh` that
+tries `\efi\boot\bootx64.efi` on every mapped filesystem (`FS0`..`FS5`). If a key
+press is ever missed, the EFI Shell chain-loads the install media instead of
+stopping at a prompt. It is a fallback, not the mechanism — the key press is what
+gets an install onto the CD.
+
 ### What the panel shows, and how you know a Windows install finished
 
 **The spec is the one you asked for.** A Windows computer's row displays the

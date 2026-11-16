@@ -96,7 +96,18 @@ const NEEDLES = {
   supervisor: [
     // registry v2 + read-migration
     ['const REGISTRY_VERSION = 2', 1],
-    ['function migrateRegistryRow(row)', 1],
+    ['function migrateRegistryRow(row, mapKey = \'\')', 1],
+    // R2: the migration INJECTS `name` into every row already on disk, so a
+    // store written before the fix stops answering "QEMU not alive" about a
+    // running process. The map key is the only place that name exists.
+    ['out[name] = migrateRegistryRow(row, name)', 1],
+    // R3: the QMP join. The backend's `(host, port, cmds, opts)` and this
+    // process's `(port, cmds, { timeoutMs, host })` are different signatures,
+    // and passing the raw primitive made the HOST the PORT. The one-line
+    // `createWindowsBackend({ store: STORE, qmp: qmpCommands, log })` needle was
+    // REPLACED (not dropped) by the multi-line wiring below, in the same commit.
+    ['const windowsBackend = createWindowsBackend({', 1],
+    ['qmp: windowsQmpAdapter(qmpCommands),', 1],
     ['function migrateRegistry(parsed)', 1],
     ['parsed.version !== REGISTRY_VERSION', 1],
     // policy keys
@@ -235,7 +246,6 @@ const NEEDLES = {
     ['Android is not available for Windows computers', 1],
     // The Windows lifecycle now drives the SAME shutdown/start machinery.
     ['async function windowsShutdown(name, meta)', 1],
-    ['const windowsBackend = createWindowsBackend({ store: STORE, qmp: qmpCommands, log })', 1],
     // K2: the runtime path of the OEM payload, spelled with its default. The
     // Dockerfile must COPY to this exact string (cross-checked in the K2
     // assertion below); this needle keeps the literal from being rewritten to a
@@ -482,6 +492,13 @@ const NEEDLES = {
     ["'-cpu', 'host'", 1],
     // disks: plain qcow2 (checkpointing still applies)
     ['file=${p.disk},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap', 1],
+    // R4: THE BOOT ORDER FOLLOWS THE PHASE. The old argv always put the disk at
+    // bootindex 1 and the CD at 2 while its comment claimed the ISO booted
+    // first: OVMF created Boot0002 for the unbootable HDD, tried it, said "HDD
+    // Not Found", then reached the DVD — a wasted boot cycle per install, and
+    // the reason cdboot's 5 s "Press any key" window was entered late.
+    ['const diskBootIndex = boot ? 2 : 1', 1],
+    ['ide-cd,drive=cd0,bus=ide.1,bootindex=1', 1],
     // install medium while installing, drivers ISO when present, OEM payload
     ['if=none,id=cd0', 1],
     // M9: read-only vvfat — nothing in the guest writes this staging directory.
@@ -530,6 +547,22 @@ const NEEDLES = {
     ['memory-below-floor', 1],
     ['Created anyway on request', 3],
     ['export async function ensureIso(', 1],
+    // R3: the backend dials `qmp(host, port, cmds, opts)` and this process's one
+    // QMP implementation is `qmpCommands(port, cmds, { timeoutMs, host })`. The
+    // raw primitive used to be handed over, so the HOST arrived as the PORT, the
+    // dial threw, and a running QEMU never reached `ready` ("QMP not answering"
+    // forever). The adapter is the join; it must be the thing passed in.
+    ['export function windowsQmpAdapter(primitive)', 1],
+    ['export function windowsRowName(spec, fallback = \'\')', 1],
+    // R1: cdboot's "Press any key to boot from CD or DVD" is pressed over QMP
+    // during the install phase only — the window is 5 s and EFI_TIMEOUT lands
+    // the firmware in the Internal Shell, a dead end.
+    ['export function cdbootKeyScheduleMs()', 1],
+    ['export async function runCdbootKeys({', 1],
+    ['if (installPending && cdbootKeysEnabled() && child?.pid)', 1],
+    // R5: belt and braces for the Shell fallback.
+    ['export function startupNshText()', 1],
+    ["writeFileSync(path.join(p.oemDir, 'startup.nsh'), startupNshText())", 1],
     ['export function writeOemPayload(', 1],
     // K2: the payload writer must NAME the files it needs (the error text and
     // this gate quote the same list), must resolve a directory that actually
@@ -826,7 +859,12 @@ const NEEDLES = {
     ['group_add: ["${KVM_GID:-kvm}"]', 1],
     ['DSH_CUA_VM_GPU=', 1],
     ['DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=', 1],
-    ['DSH_CUA_VM_LEGACY_STOP=', 1]
+    ['DSH_CUA_VM_LEGACY_STOP=', 1],
+    // R1/R5: the two new Windows knobs are documented where an operator looks,
+    // next to the OEM payload path they belong to.
+    ['DSH_CUA_WINDOWS_CDBOOT_KEYS_MS=1500,3500,5500', 1],
+    ['DSH_CUA_WINDOWS_CDBOOT_KEYS=0', 1],
+    ['startup.nsh', 1]
   ]
 }
 

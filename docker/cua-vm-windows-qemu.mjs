@@ -310,6 +310,77 @@ export function qemuBootWindowMs() {
   return 15000
 }
 
+/**
+ * R1: THE "PRESS ANY KEY TO BOOT FROM CD OR DVD" WINDOW.
+ *
+ * VERIFIED LIVE: OVMF boots the install CD, `cdboot.efi 10.0.26100.1` prints
+ * "Press any key to boot from CD or DVD", nobody presses a key, `cdboot` waits
+ * ~5 s, prints `EFI_TIMEOUT`, and BDS falls through to the EFI Internal Shell —
+ * a dead end with a firmware prompt no unattended install can leave.
+ *
+ * So the backend presses the key itself, over the same QMP input path the GUI
+ * uses, at three points inside that window (1.5 s / 3.5 s / 5.5 s by default):
+ * early enough to beat the timeout, late enough that the firmware has the
+ * keyboard ready, and repeated so a dropped event is not fatal. The delay list
+ * is overridable for tests and for a host whose firmware is slower.
+ *
+ * NOT a keystroke into an installed guest: scheduling is gated on
+ * `installPending`, so a normal boot of a finished disk never sees a key.
+ */
+export function cdbootKeyScheduleMs() {
+  const raw = process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS_MS
+  if (raw !== undefined && raw !== '') {
+    const parsed = String(raw)
+      .split(',')
+      .map((part) => Number(part.trim()))
+      .filter((value) => Number.isFinite(value) && value >= 0)
+      .map((value) => Math.min(120000, Math.trunc(value)))
+    if (parsed.length > 0) return parsed
+  }
+  return [1500, 3500, 5500]
+}
+
+/**
+ * R1 (the mechanism): run the key schedule sequentially, never in parallel.
+ *
+ * `sendKey` is the backend's own `sendKeys`, `wait` is a sleep that can be
+ * stubbed, and BOTH are injected so the suite can prove the schedule (which
+ * delays, in which order, how many attempts) without a hypervisor or a clock.
+ * A failed send is logged and SKIPPED — the firmware may simply not have the
+ * keyboard up yet, and the next attempt covers it. This function never throws
+ * and never rejects: it is background belt-and-braces, not a boot precondition.
+ */
+export async function runCdbootKeys({ scheduleMs = cdbootKeyScheduleMs(), sendKey, wait, log = () => {}, key = 'enter', name = '<name>' } = {}) {
+  const delays = Array.isArray(scheduleMs) ? scheduleMs : []
+  const sleep = typeof wait === 'function' ? wait : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const sent = []
+  let previous = 0
+  for (const at of delays) {
+    const delay = Math.max(0, Number(at) - previous)
+    previous = Math.max(previous, Number(at))
+    try {
+      await sleep(delay)
+    } catch {
+      return sent
+    }
+    try {
+      await sendKey(key)
+      sent.push(Number(at))
+      log(`windows: ${name} pressed ${key} at ~${Number(at)} ms to get past "Press any key to boot from CD or DVD"`)
+    } catch (error) {
+      log(`windows: ${name} could not press ${key} at ~${Number(at)} ms (not fatal, the next attempt covers it): ${error?.message ?? error}`)
+    }
+  }
+  return sent
+}
+
+/** A hard switch for a host that wants the old behaviour (keys not sent). */
+export function cdbootKeysEnabled() {
+  const raw = process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS
+  if (raw === undefined || raw === '') return true
+  return !/^(0|false|no|off)$/iu.test(String(raw).trim())
+}
+
 /** The last `lines` NON-EMPTY lines of a stderr capture, or '' when empty. */
 export function qemuStderrExcerpt(stderr, lines = 20) {
   const limit = Math.max(1, Math.min(200, Number(lines) || 20))
@@ -639,6 +710,29 @@ export function windowsBootSpec(spec) {
   return { ...spec, ...windowsPortsOf(spec) }
 }
 
+/**
+ * R2: A REGISTRY ROW HAS NO `name` FIELD — ITS NAME IS THE MAP KEY.
+ *
+ * The supervisor stored rows as `{ vms: { "win-box": { kind, ports, … } } }`, and
+ * every lifecycle helper read `spec.name`. For a row that is `undefined`, so
+ * `pathsFor(undefined)` resolved `/cua-vm/windows/undefined/qemu.pid`, nothing
+ * was ever alive at that path, and the install watcher printed
+ *
+ *     QEMU not alive (see qemu-stderr.log tail)
+ *
+ * forever while QMP answered `running` — the reported "fake dead" computer.
+ *
+ * The fix is at both ends: rows are WRITTEN with `name` (and the read migration
+ * injects it for rows that predate this), and every helper resolves through this
+ * one function so a caller that only has the map key still works.
+ */
+export function windowsRowName(spec, fallback = '') {
+  if (typeof spec === 'string' && spec !== '') return spec
+  const direct = spec && typeof spec === 'object' ? spec.name : ''
+  if (typeof direct === 'string' && direct !== '') return direct
+  return typeof fallback === 'string' ? fallback : ''
+}
+
 /* ------------------------------------------------------------------ *
  * The command line
  * ------------------------------------------------------------------ */
@@ -659,8 +753,20 @@ export function windowsBootSpec(spec) {
  *     because that is where Setup looks for `Autounattend.xml`. The OEM payload
  *     is a `vvfat` directory (no ISO authoring tool needed — the host may have
  *     none) exposed as a USB stick.
- *   * `bootindex` puts the install ISO first ONLY while the disk is empty;
- *     after the first boot the disk owns the boot order (see `installPending`).
+ *   * `bootindex` ORDERS THE BOOT, and the order follows the INTENT of each
+ *     phase instead of the order the devices happen to be declared in:
+ *
+ *       installPending: true   CD bootindex=1, disk bootindex=2 — Setup must
+ *                              run from the install media on a disk that has
+ *                              nothing bootable on it yet. The old argv had
+ *                              this BACKWARDS (disk 1, CD 2) while its comment
+ *                              claimed the ISO booted first: OVMF created
+ *                              Boot0002 for the unbootable HDD, tried it, said
+ *                              "HDD Not Found", and only then fell through to
+ *                              the DVD. Pinning the CD first removes a full
+ *                              failed-start cycle from every install.
+ *       installPending: false  disk bootindex=1, no CD attached — after Setup
+ *                              the disk owns the boot order.
  *   * Networking is SLIRP: outbound internet, the host reachable at 10.0.2.2,
  *     and SSH forwarded from 127.0.0.1:<port> to guest :22. No bridge, no tap,
  *     no CAP_NET_ADMIN — the harness keeps `cap_drop ALL`.
@@ -673,6 +779,11 @@ export function windowsBootSpec(spec) {
 export function buildQemuArgs(spec) {
   const p = spec.paths
   const boot = spec.installPending === true
+  // R4: ONE ORDER, DECIDED BY THE PHASE. While installing the CD is FIRST and
+  // the (still empty) disk second; afterwards the disk is FIRST and no CD is
+  // attached. The old argv always put the disk at 1 and the CD at 2 and left a
+  // comment claiming the opposite.
+  const diskBootIndex = boot ? 2 : 1
   const args = [
     '-name', `dsh-win-${spec.name}`,
     '-machine', 'q35,accel=kvm,smm=off',
@@ -686,13 +797,17 @@ export function buildQemuArgs(spec) {
     '-chardev', `socket,id=chrtpm,path=${p.tpmSocket}`,
     '-tpmdev', 'emulator,id=tpm0,chardev=chrtpm',
     '-device', 'tpm-crb,tpmdev=tpm0',
-    // system disk
+    // system disk — SECOND while installing (see diskBootIndex above)
     '-drive', `file=${p.disk},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap`,
-    '-device', spec.virtio ? 'virtio-blk-pci,drive=disk0,bootindex=1' : 'ide-hd,drive=disk0,bus=ide.0,bootindex=1',
-    // install medium (only while installing) + drivers + OEM payload
+    '-device', spec.virtio ? `virtio-blk-pci,drive=disk0,bootindex=${diskBootIndex}` : `ide-hd,drive=disk0,bus=ide.0,bootindex=${diskBootIndex}`,
+    // install medium (only while installing) + drivers + OEM payload.
+    // R4: THE CD IS bootindex=1 DURING INSTALL. Booting a blank disk first made
+    // OVMF create a Boot0002 HDD entry, try it, print "HDD Not Found" and only
+    // then reach the DVD — one wasted boot cycle per install, and the reason the
+    // CD's "Press any key to boot from CD or DVD" window was ever entered late.
     ...(boot
       ? ['-drive', `file=${spec.isoPath},media=cdrom,readonly=on,if=none,id=cd0`,
-        '-device', 'ide-cd,drive=cd0,bus=ide.1,bootindex=2']
+        '-device', 'ide-cd,drive=cd0,bus=ide.1,bootindex=1']
       : []),
     ...(spec.driverIso !== null
       ? ['-drive', `file=${spec.driverIso},media=cdrom,readonly=on,if=none,id=cd1`,
@@ -898,6 +1013,47 @@ export async function ensureIso({ url, isoDir, timeoutMs = 60 * 60 * 1000, onPro
  * file added here without its COPY is exactly the drift this constant prevents.
  */
 export const OEM_PAYLOAD_FILES = Object.freeze(['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1'])
+
+/**
+ * R5 (BELT AND BRACES): THE EFI SHELL'S `startup.nsh`.
+ *
+ * R1 presses a key through QMP to get past cdboot's "Press any key to boot from
+ * CD or DVD". If that keystroke misses — a slow firmware, a stalled QMP socket,
+ * a host that disabled the schedule — OVMF's BDS falls through to the EFI
+ * Internal Shell, which is a dead end for an unattended install.
+ *
+ * The firmware Shell DOES run a script named `startup.nsh` from the filesystem
+ * it lands on, and it maps the CD as one of FS0/FS1/… — so this script tries
+ * every mapped filesystem's `\efi\boot\bootx64.efi` in turn and chains to the
+ * first that exists, which resumes Setup instead of stopping at a prompt.
+ *
+ * It rides on the OEM vvfat stick because that directory is the one medium we
+ * author ourselves; the script is shipped in the stick's ROOT, which is exactly
+ * where the Shell looks.
+ *
+ * This is genuinely BELT AND BRACES, not the mechanism: the key press (R1) is
+ * what gets an install onto the CD, and the firmware only reaches this script
+ * if the install was already falling through to the Shell.
+ */
+export function startupNshText() {
+  // The EFI Shell dialect: `%f` iterates the word list, `if exist` tests the
+  // mapping, and a bare path on its own line chain-loads it.
+  const lines = [
+    '@echo -off',
+    "REM R5: written by dsh-cua-vm. If Windows Setup was not reached (R1's key",
+    'REM press missed, or cdboot timed out), chain-load the install media itself',
+    'REM instead of stopping at this prompt. The CD is one of FS0..FS5.',
+    'for %f in fs0 fs1 fs2 fs3 fs4 fs5',
+    '  if exist %f:\\efi\\boot\\bootx64.efi then',
+    '    echo "cua: chaining to %f:\\efi\\boot\\bootx64.efi"',
+    '    %f:\\efi\\boot\\bootx64.efi',
+    '  endif',
+    'endfor',
+    'echo "cua: no bootable \\efi\\boot\\bootx64.efi on FS0..FS5 - Windows Setup did not start."',
+    'echo "cua: the install medium is missing or unreadable; see qemu-stderr.log / serial.log on the host."'
+  ]
+  return `${lines.join('\n')}\n`
+}
 
 /** Where this module itself lives — the last-resort source of the payload. */
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url))
@@ -1134,13 +1290,60 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
   for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1']) {
     copyFileSync(path.join(p.oemDir, file), path.join(setupDir, file))
   }
-  log(`windows: ${name} OEM payload written (${files.length} files + $OEM$ scripts)`)
+  // R5: the EFI Shell fallback script goes in the stick's ROOT (that is where
+  // firmware Shell looks for `startup.nsh`), not under $OEM$.
+  writeFileSync(path.join(p.oemDir, 'startup.nsh'), startupNshText())
+  log(`windows: ${name} OEM payload written (${files.length} files + $OEM$ scripts + startup.nsh fallback)`)
   return p.oemDir
 }
 
 /* ------------------------------------------------------------------ *
  * The backend
  * ------------------------------------------------------------------ */
+
+/**
+ * R3: THE TWO QMP SIGNATURES, JOINED.
+ *
+ * The backend's helpers dial `qmp(host, port, commands, opts)`; the supervisor's
+ * one implementation is `qmpCommands(port, commands, { timeoutMs, host })`. The
+ * supervisor used to pass its primitive in directly, so the backend's HOST
+ * string arrived as the supervisor's PORT argument and every probe died before
+ * a byte reached the monitor:
+ *
+ *     probe(row) → qmpFor → qmp('127.0.0.1', 46100, …)
+ *     qmpCommands('127.0.0.1', 46100, …) → net.connect('127.0.0.1' as port) → throws
+ *     → status '' → qmp 'not answering' → a RUNNING QEMU never became ready.
+ *
+ * This adapter is the fix at the seam: it accepts the backend's signature and
+ * forwards the supervisor's, so neither side has to change its contract and a
+ * test can prove the join with a faithful stub. It is also tolerant of a plain
+ * `(port, commands, opts)` primitive (a test or an older caller), which is
+ * resolved by the argument TYPES — a number first is a port, a string first is
+ * a host.
+ */
+/** Marks a function that already IS an adapter, so wrapping is idempotent. */
+const QMP_ADAPTED = Symbol.for('dsh.cua.windows.qmpAdapted')
+
+export function windowsQmpAdapter(primitive) {
+  if (typeof primitive !== 'function') {
+    throw new Error('the Windows backend needs a QMP primitive: (host, port, commands, opts) => Promise<object[]>')
+  }
+  // DOUBLE WRAPPING IS A REAL CALL PATH: the supervisor wraps its primitive AND
+  // `createWindowsBackend` wraps whatever it is handed (a test may pass a stub
+  // with no wrapper at all). Without this marker the second wrap treats the
+  // backend-shaped call as a supervisor-shaped one — port becomes the command
+  // array — which is the same class of bug as the one being fixed.
+  if (primitive[QMP_ADAPTED] === true) return primitive
+  const adapted = function qmp(host, port, commands, opts = {}) {
+    // A caller that already speaks the supervisor's shape: (port, commands, opts).
+    if (typeof host === 'number' && Array.isArray(port) && commands === undefined) {
+      return primitive(host, port, opts)
+    }
+    return primitive(port, commands, { ...opts, host })
+  }
+  Object.defineProperty(adapted, QMP_ADAPTED, { value: true })
+  return adapted
+}
 
 /**
  * The lifecycle object.
@@ -1153,17 +1356,53 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
 export function createWindowsBackend({ store, qmp, log = () => {} }) {
   /** Monotonic counter so two frames never share a serial name. */
   let FRAME_SEQUENCE = 0
+
+  /**
+   * R3: ONE QMP CALL SIGNATURE IN, THE SUPERVISOR'S ONE OUT.
+   *
+   * The backend's helpers all dial `qmp(host, port, commands, opts)` (that is
+   * what `qmpFor` writes), but the primitive the supervisor injects has always
+   * been `qmpCommands(port, commands, { timeoutMs, host })`. Passing it straight
+   * in therefore sent the HOST as the PORT: the monitor dial threw
+   * `ECONNREFUSED`/`ERR_INVALID_ARG_TYPE` on every probe, `probe()` reported
+   * `qmp: 'not answering'`, and a perfectly running QEMU never became ready —
+   * even after the row's `name` was fixed.
+   *
+   * `windowsQmpAdapter` is that missing half, exported so a test can prove the
+   * two shapes line up instead of trusting the wiring.
+   */
+  const callQmp = windowsQmpAdapter(qmp)
+
+  /**
+   * ACCEPT A NAME *OR* A ROW. Every helper below is called with the registry row
+   * in production and with a flat spec in tests; resolving once here keeps both
+   * correct (R2).
+   */
+  function namedSpec(spec, fallback = '') {
+    const name = windowsRowName(spec, fallback)
+    if (spec && typeof spec === 'object') return spec.name === name ? spec : { ...spec, name }
+    return { name }
+  }
   /** One QEMU child per computer, so stop/kill act on the right process. */
   const children = new Map()
 
-  function pathsFor(name) {
-    return windowsPaths(store, name)
+  /**
+   * R2: A NAME, OR A ROW THAT CARRIES ONE.
+   *
+   * The supervisor's rows are keyed by name and (before this fix) had no `name`
+   * field at all, so `pathsFor(row.name)` was `pathsFor(undefined)` →
+   * `$STORE/windows/undefined/qemu.pid`, and every liveness answer was a lie.
+   * Resolving through `windowsRowName` here means the same helper is correct
+   * whether it is handed `'win-box'` or the row for it.
+   */
+  function pathsFor(target) {
+    return windowsPaths(store, windowsRowName(target))
   }
 
   /** Which of our two QEMU processes is alive (pidfile is written by QEMU). */
-  function qemuPid(name) {
+  function qemuPid(target) {
     try {
-      const pid = Number(readFileSync(pathsFor(name).qemuPid, 'utf8').trim())
+      const pid = Number(readFileSync(pathsFor(target).qemuPid, 'utf8').trim())
       return Number.isFinite(pid) && pid > 0 ? pid : 0
     } catch {
       return 0
@@ -1188,7 +1427,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    * is one millisecond away from writing its pidfile dead.
    */
   function childState(name) {
-    const child = children.get(`qemu:${name}`)
+    const child = children.get(`qemu:${windowsRowName(name)}`)
     if (child === undefined) return { known: false, exited: false }
     return { known: true, exited: child.exitCode !== null || child.signalCode !== null }
   }
@@ -1205,7 +1444,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    * chardev, so a QEMU that starts before the socket exists fails with "Failed
    * to connect to socket". It is a plain child process, killed by `stopSwtpm`.
    */
-  function startSwtpm(name) {
+  function startSwtpm(target) {
+    const name = windowsRowName(target)
     const p = pathsFor(name)
     mkdirSync(p.tpmDir, { recursive: true })
     try { unlinkSync(p.tpmSocket) } catch {}
@@ -1227,7 +1467,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     return existsSync(p.tpmSocket)
   }
 
-  function stopSwtpm(name) {
+  function stopSwtpm(target) {
+    const name = windowsRowName(target)
     const child = children.get(`tpm:${name}`)
     children.delete(`tpm:${name}`)
     try { child?.kill('SIGTERM') } catch {}
@@ -1312,6 +1553,37 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
       })
       child.unref()
       log(`windows: ${spec.name} qemu started (pid ${child.pid}${installPending ? ', installing' : ''})`)
+      // R1: THE INSTALL CD'S "PRESS ANY KEY" WINDOW, PRESSED FOR THE USER.
+      //
+      // VERIFIED LIVE: OVMF reaches the DVD, `cdboot.efi 10.0.26100.1` prints
+      // "Press any key to boot from CD or DVD", nobody presses a key within 5 s,
+      // cdboot prints EFI_TIMEOUT and BDS falls into the EFI Internal Shell —
+      // where the install simply stops. This schedules three QMP key presses
+      // inside that window (1.5 s / 3.5 s / 5.5 s by default, see
+      // `cdbootKeyScheduleMs`) and deliberately does NOT await them: boot()'s
+      // pidfile window must not be extended by a keystroke.
+      //
+      // ONLY WHILE INSTALLING. A boot of an already-installed disk has no
+      // prompt to dismiss, and typing into a live guest would be a keystroke
+      // the user never asked for.
+      //
+      // Failure to send is NOT fatal (the firmware may not have the keyboard up
+      // yet, or the child may have exited): it is logged, and the next attempt
+      // in the schedule covers the same window.
+      if (installPending && cdbootKeysEnabled() && child?.pid) {
+        const keyedSpec = windowsBootSpec({ ...attemptSpec, paths: p })
+        void runCdbootKeys({
+          scheduleMs: cdbootKeyScheduleMs(),
+          log,
+          name: spec.name,
+          sendKey: (key) => {
+            if (child.exitCode !== null || child.signalCode !== null) {
+              throw new Error('this QEMU child exited before the key was due')
+            }
+            return sendKeys(keyedSpec, { key })
+          }
+        }).catch(() => {})
+      }
       const settled = await waitForQemuBoot({
         child,
         pidFile: p.qemuPid,
@@ -1402,12 +1674,13 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     // means no caller can dial `undefined` (see windowsPortsOf).
     const { qmpPort } = windowsPortsOf(spec)
     if (qmpPort <= 0) throw new Error('this computer has no QMP port recorded (the row is missing ports.qmp)')
-    return qmp('127.0.0.1', qmpPort, commands, { timeoutMs })
+    return callQmp('127.0.0.1', qmpPort, commands, { timeoutMs })
   }
 
   /** `query-status` plus the process table: the only trustworthy "is it up". */
-  async function probe(spec) {
-    const alive = pidAlive(qemuPid(spec.name))
+  async function probe(rawSpec, { name = '' } = {}) {
+    const spec = namedSpec(rawSpec, name)
+    const alive = pidAlive(qemuPid(spec))
     let status = ''
     let error = ''
     if (alive) {
@@ -1423,7 +1696,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     // answer" is a third state, and collapsing it into "not running" is what
     // made a live install read as dead.
     const qmp = !alive ? 'no qemu' : status === '' ? 'not answering' : status
-    return { alive, status, qmp, error }
+    return { alive, status, qmp, error, name: spec.name }
   }
 
   /**
@@ -1434,7 +1707,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    * `ssh: false` or one whose first boot is still finishing. `paused` is NOT
    * ready — a paused guest keeps its VNC port open and used to read as running.
    */
-  async function ready(spec, { ssh = true, phase = 'running' } = {}) {
+  async function ready(rawSpec, { ssh = true, phase = 'running', name = '' } = {}) {
+    const spec = namedSpec(rawSpec, name)
     const state = await probe(spec)
     const ports = windowsPortsOf(spec)
     if (!state.alive || state.status !== 'running') return { ready: false, endpoint: 'none', phase, ...state }
@@ -1457,8 +1731,9 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
   }
 
   /** A PNG frame of the guest's framebuffer (QMP screendump). */
-  async function screenshot(spec, { saveTo = null } = {}) {
-    const p = pathsFor(spec.name)
+  async function screenshot(rawSpec, { saveTo = null } = {}) {
+    const spec = namedSpec(rawSpec)
+    const p = pathsFor(spec)
     const unique = `${(FRAME_SEQUENCE += 1)}-${randomBytes(4).toString('hex')}`
     const file = path.join(p.dir, `shot-${unique}.png`)
     await qmpFor(spec, [{ execute: 'screendump', arguments: { filename: file } }])
@@ -1477,7 +1752,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
   }
 
   /** Absolute pointer, in frame pixels (the frame IS the display). */
-  async function click(spec, x, y, { width, height, button = 'left' } = {}) {
+  async function click(rawSpec, x, y, { width, height, button = 'left' } = {}) {
+    const spec = namedSpec(rawSpec)
     const toAbsolute = (value, extent) => Math.max(0, Math.min(0x7fff, Math.round((Number(value) / Math.max(1, Number(extent))) * 0x7fff)))
     const events = [
       { type: 'abs', data: { axis: 'x', value: toAbsolute(x, width) } },
@@ -1489,7 +1765,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     return { x: Number(x), y: Number(y) }
   }
 
-  async function move(spec, x, y, { width, height } = {}) {
+  async function move(rawSpec, x, y, { width, height } = {}) {
+    const spec = namedSpec(rawSpec)
     const toAbsolute = (value, extent) => Math.max(0, Math.min(0x7fff, Math.round((Number(value) / Math.max(1, Number(extent))) * 0x7fff)))
     await qmpFor(spec, [{
       execute: 'input-send-event',
@@ -1503,7 +1780,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     return { x: Number(x), y: Number(y) }
   }
 
-  async function drag(spec, fromX, fromY, toX, toY, { width, height } = {}) {
+  async function drag(rawSpec, fromX, fromY, toX, toY, { width, height } = {}) {
+    const spec = namedSpec(rawSpec)
     const toAbsolute = (value, extent) => Math.max(0, Math.min(0x7fff, Math.round((Number(value) / Math.max(1, Number(extent))) * 0x7fff)))
     const at = (x, y) => [
       { type: 'abs', data: { axis: 'x', value: toAbsolute(x, width) } },
@@ -1516,7 +1794,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
   }
 
   /** Keys and ASCII text, as physical qcodes with the right modifiers. */
-  async function sendKeys(spec, { text = null, key = null } = {}) {
+  async function sendKeys(rawSpec, { text = null, key = null } = {}) {
+    const spec = namedSpec(rawSpec)
     const events = []
     const press = (qcode, { shift = false, ctrl = false, alt = false } = {}) => {
       const modifiers = []
@@ -1547,13 +1826,13 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
   }
 
   /** Suspend is QMP `stop` (pause the VM, keep RAM); resume is `cont`. */
-  async function pause(spec) {
-    await qmpFor(spec, [{ execute: 'stop' }])
+  async function pause(rawSpec) {
+    await qmpFor(namedSpec(rawSpec), [{ execute: 'stop' }])
     return { paused: true }
   }
 
-  async function unpause(spec) {
-    await qmpFor(spec, [{ execute: 'cont' }])
+  async function unpause(rawSpec) {
+    await qmpFor(namedSpec(rawSpec), [{ execute: 'cont' }])
     return { unpaused: true }
   }
 
@@ -1563,10 +1842,11 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    * The supervisor owns the checkpoint and the registry; this only makes the
    * process stop. Returns which method worked so shutdown can mark `mayBeTorn`.
    */
-  async function shutdown(spec, { timeoutMs = 120000 } = {}) {
+  async function shutdown(rawSpec, { timeoutMs = 120000 } = {}) {
+    const spec = namedSpec(rawSpec)
     const state = await probe(spec)
     if (!state.alive) {
-      stopSwtpm(spec.name)
+      stopSwtpm(spec)
       return { method: 'already-off', exited: true }
     }
     let method = 'acpi'
@@ -1580,8 +1860,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     }
     const deadline = Date.now() + Math.max(1000, timeoutMs)
     while (Date.now() < deadline) {
-      if (!pidAlive(qemuPid(spec.name))) {
-        stopSwtpm(spec.name)
+      if (!pidAlive(qemuPid(spec))) {
+        stopSwtpm(spec)
         return { method, exited: true }
       }
       await new Promise((resolve) => setTimeout(resolve, 500))
@@ -1591,8 +1871,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
       await qmpFor(spec, [{ execute: 'quit' }], { timeoutMs: 10000 })
     } catch {}
     for (let index = 0; index < 30; index += 1) {
-      if (!pidAlive(qemuPid(spec.name))) {
-        stopSwtpm(spec.name)
+      if (!pidAlive(qemuPid(spec))) {
+        stopSwtpm(spec)
         return { method, exited: true, forced: true }
       }
       await new Promise((resolve) => setTimeout(resolve, 500))
@@ -1601,7 +1881,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
   }
 
   /** Kill the process (last resort, after `shutdown` refused to exit). */
-  function kill(name) {
+  function kill(target) {
+    const name = windowsRowName(target)
     const child = children.get(`qemu:${name}`)
     children.delete(`qemu:${name}`)
     try { child?.kill('SIGKILL') } catch {}
@@ -1625,7 +1906,8 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    * truth: `qemuGone` / `swtpmGone` after `waitMs`. It never throws: a pid that
    * vanished between the two `process.kill` calls is `gone`, not a failure.
    */
-  async function forceKill(name, { waitMs = 3000 } = {}) {
+  async function forceKill(target, { waitMs = 3000 } = {}) {
+    const name = windowsRowName(target)
     const firstPid = qemuPid(name)
     kill(name)
     const deadline = Date.now() + Math.max(200, Number(waitMs) || 3000)

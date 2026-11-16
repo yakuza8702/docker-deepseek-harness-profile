@@ -241,6 +241,10 @@ const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervi
     // `windowsEarlyDeathWindowMs`; only the DURATION is overridden here.
     DSH_CUA_WINDOWS_BOOT_SETTLE_MS: '2000',
     DSH_CUA_WINDOWS_EARLY_CHECK_MS: '600',
+    // R1: the cdboot key schedule, shortened for the suite. The stub QEMU serves
+    // no QMP, so the presses FAIL here — which is exactly the "failure to send is
+    // non-fatal, log only" contract, and it still proves the schedule ran.
+    DSH_CUA_WINDOWS_CDBOOT_KEYS_MS: '300,900',
     PNG_SOURCE
   },
   stdio: ['ignore', 'pipe', 'pipe']
@@ -672,7 +676,7 @@ try {
     const askedStatus = await call({ op: 'vmWindowsStatus', name: 'ws-win-asked' })
     check('the windowsStatus payload echoes the requested spec',
       askedStatus.ok === true && askedStatus.diskGb === 20 && askedStatus.memory === 4 && askedStatus.cpu === 2,
-      `payload disk=${askedStatus.diskGb} mem=${askedStatus.memory} cpu=${askedStatus.cpu}`)
+      `payload disk=${askedStatus.diskGb} mem=${askedStatus.memory} cpu=${askedStatus.cpu} err=${askedStatus.error}`)
     check('...and its install sentence carries the serial tail and no "undefined"',
       typeof askedStatus.installDetail === 'string'
       && !/undefined/u.test(askedStatus.installDetail)
@@ -771,6 +775,109 @@ try {
       && !existsSync(stuckDir), `complete=${forced.complete} dir=${existsSync(stuckDir)}`)
     check('the ports it owned are no longer reserved by its row',
       (JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[stuckName]?.ports ?? null) === null)
+  }
+
+  // ---- R1/R2/R3/R4: THE FOUR LIVE-VERIFIED ROOT CAUSES, OVER THE SOCKET ----
+  //
+  // R1  OVMF reached the install CD, cdboot printed "Press any key to boot from
+  //     CD or DVD", nothing pressed one, EFI_TIMEOUT, then the EFI Internal
+  //     Shell. The supervisor must schedule key presses for an INSTALL boot and
+  //     never for a boot of an installed disk.
+  // R2  rows were written without `name`, so every pidfile path said
+  //     "undefined" and a RUNNING QEMU read as dead. The row must carry the name
+  //     after a create, and a migrated row must gain it.
+  // R3  the backend's QMP call and the supervisor's primitive had different
+  //     signatures: the host arrived as the port and probe() always said "not
+  //     answering". The join is the adapter; probe() must find the live pid.
+  // R4  the install argv must boot the CD first (bootindex=1) and the disk
+  //     second (2).
+  {
+    const bootName = 'ws-win-boot'
+    const argvPath = path.join(STUB_BIN, 'qemu-argv.log')
+    try { rmSync(argvPath, { force: true }) } catch {}
+    const before = stderr.length
+    const created = await call({ op: 'vmWindowsCreate', name: bootName, kind: 'windows', windowsIso: 'iso/tiny.iso' })
+    check('R1/R4: the install-phase create answers installing', created.ok === true, JSON.stringify(created).slice(0, 180))
+
+    // R2: the row carries its own name, and the migration injects it.
+    const createdRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[bootName]
+    check('R2: the row carries `name` after a create', createdRow?.name === bootName, `name=${createdRow?.name}`)
+    check('R2: ...and the migration injects the map key when a row has none',
+      registry.vms['win-legacy']?.name === 'win-legacy', `name=${registry.vms['win-legacy']?.name}`)
+
+    // R4: the argv of the INSTALL boot.
+    const argvLines = existsSync(argvPath) ? readFileSync(argvPath, 'utf8').trim().split('\n').filter((line) => line !== '') : []
+    const installArgv = argvLines.at(-1) ?? ''
+    check('R4: the install argv boots the CD FIRST (bootindex=1)',
+      /-device ide-cd,drive=cd0,bus=ide\.1,bootindex=1/u.test(installArgv), installArgv.slice(0, 160))
+    check('R4: ...and the still-empty disk second (bootindex=2)',
+      /ide-hd,drive=disk0,bus=ide\.0,bootindex=2/u.test(installArgv), installArgv.slice(0, 160))
+
+    // R1: the cdboot presses were SCHEDULED for the install boot. The stub serves
+    // no QMP, so each one fails and is logged — never fatal, never a failed
+    // create (asserted above by created.ok).
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    const bootLog = stderr.slice(before)
+    // FILTERED BY COMPUTER: other creates in this suite also schedule presses,
+    // and a line about a different computer would make this assertion vacuous.
+    const ownPresses = bootLog.split('\n').filter((line) => line.includes(`windows: ${bootName} `) && /press/u.test(line))
+    check(`R1: the install boot schedules cdboot key presses for THIS computer (1.5 s window)`,
+      ownPresses.length >= 1 && ownPresses.every((line) => /~300 ms|~900 ms/u.test(line)),
+      ownPresses.join(' | ').slice(0, 240) || bootLog.split('\n').filter((line) => /press/u.test(line)).slice(-2).join(' | ').slice(0, 200))
+    check('R1: ...a failed press is LOGGED and does not fail the create',
+      ownPresses.some((line) => /could not press enter/u.test(line) && /not fatal/u.test(line))
+      && JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[bootName]?.state !== 'error',
+      ownPresses.join(' | ').slice(0, 200))
+
+    // R2/R3 END TO END: the stub QEMU wrote its pidfile and is still alive. A
+    // Start must FIND it (through the row's name) instead of spawning a second
+    // QEMU — that is only possible if probe() resolved the pidfile AND the QMP
+    // contract was joined.
+    const startedAgain = await call({ op: 'vmStart', name: bootName })
+    check('R2: a live QEMU is found through its row (no second process, ports kept)',
+      startedAgain.ok === true && startedAgain.state === 'booting' && startedAgain.portsChanged === false,
+      JSON.stringify(startedAgain).slice(0, 220))
+    const afterBootRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[bootName]
+    check('R2: ...the row still has its name and its ports',
+      afterBootRow?.name === bootName && Number(afterBootRow?.ports?.qmp) > 0,
+      JSON.stringify({ name: afterBootRow?.name, ports: afterBootRow?.ports }))
+    // R3: probe() reached QMP (the stub answers nothing, so the QMP state must be
+    // the honest "not answering" with the pid found — never "no qemu").
+    const status = await call({ op: 'vmWindowsStatus', name: bootName })
+    check('R3: windowsStatus answers with the joined QMP contract (not a crash, not "no qemu")',
+      status.ok === true && typeof status.installDetail === 'string' && !/undefined/u.test(status.installDetail)
+      && !/no QEMU process is running/u.test(status.installDetail),
+      String(status.installDetail).slice(0, 200))
+
+    // R1 (the other half): a boot of an INSTALLED disk must send no keys. The
+    // same row, now with installComplete true and a disk on the store.
+    await call({ op: 'vmShutdown', name: bootName })
+    const installedRow = (() => {
+      const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+      reg.vms[bootName] = { ...reg.vms[bootName], installComplete: true, state: 'powered-off' }
+      writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(reg, null, 2)}\n`)
+      return reg.vms[bootName]
+    })()
+    check('R1: the installed-disk fixture is in place', installedRow?.installComplete === true)
+    const beforeInstalled = stderr.length
+    const installedStart = await call({ op: 'vmStart', name: bootName })
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    const installedLog = stderr.slice(beforeInstalled)
+    // FOLLOW THE QEMU CHILD, NOT THE ANSWER: the stub serves no QMP, so a COLD
+    // start's own `running` proof fails even though the process is healthy. What
+    // this asserts is the KEY BEHAVIOUR — no presses for an installed disk — and
+    // that the boot really reached the spawn (its argv is on the log).
+    check('R1: a boot of an INSTALLED disk sends NO cdboot keys',
+      !/press enter|pressed enter|could not press/u.test(installedLog),
+      installedLog.split('\n').filter((line) => /press|qemu started/u.test(line)).join(' | ').slice(0, 200) || String(installedStart.error).slice(0, 160))
+    check('R1: ...and that start really spawned QEMU (so the absence of keys is meaningful)',
+      /qemu started/u.test(installedLog), installedLog.split('\n').filter((line) => /qemu started/u.test(line)).join(' | ').slice(0, 160))
+    // R4: and its argv boots the DISK first.
+    const postLines = readFileSync(argvPath, 'utf8').trim().split('\n').filter((line) => line !== '')
+    const postArgv = postLines.at(-1) ?? ''
+    check('R4: the post-install argv boots the disk FIRST and attaches no CD',
+      /ide-hd,drive=disk0,bus=ide\.0,bootindex=1/u.test(postArgv) && !postArgv.includes('id=cd0'), postArgv.slice(0, 160))
+    await call({ op: 'vmDelete', name: bootName, force: true })
   }
 
   // ---- F1/F2: A DEAD QEMU IS AN ERROR NOW, WITH ITS OWN STDERR ----
