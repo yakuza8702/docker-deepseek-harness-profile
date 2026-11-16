@@ -59,7 +59,7 @@ import {
   WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
   WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
-  windowsKvmPreflight
+  windowsKvmPreflight, windowsPortsOf, windowsTailLines, formatWindowsInstallDetail, windowsReadinessSignals
 } from './cua-vm-windows-qemu.mjs'
 import { kvmDoctorFacts, kvmPreflightError, kvmStatus } from './cua-vm-kvm.mjs'
 
@@ -1608,15 +1608,26 @@ function shotFilesFor(name) {
  * Every item is attempted, every item is reported, and a failure on one never
  * stops the rest: a wedged `sb rm` must not keep the 6 GB checkpoint alive.
  */
-async function destroyVm(name, { reason = 'delete', deleteContainer = true } = {}) {
-  return withVmLock(name, () => destroyVmLocked(name, { reason, deleteContainer }))
+async function destroyVm(name, { reason = 'delete', deleteContainer = true, force = false } = {}) {
+  return withVmLock(name, () => destroyVmLocked(name, { reason, deleteContainer, force }))
 }
 
 /** Caller already holds the computer's lifecycle lock. */
-async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true } = {}) {
+async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true, force = false } = {}) {
   // First statement, before any path is built.
   assertVmName(name)
   const items = []
+  // THE ROW DECIDES WHAT KIND OF COMPUTER THIS IS, before anything is removed:
+  // a `kind: 'windows'` row has NO cua sandbox, so `cua sb rm --local <name>` is
+  // guaranteed to fail and used to fail the whole manifest.
+  const subject = (() => {
+    try {
+      return readRegistry().vms[name] ?? null
+    } catch {
+      return null
+    }
+  })()
+  const isWindows = subject?.kind === 'windows' || subject?.backend === 'qemu'
   const record = (target, status, detail) => {
     items.push({ target, status, ...(detail ? { detail } : {}) })
     if (status === 'failed') log(`destroy ${name}: ${target} failed (${detail})`)
@@ -1638,6 +1649,46 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
     }
   }
 
+  // 0. FORCE DELETE KILLS FIRST. The manifest can only unlink a disk safely when
+  //    nothing holds it, and the two things that hold a Windows disk are QEMU and
+  //    swtpm — neither of which the ordinary path is allowed to kill behind a
+  //    live guest's back. With `force`, the process tree goes FIRST, its death is
+  //    VERIFIED (pidAlive), and only then does the same manifest run with that
+  //    truth. The order is the whole promise: killing after the unlink is how a
+  //    store gets corrupted, and claiming "gone" without checking is how the
+  //    panel ends up offering Delete for ever.
+  const forced = { requested: force === true, killed: [] }
+  if (force === true) {
+    const pidBefore = isWindows ? windowsBackend.qemuPid(name) : qemuPid(name)
+    const wasAlive = pidBefore > 0 && pidAlive(pidBefore)
+    try {
+      if (isWindows) {
+        const outcome = await windowsBackend.forceKill(name, { waitMs: 5000 })
+        forced.killed.push({
+          target: `windows qemu (pid ${outcome.pid || 'none'})`,
+          status: outcome.qemuGone ? 'removed' : 'failed',
+          detail: outcome.detail
+        })
+        record(`windows qemu (pid ${outcome.pid || 'none'})`, outcome.qemuGone ? 'removed' : 'failed', outcome.detail)
+        if (!outcome.swtpmGone) {
+          record(`swtpm (pid ${outcome.swtpmPid})`, 'failed', 'swtpm is still running and holds the TPM state; the disk can be removed but the next boot will fail with "TPM is already in use"')
+        }
+      } else if (wasAlive) {
+        // A Linux computer's QEMU belongs to cua; killing it by pid is the last
+        // resort and only ever happens behind `force`.
+        try { process.kill(pidBefore, 'SIGKILL') } catch {}
+        const deadline = Date.now() + 5000
+        while (Date.now() < deadline && pidAlive(pidBefore)) await new Promise((resolve) => setTimeout(resolve, 100))
+        record(`cua qemu (pid ${pidBefore})`, pidAlive(pidBefore) ? 'failed' : 'removed', pidAlive(pidBefore) ? 'the QEMU process survived SIGKILL' : 'killed on request (force delete)')
+      }
+      // websockify / preview relays: killed by the live-view bookkeeping, then
+      // the ports are closed below as usual.
+      stopLiveView(name)
+    } catch (error) {
+      record('force kill', 'failed', error?.message ?? String(error))
+    }
+  }
+
   // 1. Port forwards and relays first: a still-listening relay would answer the
   //    browser for a guest that is about to disappear.
   // Guarded: `readRegistry` throws on a corrupt file, and a delete must still
@@ -1650,10 +1701,25 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
   record('ports.json', closed.rows > 0 ? 'removed' : 'absent', closed.rows > 0 ? `${closed.rows} row(s), ${closed.killed} child process(es) stopped` : 'no row')
 
   // 2. The sandbox itself. A failure here is REPORTED and changes the SHAPE of
-  //    the delete (see step 8): a sandbox cua still owns must not lose its row.
-  const removed = await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
-  const sandboxGone = removed.code === 0
-  record('sb rm --force', sandboxGone ? 'removed' : 'failed', sandboxGone ? '' : (removed.stderr || removed.stdout).trim().slice(-300))
+  //    the delete (see step 9): a sandbox cua still owns must not lose its row.
+  //
+  //    A WINDOWS ROW HAS NO CUA SANDBOX. Running `sb rm --local win-test` there
+  //    can only fail ("sandbox not found"), and it failed the MANIFEST — which is
+  //    the user report `Partially deleted win-test — failed: sb rm --force`, on a
+  //    row whose disks were gone and whose name stayed unusable. So the step is
+  //    skipped for Windows (recorded as `skipped` with the reason, not silently),
+  //    and `sandboxGone` starts TRUE: there is no sandbox to be gone.
+  let sandboxGone = true
+  if (isWindows) {
+    // `not-applicable` is INFORMATIONAL: neither a failure nor a kept disk, so it
+    // does not stop the manifest from being complete. (A `skipped` item means
+    // "deliberately kept", which is a different promise.)
+    record('sb rm --force', 'not-applicable', 'a Windows computer has no cua sandbox (direct QEMU: its disks and its row are removed below)')
+  } else {
+    const removed = await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
+    sandboxGone = removed.code === 0
+    record('sb rm --force', sandboxGone ? 'removed' : 'failed', sandboxGone ? '' : (removed.stderr || removed.stdout).trim().slice(-300))
+  }
 
   // 3. Checkpoints, including the restore temp and any interrupted convert.
   await step('checkpoints', async () => {
@@ -1811,7 +1877,7 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
   // and unreachable (the row had been dropped).
   const skipped = items.filter((item) => item.status === 'skipped')
   const complete = failures.length === 0 && skipped.length === 0 && sandboxGone
-  log(`destroy ${name} (${reason}): ${items.filter((item) => item.status === 'removed').length}/${items.length} item(s) removed${failures.length ? `, ${failures.length} failed` : ''}${skipped.length ? `, ${skipped.length} kept` : ''}${complete ? '' : ' (INCOMPLETE)'}`)
+  log(`destroy ${name} (${reason}${forced.requested ? ', FORCE' : ''}): ${items.filter((item) => item.status === 'removed').length}/${items.length} item(s) removed${failures.length ? `, ${failures.length} failed` : ''}${skipped.length ? `, ${skipped.length} kept` : ''}${complete ? '' : ' (INCOMPLETE)'}`)
   return {
     name,
     // `deleted` stays truthful: a partial manifest is not a deletion.
@@ -1821,13 +1887,19 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
     failures: failures.length,
     failed: failures.map((item) => ({ target: item.target, detail: item.detail ?? '' })),
     kept: skipped.map((item) => ({ target: item.target, reason: item.detail ?? '' })),
+    // WHAT FORCE ACTUALLY DID, so the panel and the tool can report it instead
+    // of implying the kill happened because it was asked for.
+    force: forced.requested ? { requested: true, killed: forced.killed } : undefined,
     ...(complete ? {} : {
       detail: skipped.length > 0
         ? 'partially deleted — the disk was kept (QEMU still holds it); it stays reachable through the orphaned row. Run cua_vm_gc after the process is gone to reclaim it.'
         : sandboxGone
-          ? `${failures.length} item(s) could not be removed; the registry row was kept`
-          : 'the sandbox could not be removed, so the registry row is kept and marked orphaned; run cua_vm_gc after the sandbox is gone'
-    })
+          ? `${failures.length} item(s) could not be removed; the registry row was kept. Force delete kills the process and removes what is left.`
+          : 'the sandbox could not be removed, so the registry row is kept and marked orphaned; run cua_vm_gc after the sandbox is gone. Force delete kills the process and removes what is left.'
+    }),
+    // Offered by the panel (a button) and the tool (`force: true`): the same
+    // manifest, preceded by a verified kill.
+    canForce: complete ? undefined : true
   }
 }
 
@@ -2915,6 +2987,15 @@ function windowsLogTail(name, lines = 40) {
   }
 }
 
+/**
+ * The cheap progress tail the PANEL reads: the last handful of non-empty serial
+ * lines. `windowsLogTail` with a small number is one bounded read of the tail
+ * region — not a full-file read, and never a second process.
+ */
+function windowsProgressTail(name, lines = 5) {
+  return windowsTailLines(windowsLogTail(name, lines), lines)
+}
+
 const WINDOWS_WATCHING = new Set()
 
 /**
@@ -2951,7 +3032,7 @@ function watchWindowsInstall(name) {
           try {
             verdict = await windowsBackend.ready(meta, { ssh: meta.ssh !== false, phase: 'install' })
           } catch (error) {
-            verdict = { ready: false, error: error?.message ?? String(error) }
+            verdict = { ready: false, endpoint: 'none', alive: false, qmp: 'not answering', error: error?.message ?? String(error) }
           }
           if (verdict.ready) {
             await mutateRegistry((fresh) => {
@@ -2961,9 +3042,12 @@ function watchWindowsInstall(name) {
               row.endpoint = verdict.endpoint
               row.installComplete = true
               row.installDetail = `ready (${verdict.endpoint} accepting, QMP running)`
+              row.readiness = windowsReadinessSignals(name)
               delete row.error
               delete row.errorLog
               delete row.startedAt
+              delete row.serialTail
+              delete row.installTailAt
             })
             return { stop: true, ready: true }
           }
@@ -2978,11 +3062,21 @@ function watchWindowsInstall(name) {
             })
             return { stop: true, timedOut: true }
           }
+          // THE PROGRESS SENTENCE IS BUILT BY `formatWindowsInstallDetail`, NOT
+          // HERE. The old inline template interpolated `verdict.endpoint` (which
+          // the port-shape bug left `undefined`) and rendered an empty QMP
+          // status as "not running" — one panel line that was wrong twice.
+          const serialTail = windowsProgressTail(name, 5)
           await mutateRegistry((fresh) => {
             const row = fresh.vms[name]
             if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
             row.state = 'installing'
-            row.installDetail = `installing (${elapsedMinutes} min): ${verdict.endpoint === 'none' ? 'no SSH yet' : `${verdict.endpoint} answering`}, QMP ${verdict.status || 'not running'}`
+            row.installDetail = formatWindowsInstallDetail({ phase: 'install', verdict, elapsedMinutes, serialTail })
+            // The tail travels with the row so the panel shows Setup progress
+            // without a second call, and an agent reading `status` sees it too.
+            row.serialTail = serialTail
+            row.installTailAt = new Date().toISOString()
+            row.readiness = windowsReadinessSignals(name)
           })
           return { stop: false }
         })
@@ -3195,7 +3289,12 @@ async function windowsCreateManaged(spec) {
       lastUsed: new Date().toISOString(),
       state: 'installing',
       endpoint: 'none',
-      installDetail: 'Windows Setup is running (the answer file installs OpenSSH, python and dsh-cua; then the first logon provisions them)'
+      // B3: the first sentence already names what is watched and how the user
+      // will know it finished (the same formatter the watcher uses, with an
+      // empty tail because Setup has not printed yet).
+      installDetail: formatWindowsInstallDetail({ phase: 'install', verdict: { endpoint: 'none', qmp: 'starting' }, elapsedMinutes: 0, serialTail: '' }),
+      serialTail: [],
+      readiness: windowsReadinessSignals(spec.name)
     }
     await mutateRegistry((fresh) => { fresh.vms[spec.name] = row })
     // Z2: THE ROW NOW OWNS THESE PORTS. The claim existed only for the window
@@ -3226,9 +3325,13 @@ async function windowsCreateManaged(spec) {
     memory,
     warnings,
     gpu: spec.gpu,
+    // B1: echo WHAT WAS ASKED FOR (the row's own numbers), so a caller can tell
+    // "created at 20 GB / 4 GB" from "created at the 64 GB default".
+    requested: { diskGb, memory, cpu },
     passwordHint: 'the generated password is in the computer list (Reveal) — user "cua"',
     console: `/vm/port/${spec.name}/`,
-    detail: `Windows ${spec.windowsVersion || spec.windowsIso} is installing. The live view is at /vm/port/${spec.name}/ as soon as the display answers; OpenSSH, python and dsh-cua are installed by the answer file, so cua_vm_exec works once the computer is ready.`
+    readiness: windowsReadinessSignals(spec.name),
+    detail: `Windows ${spec.windowsVersion || spec.windowsIso} is installing on ${diskGb} GB disk / ${memory} GB RAM / ${cpu} CPU. The live view is at /vm/port/${spec.name}/ as soon as the display answers; OpenSSH, python and dsh-cua are installed by the answer file, so cua_vm_exec works once the computer is ready. The panel badge flips to Ready when the SSH banner answers and QMP says running.`
   })
 }
 
@@ -4006,6 +4109,16 @@ const handlers = {
     if (!/^[a-z0-9][a-z0-9-]{1,30}$/.test(String(spec.name || ''))) {
       throw new Error('name must be 2-31 chars: lowercase letters, digits and dashes')
     }
+    // B1: WHICH NUMBERS DID THE CALLER ACTUALLY CHOOSE? `normaliseSpec` fills the
+    // LINUX defaults, so "omitted" has to be carried explicitly — otherwise a
+    // Windows create through THIS op (the panel's path) always looked like
+    // "nothing was given" and windowsCreateManaged wrote its own defaults
+    // (64 GB / 6 GB / 2 vCPU) over the requested 20 GB / 4 GB. `vmWindowsCreate`
+    // already did this; the panel does not call it (it posts kind:'windows' to
+    // `create`), so the flags were lost on the path users actually take.
+    spec.diskGiven = Number(input.diskGb) > 0
+    spec.memoryGiven = Number(input.memory) > 0
+    spec.cpuGiven = Number(input.cpu) > 0
     return withLock(spec.name, () => createManaged(spec))
   },
 
@@ -4187,15 +4300,15 @@ const handlers = {
    * its registry row. Every item is reported, and a failed `sb rm` no longer
    * keeps a 6 GB checkpoint alive.
    */
-  async vmDelete({ name }) {
+  async vmDelete({ name, force = false } = {}) {
     if (!name) throw new Error('name is required')
-    return ok(await destroyVm(name, { reason: 'delete' }))
+    return ok(await destroyVm(name, { reason: 'delete', force: force === true }))
   },
 
   /** Delete + "only when the user asks" alias, same manifest. */
-  async destroy({ name }) {
+  async destroy({ name, force = false } = {}) {
     if (!name) throw new Error('name is required')
-    return ok(await destroyVm(name, { reason: 'destroy' }))
+    return ok(await destroyVm(name, { reason: 'destroy', force: force === true }))
   },
 
   /** Shutdown: ACPI powerdown → checkpoint → sandbox removed → powered-off. */
@@ -4257,12 +4370,18 @@ const handlers = {
       ? await windowsBackend.ready(meta, { ssh: meta.ssh !== false })
       : { ready: false, endpoint: 'none' }
     const state = !verdict.alive
-      ? (meta.state === 'powered-off' ? 'powered-off' : 'stopped')
+      // A row that says `installing` with no process is STUCK, not "stopped":
+      // the install never finished. Leaving the state as `stopped` hid the row a
+      // user had to delete — the panel showed Start (which cannot work on a
+      // half-written disk) instead of the one action that resolves it.
+      ? (meta.state === 'installing' ? 'installing' : meta.state === 'powered-off' ? 'powered-off' : 'stopped')
       : verdict.status === 'paused' || verdict.status === 'suspended'
         ? 'suspended'
         : ready.ready ? 'ready' : 'installing'
-    // Keep the row honest even when nobody is watching the install watcher.
-    if (state !== meta.state) {
+    // Keep the row honest even when nobody is watching the install watcher —
+    // EXCEPT for a stuck install, which stays `installing` on purpose so the
+    // panel keeps offering Force delete for it.
+    if (state !== meta.state && !(state === 'installing' && meta.state === 'installing')) {
       await mutateRegistry((fresh) => {
         const row = fresh.vms[name]
         if (!row) return
@@ -4278,17 +4397,72 @@ const handlers = {
     // X8: per START ATTEMPT, the same clock the watcher's deadline uses; a
     // legacy row without startedAt still falls back to createdAt.
     const elapsedMinutes = Math.round((Date.now() - (Date.parse(meta.startedAt || meta.createdAt || '') || Date.now())) / 60000)
+    // B3: HOW THE USER KNOWS IT FINISHED. The payload carries the same sentence
+    // the watcher writes, the tail it was built from, and the two signals that
+    // decide readiness — so the panel needs no second call and an agent polling
+    // `cua_vm_status` reads the same facts as a human looking at the badge.
+    const serialTail = windowsProgressTail(name, Math.max(1, Math.min(5, Number(tail) || 20)))
+    // A ROW THAT SAYS `installing` WHILE QEMU IS GONE IS STUCK, not merely
+    // stopped: the install never finished and the process that was doing it is
+    // not there. The payload keeps the progress sentence (so the panel shows the
+    // last thing Setup printed) and adds the one fact that explains it.
+    const stuck = meta.state === 'installing' && !verdict.alive
+    const showInstall = state === 'installing' || stuck
+    const installDetail = state === 'ready'
+      ? `ready (${endpointLabel(ready)} accepting, QMP ${qmpStateLabel(verdict)})`
+      : showInstall
+        ? `${formatWindowsInstallDetail({ phase: 'install', verdict: { ...verdict, endpoint: ready.endpoint }, elapsedMinutes, serialTail })}${stuck ? ' No QEMU process is running for this row: the install is stuck — Force delete removes it.' : ''}`
+        : meta.installDetail
+    // THE SENTENCE GOES BACK TO THE ROW, not just into this answer: the list the
+    // panel renders comes from `state.vms`, so a status poll is also what keeps
+    // the row's progress picture fresh between watcher ticks (the watcher runs
+    // every 15 s, this poll every 5 s while a computer installs).
+    if (showInstall || state === 'ready') {
+      await mutateRegistry((fresh) => {
+        const row = fresh.vms[name]
+        if (!row || row.kind !== 'windows') return
+        row.installDetail = installDetail
+        if (state === 'ready') {
+          row.serialTail = []
+          row.readiness = windowsReadinessSignals(name)
+          return
+        }
+        row.serialTail = serialTail
+        row.installTailAt = new Date().toISOString()
+        row.readiness = windowsReadinessSignals(name)
+      })
+    }
     return ok({
       name,
       kind: 'windows',
       backend: 'qemu',
-      state,
+      state: stuck ? 'installing' : state,
+      stuck,
+      // THE REQUESTED SPEC, not a default: the panel shows these numbers.
+      diskGb: Number(meta.diskGb) > 0 ? Number(meta.diskGb) : undefined,
+      memory: Number(meta.memory) > 0 ? Number(meta.memory) : undefined,
+      cpu: Number(meta.cpu) > 0 ? Number(meta.cpu) : undefined,
+      windowsVersion: meta.windowsVersion || '',
+      warnings: meta.warnings ?? [],
       detail: verdict.alive
-        ? `QMP ${verdict.status || 'not answering'}, ${ready.endpoint === 'none' ? 'no endpoint yet' : `${ready.endpoint} accepting`}`
-        : 'no QEMU process',
+        ? `QMP ${qmpStateLabel(verdict)}, ${endpointLabel(ready)}`
+        : stuck
+          ? 'the row says installing but no QEMU process is running: this install is stuck, and Force delete removes it (the normal delete keeps the disk)'
+          : 'no QEMU process',
+      // THE ONE SENTENCE THE PANEL PRINTS. During install it is the progress
+      // formatter's answer (never "undefined", never a bare phase); otherwise it
+      // is the ready/booting sentence the watcher would have written.
+      installDetail,
+      serialTail: showInstall ? serialTail : [],
+      elapsedMinutes,
+      readiness: windowsReadinessSignals(name),
+      // ONE LINE A MODEL CAN ACT ON without composing its own readiness rules.
+      operationalNote: state === 'installing'
+        ? 'poll this call until state is "ready" (or call cua_vm_status): readiness answers when the SSH banner answers AND QMP says running; a timeout past installTimeoutMinutes marks the row error with the serial tail'
+        : state === 'ready' ? `exec/put/get work over SSH; the desktop is cua_vm_gui over QMP, or the live view at /vm/port/${name}/` : undefined,
+      installTimeoutMinutes: timeoutMinutes,
       console: state === 'ready' ? `/vm/port/${name}/` : undefined,
       ports: meta.ports,
-      elapsedMinutes,
       logTail: windowsLogTail(name, Math.max(1, Math.min(200, Number(tail) || 20))).slice(-4000)
     })
   },

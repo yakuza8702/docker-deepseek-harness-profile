@@ -591,6 +591,134 @@ try {
     await call({ op: 'vmDelete', name: 'ws-win-def' })
   }
 
+  // ---- B1: the WINDOWS ROW CARRIES THE REQUESTED SPEC ----
+  // The panel posts kind:'windows' to `create` → op `vmCreate` (NOT
+  // vmWindowsCreate), and that path used to lose the "was this given?" flags:
+  // normaliseSpec filled the LINUX defaults, windowsCreateManaged then read
+  // "nothing was given" and wrote 64 GB / 6 GB / 2 vCPU over the request. The
+  // user saw a 20 GB / 4 GB computer reported as 64 GB / 6 GB.
+  {
+    await call({ op: 'configSet', config: { diskQuotaGb: 120 } })
+    const asked = await call({
+      op: 'vmCreate', name: 'ws-win-asked', kind: 'windows',
+      diskGb: 20, memory: 4, cpu: 2, windowsIso: 'iso/tiny.iso'
+    })
+    check('a Windows create through vmCreate keeps the requested disk/RAM/cpu',
+      asked.ok === true && asked.diskGb === 20 && asked.memory === 4 && asked.cpu === 2,
+      `disk=${asked.diskGb} mem=${asked.memory} cpu=${asked.cpu} ${asked.error ?? ''}`)
+    const askedRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms['ws-win-asked']
+    check('...and the ROW stores the requested spec, not the defaults',
+      askedRow?.diskGb === 20 && askedRow?.memory === 4 && askedRow?.cpu === 2,
+      `row disk=${askedRow?.diskGb} mem=${askedRow?.memory} cpu=${askedRow?.cpu}`)
+    check('...while still carrying the below-floor warnings that name the floor',
+      (askedRow?.warnings ?? []).some((warning) => warning.code === 'disk-below-floor' && /64 GB/u.test(warning.message))
+      && (askedRow?.warnings ?? []).some((warning) => warning.code === 'memory-below-floor' && /6 GB/u.test(warning.message)),
+      JSON.stringify((askedRow?.warnings ?? []).map((warning) => warning.code)))
+    // The installing payload must show the same numbers (the panel reads them).
+    const askedStatus = await call({ op: 'vmWindowsStatus', name: 'ws-win-asked' })
+    check('the windowsStatus payload echoes the requested spec',
+      askedStatus.ok === true && askedStatus.diskGb === 20 && askedStatus.memory === 4 && askedStatus.cpu === 2,
+      `payload disk=${askedStatus.diskGb} mem=${askedStatus.memory} cpu=${askedStatus.cpu}`)
+    check('...and its install sentence carries the serial tail and no "undefined"',
+      typeof askedStatus.installDetail === 'string'
+      && !/undefined/u.test(askedStatus.installDetail)
+      && Array.isArray(askedStatus.serialTail)
+      && Array.isArray(askedStatus.readiness?.signals),
+      JSON.stringify({ detail: askedStatus.installDetail, tail: askedStatus.serialTail }).slice(0, 200))
+    await call({ op: 'vmDelete', name: 'ws-win-asked', force: true })
+  }
+
+  // ---- B2/B3: the install progress sentence, with a real serial log ----
+  {
+    const progName = 'ws-win-progress'
+    const progDir = path.join(STORE, 'windows', progName)
+    mkdirSync(progDir, { recursive: true })
+    // A DEAD pid (999999): QEMU is not answering, which is exactly the state the
+    // user reported. The serial log has Setup output, so the sentence must show
+    // it instead of a bare phase.
+    writeFileSync(path.join(progDir, 'qemu.pid'), '999999\n')
+    writeFileSync(path.join(progDir, 'serial.log'), [
+      'Windows Boot Manager', '', 'Loading files...', '  12%', '  47%', ''
+    ].join('\n'))
+    const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    reg.vms[progName] = {
+      workspace: '/workspace', kind: 'windows', backend: 'qemu', state: 'installing',
+      ports: { qmp: 46901, ssh: 47901, vnc: 5901 }, diskGb: 20, cpu: 2, memory: 4,
+      windowsVersion: '11ltsc', installComplete: false,
+      createdAt: new Date(Date.now() - 11 * 60000).toISOString(), startedAt: new Date(Date.now() - 11 * 60000).toISOString()
+    }
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(reg, null, 2)}\n`)
+    const progress = await call({ op: 'vmWindowsStatus', name: progName, tail: 5 })
+    check('the installing payload never prints "undefined"', progress.ok === true
+      && typeof progress.installDetail === 'string' && !/undefined/u.test(progress.installDetail), String(progress.installDetail))
+    check('it does not say "QMP not running" about a probe that simply did not answer',
+      !/QMP not running/u.test(progress.installDetail ?? ''), String(progress.installDetail).slice(0, 120))
+    check('it names what is being watched while Setup runs',
+      /serial-log tail/u.test(progress.installDetail ?? '') && /QMP/u.test(progress.installDetail ?? ''),
+      String(progress.installDetail).slice(0, 160))
+    check('it says how the user knows it finished',
+      /badge flips to Ready/u.test(progress.installDetail ?? '') && /\/vm\/port\//u.test(progress.installDetail ?? ''),
+      String(progress.installDetail).slice(0, 200))
+    check('the serial tail rides along (last non-empty lines)', Array.isArray(progress.serialTail)
+      && progress.serialTail.includes('47%') && progress.serialTail.length <= 5, JSON.stringify(progress.serialTail))
+    check('the readiness signals are the SSH banner + QMP', Array.isArray(progress.readiness?.signals)
+      && progress.readiness.signals.some((line) => /SSH banner/u.test(line))
+      && progress.readiness.signals.some((line) => /QMP/u.test(line)), JSON.stringify(progress.readiness?.signals))
+    check('the elapsed minutes are reported', Number(progress.elapsedMinutes) >= 10, String(progress.elapsedMinutes))
+    // The row the panel reads (no status poll) carries the same tail.
+    const progRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[progName]
+    check('the install sentence is also on the row the panel lists',
+      typeof progRow.installDetail === 'string' && !/undefined/u.test(progRow.installDetail))
+
+    // ---- ADD-ON: a Windows delete does NOT fail on `sb rm` ----
+    // The row has no cua sandbox. The old manifest ran `sb rm --local <name>
+    // --force` unconditionally; with a stub that fails it, the report was
+    // "Partially deleted win-test — failed: sb rm --force" and the name stayed.
+    writeFileSync(path.join(STORE, 'stub-fail-rm'), 'fail the next sb rm')
+    const winDel = await call({ op: 'vmDelete', name: progName })
+    check('a Windows delete does not fail the manifest on sb rm',
+      winDel.ok === true && !(winDel.failed ?? []).some((item) => /sb rm/u.test(item.target)), JSON.stringify(winDel.failed))
+    check('...the sb rm step is recorded as not-applicable, with its reason',
+      (winDel.items ?? []).some((item) => /sb rm/u.test(item.target) && item.status === 'not-applicable'), JSON.stringify(winDel.items?.slice(0, 3)))
+    check('...and the delete COMPLETES: row, disk dir and ports are gone',
+      winDel.complete === true && !existsSync(progDir)
+      && JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[progName] === undefined,
+      `complete=${winDel.complete} dir=${existsSync(progDir)}`)
+    rmSync(path.join(STORE, 'stub-fail-rm'), { force: true })
+  }
+
+  // ---- ADD-ON: FORCE DELETE of a stuck install (dead pid, installing row) ----
+  {
+    const stuckName = 'ws-win-stuck'
+    const stuckDir = path.join(STORE, 'windows', stuckName)
+    mkdirSync(path.join(stuckDir, 'tpm'), { recursive: true })
+    writeFileSync(path.join(stuckDir, 'disk.qcow2'), 'a stuck Windows disk')
+    writeFileSync(path.join(stuckDir, 'serial.log'), 'Setup is starting\n')
+    writeFileSync(path.join(stuckDir, 'qemu.pid'), '999998\n')
+    const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    reg.vms[stuckName] = {
+      workspace: '/workspace', kind: 'windows', backend: 'qemu', state: 'installing',
+      ports: { qmp: 46902, ssh: 47902, vnc: 5902 }, diskGb: 20, cpu: 2, memory: 4,
+      windowsVersion: '11ltsc', installComplete: false, createdAt: new Date().toISOString()
+    }
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(reg, null, 2)}\n`)
+    const forced = await call({ op: 'vmDelete', name: stuckName, force: true })
+    check('force delete answers with its kill log', forced.ok === true && forced.force?.requested === true
+      && Array.isArray(forced.force.killed), JSON.stringify(forced.force))
+    check('force delete kills/verifies the process BEFORE the manifest (the kill is reported first)',
+      (forced.force?.killed ?? []).length > 0 && /windows qemu/u.test(forced.force.killed[0].target)
+      && forced.items?.[0]?.target === forced.force.killed[0].target,
+      JSON.stringify({ killed: forced.force?.killed?.[0]?.target, firstItem: forced.items?.[0]?.target }))
+    check('...pids are gone and the record says so', (forced.force?.killed ?? []).every((item) => item.status === 'removed'),
+      JSON.stringify(forced.force?.killed))
+    check('force delete completes: registry row gone and the disk dir gone',
+      forced.complete === true
+      && JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[stuckName] === undefined
+      && !existsSync(stuckDir), `complete=${forced.complete} dir=${existsSync(stuckDir)}`)
+    check('the ports it owned are no longer reserved by its row',
+      (JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[stuckName]?.ports ?? null) === null)
+  }
+
   // ---- Z1/Z2: a cold start keeps a free port triple, and the claim is released ----
   {
     const stable = 'ws-win-stable'

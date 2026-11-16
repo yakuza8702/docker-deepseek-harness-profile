@@ -39,7 +39,7 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process'
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
 import path from 'node:path'
@@ -172,6 +172,94 @@ export function windowsEnabled() {
 }
 
 /**
+ * THE INSTALL PROGRESS SENTENCE — pure, so it can be asserted without a VM.
+ *
+ * WHAT WENT WRONG (user report): the panel showed
+ *   `installing (10 min): undefined answering, QMP not running`
+ * and the store really was mid-install. Two independent defects produced that
+ * one line, and both are why this function exists rather than a template string
+ * at the call site:
+ *
+ *   1. `verdict.endpoint` was `undefined`. The readiness probe dialled a port
+ *      field that does not exist on a registry row (`spec.sshPort` vs
+ *      `ports.ssh`), threw inside `probe()`, and `ready()` returned early —
+ *      before it ever set `endpoint: 'none'`. Interpolating the raw field put
+ *      the word "undefined" into a user-facing sentence.
+ *   2. `QMP not running` was a LIE about a live QEMU: `status` was '' because
+ *      the same bad port threw, and `'' || 'not running'` collapsed "the
+ *      monitor did not answer" into "there is no monitor".
+ *
+ * So: no raw field ever reaches the text (`text()` + `endpointLabel()`), QMP has
+ * three named states instead of two, and during Setup the sentence names what is
+ * ACTUALLY being watched — the serial log and QMP — because SSH cannot answer
+ * until the answer file has installed OpenSSH.
+ *
+ * @param {object} input
+ * @param {'install'|'running'} [input.phase]        which readiness phase
+ * @param {object} [input.verdict]                   windowsBackend.ready()'s answer
+ * @param {number} [input.elapsedMinutes]            minutes since this attempt started
+ * @param {string|string[]} [input.serialTail]       the last serial-log lines (already read)
+ */
+export function formatWindowsInstallDetail({ phase = 'install', verdict = {}, elapsedMinutes = 0, serialTail = '' } = {}) {
+  const minutes = Number(elapsedMinutes) > 0 ? Math.round(Number(elapsedMinutes)) : 0
+  const qmp = qmpStateLabel(verdict)
+  const endpoint = endpointLabel(verdict)
+  const tail = windowsTailLines(serialTail, 5)
+  const watched = phase === 'install'
+    // SSH IS NOT EXPECTED YET during Setup — saying "no SSH yet" (or worse,
+    // interpolating a missing endpoint) reads like a failure, when the guest is
+    // simply still inside Windows Setup.
+    ? 'watching the serial-log tail + QMP (the SSH banner cannot answer until the answer file has installed OpenSSH)'
+    : 'watching QMP + the SSH banner'
+  const signals = `ready when the SSH banner answers AND QMP says running (now: ${endpoint}, QMP ${qmp})`
+  const beyond = 'then the badge flips to Ready and /vm/port/<name>/ becomes the noVNC stream you can drive'
+  const head = `installing (${minutes} min): ${watched}. ${signals}; ${beyond}.`
+  if (tail.length === 0) {
+    return `${head} Serial log: no lines yet (Windows Setup has not printed to the serial console).`
+  }
+  return `${head} Serial log (last ${tail.length}): ${tail.join(' | ')}`
+}
+
+/** `running` / `paused` / `not answering` / `no qemu` — never an empty string. */
+export function qmpStateLabel(verdict = {}) {
+  const record = verdict && typeof verdict === 'object' ? verdict : {}
+  if (record.alive === false) return 'no qemu'
+  const explicit = typeof record.qmp === 'string' ? record.qmp.trim() : ''
+  if (explicit !== '') return explicit
+  const status = typeof record.status === 'string' ? record.status.trim() : ''
+  return status === '' ? 'not answering' : status
+}
+
+/** `ssh` / `vnc` / `none` — the endpoint never reads as "undefined". */
+export function endpointLabel(verdict = {}) {
+  const record = verdict && typeof verdict === 'object' ? verdict : {}
+  const value = typeof record.endpoint === 'string' ? record.endpoint.trim() : ''
+  return value === '' || value === 'none' ? 'no endpoint yet' : value
+}
+
+/** The last `count` NON-EMPTY lines of a serial tail, as an array. */
+export function windowsTailLines(serialTail, count = 5) {
+  const limit = Math.max(1, Math.min(40, Number(count) || 5))
+  const lines = Array.isArray(serialTail)
+    ? serialTail
+    : String(serialTail ?? '').split('\n')
+  return lines.map((line) => String(line).trim()).filter((line) => line !== '').slice(-limit)
+}
+
+/**
+ * The readiness contract, spelled once: the payload and the tool text both read
+ * it from here, so "how do I know it finished" cannot drift between the panel
+ * and the model.
+ */
+export function windowsReadinessSignals(name = '<name>') {
+  return {
+    signals: ['the guest SSH banner answers', 'QMP says running'],
+    onReady: `the panel badge flips to Ready, and /vm/port/${name}/ becomes the noVNC stream you can drive`,
+    watchedDuringInstall: ['serial-log tail', 'QMP query-status', 'SSH banner (not expected until the answer file has installed OpenSSH)']
+  }
+}
+
+/**
  * The capacity advice for a Windows computer.
  *
  * The three numbers below are RECOMMENDATIONS (the defaults), not gates: a
@@ -289,10 +377,65 @@ export function windowsPaths(store, name) {
     sshKey: path.join(dir, 'id_ed25519'),
     sshKeyPub: path.join(dir, 'id_ed25519.pub'),
     serialLog: path.join(dir, 'serial.log'),
+    // QEMU'S OWN STDERR, NOT THE GUEST CONSOLE. `-serial file:` above records
+    // what the GUEST prints; a QEMU that dies during init (a bad display
+    // backend, an unusable accelerator, a missing firmware file) writes its
+    // diagnosis to STDERR and nowhere else. With `stdio: 'ignore'` that text was
+    // discarded, which is why a user-reported dead create left one line
+    // ("qemu started (pid 906, installing)") and no reason anywhere.
+    qemuStderr: path.join(dir, 'qemu-stderr.log'),
     qemuPid: path.join(dir, 'qemu.pid'),
     qmp: path.join(dir, 'qmp.json'),
     isoDir: path.join(store, 'iso')
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Ports — ONE shape, whichever object the caller hands in
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE ROW AND THE BOOT SPEC DO NOT SHARE A PORT SHAPE, and that mismatch was a
+ * user-visible bug.
+ *
+ * `boot()` is called with FLAT fields (`qmpPort`, `vncPort`, `sshPort`) because
+ * it builds QEMU's argv. Every lifecycle helper (`probe`, `ready`, `qmpFor`,
+ * `screenshot`, `click`, …) is called with the REGISTRY ROW, which stores the
+ * same three numbers under `ports: { qmp, ssh, vnc }` and has no flat field at
+ * all. So `qmpFor(spec)` dialled `undefined`:
+ *
+ *   * `net.connect(undefined)` throws `TypeError: The "options" or "port" or
+ *     "path" argument must be specified`;
+ *   * `probe()` swallowed that into `error` and reported `status: ''`;
+ *   * `ready()` returned `{ ready: false, endpoint: undefined }` (it never
+ *     reached the `endpoint: 'none'` line because the throw happened first);
+ *   * the watcher interpolated that straight into the panel:
+ *     `installing (10 min): undefined answering, QMP not running`.
+ *
+ * The whole sentence was true about nothing. One resolver, used by every helper,
+ * makes the shape invisible to the caller — and it is also what keeps the row
+ * authoritative after a port reconcile moved the triple.
+ */
+export function windowsPortsOf(spec) {
+  const record = spec && typeof spec === 'object' ? spec : {}
+  const ports = record.ports && typeof record.ports === 'object' ? record.ports : {}
+  const first = (...values) => {
+    for (const value of values) {
+      const port = Number(value)
+      if (Number.isFinite(port) && port > 0) return port
+    }
+    return 0
+  }
+  return {
+    qmpPort: first(record.qmpPort, ports.qmp),
+    vncPort: first(record.vncPort, ports.vnc),
+    sshPort: first(record.sshPort, ports.ssh)
+  }
+}
+
+/** This computer's ports, in the flat shape QEMU's argv wants. */
+export function windowsBootSpec(spec) {
+  return { ...spec, ...windowsPortsOf(spec) }
 }
 
 /* ------------------------------------------------------------------ *
@@ -825,7 +968,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
 
   /** The ports one computer uses: QMP, VNC and the SSH forward. */
   function portsFor(spec) {
-    return { qmpPort: spec.qmpPort, vncPort: spec.vncPort, sshPort: spec.sshPort }
+    return windowsPortsOf(spec)
   }
 
   /**
@@ -873,7 +1016,10 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    * `installPending` is decided by the caller from the disk's existence: a fresh
    * create boots the install ISO; every later start boots the disk.
    */
-  async function boot(spec, { installPending = false } = {}) {
+  async function boot(rawSpec, { installPending = false } = {}) {
+    // ACCEPT EITHER SHAPE: the create path hands in flat fields, a start path
+    // could hand in a registry row. buildQemuArgs only reads the flat ones.
+    const spec = windowsBootSpec(rawSpec)
     const p = pathsFor(spec.name)
     mkdirSync(p.dir, { recursive: true })
     const caps = windowsHostCaps()
@@ -928,7 +1074,11 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
 
   /** QMP to this computer's loopback socket, with the supervisor's client. */
   async function qmpFor(spec, commands, { timeoutMs = 15000 } = {}) {
-    return qmp('127.0.0.1', spec.qmpPort, commands, { timeoutMs })
+    // THE ROW HAS `ports: { qmp }`, the boot spec has `qmpPort`. Resolving here
+    // means no caller can dial `undefined` (see windowsPortsOf).
+    const { qmpPort } = windowsPortsOf(spec)
+    if (qmpPort <= 0) throw new Error('this computer has no QMP port recorded (the row is missing ports.qmp)')
+    return qmp('127.0.0.1', qmpPort, commands, { timeoutMs })
   }
 
   /** `query-status` plus the process table: the only trustworthy "is it up". */
@@ -944,7 +1094,12 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
         error = caught?.message ?? String(caught)
       }
     }
-    return { alive, status, error }
+    // `qmp` is the fact the PANEL prints. It is deliberately not `status ||
+    // 'not running'` at the call sites: "QEMU is alive but its monitor did not
+    // answer" is a third state, and collapsing it into "not running" is what
+    // made a live install read as dead.
+    const qmp = !alive ? 'no qemu' : status === '' ? 'not answering' : status
+    return { alive, status, qmp, error }
   }
 
   /**
@@ -957,21 +1112,22 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
    */
   async function ready(spec, { ssh = true, phase = 'running' } = {}) {
     const state = await probe(spec)
-    if (!state.alive || state.status !== 'running') return { ready: false, phase, ...state }
+    const ports = windowsPortsOf(spec)
+    if (!state.alive || state.status !== 'running') return { ready: false, endpoint: 'none', phase, ...state }
     if (phase === 'install') {
       // DURING SETUP only SSH counts. QEMU's VNC socket answers from the first
       // second of setup.exe, so a VNC probe called a half-installed Windows
       // "ready", set installComplete, and the next Start booted the half-written
       // disk. SSH exists only after the answer file has run.
-      const banner = await bannerProbe('127.0.0.1', spec.sshPort, { timeoutMs: 3000 })
+      const banner = ports.sshPort > 0 ? await bannerProbe('127.0.0.1', ports.sshPort, { timeoutMs: 3000 }) : null
       if (banner !== null) return { ready: true, endpoint: 'ssh', banner: banner.slice(0, 24), phase, ...state }
       return { ready: false, endpoint: 'none', phase, ...state }
     }
     if (ssh) {
-      const banner = await bannerProbe('127.0.0.1', spec.sshPort)
+      const banner = ports.sshPort > 0 ? await bannerProbe('127.0.0.1', ports.sshPort) : null
       if (banner !== null) return { ready: true, endpoint: 'ssh', banner: banner.slice(0, 24), phase, ...state }
     }
-    const vnc = await bannerProbe('127.0.0.1', spec.vncPort)
+    const vnc = ports.vncPort > 0 ? await bannerProbe('127.0.0.1', ports.vncPort) : null
     if (vnc !== null) return { ready: true, endpoint: 'vnc', phase, ...state }
     return { ready: false, endpoint: 'none', phase, ...state }
   }
@@ -1132,6 +1288,55 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     stopSwtpm(name)
   }
 
+  /**
+   * FORCE KILL: the escape hatch behind "Force delete".
+   *
+   * A stuck install can leave a QEMU whose row is `installing` and whose pid
+   * file is the ONLY handle on the process (the supervisor may have been
+   * restarted, so `children` is empty). `kill()` sends the signal but cannot
+   * say whether it worked — and the delete manifest MUST be able to say so,
+   * because it decides whether the disk may be unlinked.
+   *
+   * So this waits, re-reads the pid file (QEMU may rewrite it) and reports the
+   * truth: `qemuGone` / `swtpmGone` after `waitMs`. It never throws: a pid that
+   * vanished between the two `process.kill` calls is `gone`, not a failure.
+   */
+  async function forceKill(name, { waitMs = 3000 } = {}) {
+    const firstPid = qemuPid(name)
+    kill(name)
+    const deadline = Date.now() + Math.max(200, Number(waitMs) || 3000)
+    let pid = firstPid
+    while (Date.now() < deadline) {
+      // The child we spawned is reaped asynchronously; the pid file is the
+      // durable answer, and it may have been rewritten by a late QEMU start.
+      const fromFile = qemuPid(name)
+      if (fromFile > 0 && fromFile !== pid && pidAlive(fromFile)) {
+        pid = fromFile
+        try { process.kill(fromFile, 'SIGKILL') } catch {}
+      }
+      if (!pidAlive(pid) && !pidAlive(fromFile)) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    const finalPid = qemuPid(name) || pid
+    const swtpmPid = (() => {
+      try {
+        const value = Number(readFileSync(pathsFor(name).tpmPid, 'utf8').trim())
+        return Number.isFinite(value) && value > 0 ? value : 0
+      } catch {
+        return 0
+      }
+    })()
+    return {
+      pid: finalPid,
+      qemuGone: !pidAlive(finalPid),
+      swtpmPid,
+      swtpmGone: !pidAlive(swtpmPid),
+      detail: !pidAlive(finalPid)
+        ? `QEMU (pid ${finalPid || 'none'}) is gone, swtpm is ${pidAlive(swtpmPid) ? `STILL RUNNING (pid ${swtpmPid})` : 'stopped'}`
+        : `QEMU (pid ${finalPid}) is STILL RUNNING after SIGKILL`
+    }
+  }
+
   return {
     enabled: windowsEnabled,
     hostCaps: windowsHostCaps,
@@ -1152,6 +1357,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     unpause,
     shutdown,
     kill,
+    forceKill,
     stopSwtpm
   }
 }

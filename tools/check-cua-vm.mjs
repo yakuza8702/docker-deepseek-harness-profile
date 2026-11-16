@@ -336,7 +336,52 @@ const NEEDLES = {
     ["await step('registry.json'", 1],
     // R3: the boot/timer paths cannot die on a corrupt registry.
     ['windows: install watches were NOT resumed', 1],
-    ['idle: registry unreadable', 1]
+    ['idle: registry unreadable', 1],
+    // B1: THE ROW STORES THE REQUESTED SPEC. `vmCreate` (the panel's path, not
+    // `vmWindowsCreate`) used to lose the "was this given?" flags, so a Windows
+    // create read "nothing was given" and wrote 64 GB / 6 GB over a 20 GB / 4 GB
+    // request. These lines are the fix; the floors stay warnings.
+    ['spec.diskGiven = Number(input.diskGb) > 0', 2],
+    ['spec.memoryGiven = Number(input.memory) > 0', 2],
+    ['const diskGb = given.disk ? spec.diskGb : WINDOWS_DEFAULT_DISK_GB', 1],
+    ['requested: { diskGb, memory, cpu }', 1],
+    // B2: THE PROGRESS SENTENCE HAS ONE FORMATTER, shared by the watcher and the
+    // status payload. The old inline template interpolated a raw `endpoint`
+    // (undefined) and `status || 'not running'`.
+    ['formatWindowsInstallDetail({ phase: \'install\', verdict, elapsedMinutes, serialTail })', 1],
+    ['const installDetail = state === \'ready\'', 1],
+    ['installDetail,', 1],
+    // B3: THE INSTALLING PAYLOAD CARRIES THE SERIAL TAIL AND THE READINESS
+    // SIGNALS, so the panel and the tool both answer "how do I know it finished"
+    // without a second call. Reading is a SMALL tail, not the whole file.
+    ['serialTail: showInstall ? serialTail : [],', 1],
+    ['const serialTail = windowsProgressTail(name, Math.max(1, Math.min(5, Number(tail) || 20)))', 1],
+    ['function windowsProgressTail(name, lines = 5)', 1],
+    ['readiness: windowsReadinessSignals(name),', 1],
+    ['row.serialTail = serialTail', 1],
+    // A row that says `installing` with no process is STUCK: the state is not
+    // rewritten to `stopped`, so the panel keeps offering the one action that
+    // resolves it (Force delete).
+    ['const stuck = meta.state === \'installing\' && !verdict.alive', 1],
+    ['stuck,', 1],
+    // ADD-ON 1: A WINDOWS ROW HAS NO CUA SANDBOX, so the manifest must not run
+    // `sb rm` for it — that failure is the user's "Partially deleted win-test —
+    // failed: sb rm --force". The kind is read BEFORE anything is removed.
+    ['const isWindows = subject?.kind === \'windows\' || subject?.backend === \'qemu\'', 1],
+    ['if (isWindows) {', 1],
+    ['a Windows computer has no cua sandbox (direct QEMU: its disks and its row are removed below)', 1],
+    // ...and the skipped step is INFORMATIONAL: not a failure, not a kept disk,
+    // so the manifest can be COMPLETE.
+    ["record('sb rm --force', 'not-applicable'", 1],
+    // ADD-ON 2: FORCE DELETE IS A VERIFIED KILL *BEFORE* THE MANIFEST. The kill
+    // is recorded first, so the order is visible in the answer.
+    ['if (force === true) {', 1],
+    ['await windowsBackend.forceKill(name, { waitMs: 5000 })', 1],
+    ['force: forced.requested ? { requested: true, killed: forced.killed } : undefined', 1],
+    ['canForce: complete ? undefined : true', 1],
+    ['async vmDelete({ name, force = false } = {})', 1],
+    ['async destroy({ name, force = false } = {})', 1],
+    ['force: force === true', 1]
   ],
   space: [
     ['export const CAPTURE_MAX_PIXELS = 900_000', 1],
@@ -478,6 +523,12 @@ const NEEDLES = {
     // M8: virgl when the build has it, plain virtio-gpu otherwise.
     ['virtio-gpu-gl-pci', 1],
     ['egl-headless,rendernode=', 1],
+    // B2: the readiness probe resolves the ROW's port shape, and QMP has three
+    // named states instead of an empty string that the panel read as "not
+    // running". A live install must never be reported as dead.
+    ['const qmp = !alive ? \'no qemu\' : status === \'\' ? \'not answering\' : status', 1],
+    ['const ports = windowsPortsOf(spec)', 1],
+    ['export function windowsPortsOf(spec)', 1],
     // K1: the controller appears in the argv list before the device that uses it
     // (the ORDER is asserted separately, below).
     ["'-device', 'qemu-xhci,id=xhci'", 1]
@@ -600,7 +651,28 @@ const NEEDLES = {
     // the space line is shown, not hidden
     ["api('space'", 1],
     ['rea: false', 1],
-    ['rea: draft.rea', 1]
+    ['rea: draft.rea', 1],
+    // B1: THE PANEL SENDS THE REQUESTED SPEC, and NEVER clamps it in the client.
+    // `Math.max(6, draft.memory)` / `Math.max(64, draft.diskGb)` in the create
+    // body is what made a 20 GB / 4 GB request arrive as 64 GB / 6 GB.
+    ['cpu: draft.cpu,\n                memory: draft.memory,\n                diskGb: draft.diskGb,', 1],
+    // B3: THE INSTALLING ROW SHOWS THE PROGRESS PICTURE — elapsed, the serial
+    // tail, the readiness signals, and how the user knows it finished.
+    ["api('windowsStatus'", 1],
+    ['const serialTail = Array.isArray(info?.serialTail)', 1],
+    ['elapsed ${elapsed} min of', 1],
+    ['watching: ${(readiness.signals ?? []).join', 1],
+    ['badge flips to Ready when readiness answers', 1],
+    ['serialTail.join', 1],
+    // B3: no-install-lines case is stated, not silently blank.
+    ['Serial log: no lines yet', 1],
+    // ADD-ON: FORCE DELETE affordance, with the destructive confirmation copy.
+    ["h('button', {", 1],
+    ['Force delete', 2],
+    ['This kills the VM process and removes its disks even if the delete reported failures', 1],
+    ['api(\'delete\', { name, force: true })', 1],
+    // ...and a STUCK windows install says why the normal delete is not enough.
+    ['This install is marked installing but QEMU is not running', 1]
   ],
   index: [
     ["name: 'cua_vm_start'", 1],
@@ -626,6 +698,15 @@ const NEEDLES = {
     ['not available', 1],
     ["rea: { type: 'boolean'", 1],
     ['input.rea === true', 1],
+    // ADD-ON: FORCE DELETE on the tool surface — the param, the confirmation
+    // rule (destructive: ask first), and the honest report when items survive.
+    ["force: { type: 'boolean'", 1],
+    ['force: args.force === true', 1],
+    ['Call cua_vm_destroy again with force: true', 1],
+    // B3: `cua_vm_status` polls a Windows install so an agent reads the same
+    // sentence as a human (elapsed, serial tail, readiness).
+    ["op: 'vmWindowsStatus', name, tail: 5", 1],
+    ['serial (last ${info.serialTail.length})', 1],
     // the prompt carries the invariants
     ['SPACE:', 1],
     ['SHUTDOWN vs SUSPEND:', 1],

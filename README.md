@@ -838,6 +838,56 @@ same ACPI → checkpoint → `powered-off` path as Linux. The dsh-cua element to
 attach lazily over SSH only while a Windows computer is ready (~3-8k tokens), and
 `DSH_CUA_VM_WIN_MCP=0` removes them.
 
+### What the panel shows, and how you know a Windows install finished
+
+**The spec is the one you asked for.** A Windows computer's row displays the
+`diskGb` / `memory` / `cpu` that were requested — 20 GB / 4 GB / 2 vCPU stays
+20 / 4 / 2. 64 GB disk and 6 GB RAM are the *recommended* defaults; asking for
+less creates the smaller computer and attaches a `disk-below-floor` /
+`memory-below-floor` warning that names the floor. Omitting a field still gets the
+Windows default for that field (20 for Linux, 64 for Windows).
+
+**While it installs**, the row carries the elapsed time, the last ~5 non-empty
+lines of the serial console (Windows Setup prints there) and the two readiness
+signals being watched:
+
+| Watched while Setup runs | Answers when |
+|---|---|
+| the serial-log tail | Windows Setup prints (drives the progress lines) |
+| QMP `query-status` | QEMU is up — it is, from the first second |
+| the guest SSH banner | the answer file has installed and started OpenSSH |
+
+The badge flips to **Ready** the moment the SSH banner answers AND QMP says
+`running`; `/vm/port/<name>/` then becomes the noVNC stream you can drive. The
+same sentence, tail and signals are in `vmWindowsStatus` (the panel polls it every
+5 s while a computer installs) and in `cua_vm_status` for an agent, so nobody has
+to read the supervisor log to tell "still installing" from "stuck".
+
+**A stuck install** (the row says `installing` but no QEMU process is running) is
+reported as such, and the panel offers **Force delete**.
+
+### Delete, and Force delete
+
+`Delete` runs one manifest: ports/relay, the cua sandbox, checkpoints, screenshots,
+viewer row, trajectories, the QEMU directory, the Windows tree (disk, NVRAM, TPM,
+credentials, OEM payload) and the registry row — one step per item, every item
+reported. **A Windows computer has no cua sandbox**, so its `sb rm` step is
+recorded as *not applicable* instead of failing the manifest (that failure used to
+leave the name undeletable).
+
+If an item is **kept** (a disk whose QEMU still holds it) or **failed**, the delete
+is *partial* and the row stays reachable. Then:
+
+* the panel shows **Force delete**, and
+* `cua_vm_destroy` takes `force: true`.
+
+Force delete **kills the QEMU/swtpm/websockify processes first**, verifies they are
+gone by pid, and only then re-runs the same manifest — killing after unlinking is
+how a store gets corrupted. Items that still fail are reported honestly (the same
+`failed` / `kept` lists). The confirmation says what it does: *"This kills the VM
+process and removes its disks even if the delete reported failures — the row,
+container/QEMU, swtpm, websockify, disks, ports and registry row are all removed."*
+
 ### `the OEM payload is missing from this image` when creating a Windows computer
 
 The unattended install is three data files that ship **inside the image** at

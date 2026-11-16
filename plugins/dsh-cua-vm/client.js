@@ -232,6 +232,11 @@ window.__ModuleLoader__.load({
       const [view, setView] = useState(null)
       const [metricFor, setMetricFor] = useState(null)
       const [secret, setSecret] = useState({})
+      // B3/force-delete: the per-computer install status (serial tail + the
+      // signals being watched) and the last PARTIAL delete, so the row can offer
+      // "Force delete" instead of leaving the user with a stuck name.
+      const [installInfo, setInstallInfo] = useState({})
+      const [partial, setPartial] = useState(null)
 
       const load = useCallback(async () => {
         try {
@@ -257,6 +262,73 @@ window.__ModuleLoader__.load({
         return () => clearInterval(timer)
       }, [pending, load])
 
+      /**
+       * B3: HOW THE USER KNOWS IT FINISHED.
+       *
+       * While a Windows computer installs, poll `windowsStatus` (not `state`) —
+       * it answers the install sentence, the last serial lines, the elapsed
+       * time and the two readiness signals, so the row shows Windows Setup
+       * progressing instead of a bare phase. It is ONE small request with a
+       * 5-line tail, and it stops the moment nothing is installing.
+       */
+      const installingNames = Object.entries(state?.vms ?? {})
+        .filter(([, vm]) => vm?.kind === 'windows' && vm?.state === 'installing')
+        .map(([name]) => name)
+      const installingKey = installingNames.join(',')
+      useEffect(() => {
+        if (installingKey === '') return undefined
+        let cancelled = false
+        const refresh = async () => {
+          for (const name of installingKey.split(',')) {
+            try {
+              const payload = await api('windowsStatus', { name, tail: 5 })
+              if (cancelled) return
+              setInstallInfo((current) => ({ ...current, [name]: payload }))
+            } catch {
+              // A status poll that fails (the supervisor restarted) must not
+              // wipe the row: the last good answer stays on screen.
+            }
+          }
+        }
+        void refresh()
+        const timer = setInterval(() => { void refresh() }, 5000)
+        return () => { cancelled = true; clearInterval(timer) }
+      }, [installingKey])
+
+      /**
+       * FORCE DELETE: the escape hatch for a row the normal manifest could not
+       * remove (a wedged `sb rm`, a QEMU that still holds its disk, a deleted
+       * container whose row stayed behind). It kills the process tree FIRST and
+       * then re-runs the same manifest with that truth, so the disk is only
+       * unlinked once nothing holds it.
+       */
+      const forceDelete = async (name) => {
+        const okToForce = window.confirm(`Force delete ${name}?\n\nThis kills the VM process and removes its disks even if the delete reported failures — the row, container/QEMU, swtpm, websockify, disks, ports and registry row are all removed.`)
+        if (!okToForce) return
+        setPending({ name, action: 'delete' })
+        setNote(`Force deleting ${name}: killing the process first, then removing every item…`)
+        try {
+          const payload = await api('delete', { name, force: true })
+          await load()
+          setPartial(payload.complete === false ? { name, ...payload } : null)
+          setInstallInfo((current) => {
+            const next = { ...current }
+            delete next[name]
+            return next
+          })
+          setNote(payload.complete === false
+            ? clean(`Force delete of ${name} still left: ${[
+                (payload.kept ?? []).map((item) => `${item.target} (kept: ${item.reason})`).join(', '),
+                (payload.failed ?? []).map((item) => `${item.target} (failed: ${item.detail})`).join(', ')
+              ].filter(Boolean).join('; ') || (payload.detail ?? 'see the supervisor log')}`)
+            : `Force deleted ${name}: process, disks, ports and registry row are gone.`)
+        } catch (error) {
+          setNote(clean(error?.message ?? error))
+        } finally {
+          setPending(null)
+        }
+      }
+
       const act = async (name, label, action, body) => {
         setPending({ name, action })
         setNote(label)
@@ -275,16 +347,23 @@ window.__ModuleLoader__.load({
         const windows = draft.kind === 'windows'
         setPending({ name: draft.name, action: 'create' })
         setNote(windows
-          ? `Creating ${draft.name} (Windows ${draft.windowsVersion})… QEMU starts the install at once and the first boot re-partitions a 64 GB disk, so this is tens of minutes. The computer lists as installing until SSH answers; the panel follows the serial log.`
+          ? `Creating ${draft.name} (Windows ${draft.windowsVersion})… QEMU starts the install at once with the ${draft.diskGb} GB disk and ${draft.memory} GB RAM you asked for, so this is tens of minutes. The computer lists as installing until SSH answers; the panel follows the serial log.`
           : `Creating ${draft.name}${draft.gpu === true ? ' with GPU' : ''}${draft.android ? ' + Android SDK' : ''}${draft.rea ? ' + REA' : ''}… the first start also provisions the guest (a minute or two).${draft.rea ? ' The REA kit adds several minutes for Node 22, rea-agents, a JDK, Ghidra and JADX.' : ''}`)
         try {
           await api('create', windows
             ? {
                 name: draft.name,
                 kind: 'windows',
+                // B1: THE NUMBERS THE USER TYPED TRAVEL UNCHANGED. The panel used
+                // to send `Math.max(6, draft.memory)` / `Math.max(64, draft.diskGb)`
+                // — a silent clamp in the UI — so a computer created as 20 GB /
+                // 4 GB was created as 64 GB / 6 GB and the row (correctly) showed
+                // the 64 GB it had been given. The floor is a RECOMMENDATION the
+                // supervisor warns about; only the supervisor fills a default for
+                // a field the user did not touch.
                 cpu: draft.cpu,
-                memory: Math.max(6, draft.memory),
-                diskGb: Math.max(64, draft.diskGb),
+                memory: draft.memory,
+                diskGb: draft.diskGb,
                 // REA and Android are Linux-only and the tool refuses them; the
                 // form cannot even offer them for a Windows computer.
                 gpu: draft.gpu === null ? undefined : draft.gpu,
@@ -578,9 +657,30 @@ window.__ModuleLoader__.load({
               const failed = vm.state === 'error'
               const windows = vm.kind === 'windows'
               const busy = pending?.name === name
+              // B3: the live install picture. The ROW is the source of truth for
+              // the spec, the polled payload for the progress sentence + tail.
+              const info = installInfo[name] ?? null
+              const installDetail = (info?.installDetail ?? vm.installDetail) ?? null
+              const serialTail = Array.isArray(info?.serialTail) ? info.serialTail : (Array.isArray(vm.serialTail) ? vm.serialTail : [])
+              const readiness = info?.readiness ?? vm.readiness ?? null
+              const elapsed = Number.isFinite(Number(info?.elapsedMinutes)) ? Number(info.elapsedMinutes) : null
+              // B1: THE REQUESTED SPEC. The row stores what the user asked for,
+              // so a Windows computer shows its own 20 GB / 4 GB instead of the
+              // recommendation. `?` means the row predates the field.
+              const specLine = windows
+                ? `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · Windows ${vm.windowsVersion || 'ISO'}`
+                : `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · ${vm.image ?? 'linux'}`
+              // A stuck install (installing with no live QEMU) cannot be deleted
+              // by the normal path — the panel says so and offers the force.
+              // `info.stuck` is the supervisor's own verdict (row says
+              // installing, no QEMU process), so the copy cannot drift from it.
+              const stuck = windows && installing && (info?.stuck === true
+                || (info !== null && (info.state === 'stopped' || info.state === 'powered-off' || info.detail === 'no QEMU process')))
+              const partialFor = partial !== null && partial.name === name ? partial : null
               const busyLabel = pending?.action === 'start' ? 'Starting…'
                 : pending?.action === 'shutdown' ? 'Shutting down…'
-                  : pending?.action === 'suspend' ? 'Suspending…' : null
+                  : pending?.action === 'suspend' ? 'Suspending…'
+                    : pending?.action === 'delete' ? 'Deleting…' : null
               const stateBadge = failed
                 ? { ...S.badge(false), color: T.error, border: `1px solid ${T.line}`, background: 'rgba(242, 139, 130, .12)' }
                 : installing
@@ -595,9 +695,7 @@ window.__ModuleLoader__.load({
                   vm.android === true && h('span', { style: { ...S.badge(false), color: T.success, border: `1px solid ${T.line}`, background: 'rgba(126, 231, 135, .14)' } }, 'Android'),
                   vm.rea === true && h('span', { style: { ...S.badge(false), color: T.info, border: `1px solid ${T.line}`, background: 'rgba(138, 180, 255, .14)' } }, 'REA'),
                   vm.diskGb > 0 && h('span', { style: { ...S.badge(false), color: T.caption } }, `${vm.diskGb} GB`),
-                  h('span', { style: { ...S.muted, marginLeft: 'auto' } }, windows
-                    ? `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · Windows ${vm.windowsVersion || 'ISO'}`
-                    : `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · ${vm.image ?? 'linux'}`)
+                  h('span', { style: { ...S.muted, marginLeft: 'auto' } }, specLine)
                 ),
                 h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
                   ready === false && h('button', {
@@ -647,35 +745,56 @@ window.__ModuleLoader__.load({
                   h('button', {
                     type: 'button', style: { ...S.button, color: T.error },
                     onClick: () => {
-                      if (!window.confirm(`Delete ${name}? Its disk, checkpoints, screenshots and port rows go with it.`)) return
+                      if (!window.confirm(`Delete ${name}? Its disk, checkpoints, screenshots and port rows go with it.${windows ? ' A Windows computer also has a QEMU process and a TPM: if either still holds the disk, use Force delete.' : ''}`)) return
                       void (async () => {
                         try {
                           const payload = await api('delete', { name })
                           await load()
                           // A partial manifest is not a deletion: say which
-                          // items survived instead of reporting success.
-                          // A partial manifest is not a deletion: say which
                           // items survived (usually a disk kept because QEMU
-                          // still holds it) instead of reporting success.
+                          // still holds it) instead of reporting success, and
+                          // keep it so the row can offer Force delete.
+                          setPartial(payload.complete === false ? { name, ...payload } : null)
                           const kept = (payload.kept ?? []).map((item) => item.target)
-                          const failed = (payload.failed ?? []).map((item) => item.target)
+                          const failedItems = (payload.failed ?? []).map((item) => item.target)
                           setNote(payload.complete === false
                             ? clean(`Partially deleted ${name} — ${[
                                 kept.length > 0 ? `disk kept: ${kept.join(', ')} (run Clean up to reclaim once the process is gone)` : '',
-                                failed.length > 0 ? `failed: ${failed.join(', ')}` : '',
-                                kept.length === 0 && failed.length === 0 ? (payload.detail ?? 'see the supervisor log') : ''
-                              ].filter(Boolean).join('; ')}`)
+                                failedItems.length > 0 ? `failed: ${failedItems.join(', ')}` : '',
+                                kept.length === 0 && failedItems.length === 0 ? (payload.detail ?? 'see the supervisor log') : ''
+                              ].filter(Boolean).join('; ')}. Use Force delete to kill the process and remove what is left.`)
                             : `Deleted ${name}.`)
                         } catch (error) {
                           setNote(clean(error?.message ?? error))
                         }
                       })()
                     }
-                  }, 'Delete')
+                  }, busy && busyLabel !== null ? busyLabel : 'Delete'),
+                  // FORCE DELETE: shown after a partial delete, on a stuck
+                  // Windows install, or always for Windows (its QEMU/TPM can
+                  // hold the disk in ways a Linux guest cannot).
+                  (partialFor !== null || stuck || windows) && h('button', {
+                    type: 'button',
+                    style: { ...S.button, color: T.error, border: `1px solid ${T.error}` },
+                    disabled: busy,
+                    onClick: () => void forceDelete(name)
+                  }, 'Force delete')
                 ),
                 secret[name] && h('div', { style: { ...S.muted, fontFamily: 'ui-monospace, monospace' } },
                   `user "cua" password "${secret[name]}" (also in $STORE/windows/${name}/credentials.json, mode 0600)`),
-                (installing || failed) && vm.installDetail && h('div', { style: S.muted }, clean(vm.installDetail)),
+                (installing || failed) && installDetail && h('div', { style: S.muted }, clean(installDetail)),
+                installing && elapsed !== null && h('div', { style: S.muted },
+                  `elapsed ${elapsed} min of ${vm.installTimeoutMinutes ?? info?.installTimeoutMinutes ?? 60} · the badge flips to Ready when readiness answers, and /vm/port/${name}/ becomes the noVNC stream you can drive.`),
+                installing && readiness !== null && h('div', { style: S.muted },
+                  clean(`watching: ${(readiness.signals ?? []).join(' + ')} (serial-log tail is shown live)${readiness.onReady ? ` — ${readiness.onReady}` : ''}`)),
+                installing && serialTail.length > 0 && h('pre', { style: S.pre }, clean(serialTail.join('\n'))),
+                installing && serialTail.length === 0 && h('div', { style: S.muted }, 'Serial log: no lines yet — Windows Setup has not printed to the console (the tail appears here as soon as it does).'),
+                // A STUCK INSTALL (installing with no live QEMU) cannot be
+                // deleted by the normal path, so the panel names the remedy.
+                stuck && h('div', { style: { ...S.muted, color: T.caption } },
+                  'This install is marked installing but QEMU is not running, so the normal delete keeps the disk. Use Force delete: it kills the process, then removes the disk, the TPM, the ports and the registry row.'),
+                partialFor !== null && h('div', { style: { ...S.muted, color: T.caption } },
+                  clean(`The last delete left ${[(partialFor.kept ?? []).length > 0 ? `${(partialFor.kept ?? []).length} kept item(s)` : '', (partialFor.failed ?? []).length > 0 ? `${(partialFor.failed ?? []).length} failed item(s)` : ''].filter(Boolean).join(' and ')} — Force delete kills the process and removes them.`)),
                 failed && vm.error && h('div', { style: { ...S.muted, color: T.error } }, clean(vm.error)),
                 failed && vm.errorLog && h('pre', { style: S.pre }, clean(String(vm.errorLog).slice(-1200))),
                 exec !== null && exec.name === name && h('div', { style: { display: 'grid', gap: 6 } },

@@ -394,16 +394,40 @@ export function apply(ctx, config = {}) {
       const vms = status.registry || {}
       const entries = Object.entries(vms)
       if (entries.length === 0) return { text: 'No VM has been created yet. Use cua_vm_ensure to create one.' }
-      const lines = entries.map(([name, vm]) => [
-        `${name} (${vm.state || 'unknown'})`,
-        `workspace=${vm.workspace}`,
-        `tier=${vm.tier}`,
-        `cpu=${vm.cpu}`,
-        `memory=${vm.memory}GB`,
-        vm.lastUsed ? `lastUsed=${vm.lastUsed}` : null,
-        vm.rea === true ? 'rea=yes' : null,
-        vm.lastCommand ? `lastCommand=${vm.lastCommand}` : null
-      ].filter(Boolean).join(' · '))
+      // A WINDOWS COMPUTER'S INSTALL IS POLLABLE FROM HERE TOO (B3): the row
+      // alone says "installing"; `vmWindowsStatus` answers the same sentence the
+      // panel shows (elapsed, the serial tail, the readiness signals) in ONE
+      // small call, so an agent can watch an install without reading the log.
+      const live = {}
+      for (const [name, vm] of entries) {
+        if (vm?.kind !== 'windows' || vm?.state !== 'installing') continue
+        try {
+          live[name] = await call({ op: 'vmWindowsStatus', name, tail: 5 })
+        } catch {
+          // A status poll may fail while the supervisor restarts; the row is
+          // still worth printing.
+        }
+      }
+      const lines = entries.map(([name, vm]) => {
+        const info = live[name] ?? null
+        return [
+          `${name} (${vm.state || 'unknown'})`,
+          `workspace=${vm.workspace}`,
+          vm.kind === 'windows' ? null : `tier=${vm.tier}`,
+          `cpu=${vm.cpu}`,
+          `memory=${vm.memory}GB`,
+          vm.diskGb > 0 ? `disk=${vm.diskGb}GB` : null,
+          vm.kind === 'windows' ? `windows=${vm.windowsVersion || 'ISO'}` : null,
+          vm.lastUsed ? `lastUsed=${vm.lastUsed}` : null,
+          vm.rea === true ? 'rea=yes' : null,
+          vm.lastCommand ? `lastCommand=${vm.lastCommand}` : null,
+          vm.kind === 'windows' && info?.installDetail ? `install: ${info.installDetail}` : null,
+          vm.kind === 'windows' && Array.isArray(info?.serialTail) && info.serialTail.length > 0
+            ? `serial (last ${info.serialTail.length}): ${info.serialTail.join(' | ')}`
+            : null,
+          vm.kind === 'windows' && info?.operationalNote ? info.operationalNote : null
+        ].filter(Boolean).join(' · ')
+      })
       return { text: lines.join('\n') }
     }
   })
@@ -878,11 +902,20 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'cua_vm_destroy',
-    description: 'Delete the VM and everything it left in the store. Only when the user asks.',
-    parameters: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] },
-    output: textOutput('Destroy result, or the items that survived.'),
+    description: 'Delete the VM and everything it left in the store. Only when the user asks. `force: true` kills the QEMU/swtpm/websockify processes FIRST and then removes what is left — use it when a normal delete reported failures.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        name: { type: 'string' },
+        force: { type: 'boolean', description: 'Force delete: kill the VM process (QEMU/swtpm/websockify) and remove its disks even if the normal delete reported failures — the row, disks, ports and registry row all go. Ask for confirmation first: it is destructive.' }
+      },
+      required: ['name']
+    },
+    output: textOutput('Destroy result, the items that survived, and the kill log when force was used.'),
     async execute(args = {}) {
-      const result = await call({ op: 'destroy', name: args.name })
+      const result = await call({ op: 'destroy', name: args.name, force: args.force === true })
+      const killed = (result.force?.killed ?? []).map((item) => `- ${item.status === 'removed' ? 'KILLED' : 'STILL RUNNING'} ${item.target}: ${item.detail}`).join('\n')
       if (result.complete === false) {
         // A PARTIAL manifest is not a deletion, and a KEPT item is the usual
         // case: a disk whose QEMU is still running is deliberately left alone,
@@ -890,9 +923,12 @@ export function apply(ctx, config = {}) {
         // is gone. Print both lists: what failed and what was kept on purpose.
         const failed = (result.failed ?? []).map((item) => `- FAILED ${item.target}: ${item.detail}`).join('\n')
         const kept = (result.kept ?? []).map((item) => `- KEPT ${item.target}: ${item.reason}`).join('\n')
-        return { text: `${result.name} was NOT fully deleted. ${result.detail ?? ''}\n${[kept, failed].filter(Boolean).join('\n')}` }
+        const offer = result.canForce === true && args.force !== true
+          ? '\nCall cua_vm_destroy again with force: true to kill the process and remove what is left.'
+          : ''
+        return { text: `${result.name} was NOT fully deleted. ${result.detail ?? ''}\n${[kept, failed, killed].filter(Boolean).join('\n')}${offer}` }
       }
-      return { text: `${result.name} destroyed (${result.items?.length ?? 0} store item(s) removed). The next ensure starts from the base image.` }
+      return { text: `${result.name} destroyed (${result.items?.length ?? 0} store item(s) removed)${killed ? `.\n${killed}` : ''}. The next ensure starts from the base image.` }
     }
   })
 }
