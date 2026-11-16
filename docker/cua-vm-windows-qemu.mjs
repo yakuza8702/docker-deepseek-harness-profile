@@ -43,6 +43,7 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, sta
 import http from 'node:http'
 import https from 'node:https'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
 import { pngSize } from './cua-vm-space.mjs'
 
@@ -499,6 +500,84 @@ export async function ensureIso({ url, isoDir, timeoutMs = 60 * 60 * 1000, onPro
  * ------------------------------------------------------------------ */
 
 /**
+ * The three files the unattended install cannot run without. Exported because
+ * both the error text and the image gate talk about the same list: a fourth
+ * file added here without its COPY is exactly the drift this constant prevents.
+ */
+export const OEM_PAYLOAD_FILES = Object.freeze(['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1'])
+
+/** Where this module itself lives — the last-resort source of the payload. */
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url))
+
+/**
+ * A directory that holds ALL of `OEM_PAYLOAD_FILES`, or null.
+ *
+ * A directory is enough — the flat image check tree (`/opt/seek-harness/
+ * cua-check/`) keeps the same three files at its root, so the same predicate
+ * answers "is this a payload directory?" for both layouts.
+ */
+export function oemPayloadDir(dir) {
+  if (typeof dir !== 'string' || dir.length === 0) return null
+  return OEM_PAYLOAD_FILES.every((file) => {
+    try {
+      return existsSync(path.join(dir, file))
+    } catch {
+      return false
+    }
+  })
+    ? dir
+    : null
+}
+
+/**
+ * The first directory among `candidates` that carries the whole payload.
+ * Order matters: the configured source wins, the fallbacks are self-healing.
+ */
+export function resolveOemSourceDir(candidates) {
+  for (const candidate of candidates) {
+    const found = oemPayloadDir(candidate)
+    if (found !== null) return found
+  }
+  return null
+}
+
+/**
+ * WHAT THE USER SEES WHEN THE IMAGE HAS NO WINDOWS BACKEND.
+ *
+ * The old one-liner ("the OEM payload is missing from this image: <path>") named
+ * a path and nothing else: no reason, no rebuild steps, no way to tell a stale
+ * image from a broken mount. It is a failure of the IMAGE, not of the computer
+ * spec, so the message says so in that order and ends with a command to run.
+ */
+export function oemPayloadMissingError({ sourceDir, fallbackDirs }) {
+  const looked = [sourceDir, ...fallbackDirs].filter(Boolean)
+  return new Error([
+    `the Windows OEM payload is missing from this image: no ${OEM_PAYLOAD_FILES.join(', ')} under ${looked.join(' or ')}`,
+    '',
+    'A Windows computer is a DIRECT-QEMU guest: its unattended install reads those files from',
+    `the image (default /usr/local/share/cua-vm/windows-oem/). An image without the Windows backend —`,
+    'a main-branch build, or any build older than the one that added the Windows backend — cannot',
+    'create one, and no computer setting can fix that. Pull or build a newer image:',
+    '',
+    '  1. build it from branch cua-vm-improve WITH the virgl QEMU (the Windows guest needs it):',
+    '     git fetch origin && git checkout cua-vm-improve',
+    '     docker build --build-arg WITH_VIRGL_QEMU=1 -t ghcr.io/OWNER/REPO:local .',
+    '     (or run Actions → docker-build on cua-vm-improve with channel=github-tag, virgl=true,',
+    '      which publishes ghcr.io/OWNER/REPO:latest; then docker pull ghcr.io/OWNER/REPO:latest)',
+    '  2. recreate the container against the NEW image, with the SAME compose env you use now',
+    '     (notably DSH_CUA_VM_GPU=virgl if your computer is a GPU one), keeping the /cua-vm',
+    '     volume mounted at /cua-vm so the existing store and its computers survive:',
+    '     docker compose -f compose.windows.yaml up -d --force-recreate',
+    '  3. confirm the payload actually landed, from inside the running container',
+    '     (`seek-harness` is the service name in compose.yaml / compose.windows.yaml):',
+    `     docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/${OEM_PAYLOAD_FILES.join(' ')}`,
+    '',
+    'If step 3 lists all three files and this error persists, DSH_CUA_WINDOWS_OEM_DIR points',
+    `somewhere else — unset it (it currently overrides the image default with ${sourceDir}).`
+  ].join('\n'))
+}
+
+/**
  * Write the unattended-answer payload into `$STORE/windows/<name>/oem/`.
  *
  * The files live in the repository (`docker/windows-oem/`) so they can be read,
@@ -510,8 +589,14 @@ export async function ensureIso({ url, isoDir, timeoutMs = 60 * 60 * 1000, onPro
  *   {{SSH_PUBKEY}}    the supervisor's public key (authorized_keys)
  *   {{PYTHON_URL}}    the pinned python.org installer
  *   {{DSH_CUA_PIP}}   the dsh-cua package spec
+ *
+ * SELF-HEALING: `sourceDir` is the image path the supervisor resolves; the
+ * `fallbackDirs` are the other places the SAME three files are known to exist
+ * (the image's flat check tree, the module's own directory, a checkout). A file
+ * or two missing from `sourceDir` therefore costs a log line, not a failed
+ * computer create — as long as ONE candidate directory is complete.
  */
-export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir, pythonUrl, dshCuaSpec, log = () => {} }) {
+export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir, fallbackDirs = [], pythonUrl, dshCuaSpec, log = () => {} }) {
   mkdirSync(p.oemDir, { recursive: true })
   const substitutions = {
     '{{COMPUTERNAME}}': `cua-${name}`.slice(0, 15).toUpperCase(),
@@ -520,10 +605,15 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
     '{{PYTHON_URL}}': pythonUrl,
     '{{DSH_CUA_PIP}}': dshCuaSpec
   }
-  const files = ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1']
+  const files = OEM_PAYLOAD_FILES
+  const candidates = [sourceDir, ...fallbackDirs, path.join(MODULE_DIR, 'windows-oem'), path.resolve(MODULE_DIR, '..', 'docker', 'windows-oem')]
+  const resolved = resolveOemSourceDir(candidates)
+  if (resolved === null) throw oemPayloadMissingError({ sourceDir, fallbackDirs })
+  if (path.resolve(resolved) !== path.resolve(sourceDir)) {
+    log(`windows: OEM payload not found at ${sourceDir}; using the copy at ${resolved}`)
+  }
   for (const file of files) {
-    const source = path.join(sourceDir, file)
-    if (!existsSync(source)) throw new Error(`the OEM payload is missing from this image: ${source}`)
+    const source = path.join(resolved, file)
     let text = readFileSync(source, 'utf8')
     for (const [needle, value] of Object.entries(substitutions)) text = text.split(needle).join(value)
     writeFileSync(path.join(p.oemDir, file), text)

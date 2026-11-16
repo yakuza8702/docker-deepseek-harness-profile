@@ -830,6 +830,44 @@ same ACPI → checkpoint → `powered-off` path as Linux. The dsh-cua element to
 attach lazily over SSH only while a Windows computer is ready (~3-8k tokens), and
 `DSH_CUA_VM_WIN_MCP=0` removes them.
 
+### `the OEM payload is missing from this image` when creating a Windows computer
+
+The unattended install is three data files that ship **inside the image** at
+`/usr/local/share/cua-vm/windows-oem/`: `Autounattend.xml`, `setupcomplete.cmd`
+and `cua-firstboot.ps1`. The create path copies them into
+`/cua-vm/windows/<name>/oem/` (a read-only vvfat USB stick) before QEMU starts,
+so a missing file stops the computer before the first boot — it is an **image**
+problem, not a setting:
+
+* your image was built **before the Windows backend existed** (a `main`-branch
+  build: `main` has no Windows code at all), or
+* the image's `COPY` and the supervisor's `DSH_CUA_WINDOWS_OEM_DIR` disagree.
+
+Pull or build a newer image from this branch with the virgl QEMU, then recreate
+the container **keeping the `/cua-vm` volume** (the store and every existing
+computer survive — only the container is replaced):
+
+```bash
+# build (or: Actions → docker-build on cua-vm-improve, channel=github-tag, virgl=true)
+git fetch origin && git checkout cua-vm-improve
+docker build --build-arg WITH_VIRGL_QEMU=1 -t ghcr.io/yakuza8702/docker-deepseek-harness-profile:local .
+# …or pull the published branch build
+docker pull ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest
+
+# recreate against the new image, same compose env (compose.windows.yaml adds the devices)
+docker compose -f compose.yaml -f compose.windows.yaml up -d --force-recreate
+
+# verify — all three files must be listed
+docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/Autounattend.xml \
+  /usr/local/share/cua-vm/windows-oem/setupcomplete.cmd /usr/local/share/cua-vm/windows-oem/cua-firstboot.ps1
+```
+
+Two safety nets: `DSH_CUA_WINDOWS_OEM_FALLBACK_DIRS` (colon-separated, default
+`/opt/seek-harness/cua-check`, which carries the same three files) is tried when
+the primary directory is incomplete, and `tools/check-cua-vm.mjs` pins the
+Dockerfile's `COPY` **destination** to the supervisor's runtime default, so a
+drift fails the build instead of the first create.
+
 ### Shutdown, suspend, and why Start cold-boots
 
 `cua sb suspend` pauses QEMU and keeps its sandbox: fast, and it resumes exactly

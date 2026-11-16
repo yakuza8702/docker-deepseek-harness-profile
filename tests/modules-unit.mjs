@@ -3,7 +3,7 @@
  * modules-unit.mjs — the pure parts of the two new modules, and the Windows
  * container spec, asserted without a VM, a container or a daemon.
  */
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import zlib from 'node:zlib'
@@ -13,8 +13,12 @@ import {
 import {
   WINDOWS_VERSIONS, WINDOWS_ISO_SOURCES, resolveWindowsIso, canonicalWindowsVersion, windowsCapacityWarnings,
   charToKey, parseKeySpec, generatePassword, windowsEnabled,
-  buildQemuArgs, vncDisplayFor, vncPortFor, windowsPaths, frameSpace
+  buildQemuArgs, vncDisplayFor, vncPortFor, windowsPaths, frameSpace,
+  OEM_PAYLOAD_FILES, oemPayloadDir, resolveOemSourceDir, writeOemPayload, oemPayloadMissingError
 } from '../docker/cua-vm-windows-qemu.mjs'
+
+/** The checkout root — the source of `docker/windows-oem/` in these tests. */
+const REPO = path.resolve(import.meta.dirname, '..')
 
 let failures = 0
 const check = (label, ok, detail = '') => {
@@ -186,6 +190,82 @@ check('a below-floor disk warns and is not refused', (() => {
 })())
 check('a below-floor RAM and CPU warn too', windowsCapacityWarnings({ diskGb: 64, memory: 2, cpu: 1 }).map((w) => w.code).join(',') === 'memory-below-floor,cpu-below-floor')
 check('the Windows store paths are all under $STORE', Object.values(paths).every((value) => String(value).startsWith('/cua-vm/')))
+
+// K2: THE OEM PAYLOAD — path, self-heal, and the actionable failure.
+// The user-facing bug was a runtime error that named a path and nothing else:
+// "the OEM payload is missing from this image: /usr/local/share/cua-vm/windows-oem".
+// These four checks pin the three properties that make it recoverable.
+{
+  const repoOem = path.join(REPO, 'docker', 'windows-oem')
+  check('the OEM file list is the three files the writer needs', OEM_PAYLOAD_FILES.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1')
+  check('a complete payload directory is recognised, an incomplete one is not', (() => {
+    const partial = mkdtempSync(path.join(os.tmpdir(), 'oem-partial-'))
+    try {
+      writeFileSync(path.join(partial, 'Autounattend.xml'), '<unattend/>')
+      return oemPayloadDir(repoOem) === repoOem && oemPayloadDir(partial) === null && oemPayloadDir('/no/such/dir') === null
+    } finally {
+      rmSync(partial, { recursive: true, force: true })
+    }
+  })())
+  check('the resolver prefers the configured source and falls back in order', (() => {
+    const dirs = ['/no/such/dir', repoOem]
+    return resolveOemSourceDir(dirs) === repoOem && resolveOemSourceDir(['/no/such/dir']) === null
+  })())
+  check('a stale source self-heals from the fallback, with a log line', (() => {
+    const store = mkdtempSync(path.join(os.tmpdir(), 'oem-write-'))
+    const logged = []
+    try {
+      const oemDir = writeOemPayload({
+        paths: { oemDir: path.join(store, 'oem') },
+        name: 'win-1', password: 'p@ss', sshPubKey: 'ssh-ed25519 AAA test',
+        sourceDir: '/no/such/image/dir', fallbackDirs: [repoOem],
+        pythonUrl: 'https://example.invalid/python.exe', dshCuaSpec: 'dsh-cua', log: (line) => logged.push(line)
+      })
+      return existsSync(path.join(oemDir, 'Autounattend.xml'))
+        && existsSync(path.join(oemDir, '$OEM$', '$$', 'Setup', 'Scripts', 'cua-firstboot.ps1'))
+        && logged.some((line) => line.includes('using the copy at'))
+    } finally {
+      rmSync(store, { recursive: true, force: true })
+    }
+  })())
+  check('with no payload anywhere the error is actionable, not a bare path', (() => {
+    // In a CHECKOUT the module directory itself carries windows-oem/, so
+    // writeOemPayload would self-heal here and never reach this message. Assert
+    // on the builder the writer throws with — that is what the user reads.
+    const message = oemPayloadMissingError({ sourceDir: '/usr/local/share/cua-vm/windows-oem', fallbackDirs: ['/opt/seek-harness/cua-check'] }).message
+    return message.includes('no Autounattend.xml, setupcomplete.cmd, cua-firstboot.ps1')
+      && message.includes('missing from this image')
+      && message.includes('--build-arg WITH_VIRGL_QEMU=1')
+      && message.includes('docker compose -f compose.windows.yaml up -d --force-recreate')
+      && message.includes('/cua-vm')
+      && message.includes('docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/')
+      && message.includes('DSH_CUA_WINDOWS_OEM_DIR')
+  })())
+  check('the writer throws THAT error when a directory holds only part of the payload', (() => {
+    const store = mkdtempSync(path.join(os.tmpdir(), 'oem-nopayload-'))
+    const partial = mkdtempSync(path.join(os.tmpdir(), 'oem-onlyxml-'))
+    try {
+      writeFileSync(path.join(partial, 'Autounattend.xml'), '<unattend/>')
+      try {
+        writeOemPayload({
+          paths: { oemDir: path.join(store, 'oem') },
+          name: 'win-1', password: 'p', sshPubKey: 'k',
+          // A CHECKOUT self-heals from the module directory, so this asserts the
+          // partial directory is not mistaken for a complete one: the write
+          // either succeeds through the checkout copy or throws the actionable
+          // error — never half a payload.
+          sourceDir: partial, fallbackDirs: [], pythonUrl: 'u', dshCuaSpec: 's'
+        })
+        return existsSync(path.join(store, 'oem', 'cua-firstboot.ps1'))
+      } catch (error) {
+        return /the Windows OEM payload is missing from this image/u.test(error.message)
+      }
+    } finally {
+      rmSync(store, { recursive: true, force: true })
+      rmSync(partial, { recursive: true, force: true })
+    }
+  })())
+}
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

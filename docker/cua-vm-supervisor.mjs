@@ -1224,8 +1224,30 @@ const space = createSpace({
  */
 const windowsBackend = createWindowsBackend({ store: STORE, qmp: qmpCommands, log })
 
-/** The OEM payload lives in the image next to this file. */
+/**
+ * THE OEM PAYLOAD'S TWO ENDS.
+ *
+ * `WINDOWS_OEM_DIR` is the runtime path; the Dockerfile's
+ * `COPY docker/windows-oem/ <that path>` is the image end. They are two strings
+ * in two files with nothing between them, which is why tools/check-cua-vm.mjs
+ * pins the dockerfile destination to this literal (K2) — an image that copies
+ * the payload somewhere else, or not at all, fails the build instead of failing
+ * the first Windows create with a path in the error.
+ */
 const WINDOWS_OEM_DIR = String(process.env.DSH_CUA_WINDOWS_OEM_DIR || '/usr/local/share/cua-vm/windows-oem')
+/**
+ * Self-healing fallbacks, in order. The image's flat gate tree keeps the same
+ * three files at its root (/opt/seek-harness/cua-check/, see the Dockerfile),
+ * and the module's own directory carries a `windows-oem/` copy inside a
+ * checkout — so a stale mount that hides only the primary directory degrades to
+ * a log line instead of a dead "create Windows computer" button.
+ * Colon-separated, like PATH; empty by default except for the image tree.
+ */
+const WINDOWS_OEM_FALLBACK_DIRS = String(process.env.DSH_CUA_WINDOWS_OEM_FALLBACK_DIRS
+  || '/opt/seek-harness/cua-check:/usr/local/bin/windows-oem')
+  .split(':')
+  .map((dir) => dir.trim())
+  .filter(Boolean)
 /** Pinned python.org installer for the guest (silent install). */
 const WINDOWS_PYTHON_URL = String(process.env.DSH_CUA_WINDOWS_PYTHON_URL
   || 'https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe')
@@ -3098,6 +3120,7 @@ async function windowsCreateManaged(spec) {
       password,
       sshPubKey,
       sourceDir: WINDOWS_OEM_DIR,
+      fallbackDirs: WINDOWS_OEM_FALLBACK_DIRS,
       pythonUrl: WINDOWS_PYTHON_URL,
       dshCuaSpec: WINDOWS_DSH_CUA_SPEC,
       log

@@ -235,6 +235,15 @@ const NEEDLES = {
     // The Windows lifecycle now drives the SAME shutdown/start machinery.
     ['async function windowsShutdown(name, meta)', 1],
     ['const windowsBackend = createWindowsBackend({ store: STORE, qmp: qmpCommands, log })', 1],
+    // K2: the runtime path of the OEM payload, spelled with its default. The
+    // Dockerfile must COPY to this exact string (cross-checked in the K2
+    // assertion below); this needle keeps the literal from being rewritten to a
+    // path no image ships.
+    ["DSH_CUA_WINDOWS_OEM_DIR || '/usr/local/share/cua-vm/windows-oem'", 1],
+    // K2: the fallback list is RESOLVED and HANDED to the writer, not just
+    // declared — a constant nothing reads is not a fallback.
+    ['fallbackDirs: WINDOWS_OEM_FALLBACK_DIRS', 1],
+    ['DSH_CUA_WINDOWS_OEM_FALLBACK_DIRS', 1],
     ['function sshRun(meta, command,', 1],
     ['function scpRun(meta, localPath, guestPath', 1],
     ['await ensureWindowsConsoleRelay(name)', 2],
@@ -396,6 +405,18 @@ const NEEDLES = {
     ['Created anyway on request', 3],
     ['export async function ensureIso(', 1],
     ['export function writeOemPayload(', 1],
+    // K2: the payload writer must NAME the files it needs (the error text and
+    // this gate quote the same list), must resolve a directory that actually
+    // holds all of them, and must fail with the actionable image message rather
+    // than a bare path. Deleting any of these re-creates the user-facing bug:
+    // "the OEM payload is missing from this image: <path>" with no way forward.
+    ['export const OEM_PAYLOAD_FILES = Object.freeze(', 1],
+    ['export function oemPayloadDir(dir)', 1],
+    ['export function resolveOemSourceDir(candidates)', 1],
+    ['throw oemPayloadMissingError({ sourceDir, fallbackDirs })', 1],
+    ['docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/', 1],
+    ['--build-arg WITH_VIRGL_QEMU=1', 1],
+    ['docker compose -f compose.windows.yaml up -d --force-recreate', 1],
     // frames and input over QMP
     ["execute: 'screendump'", 1],
     ["execute: 'input-send-event'", 1],
@@ -477,6 +498,15 @@ const NEEDLES = {
     ['docker/cua-vm-space.mjs', 1],
     ['docker/cua-vm-windows-qemu.mjs', 1],
     ['docker/windows-oem/', 1],
+    // K2: THE DESTINATION, not just the source. `docker/windows-oem/` alone is
+    // satisfied by a COPY anywhere, including the flat gate tree at
+    // /opt/seek-harness/cua-check/ — which is exactly the drift that lets an
+    // image build green and then fail the first Windows create with
+    // "the OEM payload is missing from this image: /usr/local/share/cua-vm/windows-oem".
+    // The destination string is pinned here AND cross-checked against the
+    // supervisor's runtime constant in the K2 assertion below.
+    ['docker/windows-oem/ /usr/local/share/cua-vm/windows-oem/', 1],
+    ['--chmod=0644 docker/windows-oem/', 1],
     ['ovmf swtpm', 1],
     ['tools/check-cua-vm.mjs /opt/seek-harness/check-cua-vm.mjs', 1],
     ['node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check', 1]
@@ -710,6 +740,44 @@ function sourceOf(label, name) {
       failures += 1
       missing.push('docker/cua-vm-windows-qemu.mjs: the xhci controller must come BEFORE usb-storage,bus=xhci.0 (QEMU parses argv in order: "Bus \'xhci.0\' not found")')
       console.log('  FAIL K1 xhci ordering')
+    }
+  }
+  // K2: THE OEM PATH AGREEMENT. The supervisor resolves the payload from one
+  // string; the Dockerfile COPY decides where it lands. Nothing in the language
+  // ties them together, and the failure mode is a green build followed by a red
+  // create: "the OEM payload is missing from this image: <path>" (CI run
+  // 43736227888 shipped exactly this shape). Parse both, fail on any difference,
+  // and say which side moved.
+  {
+    const supervisor = sourceOf('K2', 'cua-vm-supervisor.mjs')
+    const dockerfile = sourceOf('K2', 'Dockerfile')
+    total += 1
+    if (supervisor === null || dockerfile === null) {
+      failures += 1
+      missing.push('K2: the Dockerfile and docker/cua-vm-supervisor.mjs are both needed to prove the OEM COPY destination matches the runtime path')
+      console.log('  FAIL K2 OEM path agreement (missing file)')
+    } else {
+      const runtime = /DSH_CUA_WINDOWS_OEM_DIR\s*\|\|\s*'([^']+)'/u.exec(supervisor)?.[1] ?? null
+      // The LAST token of the COPY line is the destination; the source list is
+      // every token after --chmod=… that starts with docker/.
+      const copyLines = dockerfile.split('\n').filter((line) => /^\s*COPY\b/u.test(line) && line.includes('windows-oem/'))
+      // Every destination those COPYs write to (the last token, minus the
+      // sources). The flat gate tree is one of them and is NOT the runtime path,
+      // so the assertion is "the runtime path is among them", not "the only one".
+      const destinations = copyLines
+        .map((line) => line.trim().split(/\s+/u).at(-1))
+        .filter((target) => typeof target === 'string' && !target.startsWith('docker/'))
+      // `cp -a`-style: the destination may or may not end in a slash; Docker
+      // treats `dir/ /d/` and `dir/ /d` the same, so compare normalised.
+      const norm = (value) => (value === null ? null : value.replace(/\/+$/u, ''))
+      const agrees = runtime !== null && destinations.some((target) => norm(target) === norm(runtime))
+      if (agrees) {
+        if (!quietMode) console.log(`  ok   K2 the Dockerfile copies the OEM payload to the path the supervisor reads (${norm(runtime)})`)
+      } else {
+        failures += 1
+        missing.push(`K2: no COPY writes the OEM payload to the supervisor's DSH_CUA_WINDOWS_OEM_DIR default (${runtime ?? 'constant not found'}); destinations found: ${destinations.join(', ') || 'none'} — otherwise the image builds green and every Windows create fails with "the OEM payload is missing from this image"`)
+        console.log('  FAIL K2 OEM path agreement')
+      }
     }
   }
   // L5: the runtime suite ships IN the repository (it used to live outside it,
