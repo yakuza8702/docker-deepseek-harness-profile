@@ -4,7 +4,7 @@
  * container spec, asserted without a VM, a container or a daemon.
  */
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, accessSync, statSync, constants as fsConstants } from 'node:fs'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
 import zlib from 'node:zlib'
@@ -896,6 +896,128 @@ check('windowsKvmPreflight is the shared module (no second message)',
       } finally {
         rmSync(oemStore, { recursive: true, force: true })
       }
+    }
+    // ---- F2: A PAUSED GUEST IS CONTINUED BEFORE IT IS ASKED FOR ACPI ----
+    //
+    // The live defect: a VM left `paused` (a suspend, or a `-S` boot) never runs
+    // its ACPI handler, so `system_powerdown` was accepted by QEMU and then
+    // nothing happened for the full 120 s before a forced `quit`. The stub QMP
+    // records the COMMAND ORDER, which is the only way to prove `cont` came
+    // first, and ends the pid it reports when `quit` arrives so the wait loop
+    // finishes in milliseconds instead of 15 s.
+    const livePid = async () => {
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+      // Wait for the pid to exist so pidAlive() is true on the first read.
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try { process.kill(child.pid, 0); break } catch { await new Promise((r) => setTimeout(r, 20)) }
+      }
+      return child
+    }
+    const qmpRecorder = (order, { status, onQuit, onPowerdown }) => async (port, commands) => {
+      for (const command of commands) {
+        order.push(command.execute)
+        if (command.execute === 'quit' && onQuit) onQuit()
+        // A guest that HONOURS the powerdown: the process goes away inside the
+        // wait window, which is the only shape where the outcome is not forced.
+        if (command.execute === 'system_powerdown' && onPowerdown) onPowerdown()
+      }
+      if (commands[0].execute === 'query-status') return [{ return: { status } }]
+      return [{ return: {} }]
+    }
+    {
+      const child = await livePid()
+      const name = 'win-paused'
+      const paths = windowsPaths(store, name)
+      mkdirSync(paths.dir, { recursive: true })
+      writeFileSync(paths.qemuPid, `${child.pid}\n`)
+      const order = []
+      const backend = createWindowsBackend({
+        store,
+        qmp: qmpRecorder(order, {
+          status: 'paused',
+          onPowerdown: () => { try { child.kill('SIGKILL') } catch {} },
+          onQuit: () => { try { child.kill('SIGKILL') } catch {} }
+        }),
+        log: () => {}
+      })
+      const row = { name, kind: 'windows', state: 'ready', ports: { qmp: 46912, ssh: 47912, vnc: 5912 } }
+      const outcome = await backend.shutdown(row, { timeoutMs: 1000 })
+      try { child.kill('SIGKILL') } catch {}
+      check('F2: a PAUSED guest is sent `cont` before `system_powerdown`',
+        order.join(',') === 'query-status,cont,system_powerdown', order.join(','))
+      check('F2: ...and the continue-then-powerdown exit is not marked forced',
+        outcome.exited === true && outcome.forced !== true, JSON.stringify(outcome))
+    }
+    // ---- F2: A MID-INSTALL SHUTDOWN IS SHORT, EXPLICIT AND TORN ----
+    {
+      const saved = process.env.DSH_CUA_WINDOWS_INSTALL_SHUTDOWN_MS
+      try {
+        process.env.DSH_CUA_WINDOWS_INSTALL_SHUTDOWN_MS = '0'
+        const child = await livePid()
+        const name = 'win-setup-shutdown'
+        const paths = windowsPaths(store, name)
+        mkdirSync(paths.dir, { recursive: true })
+        writeFileSync(paths.qemuPid, `${child.pid}\n`)
+        const order = []
+        const backend = createWindowsBackend({
+          store,
+          qmp: qmpRecorder(order, { status: 'running', onQuit: () => { try { child.kill('SIGKILL') } catch {} } }),
+          log: () => {}
+        })
+        // timeoutMs is the NORMAL 120 s: a mid-install guest must ignore it.
+        const started = Date.now()
+        const outcome = await backend.shutdown({ name, kind: 'windows', state: 'installing', ports: { qmp: 46913, ssh: 47913, vnc: 5913 } }, { timeoutMs: 120000 })
+        const elapsed = Date.now() - started
+        try { child.kill('SIGKILL') } catch {}
+        check('F2: an installing row does not burn the full shutdown timeout',
+          elapsed < 5000, `${elapsed} ms`)
+        check('F2: ...it is a quit, classified installing, and marked forced (mayBeTorn)',
+          outcome.installInProgress === true && outcome.forced === true && outcome.exited === true,
+          JSON.stringify(outcome))
+        check('F2: ...without a useless `cont` on a guest that is not paused',
+          !order.includes('cont'), order.join(','))
+        check('F2: the install window is clamped and defaults to 5 s',
+          createWindowsBackend({ store, qmp: async () => [], log: () => {} }).installShutdownWindowMs() === 0)
+        delete process.env.DSH_CUA_WINDOWS_INSTALL_SHUTDOWN_MS
+        check('F2: ...unset it is 5 s',
+          createWindowsBackend({ store, qmp: async () => [], log: () => {} }).installShutdownWindowMs() === 5000)
+        process.env.DSH_CUA_WINDOWS_INSTALL_SHUTDOWN_MS = '999999'
+        check('F2: ...and it never exceeds 30 s',
+          createWindowsBackend({ store, qmp: async () => [], log: () => {} }).installShutdownWindowMs() === 30000)
+      } finally {
+        if (saved === undefined) delete process.env.DSH_CUA_WINDOWS_INSTALL_SHUTDOWN_MS
+        else process.env.DSH_CUA_WINDOWS_INSTALL_SHUTDOWN_MS = saved
+      }
+    }
+    // ---- F3: AN INSTALLING ROW IS NOT PROMOTED BY THE VNC BANNER ----
+    //
+    // The bug needs a REAL VNC peer: QEMU's VNC socket answers from the first
+    // second of setup.exe, which is what made an ordinary status poll answer
+    // "ready". The SSH port here has NO listener (the answer file has not
+    // installed OpenSSH yet), so the two calls must disagree — the running
+    // path accepts VNC, the install path (SSH only) refuses it.
+    {
+      const net = await import('node:net')
+      const vnc = net.createServer((socket) => { try { socket.write('RFB 003.008\n') } catch {} })
+      await new Promise((resolve) => vnc.listen(0, '127.0.0.1', resolve))
+      const vncPort = vnc.address().port
+      const name = 'win-setup-ready'
+      const paths = windowsPaths(store, name)
+      mkdirSync(paths.dir, { recursive: true })
+      writeFileSync(paths.qemuPid, `${process.pid}\n`)
+      const backend = createWindowsBackend({
+        store,
+        qmp: async () => [{ return: { status: 'running' } }],
+        log: () => {}
+      })
+      const row = { name, kind: 'windows', state: 'installing', ports: { qmp: 46914, ssh: 0, vnc: vncPort } }
+      const runningPhase = await backend.ready(row, { ssh: true })
+      const installPhase = await backend.ready(row, { ssh: true, phase: 'install' })
+      vnc.close()
+      check('F3: the RUNNING readiness path accepts a bare VNC banner (the shape that promoted Setup)',
+        runningPhase.ready === true && runningPhase.endpoint === 'vnc', JSON.stringify(runningPhase))
+      check('F3: the INSTALL readiness path refuses it — SSH only, so the row stays installing',
+        installPhase.ready === false && installPhase.endpoint === 'none', JSON.stringify(installPhase))
     }
   } finally {
     rmSync(store, { recursive: true, force: true })

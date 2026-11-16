@@ -272,6 +272,14 @@ const NEEDLES = {
     // K3: during Setup only SSH gates `ready` (QEMU's VNC socket answers from
     // the first second of setup.exe and used to mark a half-install ready).
     ["phase: 'install'", 1],
+    // F3: THE STATUS POLL MUST NOT PROMOTE A HALF-INSTALL. `vmWindowsStatus`
+    // called `ready(meta, { ssh })` with NO phase, so an ordinary panel poll
+    // took the RUNNING path, accepted the VNC banner (which answers from the
+    // first second of setup.exe), wrote state:'ready' + installComplete, stopped
+    // the watcher and let the idle timer suspend a live install. The poll now
+    // passes the SAME phase the watcher does, decided from the row.
+    ['const installPhase = meta.state === \'installing\' || meta.state === \'booting\'', 1],
+    ['...(installPhase ? { phase: \'install\' } : {})', 1],
     // H4: the abandoned Windows shutdown marks its restore point, like Linux.
     ['async function markWindowsShutdownAbandoned(name, because)', 1],
     ['windowsBackend.pidAlive(windowsPid)', 1],
@@ -699,7 +707,24 @@ const NEEDLES = {
     ['export function windowsPortsOf(spec)', 1],
     // K1: the controller appears in the argv list before the device that uses it
     // (the ORDER is asserted separately, below).
-    ["'-device', 'qemu-xhci,id=xhci'", 1]
+    ["'-device', 'qemu-xhci,id=xhci'", 1],
+    // F2: A SHUTDOWN THE GUEST CAN ACTUALLY HONOUR.
+    //
+    // * A PAUSED machine does not run its ACPI handler, so `system_powerdown`
+    //   was accepted and then nothing happened for the whole 120 s timeout.
+    //   `cont` FIRST is the fix, and the ORDER is asserted semantically below.
+    ['await qmpFor(spec, [{ execute: \'cont\' }], { timeoutMs: 5000 })', 1],
+    ['const paused = state.status === \'paused\' || state.status === \'suspended\'', 1],
+    // * A MID-INSTALL WinPE has no ACPI handler either: it gets a SHORT window
+    //   and then `quit`, and the result says so, so the supervisor persists
+    //   `mayBeTorn` instead of recording a clean restore point from a
+    //   half-written disk.
+    ['const installInProgress = rowState === \'installing\' || rowState === \'booting\'', 1],
+    ['function installShutdownWindowMs()', 1],
+    ['return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 30000) : 5000', 1],
+    ['const waitMs = installInProgress ? installShutdownWindowMs() : Math.max(1000, timeoutMs)', 1],
+    ['...(installInProgress ? { forced: true } : {})', 1],
+    ['forced: true, installInProgress', 1]
   ],
   winMcp: [
     ['export function windowsMcpEnabled()', 1],
@@ -867,7 +892,23 @@ const NEEDLES = {
     ['This kills the VM process and removes its disks even if the delete reported failures', 1],
     ['api(\'delete\', { name, force: true })', 1],
     // ...and a STUCK windows install says why the normal delete is not enough.
-    ['This install is marked installing but QEMU is not running', 1]
+    ['This install is marked installing but QEMU is not running', 1],
+    // F4: THE PANEL AFFORDANCES.
+    //
+    // * Shutdown/Suspend are offered for an INSTALLING Windows row too — with a
+    //   confirm that says it aborts the install (hiding them left Force delete
+    //   as the only way out of a 40-minute install).
+    ['(ready || (windows && installing)) && h(\'button\'', 2],
+    ['THIS ABORTS THE WINDOWS INSTALL', 1],
+    ['Mid-install this PAUSES Windows Setup', 1],
+    // * The wait is VISIBLE: a one-second ticker plus the row's own state, so a
+    //   120 s ACPI wait no longer looks like a hung button.
+    ['setWaitTick((value) => value + 1)', 1],
+    ["const withWait = (text) => (waitedSec > 0 ? `${text} ${waitedSec}s` : text)", 1],
+    ['Waiting for ${name} to power off', 1],
+    // * The result is SURFACED: a mayBeTorn answer and the supervisor's own
+    //   detail sentence reach the note instead of a silent success.
+    ['payload?.mayBeTorn === true', 1]
   ],
   index: [
     ["name: 'cua_vm_start'", 1],
@@ -877,6 +918,13 @@ const NEEDLES = {
     ["op: 'vmWindowsCreate'", 1],
     ["op: 'vmGc'", 1],
     ["op: 'vmDoctor'", 1],
+    // F1: THE `/cua` SWITCH ANSWERS `suspend`. Shutdown, stop and gc had cases;
+    // `suspend` did not, so the panel's Suspend button fell through to
+    // `default` and answered 404 "unknown action: suspend" — a plugin-dispatch
+    // gap the tool (`cua_vm_suspend`) never hit because it calls the supervisor
+    // directly. The case must send the SAME op name the tool does.
+    ["case 'suspend': return send(200, { ok: true, ...(await call({ op: 'suspend', ...(await body()) })) })", 1],
+    ["const result = await call({ op: 'suspend', name: args.name })", 1],
     // R1: a partial delete prints what failed AND what was kept on purpose.
     ['- KEPT ${item.target}: ${item.reason}', 1],
     // B3: the create result must not describe the container backend.
@@ -1132,6 +1180,66 @@ function sourceOf(label, name) {
       failures += 1
       missing.push('docker/cua-vm-windows-qemu.mjs: setup.img must attach WRITABLE (no readonly=on: QEMU 10 rejects a read-only node on ide-hd) on ide.2 AFTER disk0 on ide.0 (so the qcow2 is Windows Disk 0 / DiskID 0), and no usb-storage/file=fat:ro: OEM stick may remain (the stick Setup could not see)')
       console.log('  FAIL K1 answer-disk order / writability / no vvfat stick')
+    }
+  }
+  // F2 (shutdown): `cont` BEFORE `system_powerdown`, INSIDE `shutdown`.
+  //
+  // A needle list can prove both commands exist; only an ORDER assertion proves
+  // the paused case is actually fixed. A paused guest ignores ACPI entirely, so
+  // a `system_powerdown` that runs first costs the whole 120 s timeout and then
+  // ends in `quit` — exactly the reported stall. The `cont` must also live in
+  // `shutdown` (not in `unpause`, which the gate cannot tell apart from a needle
+  // hit) and must precede the powerdown within that function's body.
+  {
+    total += 1
+    const windows = sourceOf('F2', 'cua-vm-windows-qemu.mjs')
+    if (windows === null) {
+      failures += 1
+      missing.push('docker/cua-vm-windows-qemu.mjs: file not found (F2 shutdown ordering cannot be checked)')
+    } else {
+      const bodyStart = windows.indexOf('async function shutdown(rawSpec')
+      const bodyEnd = bodyStart === -1 ? -1 : windows.indexOf('\n  /** Kill the process', bodyStart)
+      const body = bodyStart === -1 ? '' : windows.slice(bodyStart, bodyEnd === -1 ? windows.length : bodyEnd)
+      const cont = body.indexOf("execute: 'cont'")
+      const power = body.indexOf("execute: 'system_powerdown'")
+      const quitOnInstall = body.indexOf('installInProgress')
+      const ok = cont !== -1 && power !== -1 && quitOnInstall !== -1 && cont < power
+      if (ok) {
+        if (!quietMode) console.log('  ok   F2 shutdown continues a PAUSED guest before asking for ACPI, and carries the mid-install classification')
+      } else {
+        failures += 1
+        missing.push('docker/cua-vm-windows-qemu.mjs: inside `shutdown`, the QMP `cont` must precede `system_powerdown` (a paused guest never runs its ACPI handler, so the powerdown is a no-op that burns the full timeout), and the function must classify `installing`/`booting` so a mid-install shutdown is a short window + `quit` + mayBeTorn')
+        console.log('  FAIL F2 shutdown ordering / mid-install classification')
+      }
+    }
+  }
+  // F3: AN INSTALLING ROW IS NEVER PROMOTED BY THE STATUS POLL.
+  //
+  // `vmWindowsStatus` must pass `phase: 'install'` exactly when the row says
+  // `installing`/`booting` — the same gate the watcher uses. A needle proves the
+  // flag exists; this proves it is WIRED TO THE ROW STATE in that function, and
+  // that the unconditional `{ ssh: meta.ssh !== false }` call is gone from it.
+  {
+    total += 1
+    const supervisor = sourceOf('F3', 'cua-vm-supervisor.mjs')
+    if (supervisor === null) {
+      failures += 1
+      missing.push('docker/cua-vm-supervisor.mjs: file not found (F3 status-poll promotion cannot be checked)')
+    } else {
+      const start = supervisor.indexOf('async vmWindowsStatus(')
+      const end = start === -1 ? -1 : supervisor.indexOf('  async vmWindowsShutdown(', start)
+      const body = start === -1 ? '' : supervisor.slice(start, end === -1 ? supervisor.length : end)
+      const wired = /const installPhase = meta\.state === 'installing' \|\| meta\.state === 'booting'/u.test(body)
+        && /\.\.\.\(installPhase \? \{ phase: 'install' \} : \{\}\)/u.test(body)
+      const unguarded = /windowsBackend\.ready\(meta, \{ ssh: meta\.ssh !== false \}\)/u.test(body)
+      const ok = wired && !unguarded
+      if (ok) {
+        if (!quietMode) console.log('  ok   F3 vmWindowsStatus gates readiness on the row state, so a Setup screen cannot be promoted to ready')
+      } else {
+        failures += 1
+        missing.push('docker/cua-vm-supervisor.mjs: vmWindowsStatus must pass phase:\'install\' when the row is installing/booting (SSH-only readiness) — the unguarded ready(meta, { ssh }) call took the VNC fallback, promoted a mid-install Setup screen to state:"ready" + installComplete, stopped the watcher and let the idle timer suspend a half-install')
+        console.log('  FAIL F3 status-poll promotion gate')
+      }
     }
   }
   // F2: THE ANSWER FILE NAMES THE IMAGE, IN SCHEMA ORDER. A needle list can say

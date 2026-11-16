@@ -101,6 +101,54 @@ esac
 exit 0
 `, { mode: 0o755 })
 
+/**
+ * F3 (smoke): A MID-INSTALL ROW MUST NOT BE PROMOTED TO READY BY THE STATUS POLL.
+ *
+ * The reported defect needs TWO live peers, so both are real here: a QMP peer
+ * that answers `query-status` with `running`, and a VNC socket that speaks a
+ * banner (QEMU's answers from the first second of setup.exe). During Setup only
+ * SSH may count — and this row deliberately has NO SSH listener, because the
+ * answer file has not installed OpenSSH yet. Before the fix `vmWindowsStatus`
+ * took the RUNNING path, accepted the VNC banner, wrote state:'ready' +
+ * installComplete, stopped the watch and let the idle timer suspend the install.
+ */
+const WIN_SETUP = 'win-setup'
+const freePort = () => new Promise((resolve) => {
+  const server = net.createServer()
+  server.listen(0, '127.0.0.1', () => { const { port } = server.address(); server.close(() => resolve(port)) })
+})
+const winQmpPort = await freePort()
+const winVncPort = await freePort()
+const winSshPort = await freePort() // bound by nothing: no SSH until the answer file ran
+const vncPeer = net.createServer((socket) => { try { socket.write('RFB 003.008\n') } catch {} })
+await new Promise((resolve) => vncPeer.listen(winVncPort, '127.0.0.1', resolve))
+// The probe the supervisor dials: `qmp_capabilities`, then one command per line.
+const qmpPeer = net.createServer((socket) => {
+  socket.setEncoding('utf8')
+  let buffer = ''
+  socket.on('data', (chunk) => {
+    buffer += chunk
+    let newline = buffer.indexOf('\n')
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline)
+      buffer = buffer.slice(newline + 1)
+      newline = buffer.indexOf('\n')
+      if (line.trim() === '') continue
+      let message = {}
+      try { message = JSON.parse(line) } catch { continue }
+      const answer = message.execute === 'query-status' ? { return: { status: 'running' } } : { return: {} }
+      try { socket.write(`${JSON.stringify(answer)}\n`) } catch {}
+    }
+  })
+  socket.on('error', () => {})
+})
+await new Promise((resolve) => qmpPeer.listen(winQmpPort, '127.0.0.1', resolve))
+// The row's pid file points at THIS process (alive), which is what the backend
+// reads — the same "pid is the truth" contract every Windows row has.
+const WIN_SETUP_DIR = path.join(STORE, 'windows', WIN_SETUP)
+mkdirSync(WIN_SETUP_DIR, { recursive: true })
+writeFileSync(path.join(WIN_SETUP_DIR, 'qemu.pid'), `${process.pid}\n`)
+
 // A v1 registry: the read path must migrate it and keep the row's fields.
 const NAME = 'ws-0123456789ab'
 writeFileSync(path.join(STORE, 'registry.json'), JSON.stringify({
@@ -995,7 +1043,15 @@ try {
 
     // R1 (the other half): a boot of an INSTALLED disk must send no keys. The
     // same row, now with installComplete true and a disk on the store.
-    await call({ op: 'vmShutdown', name: bootName })
+    //
+    // F2 NOTE — THE FIXTURE IS MARKED INSTALLED *BEFORE* THE SHUTDOWN. This row
+    // still says `installing` up to here, which is a guest in WinPE: the backend
+    // now gives such a row a SHORT powerdown window and then `quit`, because a
+    // Setup screen has no ACPI handler and its disk must be marked mayBeTorn.
+    // That is right for a real install and wrong for THIS fixture, which is
+    // about the INSTALLED disk's next start (and whose stub QEMU is a bare
+    // `sleep 120` that only ever exits by itself). Marking it installed first
+    // also keeps the shutdown on the normal 120 s path, exactly as before.
     const installedRow = (() => {
       const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
       reg.vms[bootName] = { ...reg.vms[bootName], installComplete: true, state: 'powered-off' }
@@ -1003,6 +1059,7 @@ try {
       return reg.vms[bootName]
     })()
     check('R1: the installed-disk fixture is in place', installedRow?.installComplete === true)
+    await call({ op: 'vmShutdown', name: bootName })
     const beforeInstalled = stderr.length
     const installedStart = await call({ op: 'vmStart', name: bootName })
     await new Promise((resolve) => setTimeout(resolve, 900))
@@ -1183,6 +1240,54 @@ try {
     // put a valid registry back for the checks that follow
     writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify({ version: 2, vms: {} }, null, 2)}\n`)
   }
+  // ---- F3 (smoke): the status poll does NOT promote a mid-install row ----
+  //
+  // Real QMP peer answering `running`, real VNC peer answering a banner, NO SSH
+  // listener: exactly the live shape that used to read as ready. The row is
+  // written HERE (not in the fixture registry) because the checks above count
+  // `maxRunning` and the earlier cases rebuild registry.json from scratch.
+  {
+    writeFileSync(path.join(STORE, 'registry.json'), JSON.stringify({
+      version: 2,
+      vms: {
+        [WIN_SETUP]: {
+          workspace: '/w4', kind: 'windows', backend: 'qemu', state: 'installing', cpu: 2, memory: 4,
+          windowsVersion: '11', diskGb: 64,
+          createdAt: new Date().toISOString(), startedAt: new Date().toISOString(),
+          ports: { qmp: winQmpPort, ssh: winSshPort, vnc: winVncPort }
+        }
+      }
+    }, null, 2) + '\n')
+    const setupStatus = await call({ op: 'vmWindowsStatus', name: WIN_SETUP, tail: 3 })
+    check('F3: an installing row with a live VNC banner and NO SSH stays `installing`',
+      setupStatus.ok === true && setupStatus.state === 'installing', `state=${setupStatus.state}`)
+    check('F3: ...and the poll records no installComplete',
+      JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[WIN_SETUP]?.installComplete !== true)
+    check('F3: ...its readiness sentence still waits for the SSH banner, never claims ready',
+      /SSH banner cannot answer until the answer file/u.test(String(setupStatus.installDetail ?? '')),
+      String(setupStatus.installDetail ?? '').slice(0, 160))
+    // Put the registry back the way the harness left it for the teardown.
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify({ version: 2, vms: {} }, null, 2)}\n`)
+  }
+
+  // ---- F1 (smoke): every action the PANEL sends has a case in the plugin ----
+  //
+  // The `/cua` switch is the one hop the supervisor tests cannot reach: it lives
+  // in the plugin, and a missing `case` answers 404 "unknown action" without the
+  // supervisor seeing anything. `suspend` was exactly that. This parity check is
+  // the cheap end-to-end cover for the dispatch layer.
+  {
+    const clientSource = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'client.js'), 'utf8')
+    const indexSource = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'index.js'), 'utf8')
+    const sent = [...new Set([...clientSource.matchAll(/api\('([a-zA-Z]+)'/gu)].map((match) => match[1]))]
+    const cases = new Set([...indexSource.matchAll(/case '([a-zA-Z]+)':/gu)].map((match) => match[1]))
+    const unrouted = sent.filter((action) => !cases.has(action))
+    check('F1: every panel action (suspend included) has a case in the /cua switch',
+      unrouted.length === 0, `unrouted: ${unrouted.join(',') || 'none'} (panel sends ${sent.length}, switch has ${cases.size})`)
+    check('F1: `suspend` is dispatched to the supervisor suspend op',
+      /case 'suspend': return send\(200, \{ ok: true, \.\.\.\(await call\(\{ op: 'suspend'/u.test(indexSource))
+  }
+
 } catch (error) {
   failures += 1
   console.log(` FAIL harness: ${error.message}`)

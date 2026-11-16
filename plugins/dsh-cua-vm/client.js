@@ -227,6 +227,11 @@ window.__ModuleLoader__.load({
         android: false, rea: false, windowsVersion: '11', windowsIso: '', windowsKey: ''
       })
       const [pending, setPending] = useState(null)
+      // F4: the wait needs a CLOCK. A shutdown can take the whole
+      // shutdownTimeoutSec (120 s for a slow init), and a label that never
+      // changes is indistinguishable from a hung panel — so while an action is
+      // pending this ticks once a second and the label counts.
+      const [, setWaitTick] = useState(0)
       const [exec, setExec] = useState(null)
       const [form, setForm] = useState(null)
       const [view, setView] = useState(null)
@@ -261,6 +266,15 @@ window.__ModuleLoader__.load({
         const timer = setInterval(() => { void load() }, 4000)
         return () => clearInterval(timer)
       }, [pending, load])
+
+      // F4: ...and tick once a second so the LABEL moves while that poll is in
+      // flight. Polling alone updates the row every 4 s, which still reads as a
+      // frozen button for the first seconds of a 120 s shutdown.
+      useEffect(() => {
+        if (pending === null) return undefined
+        const timer = setInterval(() => setWaitTick((value) => value + 1), 1000)
+        return () => clearInterval(timer)
+      }, [pending])
 
       /**
        * B3: HOW THE USER KNOWS IT FINISHED.
@@ -330,12 +344,18 @@ window.__ModuleLoader__.load({
       }
 
       const act = async (name, label, action, body) => {
-        setPending({ name, action })
+        // F4: `at` is what the label counts from. A shutdown that ends in the
+        // forced `quit` path answers with a `detail`, and a failure answers with
+        // the supervisor's own sentence — BOTH are surfaced in the note, so the
+        // row never goes quiet after a shutdown that did not do what it said.
+        setPending({ name, action, at: Date.now() })
         setNote(label)
         try {
-          await api(action, body)
+          const payload = await api(action, body)
           await load()
-          setNote(null)
+          setNote(payload?.mayBeTorn === true
+            ? clean(`${name}: ${payload?.detail ?? `${action} finished`} Its restore point is marked mayBeTorn, so the next Start boots the disk instead of trusting it.`)
+            : typeof payload?.detail === 'string' && payload.detail !== '' ? clean(`${name}: ${payload.detail}`) : null)
         } catch (error) {
           setNote(clean(error?.message ?? error))
         } finally {
@@ -687,10 +707,17 @@ window.__ModuleLoader__.load({
               const stuck = windows && installing && (info?.stuck === true
                 || (info !== null && (info.state === 'stopped' || info.state === 'powered-off' || info.detail === 'no QEMU process')))
               const partialFor = partial !== null && partial.name === name ? partial : null
-              const busyLabel = pending?.action === 'start' ? 'Starting…'
-                : pending?.action === 'shutdown' ? 'Shutting down…'
-                  : pending?.action === 'suspend' ? 'Suspending…'
-                    : pending?.action === 'delete' ? 'Deleting…' : null
+              // F4: THE WAIT IS VISIBLE. The elapsed seconds come from `at`
+              // (set by `act`) and `waitTick` re-renders the label every second
+              // while the 4 s `load()` poll refreshes the row underneath it.
+              const waitedSec = pending?.at
+                ? Math.max(0, Math.round((Date.now() - pending.at) / 1000))
+                : 0
+              const withWait = (text) => (waitedSec > 0 ? `${text} ${waitedSec}s` : text)
+              const busyLabel = pending?.action === 'start' ? withWait('Starting…')
+                : pending?.action === 'shutdown' ? withWait('Shutting down…')
+                  : pending?.action === 'suspend' ? withWait('Suspending…')
+                    : pending?.action === 'delete' ? withWait('Deleting…') : null
               const stateBadge = failed
                 ? { ...S.badge(false), color: T.error, border: `1px solid ${T.line}`, background: 'rgba(242, 139, 130, .12)' }
                 : installing
@@ -716,19 +743,36 @@ window.__ModuleLoader__.load({
                   // real ACPI power-off (checkpoint, sandbox removed, Start cold
                   // boots); suspend keeps the sandbox and resumes instantly. A
                   // A Windows computer only has the live view.
-                  ready && h('button', {
+                  //
+                  // F4: AN INSTALLING WINDOWS ROW GETS BOTH BUTTONS, WITH A
+                  // CONFIRM THAT SAYS WHAT IT COSTS. Hiding them left the user
+                  // with no way out of a 40-minute install except Force delete,
+                  // and a silent "Shutting down…" hid that the supervisor was
+                  // waiting on this exact window. The confirm is the honest part:
+                  // there is no ACPI handler in Setup, so Shutdown aborts the
+                  // install (the backend sends a short powerdown window then
+                  // `quit` and marks the disk mayBeTorn); Suspend pauses the
+                  // machine and Start continues it.
+                  (ready || (windows && installing)) && h('button', {
                     type: 'button', style: S.button, disabled: busy,
                     onClick: () => {
-                      if (!window.confirm(`Do you want to shutdown ${name}? Its disk is checkpointed and Start boots it again.`)) return
-                      void act(name, `Shutting down ${name}…`, 'shutdown', { name })
+                      const question = windows && installing
+                        ? `Shut ${name} down?\n\nTHIS ABORTS THE WINDOWS INSTALL. Setup has no ACPI handler, so it will be stopped (a short window, then a forced quit) and its half-written disk marked mayBeTorn — Start will NOT resume Setup, and you will have to create the computer again.`
+                        : `Do you want to shutdown ${name}? Its disk is checkpointed and Start boots it again.`
+                      if (!window.confirm(question)) return
+                      void act(name, `Shutting down ${name}… this can take up to ${state?.config?.shutdownTimeoutSec ?? 120} s (ACPI, then a forced quit).`, 'shutdown', { name })
                     }
                   }, busy && busyLabel !== null ? busyLabel : 'Shutdown'),
                   // Both kinds can be suspended: `cua sb suspend` on Linux,
                   // QMP stop on Windows (the tool says which).
-                  ready && h('button', {
+                  (ready || (windows && installing)) && h('button', {
                     type: 'button', style: S.button, disabled: busy,
-                    onClick: () => void act(name, `Suspending ${name}…`, 'suspend', { name })
-                  }, 'Suspend'),
+                    onClick: () => {
+                      if (windows && installing
+                        && !window.confirm(`Suspend ${name}? Mid-install this PAUSES Windows Setup: the machine keeps its RAM and Start continues where it stopped, but the install does not finish while it is paused (the install deadline keeps running).`)) return
+                      void act(name, `Suspending ${name}…`, 'suspend', { name })
+                    }
+                  }, busy && busyLabel !== null ? busyLabel : 'Suspend'),
                   h('button', { type: 'button', style: S.button, onClick: () => void showVm(name) }, 'Show VM'),
                   windows && h('button', {
                     type: 'button', style: S.button,
@@ -792,6 +836,14 @@ window.__ModuleLoader__.load({
                 ),
                 secret[name] && h('div', { style: { ...S.muted, fontFamily: 'ui-monospace, monospace' } },
                   `user "cua" password "${secret[name]}" (also in $STORE/windows/${name}/credentials.json, mode 0600)`),
+                // F4: THE WAITING ROW SAYS WHAT IT IS WAITING FOR. The poll above
+                // already refreshes `vm.state`; printing it here is what turns a
+                // silent 120 s label into "ACPI was asked, the guest has not
+                // answered yet".
+                busy && (pending?.action === 'shutdown' || pending?.action === 'suspend') && h('div', { style: S.muted },
+                  pending.action === 'shutdown'
+                    ? `Waiting for ${name} to power off — state is "${vm.state ?? 'unknown'}" after ${waitedSec} s. A paused guest is continued first, then asked for ACPI; a mid-install guest gets a short window and then a forced quit. The timeout is ${state?.config?.shutdownTimeoutSec ?? 120} s.`
+                    : `Waiting for ${name} to pause — state is "${vm.state ?? 'unknown'}" after ${waitedSec} s.`),
                 (installing || failed) && installDetail && h('div', { style: S.muted }, clean(installDetail)),
                 installing && elapsed !== null && h('div', { style: S.muted },
                   `elapsed ${elapsed} min of ${vm.installTimeoutMinutes ?? info?.installTimeoutMinutes ?? 60} · the badge flips to Ready when readiness answers, and /vm/port/${name}/ becomes the noVNC stream you can drive.`),

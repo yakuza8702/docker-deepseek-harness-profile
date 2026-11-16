@@ -3996,7 +3996,15 @@ async function windowsShutdown(name, meta) {
     if (!row) return
     row.state = 'powered-off'
     row.lastUsed = new Date().toISOString()
-    row.lastShutdown = { at: new Date().toISOString(), method: outcome.method, reason: 'shutdown', ...(checkpointSkipped !== '' ? { checkpointSkipped } : {}) }
+    row.lastShutdown = {
+      at: new Date().toISOString(),
+      method: outcome.method,
+      reason: 'shutdown',
+      // F2: a shutdown during Setup is recorded as what it was, so nothing
+      // downstream has to infer "torn" from `mayBeTorn` alone.
+      ...(outcome.installInProgress === true ? { installInProgress: true } : {}),
+      ...(checkpointSkipped !== '' ? { checkpointSkipped } : {})
+    }
     row.restoreFrom = checkpoint !== null
       ? { kind: 'checkpoint', file: checkpoint }
       : { kind: 'image', image: 'windows' }
@@ -4010,7 +4018,7 @@ async function windowsShutdown(name, meta) {
     method: outcome.method,
     checkpoint: checkpoint ?? undefined,
     mayBeTorn: outcome.forced || undefined,
-    detail: `powered off via ${outcome.method}${checkpoint !== null ? '; its disk is checkpointed and Start cold-boots from it' : '; Start boots the disk it already has'}.`
+    detail: `powered off via ${outcome.method}${checkpoint !== null ? '; its disk is checkpointed and Start cold-boots from it' : '; Start boots the disk it already has'}.${outcome.installInProgress === true ? ' The install was still in progress: this ABORTED it, its disk is marked mayBeTorn, and Start will not resume Setup.' : ''}`
   })
 }
 
@@ -4569,8 +4577,19 @@ const handlers = {
     if (!meta || meta.kind !== 'windows') return fail(`no Windows computer named "${name}"`)
     const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
     const verdict = await windowsBackend.probe(meta)
+    // F3: THE STATUS POLL MUST NOT PROMOTE A HALF-INSTALL.
+    //
+    // This call omitted `phase`, so it took the RUNNING path: SSH, then the VNC
+    // banner as the fallback. QEMU's VNC socket answers from the first second of
+    // setup.exe, so an ordinary panel poll during Setup answered "ready", wrote
+    // `installComplete = true` and `state: 'ready'` — the watcher then stopped
+    // (its state guard says only installing/booting tick) and the idle timer
+    // read a live install as an idle computer and suspended it under the user.
+    // A row that is installing/booting is in SETUP: only SSH counts, exactly
+    // like the watcher's own call.
+    const installPhase = meta.state === 'installing' || meta.state === 'booting'
     const ready = verdict.alive && verdict.status === 'running'
-      ? await windowsBackend.ready(meta, { ssh: meta.ssh !== false })
+      ? await windowsBackend.ready(meta, { ssh: meta.ssh !== false, ...(installPhase ? { phase: 'install' } : {}) })
       : { ready: false, endpoint: 'none' }
     const state = !verdict.alive
       // A row that says `installing` with no process is STUCK, not "stopped":

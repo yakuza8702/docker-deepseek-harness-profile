@@ -2407,19 +2407,61 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     return { unpaused: true }
   }
 
+  /** F2: how long a mid-install guest may have for ACPI before `quit`. */
+  function installShutdownWindowMs() {
+    const raw = Number(process.env.DSH_CUA_WINDOWS_INSTALL_SHUTDOWN_MS)
+    return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 30000) : 5000
+  }
+
   /**
    * Graceful power-off: `system_powerdown`, then wait, then `quit`.
    *
    * The supervisor owns the checkpoint and the registry; this only makes the
    * process stop. Returns which method worked so shutdown can mark `mayBeTorn`.
+   *
+   * F2 — TWO GUESTS THAT CANNOT HONOUR A 120 s ACPI WAIT, and used to burn it
+   * anyway:
+   *
+   *   * PAUSED. `query-status` says `paused` (a suspend left the machine paused,
+   *     or it was created `-S` and never continued). A paused guest does not run
+   *     its ACPI handler at all: `system_powerdown` is accepted by QEMU and then
+   *     nothing happens for the whole timeout. Sending `cont` FIRST is the fix —
+   *     the guest gets to run the handler, and a suspend→resume→shutdown is
+   *     honest instead of a 120 s stall ending in `quit`.
+   *
+   *   * MID-INSTALL. A WinPE / Setup screen has no ACPI handler either, so a
+   *     shutdown during a half-finished install is never "clean". It gets a
+   *     SHORT explicit window and then `quit`, and the result says
+   *     `installing: true` + `forced: true` so the supervisor marks `mayBeTorn`:
+   *     the disk is half-written and must never be recorded as a clean restore
+   *     point that Start would silently cold-boot.
+   *
+   * A NORMAL RUNNING GUEST keeps the full timeout semantics (the 120 s default
+   * is for a slow init).
    */
   async function shutdown(rawSpec, { timeoutMs = 120000 } = {}) {
     const spec = namedSpec(rawSpec)
     const state = await probe(spec)
     if (!state.alive) {
       stopSwtpm(spec)
-      return { method: 'already-off', exited: true }
+      return { method: 'already-off', exited: true, installInProgress: false }
     }
+    // F2a: a paused machine ignores ACPI. Continue it first, or the powerdown
+    // below is a no-op that costs the entire timeout.
+    const paused = state.status === 'paused' || state.status === 'suspended'
+    if (paused) {
+      try {
+        await qmpFor(spec, [{ execute: 'cont' }], { timeoutMs: 5000 })
+      } catch {
+        // A monitor that will not `cont` still has `quit`; fall through and let
+        // the powerdown/quit path decide.
+      }
+    }
+    // F2b: classify the row, not just the process. `installing`/`booting` is a
+    // guest in Setup: no ACPI handler, half-written disk.
+    const rowState = String(rawSpec?.state ?? '')
+    const installInProgress = rowState === 'installing' || rowState === 'booting'
+    const waitMs = installInProgress ? installShutdownWindowMs() : Math.max(1000, timeoutMs)
     let method = 'acpi'
     try {
       const answer = await qmpFor(spec, [{ execute: 'system_powerdown' }], { timeoutMs: 15000 })
@@ -2429,11 +2471,13 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     } catch {
       method = 'quit'
     }
-    const deadline = Date.now() + Math.max(1000, timeoutMs)
+    const deadline = Date.now() + Math.max(installInProgress ? 0 : 1000, waitMs)
     while (Date.now() < deadline) {
       if (!pidAlive(qemuPid(spec))) {
         stopSwtpm(spec)
-        return { method, exited: true }
+        // F2b: a mid-install exit is still a torn disk — never a clean restore
+        // point — so it carries `forced` even when ACPI appeared to work.
+        return { method, exited: true, ...(installInProgress ? { forced: true } : {}), installInProgress }
       }
       await new Promise((resolve) => setTimeout(resolve, 500))
     }
@@ -2444,11 +2488,14 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     for (let index = 0; index < 30; index += 1) {
       if (!pidAlive(qemuPid(spec))) {
         stopSwtpm(spec)
-        return { method, exited: true, forced: true }
+        // F2b: `forced` is the truth the supervisor persists as `mayBeTorn`. A
+        // guest that actually honoured ACPI is NOT forced; a mid-install `quit`
+        // is, even though it exited — the disk is half-written either way.
+        return { method, exited: true, forced: true, installInProgress }
       }
       await new Promise((resolve) => setTimeout(resolve, 500))
     }
-    return { method: 'quit', exited: false, forced: true }
+    return { method: 'quit', exited: false, forced: true, installInProgress }
   }
 
   /** Kill the process (last resort, after `shutdown` refused to exit). */
@@ -2534,6 +2581,7 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     pause,
     unpause,
     shutdown,
+    installShutdownWindowMs,
     kill,
     forceKill,
     stopSwtpm

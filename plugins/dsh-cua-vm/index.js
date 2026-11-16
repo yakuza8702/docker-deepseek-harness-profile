@@ -316,6 +316,16 @@ export function apply(ctx, config = {}) {
             const answer = await call({ op: 'vmShutdown', ...(await body()) })
             return send(200, { ok: true, ...answer })
           }
+          // F1: THE PANEL'S SUSPEND BUTTON HAD NO ROUTE. `shutdown` powers off
+          // and `stop` is the legacy alias, but nothing answered `suspend`, so
+          // the switch fell through to `default` and the button got a 404 with
+          // "unknown action: suspend" — a plugin-dispatch gap, not a supervisor
+          // one. The op name is the SAME one `cua_vm_suspend` sends ('suspend',
+          // Linux `sb suspend` / Windows QMP stop), so the two entry points
+          // cannot drift. `stop` keeps its legacy meaning and
+          // DSH_CUA_VM_LEGACY_STOP still aliases it to suspend at the
+          // supervisor, unchanged.
+          case 'suspend': return send(200, { ok: true, ...(await call({ op: 'suspend', ...(await body()) })) })
           case 'gc': return send(200, { ok: true, ...(await call({ op: 'vmGc', ...(await body()) })) })
           case 'doctor': return send(200, { ok: true, ...(await call({ op: 'vmDoctor' })) })
           case 'space': return send(200, { ok: true, ...(await call({ op: 'vmSpace', ...(await body()) })) })
