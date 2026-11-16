@@ -890,9 +890,20 @@ try {
     // attaches it AFTER the system disk, so the qcow2 remains Windows Disk 0.
     check('S1: the create built the answer disk at $STORE/windows/<name>/setup.img',
       existsSync(path.join(STORE, 'windows', bootName, 'setup.img')))
-    check('S1: the install argv attaches setup.img read-only on ide.2',
-      /-drive file=[^ ]*\/setup\.img,format=raw,if=none,id=setup0,readonly=on/u.test(installArgv)
+    // F1: WRITABLE. `readonly=on` on an ide-hd is exactly what QEMU 10 refused
+    // ("Block node is read-only"), which is why this assertion flipped.
+    check('F1: the install argv attaches setup.img WRITABLE on ide.2 (no readonly=on)',
+      /-drive file=[^ ]*\/setup\.img,format=raw,if=none,id=setup0/u.test(installArgv)
+      && !/id=setup0[^ ]*read-?only/u.test(installArgv)
       && /ide-hd,drive=setup0,bus=ide\.2/u.test(installArgv), installArgv.slice(0, 200))
+    // F1/F4: the media exists BEFORE the boot and is writable by the runtime
+    // uid (the supervisor runs as uid 1000 in the image).
+    {
+      const setupPath = path.join(STORE, 'windows', bootName, 'setup.img')
+      const st = existsSync(setupPath) ? statSync(setupPath) : null
+      check('F1/F4: setup.img exists before boot, owner-writable, owned by this uid',
+        st !== null && (st.mode & 0o200) !== 0 && st.uid === process.getuid(), st === null ? 'missing' : `mode=${(st.mode & 0o777).toString(8)} uid=${st.uid}`)
+    }
     check('S1: ...after the system disk, and with no usb-storage OEM stick',
       installArgv.indexOf('id=setup0') > installArgv.indexOf('id=disk0')
       && !/usb-storage|fat:ro:/u.test(installArgv))

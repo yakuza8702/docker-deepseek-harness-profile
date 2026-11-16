@@ -504,13 +504,19 @@ const NEEDLES = {
     ['if=none,id=cd0', 1],
     // S1: THE ANSWER-FILE DISK REPLACED THE vvfat USB STICK. dockur/windows'
     // mechanism: a FAT32 HARD-DISK image whose root holds Autounattend.xml,
-    // attached AFTER the system disk. `readonly=on` is the medium's write
-    // protection (Setup only reads it); `ide.2` is the first slot after the
-    // qcow2 on ide.0, so Windows still sees the qcow2 as Disk 0 (DiskID 0).
+    // attached AFTER the system disk. `ide.2` is the first slot after the qcow2
+    // on ide.0, so Windows still sees the qcow2 as Disk 0 (DiskID 0).
     // The old `file=fat:ro:${p.oemDir}` + usb-storage pair is GONE — Setup did
     // not reliably enumerate that stick, which is why a human had to click
     // through Setup. Never reintroduce it.
-    ['file=${p.setupImg},format=raw,if=none,id=setup0,readonly=on', 1],
+    //
+    // F1/M9: THE MEDIUM IS WRITABLE. This needle used to require
+    // `readonly=on` (the OLD OEM stick's write protection). QEMU 10 rejects a
+    // read-only node behind ide-hd ("Block node is read-only") and the create
+    // died before swtpm's socket existed. The needle now pins the writable
+    // setup0 drive; the semantic assertion below rejects ANY `readonly=on`
+    // reappearing on this drive. Never delete this needle class — retarget it.
+    ['file=${p.setupImg},format=raw,if=none,id=setup0', 1],
     ['ide-hd,drive=setup0,bus=ide.2', 1],
     ["setupImg: path.join(dir, 'setup.img')", 1],
     ['export function buildSetupImage(', 1],
@@ -1064,17 +1070,26 @@ function sourceOf(label, name) {
     // and setup.img on ide.2 AFTER it, so Windows Setup sees the qcow2 as Disk 0
     // — the disk Autounattend.xml's <DiskID>0</DiskID> targets. This is an ORDER
     // assertion, not a presence one: reordering the argv silently partitions the
-    // read-only answer medium instead.
+    // answer medium instead.
     const diskAttach = windowsSource.indexOf('ide-hd,drive=disk0,bus=ide.0')
     const setupAttach = windowsSource.indexOf('ide-hd,drive=setup0,bus=ide.2')
     const noUsbStick = !/usb-storage,drive=oem0/u.test(windowsSource) && !/file=fat:ro:/u.test(windowsSource)
     const setupAfterDisk = diskAttach !== -1 && setupAttach !== -1 && diskAttach < setupAttach
-    if (setupAfterDisk && noUsbStick) {
-      if (!quietMode) console.log('  ok   K1 the answer disk (ide.2) is attached after the system disk (ide.0) and the vvfat OEM stick is gone')
+    // F1/M9: NO READ-ONLY BLOCK NODE ON AN ide-hd. QEMU 10 refuses
+    // `-device ide-hd,drive=setup0`: "Block node is read-only", and the create
+    // then cascades into "swtpm did not create its socket". The setup drive
+    // line must not carry readonly/read-only, and the old OEM stick string
+    // (`read-only=on,if=none,id=oem0`) must never come back either.
+    const setupWritable = !/[^\n]*read-?only[^\n]*id=setup0/iu.test(windowsSource)
+      && !/id=setup0[^\n]*read-?only/iu.test(windowsSource)
+      && !/drive=setup0[^\n]*read-?only/iu.test(windowsSource)
+      && !/id=oem0[^\n]*read-?only/iu.test(windowsSource)
+    if (setupAfterDisk && noUsbStick && setupWritable) {
+      if (!quietMode) console.log('  ok   K1 the answer disk (ide.2) is attached WRITABLE after the system disk (ide.0) and the vvfat OEM stick is gone')
     } else {
       failures += 1
-      missing.push('docker/cua-vm-windows-qemu.mjs: setup.img must attach on ide.2 AFTER disk0 on ide.0 (so the qcow2 is Windows Disk 0 / DiskID 0), and no usb-storage/file=fat:ro: OEM stick may remain (the stick Setup could not see)')
-      console.log('  FAIL K1 answer-disk order / no vvfat stick')
+      missing.push('docker/cua-vm-windows-qemu.mjs: setup.img must attach WRITABLE (no readonly=on: QEMU 10 rejects a read-only node on ide-hd) on ide.2 AFTER disk0 on ide.0 (so the qcow2 is Windows Disk 0 / DiskID 0), and no usb-storage/file=fat:ro: OEM stick may remain (the stick Setup could not see)')
+      console.log('  FAIL K1 answer-disk order / writability / no vvfat stick')
     }
   }
   // K2: THE OEM PATH AGREEMENT. The supervisor resolves the payload from one

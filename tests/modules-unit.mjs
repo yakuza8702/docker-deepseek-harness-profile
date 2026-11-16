@@ -188,9 +188,24 @@ check('kvm + host cpu are the acceleration', has('q35,accel=kvm,smm=off') && has
 // dockur/windows' mechanism: Setup reliably finds Autounattend.xml on a disk
 // root; our old `fat:ro:` directory behind usb-storage was not visible, which
 // is why the user had to click through Setup.
-check('S1: the answer medium is setup.img as a read-only hard disk',
-  argv.join(' ').includes(`file=${paths.setupImg},format=raw,if=none,id=setup0,readonly=on`)
+// F1: WRITABLE, NOT READ-ONLY. QEMU 10 answers a read-only block node behind
+// ide-hd with "Block node is read-only" and the create dies before swtpm's
+// socket (the reported cascade). dockur's SETUP overlay is a writable disk.
+check('F1: the answer medium is setup.img as a WRITABLE hard disk',
+  argv.join(' ').includes(`file=${paths.setupImg},format=raw,if=none,id=setup0`)
+  && !argv.join(' ').includes('id=setup0,readonly=on')
   && has('ide-hd,drive=setup0,bus=ide.2'))
+check('F1/F2: no ide-hd device in the argv sits behind a read-only block node', (() => {
+  // Map each ide-hd device to its drive id, then look up the -drive line that
+  // declares that id: `readonly=on` on a hard-disk backend is what QEMU 10
+  // rejects. CD-ROM and pflash backends are allowed to stay read-only.
+  const hardDiskDrives = argv.filter((item) => String(item).startsWith('ide-hd,'))
+    .map((item) => /drive=([^,]+)/u.exec(item)?.[1]).filter(Boolean)
+  return hardDiskDrives.length > 0 && hardDiskDrives.every((id) => {
+    const drive = argv.find((item) => String(item).includes(`id=${id}`))
+    return typeof drive === 'string' && !/read-?only/u.test(drive)
+  })
+})())
 check('S1: the vvfat USB OEM stick is GONE from the install argv',
   !argv.join(' ').includes('fat:ro:') && !argv.join(' ').includes('usb-storage')
   && !argv.join(' ').includes('id=oem0'))
@@ -906,6 +921,21 @@ check('windowsKvmPreflight is the shared module (no second message)',
       const image = buildSetupImage({ paths: setupPaths })
       check('S1: buildSetupImage produces $STORE/windows/<name>/setup.img', image === setupPaths.setupImg && existsSync(image)
         && statSyncSafe(image) >= 32 * 1024 * 1024, `${image}`)
+      // F1/F4: QEMU opens setup0 read-write; the runtime uid owns it and the
+      // owner-write bit is set after the build (chmod 0600). A media file the
+      // uid cannot write is the same class as `readonly=on`: device realize dies.
+      {
+        const st = statSync(image)
+        check('F1/F4: setup.img is owner-writable and owned by the runtime uid (mode 0600)',
+          (st.mode & 0o200) !== 0 && (st.mode & 0o777) === 0o600 && st.uid === process.getuid(), `mode=${(st.mode & 0o777).toString(8)} uid=${st.uid}`)
+        // Rebuild policy: a second create must NEVER reuse the guest-written
+        // image — it is unlinked and built fresh (byte-verified again).
+        writeFileSync(path.join(setupPaths.setupImg), 'GUEST SCRATCH', { flag: 'r+' })
+        const rebuilt = buildSetupImage({ paths: setupPaths })
+        check('F1: a re-create REBUILDS setup.img fresh (no idempotent skip over guest writes)',
+          rebuilt === setupPaths.setupImg && verifySetupImage({ paths: setupPaths }).entries.includes('Autounattend.xml')
+          && statSync(rebuilt).size >= 32 * 1024 * 1024)
+      }
       const verified = verifySetupImage({ paths: setupPaths })
       check('S2: mdir lists Autounattend.xml at the image ROOT',
         verified.entries.includes('Autounattend.xml'), verified.entries.join(','))

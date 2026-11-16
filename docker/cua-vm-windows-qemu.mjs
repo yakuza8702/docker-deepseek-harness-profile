@@ -757,10 +757,13 @@ export function windowsRowName(spec, fallback = '') {
  *     connects to it. Both are cleaned up by `stopSwtpm`.
  *   * The install medium is the untouched Microsoft ISO on a CD-ROM. The
  *     answer file and its scripts live on a SEPARATE FAT32 HARD DISK
- *     (`setup.img`, built with mtools), attached after the system disk. This
- *     mirrors dockur/windows: WinPE reliably finds `Autounattend.xml` on a
- *     disk at the root of a real filesystem, while the old `fat:ro:` vvfat
- *     directory behind usb-storage was evidently not seen by Setup at all.
+ *     (`setup.img`, built with mtools), attached WRITABLE after the system
+ *     disk. This mirrors dockur/windows: WinPE reliably finds
+ *     `Autounattend.xml` on a disk at the root of a real filesystem, while the
+ *     old `fat:ro:` vvfat directory behind usb-storage was evidently not seen
+ *     by Setup at all. The disk is writable because QEMU 10 refuses a
+ *     read-only block node behind `ide-hd` (it would be legal on a CD-ROM or
+ *     usb-storage) and because Setup may write logs/scratch to the medium.
  *   * `bootindex` ORDERS THE BOOT, and the order follows the INTENT of each
  *     phase instead of the order the devices happen to be declared in:
  *
@@ -820,15 +823,26 @@ export function buildQemuArgs(spec) {
     //
     //   ide.0  system qcow2      -> Windows Disk 0  (EFI/MSR/Primary)
     //   ide.1  install CD-ROM    -> not a disk, but the boot device during install
-    //   ide.2  setup.img         -> Windows Disk 1  (read-only answer medium)
+    //   ide.2  setup.img         -> Windows Disk 1  (answer medium, WRITABLE)
     //   ide.3  virtio-win CD-ROM -> not a disk (when a driver ISO is supplied)
     //
-    // The setup disk MUST be declared here, immediately after the system disk,
-    // and stay read-only: Setup reads it, never writes it. ide.2 used to hold the
-    // optional driver CD; that moved to ide.3 so the answer disk keeps the
-    // first free slot after the system disk.
+    // The setup disk MUST be declared here, immediately after the system disk.
+    // ide.2 used to hold the optional driver CD; that moved to ide.3 so the
+    // answer disk keeps the first free slot after the system disk.
+    //
+    // F1: THE MEDIUM IS ATTACHED **WRITABLE**, AND THAT IS NOT NEGOTIABLE.
+    // QEMU 10 rejects a read-only block node on an IDE hard-disk device:
+    //   qemu-system-x86_64: -device ide-hd,drive=setup0,bus=ide.2:
+    //     Block node is read-only
+    // and the create cascades into "swtpm did not create its socket" because
+    // QEMU never reached device realize. `readonly=on` would be legal on a
+    // CD-ROM or usb-storage device, not on ide-hd. dockur/windows attaches its
+    // SETUP overlay as a writable hard disk for the same reason: Setup may
+    // write logs/scratch to the medium. The image is rebuilt fresh on every
+    // create anyway (see buildSetupImage), so guest writes never leak into the
+    // next install.
     ...(boot
-      ? ['-drive', `file=${p.setupImg},format=raw,if=none,id=setup0,readonly=on`,
+      ? ['-drive', `file=${p.setupImg},format=raw,if=none,id=setup0`,
         '-device', 'ide-hd,drive=setup0,bus=ide.2']
       : []),
     ...(boot
@@ -1126,6 +1140,15 @@ export function assertAnswerFileTargetsSystemDisk(xml, { expected = 0 } = {}) {
  *   4. `mdir` must list Autounattend.xml at the root, and `mtype` must return
  *      bytes IDENTICAL to the staged file (dockur's own verification shape).
  *
+ * F1: REBUILD POLICY — ALWAYS FRESH, ON EVERY CREATE. The image is attached
+ * WRITABLE (QEMU rejects `readonly=on` on an ide-hd device, and dockur's SETUP
+ * overlay is a writable hard disk because Setup may write logs/scratch to it),
+ * so the guest can legitimately leave bytes behind. There is deliberately no
+ * "skip if it already exists" branch: a re-create of the same computer must
+ * start from a byte-exact answer medium, never from a possibly-modified one.
+ * The old file is unlinked and rebuilt, and the FAT32 image is chmod 0600 for
+ * the runtime uid so QEMU can open it read-write.
+ *
  * mtools is a runtime dependency in the image (see the Dockerfile); a host
  * without it gets an error naming the package, not a QEMU that cannot boot.
  */
@@ -1159,6 +1182,10 @@ export function buildSetupImage({ paths: p, log = () => {}, expectedDiskId = 0 }
   // scripts visible at the medium's root where a human (and the EFI Shell for
   // startup.nsh) expects them.
   run(MTOOLS.copy, ['-i', p.setupImg, '-s', ...staged, oemTree, '::'])
+  // F1: the medium is WRITABLE by the user that runs QEMU (uid 1000). mkstemp's
+  // default mode is already owner-writable, but pinning it makes the contract
+  // explicit and survives a restrictive umask / a copied store.
+  chmodSync(p.setupImg, 0o600)
   const verified = verifySetupImage({ paths: p })
   log(`windows: setup.img built (${(SETUP_IMAGE_BYTES / 1024 ** 2).toFixed(0)} MB FAT32, ${verified.entries.length} root entries, Autounattend.xml byte-verified)`)
   return p.setupImg

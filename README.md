@@ -963,20 +963,24 @@ The unattended install is four data files that ship **inside the image** at
 `/usr/local/share/cua-vm/windows-oem/`: `Autounattend.xml`, `setupcomplete.cmd`,
 `cua-firstboot.ps1` and `Unattend.vbs`. The create path stages them into
 `/cua-vm/windows/<name>/oem/`, builds them into a FAT32 `setup.img` (mtools) and
-attaches that image as a read-only hard disk before QEMU starts, so a missing file
-stops the computer before the first boot — it is an **image** problem, not a
+attaches that image as a **writable** hard disk before QEMU starts, so a missing
+file stops the computer before the first boot — it is an **image** problem, not a
 setting:
 
 * your image was built **before the Windows backend existed** (a `main`-branch
   build: `main` has no Windows code at all), or
 * the image's `COPY` and the supervisor's `DSH_CUA_WINDOWS_OEM_DIR` disagree.
 
-The medium itself is **read-only**, and that is deliberate: nothing in the guest
-writes it. The image is a plain FAT32 hard disk, so QEMU does not need a writable
-block node (the old `usb-storage`/vvfat pairing did, which is why it was fragile
-and, in practice, invisible to Setup). The image needs **mtools in the image**;
-without it a create refuses with a message naming the package, not a QEMU that
-cannot boot.
+The medium is attached **writable**, and that is deliberate. QEMU 10 rejects a
+read-only block node on an IDE hard-disk device (`-device ide-hd,drive=setup0:
+Block node is read-only`) and the create dies before QEMU reaches device realize
+— which surfaced as the misleading *"swtpm did not create its socket"* cascade.
+`readonly=on` is legal on a CD-ROM or a usb-storage stick, not on `ide-hd`.
+dockur/windows attaches its SETUP overlay as a writable hard disk for the same
+reason: Setup may write logs/scratch to it. The image is rebuilt fresh on every
+create (and its answer file byte-verified), so writes left by one install never
+reach the next. The image needs **mtools in the image**; without it a create
+refuses with a message naming the package, not a QEMU that cannot boot.
 
 Pull or build a newer image from this branch with the virgl QEMU, then recreate
 the container **keeping the `/cua-vm` volume** (the store and every existing

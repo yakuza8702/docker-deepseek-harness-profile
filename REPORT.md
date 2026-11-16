@@ -843,6 +843,66 @@ OOBE) is still not attempted here; the replay boots real QEMU with a real OVMF
 medium), so what it proves is that QEMU **accepts the argv and initializes** —
 which is exactly the two defects above.
 
+### 9.6.12 Live-verified Windows create failure: a read-only node on `ide-hd` (F1–F4)
+
+Reported against the image built from the previous round: a Windows create failed
+with
+
+```
+qemu-system-x86_64: -device ide-hd,drive=setup0,bus=ide.2: Block node is read-only
+```
+
+and the failure surfaced as a *"swtpm did not create its socket"* cascade: QEMU
+exits during option parsing, before device realize, so the TPM chardev socket the
+supervisor waits for is never created. The previous round had attached the answer
+disk as `-drive file=setup.img,format=raw,if=none,id=setup0,readonly=on` +
+`-device ide-hd,drive=setup0,bus=ide.2`. QEMU 10 accepts a read-only block node
+behind a **CD-ROM** or **usb-storage** device, but **not** behind an IDE hard
+disk; `readonly=on` was carried over from the old OEM stick argv (N2) where the
+device class was different. dockur/windows models its SETUP overlay as a
+writable hard disk because Setup may write logs/scratch to the medium.
+
+| # | Defect / work item | Fix |
+|---|---|---|
+| F1 | `setup.img` was attached read-only behind `ide-hd`; QEMU 10 refuses it during option parsing and every create dies before swtpm's socket | the drive is now `file=${p.setupImg},format=raw,if=none,id=setup0` (no `readonly=on`) + the unchanged `ide-hd,drive=setup0,bus=ide.2`. The in-code comment states why: QEMU rejects a read-only node on an ide-hd, and the dockur model is a writable SETUP overlay. `buildSetupImage()` now pins the image to mode **0600** for the runtime uid, so QEMU can open the node read-write. **Rebuild policy decided: rebuild on EVERY create** (fresh answer file). There is deliberately no "skip if it already exists" branch: the medium is writable, Setup may legitimately leave bytes in it, and a re-create of the same computer must start from a byte-exact, mdir/mtype-verified image, never a possibly-modified one. This is documented in `buildSetupImage()`'s doc comment and asserted by a read-back test that first scribbles a guest-like write into the image, then rebuilds and verifies `Autounattend.xml` is listed again |
+| F2 | The same class could hide on any `ide-hd` | the argv builder is audited: the only remaining `readonly=on` block nodes are the OVMF **pflash** code drive and the two **cdrom** drives (`media=cdrom`), which QEMU allows. `tests/modules-unit.mjs` now maps every `ide-hd` device to its `drive=` id and fails unless the matching `-drive` line is free of `read-only`/`readonly` |
+| F3 | the M9-class gate needle pinned the OLD read-only OEM argv, so a reintroduced `readonly=on` on setup0 would still have passed | retargeted, never deleted: the needle is now `file=${p.setupImg},format=raw,if=none,id=setup0` (the writable line) and the `ide-hd,drive=setup0,bus=ide.2` needle is untouched. The existing `no usb-storage` / `no file=fat:ro:` needles stay. A new **semantic** K1 assertion fails on any `read-?only` appearing before or after `id=setup0`, on `drive=setup0` with a read-only marker, or on the old `id=oem0` stick reappearing — a needle list cannot express "this line must NOT contain X" |
+| F4 | tests still asserted the read-only shape | `tests/modules-unit.mjs`: the argv assertion now demands `id=setup0` **without** `readonly=on`, plus F2's mapping check; the real-mtools block adds a read-back assertion that `setup.img` exists with mode `0600`, owner-write bit set and owner = the runtime uid, and that a second `buildSetupImage()` rebuilds it after a guest-style scribble. `tests/supervisor-smoke.mjs`: the create asserts `setup.img` exists **before boot**, is owner-writable and owned by this uid, and that the install argv's setup drive carries no `read-only` marker in the same token sequence |
+
+**Verified live in this container (QEMU 10.0.13, `/dev/kvm` `0666` and openable, `mtools` present).**
+
+Replay script: a real `/tmp` store (`writeOemPayload()` + `buildSetupImage()` +
+`qemu-img create` qcow2 disk + OVMF vars qcow2), a real `swtpm socket` on the
+computer's TPM socket, a 1 MiB dummy install ISO, `installPending: true` so the
+setup disk is attached, `gpu: false` (plain VGA, no EGL/virgl), `-machine
+q35,accel=kvm` (KVM was usable, no `accel=tcg` fallback needed), 2.5 s window:
+
+* **old argv** (`readonly=on` re-inserted): exits 1 immediately with the exact
+  reported string `qemu-system-x86_64: -device ide-hd,drive=setup0,bus=ide.2:
+  Block node is read-only`; `qemu.pid` **absent**, `serial.log` **0 bytes**.
+  This is the user's failure reproduced byte-for-byte.
+* **fixed argv**: process still **UP** after the 2.5 s window, `qemu.pid`
+  written (`1433`, readable), `serial.log` **1336 bytes** (real OVMF output),
+  `qemu-stderr.log` **empty** — device realize passed and the VM initialized.
+
+The replay store was removed afterwards; the dummy ISO is not a bootable install
+medium, so this proves argv acceptance/initialization, not a completed setup —
+the same boundary as the N1/N2 replay.
+
+* `node tools/check-cua-vm.mjs` → **516** assertions (checkout, up from 475);
+  flat cua-check replay from `cwd=/` → **514**, with L5 + N3 `n/a` as designed.
+* `node tools/check-cua-rea.mjs` → **67**.
+* `node tools/ci-gates.mjs` → **9 passed / 1 failed / 1 skipped**; the failure is
+  `check-office.mjs` (`@deepseek-ai/dsh-skill-office is not installed`), the
+  pre-existing environment failure, unchanged by this round.
+* `tests/{supervisor-smoke,modules-unit,windows-boot,qmp-shutdown}.mjs` → all
+  **PASS**.
+* `node --check` clean on every changed file.
+
+**NOT RUN, with the reason.** A full Windows install (ISO download, OVMF/swtpm,
+OOBE) is still not attempted here. This host reproduces the argv rejection and
+proves the fixed argv initializes, which is the defect class reported.
+
 ### 9.7 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),
