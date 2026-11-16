@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Autounattend.xml — the unattended answer file the supervisor writes into
-  $STORE/windows/<name>/oem/ and presents as a USB stick (QEMU vvfat).
+  Autounattend.xml — the unattended answer file the supervisor stages into
+  $STORE/windows/<name>/oem/ and copies into setup.img, a FAT32 HARD DISK
+  attached after the system disk (dockur/windows' mechanism). Windows Setup
+  (WinPE) reliably reads it from the image's ROOT.
 
   Substitutions performed by writeOemPayload():
     {{COMPUTERNAME}}  cua-<name>, upper-cased, <= 15 chars
@@ -9,6 +11,8 @@
     {{SSH_PUBKEY}}    authorized key for the cua user
     {{PYTHON_URL}}    pinned python.org installer
     {{DSH_CUA_PIP}}   pip spec for the dsh-cua package
+    {{PRODUCT_KEY}}   optional <ProductKey> block, or nothing for evaluation
+                      media (see windowsKey in writeOemPayload)
 
   ELEMENT ORDER IS SCHEMA ORDER, not reading order: Setup validates the
   component children against the answer-file schema, and a RunSynchronous that
@@ -70,6 +74,13 @@
       </RunSynchronous>
       <UserData>
         <AcceptEula>true</AcceptEula>
+        <!-- S3: EVALUATION MEDIA (11ltsc, 2025) IGNORE THIS, and the pinned
+             ISOs need no key. A licensed operator ISO passes windowsKey, which
+             becomes the block below with WillShowUI Never so Setup never stops
+             at a product-key page. When no key is given the placeholder is
+             replaced with nothing, leaving AcceptEula directly before FullName
+             (the schema order). -->
+        {{PRODUCT_KEY}}
         <FullName>cua</FullName>
         <Organization>dsh</Organization>
       </UserData>
@@ -97,8 +108,13 @@
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
           <Order>1</Order>
-          <CommandLine>powershell -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\cua-firstboot.ps1</CommandLine>
-          <Description>cua first-boot provisioning (OpenSSH, python, dsh-cua)</Description>
+          <!-- S4: Unattend.vbs is the HIDDEN launcher (wscript, window style 0)
+               that dockur uses: it starts cua-firstboot.ps1, waits for it and
+               passes its exit code through. SetupComplete.cmd already ran the
+               same script as SYSTEM; cua-firstboot.ps1 is idempotent through
+               C:\cua-provision.json, so whichever pass runs first wins. -->
+          <CommandLine>wscript //nologo C:\Windows\Setup\Scripts\Unattend.vbs</CommandLine>
+          <Description>cua first-boot provisioning, hidden (OpenSSH, python, dsh-cua)</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
       <OOBE>

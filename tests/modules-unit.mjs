@@ -3,7 +3,8 @@
  * modules-unit.mjs — the pure parts of the two new modules, and the Windows
  * container spec, asserted without a VM, a container or a daemon.
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, accessSync, statSync, constants as fsConstants } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
 import zlib from 'node:zlib'
@@ -16,6 +17,8 @@ import {
   buildQemuArgs, vncDisplayFor, vncPortFor, windowsPaths, frameSpace,
   OEM_PAYLOAD_FILES, oemPayloadDir, oemPayloadDirStatus, oemPayloadDeniedDir, resolveOemSourceDir, writeOemPayload,
   oemPayloadMissingError, oemPayloadDeniedError, windowsKvmPreflight,
+  SETUP_IMAGE_ENTRIES, SETUP_IMAGE_LABEL, buildSetupImage, verifySetupImage, answerFileDiskIds,
+  assertAnswerFileTargetsSystemDisk, normaliseProductKey,
   formatWindowsInstallDetail, qmpStateLabel, endpointLabel, windowsTailLines, windowsPortsOf, windowsBootSpec,
   windowsReadinessSignals, qemuBootWindowMs, waitForQemuBoot,
   windowsRowName, windowsQmpAdapter, cdbootKeyScheduleMs, cdbootKeysEnabled, runCdbootKeys, startupNshText,
@@ -33,6 +36,9 @@ const check = (label, ok, detail = '') => {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${detail ? ` — ${detail}` : ''}`)
   if (!ok) failures += 1
 }
+
+/** Size in bytes, or -1 — used only to prove the sparse image was created. */
+const statSyncSafe = (file) => { try { return statSync(file).size } catch { return -1 } }
 
 /** A real 1200x750 PNG (IHDR + one IDAT + IEND), built with zlib only. */
 function makePng(width, height) {
@@ -178,20 +184,29 @@ check('kvm + host cpu are the acceleration', has('q35,accel=kvm,smm=off') && has
     buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: true })
       .includes('virtio-blk-pci,drive=disk0,bootindex=2'))
 }
-// M9 + M10: the OEM medium is READ-ONLY **and** its block node is attached
-// with `read-only=on`. Without that token usb-storage attaches a writable SCSI
-// disk to a read-only vvfat BlockBackend and QEMU 10.0.13 refuses it:
-//   -device usb-storage,drive=oem0,bus=xhci.0: Block node is read-only
-// (observed ~118 ms into a real create; pidfile never written, serial.log 0 B).
-check('the OEM payload is a READ-ONLY vvfat USB stick',
-  argv.join(' ').includes(`file=fat:ro:${paths.oemDir},format=raw,read-only=on,if=none,id=oem0`)
-  && has('usb-storage,drive=oem0,bus=xhci.0'))
-check('M10: the OEM drive declares read-only=on (usb-storage cannot attach a ro node without it)',
-  argv.filter((item) => item.startsWith('file=fat:ro:')).every((item) => item.includes('read-only=on'))
-  && !argv.some((item) => item.startsWith('file=fat:rw:')),
-  argv.find((item) => item.startsWith('file=fat:')))
-check('the USB controller is declared before the device that uses its bus', argv.indexOf('qemu-xhci,id=xhci') !== -1
-  && argv.indexOf('qemu-xhci,id=xhci') < argv.indexOf('usb-storage,drive=oem0,bus=xhci.0'))
+// S1: THE ANSWER-FILE MEDIUM IS A FAT32 HARD DISK, NOT A vvfat USB STICK.
+// dockur/windows' mechanism: Setup reliably finds Autounattend.xml on a disk
+// root; our old `fat:ro:` directory behind usb-storage was not visible, which
+// is why the user had to click through Setup.
+check('S1: the answer medium is setup.img as a read-only hard disk',
+  argv.join(' ').includes(`file=${paths.setupImg},format=raw,if=none,id=setup0,readonly=on`)
+  && has('ide-hd,drive=setup0,bus=ide.2'))
+check('S1: the vvfat USB OEM stick is GONE from the install argv',
+  !argv.join(' ').includes('fat:ro:') && !argv.join(' ').includes('usb-storage')
+  && !argv.join(' ').includes('id=oem0'))
+check('S1: the system qcow2 is attached (ide.0) BEFORE setup.img (ide.2), so it stays Windows Disk 0',
+  argv.indexOf('ide-hd,drive=disk0,bus=ide.0,bootindex=2') !== -1
+  && argv.indexOf('ide-hd,drive=disk0,bus=ide.0,bootindex=2') < argv.indexOf('ide-hd,drive=setup0,bus=ide.2'))
+check('S1: the setup disk is only attached while installing (no stale answer disk after Setup)',
+  !buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: false, virtio: false })
+    .join(' ').includes('setup0'))
+check('S1: a driver ISO moved to ide.3 so ide.2 belongs to setup.img', (() => {
+  const withDrivers = buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: '/drv.iso', sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: false })
+  return withDrivers.includes('ide-cd,drive=cd1,bus=ide.3') && withDrivers.includes('ide-hd,drive=setup0,bus=ide.2')
+    && !withDrivers.join(' ').includes('ide-cd,drive=cd1,bus=ide.2')
+})())
+check('the USB controller is declared before the USB input devices',
+  argv.indexOf('qemu-xhci,id=xhci') !== -1 && argv.indexOf('qemu-xhci,id=xhci') < argv.indexOf('usb-kbd'))
 check('networking is SLIRP with an SSH forward', argv.join(' ').includes('user,id=net0,hostfwd=tcp:127.0.0.1:47100-:22'))
 check('absolute pointing needs usb-tablet', has('usb-tablet'))
 // B1: `-vnc` takes a DISPLAY number, so the argv must carry 5931-5900 = 31.
@@ -238,7 +253,7 @@ check('the Windows store paths are all under $STORE', Object.values(paths).every
 // These four checks pin the three properties that make it recoverable.
 {
   const repoOem = path.join(REPO, 'docker', 'windows-oem')
-  check('the OEM file list is the three files the writer needs', OEM_PAYLOAD_FILES.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1')
+  check('the OEM file list is the four files the writer needs (S4 adds the hidden launcher)', OEM_PAYLOAD_FILES.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1,Unattend.vbs')
   check('a complete payload directory is recognised, an incomplete one is not', (() => {
     const partial = mkdtempSync(path.join(os.tmpdir(), 'oem-partial-'))
     try {
@@ -264,6 +279,7 @@ check('the Windows store paths are all under $STORE', Object.values(paths).every
       })
       return existsSync(path.join(oemDir, 'Autounattend.xml'))
         && existsSync(path.join(oemDir, '$OEM$', '$$', 'Setup', 'Scripts', 'cua-firstboot.ps1'))
+        && existsSync(path.join(oemDir, '$OEM$', '$$', 'Setup', 'Scripts', 'Unattend.vbs'))
         && logged.some((line) => line.includes('using the copy at'))
     } finally {
       rmSync(store, { recursive: true, force: true })
@@ -867,6 +883,78 @@ check('windowsKvmPreflight is the shared module (no second message)',
     rmSync(store, { recursive: true, force: true })
   }
 }
+
+// ---- S1/S2/S3: THE FAT32 ANSWER MEDIUM, ITS READ-BACK, AND THE OPTIONAL KEY ----
+//
+// The real proof is a REAL mtools build: mformat/mcopy produce setup.img and
+// mdir/mtype read it back. mtools is a runtime dependency in the image, but a
+// developer host may not have it; that case is reported NOT RUN, never as a
+// pass (a fake green here would hide exactly the class of bug this replaces:
+// a medium that looks attached and holds no answer file).
+{
+  const mtools = ['mformat', 'mcopy', 'mdir', 'mtype'].every((tool) => spawnSync(tool, ['--version'], { stdio: 'ignore' }).status === 0)
+  if (!mtools) {
+    console.log('  n/a  S1/S2 setup.img build: mtools is absent from this host — NOT RUN (the image installs it; `apt-get install mtools` to run this here)')
+  } else {
+    const store = mkdtempSync(path.join(os.tmpdir(), 'cua-setup-img-'))
+    try {
+      const setupPaths = windowsPaths(store, 'win-setup')
+      writeOemPayload({
+        paths: setupPaths, name: 'win-setup', password: 'pw', sshPubKey: 'ssh-ed25519 AAAA x',
+        sourceDir: path.join(REPO, 'docker', 'windows-oem'), pythonUrl: 'https://python', dshCuaSpec: 'dsh-cua==1'
+      })
+      const image = buildSetupImage({ paths: setupPaths })
+      check('S1: buildSetupImage produces $STORE/windows/<name>/setup.img', image === setupPaths.setupImg && existsSync(image)
+        && statSyncSafe(image) >= 32 * 1024 * 1024, `${image}`)
+      const verified = verifySetupImage({ paths: setupPaths })
+      check('S2: mdir lists Autounattend.xml at the image ROOT',
+        verified.entries.includes('Autounattend.xml'), verified.entries.join(','))
+      check('S2: mdir lists startup.nsh and the three scripts at the root',
+        ['startup.nsh', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs'].every((name) => verified.entries.includes(name)))
+      check('S2: $OEM$/$$/Setup/Scripts carries the SetupComplete + hidden launcher chain',
+        ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs'].every((name) => verified.oemScripts.includes(name)),
+        verified.oemScripts.join(','))
+      check('S2: the image copy of Autounattend.xml is BYTE-identical to the staged file (mtype read-back)',
+        verified.image === setupPaths.setupImg && readFileSync(path.join(setupPaths.oemDir, 'Autounattend.xml')).length > 0)
+      const xml = readFileSync(path.join(setupPaths.oemDir, 'Autounattend.xml'), 'utf8')
+      check('S2: every <DiskID> targets Disk 0 (the qcow2 on ide.0, not setup.img on ide.2)',
+        answerFileDiskIds(xml).length === 2 && answerFileDiskIds(xml).every((id) => id === 0), answerFileDiskIds(xml).join(','))
+      check('S2: the answer file has an explicit <InstallTo><DiskID>0</DiskID>',
+        /<InstallTo>\s*<DiskID>0<\/DiskID>/u.test(xml))
+      check('S2: assertAnswerFileTargetsSystemDisk accepts the staged file', (() => {
+        try { return assertAnswerFileTargetsSystemDisk(xml).every((id) => id === 0) } catch { return false }
+      })())
+      check('S2: a wrong DiskID is REFUSED (the read-only medium would be wiped)', (() => {
+        try { assertAnswerFileTargetsSystemDisk('<InstallTo><DiskID>1</DiskID></InstallTo><DiskID>1</DiskID>'); return false } catch (error) {
+          return /targets DiskID 1/u.test(error.message)
+        }
+      })())
+      check('S3: no windowsKey = no <ProductKey> block (evaluation media need none)',
+        !/<ProductKey><Key>/u.test(xml) && !xml.includes('{{PRODUCT_KEY}}'))
+
+      // A licensed operator ISO: the key is normalised and written with
+      // WillShowUI Never, so Setup never stops to ask.
+      const keyed = windowsPaths(store, 'win-keyed')
+      writeOemPayload({
+        paths: keyed, name: 'win-keyed', password: 'pw', sshPubKey: 'ssh-ed25519 AAAA x',
+        sourceDir: path.join(REPO, 'docker', 'windows-oem'), pythonUrl: 'https://python', dshCuaSpec: 'dsh-cua==1',
+        windowsKey: 'vk7jg-nphtm-c97jm-9mpgt-3v66t'
+      })
+      const keyedXml = readFileSync(path.join(keyed.oemDir, 'Autounattend.xml'), 'utf8')
+      check('S3: windowsKey writes <ProductKey> with WillShowUI Never',
+        keyedXml.includes('<ProductKey><Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key><WillShowUI>Never</WillShowUI></ProductKey>'))
+      check('S3: normaliseProductKey accepts dashed/lowercase and inserts dashes from 25 chars',
+        normaliseProductKey(' vk7jg nphtm c97jm 9mpgt 3v66t ') === 'VK7JG-NPHTM-C97JM-9MPGT-3V66T'
+        && normaliseProductKey('') === '')
+      check('S3: a malformed key is refused with the accepted shape', (() => {
+        try { normaliseProductKey('NOPE'); return false } catch (error) { return /not a Windows product key/u.test(error.message) }
+      })())
+    } finally {
+      rmSync(store, { recursive: true, force: true })
+    }
+  }
+}
+
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

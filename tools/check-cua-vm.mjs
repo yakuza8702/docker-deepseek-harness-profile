@@ -73,6 +73,7 @@ const FILES = {
   oemAnswer: { label: 'docker/windows-oem/Autounattend.xml', name: 'Autounattend.xml' },
   oemSetup: { label: 'docker/windows-oem/setupcomplete.cmd', name: 'setupcomplete.cmd' },
   oemBoot: { label: 'docker/windows-oem/cua-firstboot.ps1', name: 'cua-firstboot.ps1' },
+  oemLauncher: { label: 'docker/windows-oem/Unattend.vbs', name: 'Unattend.vbs' },
   provision: { label: 'docker/cua-guest-provision.sh', name: 'cua-guest-provision.sh' },
   android: { label: 'docker/cua-guest-android.sh', name: 'cua-guest-android.sh' },
   dockerfile: { label: 'Dockerfile', name: 'Dockerfile' },
@@ -499,21 +500,37 @@ const NEEDLES = {
     // the reason cdboot's 5 s "Press any key" window was entered late.
     ['const diskBootIndex = boot ? 2 : 1', 1],
     ['ide-cd,drive=cd0,bus=ide.1,bootindex=1', 1],
-    // install medium while installing, drivers ISO when present, OEM payload
+    // install medium while installing, drivers ISO when present
     ['if=none,id=cd0', 1],
-    // M9: read-only vvfat — nothing in the guest writes this staging directory.
-    //
-    // M10: `read-only=on` IS PART OF THIS ARGV, not decoration. usb-storage
-    // attaches a SCSI disk whose block node must be WRITABLE; a `fat:ro:` vvfat
-    // node is read-only, so QEMU 10.0.13 refused the pair with
-    // `-device usb-storage,drive=oem0,bus=xhci.0: Block node is read-only`
-    // ~118 ms into a real Windows create — the pidfile was never written and the
-    // serial log stayed 0 bytes. `read-only=on` marks the MEDIUM read-only (a
-    // write-protected stick, which is what an install medium is) and boots.
-    // `fat:rw:` is not the alternative: this image's rootfs is read-only, and
-    // vvfat in rw mode wants a temp dir under /var/tmp (EROFS).
-    ['file=fat:ro:${p.oemDir},format=raw,read-only=on,if=none,id=oem0', 1],
-    ['usb-storage,drive=oem0,bus=xhci.0', 1],
+    // S1: THE ANSWER-FILE DISK REPLACED THE vvfat USB STICK. dockur/windows'
+    // mechanism: a FAT32 HARD-DISK image whose root holds Autounattend.xml,
+    // attached AFTER the system disk. `readonly=on` is the medium's write
+    // protection (Setup only reads it); `ide.2` is the first slot after the
+    // qcow2 on ide.0, so Windows still sees the qcow2 as Disk 0 (DiskID 0).
+    // The old `file=fat:ro:${p.oemDir}` + usb-storage pair is GONE — Setup did
+    // not reliably enumerate that stick, which is why a human had to click
+    // through Setup. Never reintroduce it.
+    ['file=${p.setupImg},format=raw,if=none,id=setup0,readonly=on', 1],
+    ['ide-hd,drive=setup0,bus=ide.2', 1],
+    ["setupImg: path.join(dir, 'setup.img')", 1],
+    ['export function buildSetupImage(', 1],
+    ['export function verifySetupImage(', 1],
+    ['export const SETUP_IMAGE_ENTRIES = Object.freeze([', 1],
+    ["export const SETUP_IMAGE_LABEL = 'SETUP'", 1],
+    ['export function answerFileDiskIds(xml)', 1],
+    ['export function assertAnswerFileTargetsSystemDisk(', 1],
+    ['export function normaliseProductKey(value)', 1],
+    ["['-i', p.setupImg, '-F', '-v', SETUP_IMAGE_LABEL, '::']", 1],
+    ["['-i', p.setupImg, '-b', spec]", 1],
+    ['mdir', 1],
+    // S2: the byte compare is part of the build, not a comment.
+    ['staged.equals(fromImage)', 1],
+    // S3: optional product key, never shown by Setup.
+    ['{{PRODUCT_KEY}}', 1],
+    ['WillShowUI>Never', 1],
+    // S4: dockur's hidden launcher shape (the launcher itself is asserted in
+    // oemLauncher / oemSetup; the writer must copy it into $OEM$).
+    ['Unattend.vbs', 2],
     // networking: SLIRP + the SSH forward (no bridge, no tap)
     ['user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22', 1],
     ['e1000e,netdev=net0', 1],
@@ -666,11 +683,27 @@ const NEEDLES = {
     ['<Name>cua</Name>', 1],
     ['{{PASSWORD}}', 3],
     ['BypassTPMCheck', 1],
-    ['<AutoLogon>', 1]
+    ['<AutoLogon>', 1],
+    // S3: the key block is a placeholder; evaluation media leave it empty.
+    ['{{PRODUCT_KEY}}', 1],
+    // S4: FirstLogonCommands uses the hidden launcher, not a bare powershell.
+    ['wscript //nologo C:\\Windows\\Setup\\Scripts\\Unattend.vbs', 1]
   ],
   oemSetup: [
     ['cua-firstboot.ps1', 1],
-    ['setupcomplete exit', 1]
+    ['Unattend.vbs', 1],
+    ['wscript //nologo', 1],
+    ['setupcomplete exit', 1],
+    // S4: exit passthrough, not a hardcoded success.
+    ['exit /b %CUA_EXIT%', 1]
+  ],
+  oemLauncher: [
+    // S4: hidden window style (0) + wait (True) + exit passthrough.
+    ['CreateObject("WScript.Shell")', 1],
+    ['0, _', 1],
+    ['True)', 1],
+    ['WScript.Quit exitCode', 1],
+    ['C:\\Windows\\Setup\\Scripts\\cua-firstboot.ps1', 1]
   ],
   oemBoot: [
     ['OpenSSH.Server', 2],
@@ -710,6 +743,10 @@ const NEEDLES = {
     // the KVM probe ships in BOTH trees (runtime + flat gate tree)
     ['docker/cua-vm-kvm.mjs', 2],
     ['docker/windows-oem/', 1],
+    // S1: mtools is a RUNTIME dependency (mformat/mcopy/mdir/mtype), not a build
+    // convenience. Without it every Windows create fails at buildSetupImage.
+    ['mtools', 2],
+    ['docker/windows-oem/Unattend.vbs', 1],
     // K2: THE DESTINATION, not just the source. `docker/windows-oem/` alone is
     // satisfied by a COPY anywhere, including the flat gate tree at
     // /opt/seek-harness/cua-check/ — which is exactly the drift that lets an
@@ -1023,14 +1060,21 @@ function sourceOf(label, name) {
     failures += 1
     missing.push('docker/cua-vm-windows-qemu.mjs: file not found (K1 xhci ordering cannot be checked)')
   } else {
-    const controller = windowsSource.indexOf("'-device', 'qemu-xhci,id=xhci'")
-    const usbStorage = windowsSource.indexOf('usb-storage,drive=oem0,bus=xhci.0')
-    if (controller !== -1 && usbStorage !== -1 && controller < usbStorage) {
-      if (!quietMode) console.log('  ok   K1 the USB controller precedes the device that names bus xhci.0')
+    // S1/S2: DISK ORDER IS THE CONTRACT. The system qcow2 is attached on ide.0
+    // and setup.img on ide.2 AFTER it, so Windows Setup sees the qcow2 as Disk 0
+    // — the disk Autounattend.xml's <DiskID>0</DiskID> targets. This is an ORDER
+    // assertion, not a presence one: reordering the argv silently partitions the
+    // read-only answer medium instead.
+    const diskAttach = windowsSource.indexOf('ide-hd,drive=disk0,bus=ide.0')
+    const setupAttach = windowsSource.indexOf('ide-hd,drive=setup0,bus=ide.2')
+    const noUsbStick = !/usb-storage,drive=oem0/u.test(windowsSource) && !/file=fat:ro:/u.test(windowsSource)
+    const setupAfterDisk = diskAttach !== -1 && setupAttach !== -1 && diskAttach < setupAttach
+    if (setupAfterDisk && noUsbStick) {
+      if (!quietMode) console.log('  ok   K1 the answer disk (ide.2) is attached after the system disk (ide.0) and the vvfat OEM stick is gone')
     } else {
       failures += 1
-      missing.push('docker/cua-vm-windows-qemu.mjs: the xhci controller must come BEFORE usb-storage,bus=xhci.0 (QEMU parses argv in order: "Bus \'xhci.0\' not found")')
-      console.log('  FAIL K1 xhci ordering')
+      missing.push('docker/cua-vm-windows-qemu.mjs: setup.img must attach on ide.2 AFTER disk0 on ide.0 (so the qcow2 is Windows Disk 0 / DiskID 0), and no usb-storage/file=fat:ro: OEM stick may remain (the stick Setup could not see)')
+      console.log('  FAIL K1 answer-disk order / no vvfat stick')
     }
   }
   // K2: THE OEM PATH AGREEMENT. The supervisor resolves the payload from one

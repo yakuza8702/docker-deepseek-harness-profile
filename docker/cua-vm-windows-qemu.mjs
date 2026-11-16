@@ -39,7 +39,7 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process'
-import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
+import { closeSync, createWriteStream, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
 import path from 'node:path'
@@ -642,6 +642,12 @@ export function windowsPaths(store, name) {
     tpmSocket: path.join(dir, 'swtpm.sock'),
     tpmPid: path.join(dir, 'swtpm.pid'),
     oemDir: path.join(dir, 'oem'),
+    // THE ANSWER-FILE MEDIUM. A FAT32 image, not the host directory: Windows
+    // Setup's WinPE enumerates DISKS for an answer file, and a directory-backed
+    // vvfat stick behind usb-storage was not reliably visible (the user had to
+    // click through Setup by hand). dockur builds the same thing with mtools and
+    // attaches it as a hard disk — see buildSetupImage().
+    setupImg: path.join(dir, 'setup.img'),
     credentials: path.join(dir, 'credentials.json'),
     sshKey: path.join(dir, 'id_ed25519'),
     sshKeyPub: path.join(dir, 'id_ed25519.pub'),
@@ -749,10 +755,12 @@ export function windowsRowName(spec, fallback = '') {
  *     measured state survive a restart (a fresh vars file re-runs Setup).
  *   * `swtpm` is a separate process listening on a unix socket; QEMU's chardev
  *     connects to it. Both are cleaned up by `stopSwtpm`.
- *   * The install medium and the OEM payload are CD-ROM / USB removable media,
- *     because that is where Setup looks for `Autounattend.xml`. The OEM payload
- *     is a `vvfat` directory (no ISO authoring tool needed — the host may have
- *     none) exposed as a USB stick.
+ *   * The install medium is the untouched Microsoft ISO on a CD-ROM. The
+ *     answer file and its scripts live on a SEPARATE FAT32 HARD DISK
+ *     (`setup.img`, built with mtools), attached after the system disk. This
+ *     mirrors dockur/windows: WinPE reliably finds `Autounattend.xml` on a
+ *     disk at the root of a real filesystem, while the old `fat:ro:` vvfat
+ *     directory behind usb-storage was evidently not seen by Setup at all.
  *   * `bootindex` ORDERS THE BOOT, and the order follows the INTENT of each
  *     phase instead of the order the devices happen to be declared in:
  *
@@ -805,37 +813,43 @@ export function buildQemuArgs(spec) {
     // OVMF create a Boot0002 HDD entry, try it, print "HDD Not Found" and only
     // then reach the DVD — one wasted boot cycle per install, and the reason the
     // CD's "Press any key to boot from CD or DVD" window was ever entered late.
+    // S1: THE ANSWER-FILE DISK, AFTER THE SYSTEM DISK. `ide.0` is the qcow2 and
+    // therefore Windows DISK 0 — which is what Autounattend.xml's
+    // <DiskID>0</DiskID> targets. On QEMU's q35 (ICH9 AHCI, six IDE/SATA ports,
+    // verified with `-device ide-hd,bus=ide.N` for N=0..5) the numbering is:
+    //
+    //   ide.0  system qcow2      -> Windows Disk 0  (EFI/MSR/Primary)
+    //   ide.1  install CD-ROM    -> not a disk, but the boot device during install
+    //   ide.2  setup.img         -> Windows Disk 1  (read-only answer medium)
+    //   ide.3  virtio-win CD-ROM -> not a disk (when a driver ISO is supplied)
+    //
+    // The setup disk MUST be declared here, immediately after the system disk,
+    // and stay read-only: Setup reads it, never writes it. ide.2 used to hold the
+    // optional driver CD; that moved to ide.3 so the answer disk keeps the
+    // first free slot after the system disk.
+    ...(boot
+      ? ['-drive', `file=${p.setupImg},format=raw,if=none,id=setup0,readonly=on`,
+        '-device', 'ide-hd,drive=setup0,bus=ide.2']
+      : []),
     ...(boot
       ? ['-drive', `file=${spec.isoPath},media=cdrom,readonly=on,if=none,id=cd0`,
         '-device', 'ide-cd,drive=cd0,bus=ide.1,bootindex=1']
       : []),
     ...(spec.driverIso !== null
       ? ['-drive', `file=${spec.driverIso},media=cdrom,readonly=on,if=none,id=cd1`,
-        '-device', 'ide-cd,drive=cd1,bus=ide.2']
+        '-device', 'ide-cd,drive=cd1,bus=ide.3']
       : []),
     // THE USB CONTROLLER COMES FIRST. QEMU parses argv in order, so a device
     // that names `bus=xhci.0` before `-device qemu-xhci,id=xhci` dies with
     // "Bus 'xhci.0' not found" (verified on QEMU 10). Order is asserted by a
     // gate needle, because it is invisible in a diff.
     '-device', 'qemu-xhci,id=xhci',
-    // the OEM payload: a READ-ONLY vvfat directory presented as a USB stick
-    // (nothing in the guest writes to it; `rw` only gives Setup a chance to
-    // corrupt the staging directory until the host copy breaks)
-    //
-    // `read-only=on` IS NOT DECORATION. usb-storage attaches a SCSI disk whose
-    // node must be WRITABLE; a `fat:ro:` vvfat is a read-only BlockBackend, so
-    // the pair above failed on QEMU 10.0.13 with
-    //   qemu-system-x86_64: -device usb-storage,drive=oem0,bus=xhci.0:
-    //   Block node is read-only
-    // at ~118 ms into a real Windows create (pidfile never written, serial.log
-    // empty). `read-only=on` marks the medium read-only instead of the node, and
-    // the device then advertises a write-protected USB stick — which is what an
-    // unattended install medium is. `fat:rw:` is NOT the alternative here: this
-    // image's rootfs is read-only, and vvfat in rw mode wants a temp dir under
-    // /var/tmp (EROFS). Verified bootable on QEMU 10.0.13 with the exact argv
-    // below (see REPORT.md §9.6.11).
-    '-drive', `file=fat:ro:${p.oemDir},format=raw,read-only=on,if=none,id=oem0`,
-    '-device', 'usb-storage,drive=oem0,bus=xhci.0',
+    // S1: THERE IS NO USB OEM STICK ANY MORE. The only removable-medium path
+    // that remained was the `fat:ro:` vvfat directory behind usb-storage, and
+    // Windows Setup did not see it reliably — which is why the user had to
+    // interact with Setup. The answer file now rides on setup0 (a real FAT32
+    // hard-disk image, attached above). The xHCI controller stays because the
+    // absolute pointer and keyboard are USB devices.
     // networking: SLIRP + the SSH forward
     '-netdev', `user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22`,
     '-device', spec.virtio ? 'virtio-net-pci,netdev=net0' : 'e1000e,netdev=net0',
@@ -1012,28 +1026,200 @@ export async function ensureIso({ url, isoDir, timeoutMs = 60 * 60 * 1000, onPro
  * both the error text and the image gate talk about the same list: a fourth
  * file added here without its COPY is exactly the drift this constant prevents.
  */
-export const OEM_PAYLOAD_FILES = Object.freeze(['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1'])
+export const OEM_PAYLOAD_FILES = Object.freeze(['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs'])
+
+/**
+ * S1: THE ANSWER-FILE MEDIUM'S ROOT ENTRIES.
+ *
+ * This is the list copied into `setup.img`'s ROOT — the same layout dockur uses:
+ *
+ *   Autounattend.xml                     what WinPE reads
+ *   startup.nsh                          the EFI Shell fallback (see R5)
+ *   $OEM$/$$/Setup/Scripts/*.cmd|ps1|vbs  copied by Setup into C:\Windows\Setup\Scripts
+ *
+ * `setupcomplete.cmd` and `cua-firstboot.ps1` are ALSO at the root: Setup finds
+ * the `$OEM$` copies, and the root copies are what a human can inspect from the
+ * medium. `Unattend.vbs` is the hidden launcher (see docker/windows-oem/).
+ */
+export const SETUP_IMAGE_ENTRIES = Object.freeze([
+  'Autounattend.xml',
+  'setupcomplete.cmd',
+  'cua-firstboot.ps1',
+  'Unattend.vbs',
+  'startup.nsh'
+])
+
+/** The FAT32 volume label Setup presents as the answer medium. */
+export const SETUP_IMAGE_LABEL = 'SETUP'
+
+/**
+ * FAT32's minimum useful size (the format needs >= 65525 clusters of 512 B),
+ * rounded up to 64 MiB: sparse on the host, trivial for the guest, and large
+ * enough that mtools never has to guess about cluster geometry.
+ */
+export const SETUP_IMAGE_BYTES = 64 * 1024 * 1024
+
+/** The mtools commands, named once so a gate and the error text agree. */
+export const MTOOLS = Object.freeze({ format: 'mformat', copy: 'mcopy', dir: 'mdir', type: 'mtype' })
+
+/**
+ * S3: PRODUCT KEYS ARE OPTIONAL, AND VALIDATED BEFORE THEY REACH XML.
+ *
+ * The pinned media are EVALUATION images (11ltsc, 2025): they need no key, and
+ * an evaluation image ignores a <ProductKey> it is handed. A future operator
+ * ISO (a volume/licensed Windows) can pass `windowsKey`, which is written into
+ * the staged Autounattend.xml with `<WillShowUI>Never</WillShowUI>` so Setup
+ * never stops to ask. Accepts the canonical 25-character form with or without
+ * dashes; anything else is refused with the accepted shape in the message.
+ */
+export function normaliseProductKey(value) {
+  const text = String(value ?? '').trim().toUpperCase().replace(/\s+/gu, '')
+  if (text === '') return ''
+  const compact = text.replace(/-/gu, '')
+  if (!/^[A-Z0-9]{25}$/u.test(compact)) {
+    throw new Error(`windowsKey "${value}" is not a Windows product key: expected 25 letters/digits, with or without dashes (XXXXX-XXXXX-XXXXX-XXXXX-XXXXX). Leave it empty for the pinned EVALUATION media, which need no key.`)
+  }
+  return compact.match(/.{5}/gu).join('-')
+}
+
+/** Every `<DiskID>` an answer file names, in document order. */
+export function answerFileDiskIds(xml) {
+  return [...String(xml).matchAll(/<DiskID>\s*(\d+)\s*<\/DiskID>/gu)].map((match) => Number(match[1]))
+}
+
+/**
+ * S2: THE ANSWER FILE MUST TARGET THE SYSTEM DISK, AND THE SYSTEM DISK MUST BE
+ * THE QCOW2.
+ *
+ * The QEMU argv puts the qcow2 on `ide.0` (first) and setup.img on `ide.2`
+ * (after it), so Windows sees the qcow2 as Disk 0. If a future argv change
+ * reorders those, Setup would happily partition the READ-ONLY answer medium and
+ * fail in a way that looks like a corrupt ISO. This is the check that makes the
+ * ordering a contract instead of a comment.
+ */
+export function assertAnswerFileTargetsSystemDisk(xml, { expected = 0 } = {}) {
+  const ids = answerFileDiskIds(xml)
+  if (ids.length === 0) throw new Error('Autounattend.xml has no <DiskID> — Setup would ask which disk to use')
+  const wrong = ids.filter((id) => id !== expected)
+  if (wrong.length > 0) {
+    throw new Error(`Autounattend.xml targets DiskID ${wrong.join(', ')} but the system qcow2 is Disk ${expected} (QEMU: disk0 on ide.0, setup.img on ide.2). Fix the disk order in buildQemuArgs() or the XML together — never one alone.`)
+  }
+  if (!/<InstallTo>\s*<DiskID>\s*0\s*<\/DiskID>/u.test(String(xml))) {
+    throw new Error('Autounattend.xml has no <InstallTo><DiskID>0</DiskID> — Setup would not know where to install Windows')
+  }
+  return ids
+}
+
+/**
+ * S1: BUILD `$STORE/windows/<name>/setup.img` — a FAT32 hard-disk image whose
+ * ROOT holds the answer file and whose `$OEM$` tree holds the Setup scripts.
+ *
+ * WHY A DISK IMAGE AND NOT A vvfat DIRECTORY: this is exactly dockur/windows'
+ * mechanism. WinPE reliably enumerates hard disks for `Autounattend.xml`; a
+ * directory-backed vvfat stick behind usb-storage was not visible to Setup in
+ * practice, so the user had to answer the interactive installer.
+ *
+ * The build is deterministic and verified in the same call:
+ *   1. truncate a 64 MiB raw image (sparse);
+ *   2. `mformat -F -v SETUP` (FAT32);
+ *   3. `mcopy -s` the root files and `$OEM$` tree;
+ *   4. `mdir` must list Autounattend.xml at the root, and `mtype` must return
+ *      bytes IDENTICAL to the staged file (dockur's own verification shape).
+ *
+ * mtools is a runtime dependency in the image (see the Dockerfile); a host
+ * without it gets an error naming the package, not a QEMU that cannot boot.
+ */
+export function buildSetupImage({ paths: p, log = () => {}, expectedDiskId = 0 } = {}) {
+  if (!p || typeof p.setupImg !== 'string' || typeof p.oemDir !== 'string') {
+    throw new Error('buildSetupImage needs paths.setupImg and paths.oemDir')
+  }
+  const staged = SETUP_IMAGE_ENTRIES.map((name) => path.join(p.oemDir, name))
+  const missing = SETUP_IMAGE_ENTRIES.filter((name, index) => !existsSync(staged[index]))
+  if (missing.length > 0) {
+    throw new Error(`the staged OEM payload is incomplete (missing ${missing.join(', ')} in ${p.oemDir}); writeOemPayload() must run first`)
+  }
+  // S2: the answer file's disk target, checked BEFORE the image is built.
+  assertAnswerFileTargetsSystemDisk(readFileSync(path.join(p.oemDir, 'Autounattend.xml'), 'utf8'), { expected: expectedDiskId })
+  const oemTree = path.join(p.oemDir, '$OEM$')
+  if (!existsSync(path.join(oemTree, '$$', 'Setup', 'Scripts', 'setupcomplete.cmd'))) {
+    throw new Error(`the staged $OEM$/$$/Setup/Scripts tree is missing under ${p.oemDir}; Setup would never run SetupComplete.cmd`)
+  }
+  try {
+    execFileSync(MTOOLS.format, ['--version'], { stdio: 'ignore', timeout: 10000 })
+  } catch {
+    throw new Error(`mtools is not installed (${MTOOLS.format} not found on PATH). The Windows answer-file disk needs mtools: install the "mtools" package in the image.`)
+  }
+  mkdirSync(path.dirname(p.setupImg), { recursive: true })
+  try { unlinkSync(p.setupImg) } catch {}
+  const fd = openSync(p.setupImg, 'w')
+  try { ftruncateSync(fd, SETUP_IMAGE_BYTES) } finally { closeSync(fd) }
+  const run = (command, args) => execFileSync(command, args, { stdio: 'pipe', timeout: 120000 })
+  run(MTOOLS.format, ['-i', p.setupImg, '-F', '-v', SETUP_IMAGE_LABEL, '::'])
+  // `-s` recurses into $OEM$; the explicit root list keeps startup.nsh and the
+  // scripts visible at the medium's root where a human (and the EFI Shell for
+  // startup.nsh) expects them.
+  run(MTOOLS.copy, ['-i', p.setupImg, '-s', ...staged, oemTree, '::'])
+  const verified = verifySetupImage({ paths: p })
+  log(`windows: setup.img built (${(SETUP_IMAGE_BYTES / 1024 ** 2).toFixed(0)} MB FAT32, ${verified.entries.length} root entries, Autounattend.xml byte-verified)`)
+  return p.setupImg
+}
+
+/**
+ * S2: READ THE IMAGE BACK. This is the assertion that would have caught the
+ * invisible-media bug: `mdir` must list `Autounattend.xml` at the root, the
+ * `$OEM$` script path must exist, and `mtype` must return the SAME BYTES that
+ * were staged (a FAT write that silently truncates is a Setup that asks
+ * questions).
+ */
+export function verifySetupImage({ paths: p } = {}) {
+  const readDir = (spec) => {
+    const listing = execFileSync(MTOOLS.dir, ['-i', p.setupImg, '-b', spec], { encoding: 'utf8', timeout: 30000 })
+    return listing
+      .split(/\r?\n/u)
+      .map((line) => line.trim().replace(/^::[\\/]?/u, '').replace(/\\/gu, '/'))
+      .filter(Boolean)
+      // mdir prints a nested listing with the whole path; callers compare names.
+      .map((entry) => entry.split('/').filter(Boolean).pop())
+  }
+  const root = readDir('::/')
+  for (const required of SETUP_IMAGE_ENTRIES) {
+    if (!root.includes(required)) {
+      throw new Error(`setup.img does not list ${required} at its root (mdir said: ${root.slice(0, 12).join(', ') || 'nothing'}). Setup will not find the answer file.`)
+    }
+  }
+  // The `$OEM$` tree is a DIRECTORY entry at the root; its contents need their
+  // own listing. Setup copies these into C:\Windows\Setup\Scripts, and
+  // SetupComplete.cmd is what makes the provisioning run at all.
+  const oemScripts = readDir('::/$OEM$/$$/Setup/Scripts')
+  for (const script of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs']) {
+    if (!oemScripts.includes(script)) {
+      throw new Error(`setup.img's $OEM$/$$/Setup/Scripts is missing ${script} (listed: ${oemScripts.join(', ') || 'nothing'}) — Setup would never stage it into C:\\Windows\\Setup\\Scripts`)
+    }
+  }
+  // BYTE COMPARE, exactly like dockur: the host copy and the image copy must be
+  // indistinguishable. mtype emits the raw file.
+  for (const name of ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs']) {
+    const staged = readFileSync(path.join(p.oemDir, name))
+    const fromImage = execFileSync(MTOOLS.type, ['-i', p.setupImg, `::/${name}`], { timeout: 30000 })
+    if (!staged.equals(fromImage)) {
+      throw new Error(`setup.img's ${name} differs from the staged copy (${fromImage.length} vs ${staged.length} bytes) — the answer medium is corrupt`)
+    }
+  }
+  const startup = execFileSync(MTOOLS.type, ['-i', p.setupImg, '::/startup.nsh'], { timeout: 30000 })
+  if (!startup.equals(readFileSync(path.join(p.oemDir, 'startup.nsh')))) {
+    throw new Error('setup.img\'s startup.nsh differs from the staged copy — the EFI Shell fallback would not run')
+  }
+  return { entries: root, oemScripts, image: p.setupImg }
+}
 
 /**
  * R5 (BELT AND BRACES): THE EFI SHELL'S `startup.nsh`.
  *
- * R1 presses a key through QMP to get past cdboot's "Press any key to boot from
- * CD or DVD". If that keystroke misses — a slow firmware, a stalled QMP socket,
- * a host that disabled the schedule — OVMF's BDS falls through to the EFI
- * Internal Shell, which is a dead end for an unattended install.
- *
- * The firmware Shell DOES run a script named `startup.nsh` from the filesystem
- * it lands on, and it maps the CD as one of FS0/FS1/… — so this script tries
- * every mapped filesystem's `\efi\boot\bootx64.efi` in turn and chains to the
- * first that exists, which resumes Setup instead of stopping at a prompt.
- *
- * It rides on the OEM vvfat stick because that directory is the one medium we
- * author ourselves; the script is shipped in the stick's ROOT, which is exactly
- * where the Shell looks.
- *
- * This is genuinely BELT AND BRACES, not the mechanism: the key press (R1) is
- * what gets an install onto the CD, and the firmware only reaches this script
- * if the install was already falling through to the Shell.
+ * If R1's QMP key press misses, OVMF's BDS falls into the EFI Internal Shell.
+ * The firmware Shell runs `startup.nsh` from the filesystem it lands on, so this
+ * script tries `\efi\boot\bootx64.efi` on every mapped FS0..FS5 and chain-loads
+ * the install media instead of stopping at a prompt. It is shipped at the ROOT
+ * of setup.img (the medium we author ourselves), which is where the Shell looks.
  */
 export function startupNshText() {
   // The EFI Shell dialect: `%f` iterates the word list, `if exist` tests the
@@ -1062,7 +1248,7 @@ const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url))
  * A directory that holds ALL of `OEM_PAYLOAD_FILES`, or null.
  *
  * A directory is enough — the flat image check tree (`/opt/seek-harness/
- * cua-check/`) keeps the same three files at its root, so the same predicate
+ * cua-check/`) keeps the same files at its root, so the same predicate
  * answers "is this a payload directory?" for both layouts.
  *
  * EACCES IS NOT "MISSING". `existsSync` answers false for BOTH, which is how a
@@ -1227,7 +1413,7 @@ export function oemPayloadMissingError({ sourceDir, fallbackDirs }) {
     '     (`seek-harness` is the service name in compose.yaml / compose.windows.yaml):',
     `     docker compose exec seek-harness ls -l /usr/local/share/cua-vm/windows-oem/${OEM_PAYLOAD_FILES.join(' ')}`,
     '',
-    'If step 3 lists all three files and this error persists, DSH_CUA_WINDOWS_OEM_DIR points',
+    'If step 3 lists all the files and this error persists, DSH_CUA_WINDOWS_OEM_DIR points',
     `somewhere else — unset it (it currently overrides the image default with ${sourceDir}).`
   ].join('\n'))
 }
@@ -1244,21 +1430,29 @@ export function oemPayloadMissingError({ sourceDir, fallbackDirs }) {
  *   {{SSH_PUBKEY}}    the supervisor's public key (authorized_keys)
  *   {{PYTHON_URL}}    the pinned python.org installer
  *   {{DSH_CUA_PIP}}   the dsh-cua package spec
+ *   {{PRODUCT_KEY}}   empty for evaluation media, or a <ProductKey> block when
+ *                     the operator passed a licensed-ISO windowsKey
  *
  * SELF-HEALING: `sourceDir` is the image path the supervisor resolves; the
- * `fallbackDirs` are the other places the SAME three files are known to exist
+ * `fallbackDirs` are the other places the SAME files are known to exist
  * (the image's flat check tree, the module's own directory, a checkout). A file
  * or two missing from `sourceDir` therefore costs a log line, not a failed
  * computer create — as long as ONE candidate directory is complete.
  */
-export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir, fallbackDirs = [], pythonUrl, dshCuaSpec, log = () => {} }) {
+export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir, fallbackDirs = [], pythonUrl, dshCuaSpec, windowsKey = '', log = () => {} }) {
   mkdirSync(p.oemDir, { recursive: true })
+  const productKey = normaliseProductKey(windowsKey)
   const substitutions = {
     '{{COMPUTERNAME}}': `cua-${name}`.slice(0, 15).toUpperCase(),
     '{{PASSWORD}}': password,
     '{{SSH_PUBKEY}}': sshPubKey.trim(),
     '{{PYTHON_URL}}': pythonUrl,
-    '{{DSH_CUA_PIP}}': dshCuaSpec
+    '{{DSH_CUA_PIP}}': dshCuaSpec,
+    // S3: EVALUATION MEDIA IGNORE THIS; a licensed operator ISO uses it and
+    // Setup never shows a product-key page (WillShowUI Never).
+    '{{PRODUCT_KEY}}': productKey === ''
+      ? ''
+      : `<ProductKey><Key>${productKey}</Key><WillShowUI>Never</WillShowUI></ProductKey>`
   }
   const files = OEM_PAYLOAD_FILES
   const candidates = [sourceDir, ...fallbackDirs, path.join(MODULE_DIR, 'windows-oem'), path.resolve(MODULE_DIR, '..', 'docker', 'windows-oem')]
@@ -1287,11 +1481,15 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
   // and the scripts arrive under $OEM$ so Setup copies them into the image.
   const setupDir = path.join(p.oemDir, '$OEM$', '$$', 'Setup', 'Scripts')
   mkdirSync(setupDir, { recursive: true })
-  for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1']) {
+  // S4: the SAME scripts Setup copies into C:\Windows\Setup\Scripts.
+  // SetupComplete.cmd is the SYSTEM pass and Unattend.vbs is the hidden
+  // first-logon launcher; both invoke cua-firstboot.ps1 idempotently.
+  for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs']) {
     copyFileSync(path.join(p.oemDir, file), path.join(setupDir, file))
   }
-  // R5: the EFI Shell fallback script goes in the stick's ROOT (that is where
-  // firmware Shell looks for `startup.nsh`), not under $OEM$.
+  // R5: the EFI Shell fallback script goes in the medium's ROOT (that is where
+  // firmware Shell looks for `startup.nsh`), not under $OEM$. buildSetupImage()
+  // copies it into setup.img's root beside Autounattend.xml.
   writeFileSync(path.join(p.oemDir, 'startup.nsh'), startupNshText())
   log(`windows: ${name} OEM payload written (${files.length} files + $OEM$ scripts + startup.nsh fallback)`)
   return p.oemDir

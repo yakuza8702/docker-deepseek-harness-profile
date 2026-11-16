@@ -59,6 +59,7 @@ import {
   WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
   WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
+  buildSetupImage, normaliseProductKey,
   windowsKvmPreflight, windowsPortsOf, windowsTailLines, formatWindowsInstallDetail, windowsReadinessSignals,
   // R3-adjacent: `qmpStateLabel` / `endpointLabel` are used by the windowsStatus
   // sentences. They were never imported, so every status call that REACHED those
@@ -2242,6 +2243,8 @@ const SPEC_DEFAULTS = {
   rea: false,
   windowsVersion: '11',
   windowsIso: '',
+  // S3: optional product key for a licensed (non-evaluation) operator ISO.
+  windowsKey: '',
   waitDesktop: false,
   workspace: WORKSPACE_ROOT
 }
@@ -2288,6 +2291,8 @@ function normaliseSpec(input = {}) {
     rea: flags.rea,
     windowsVersion: String(raw.windowsVersion || SPEC_DEFAULTS.windowsVersion),
     windowsIso: String(raw.windowsIso || ''),
+    // S3: only non-evaluation media need it; validated in windowsCreateManaged.
+    windowsKey: String(raw.windowsKey || '').trim(),
     waitDesktop: raw.waitDesktop === true,
     workspace: String(raw.workspace || WORKSPACE_ROOT)
   }
@@ -3233,6 +3238,9 @@ async function windowsCreateManaged(spec) {
   if (windowsEnabled() === false) throw new Error('the Windows backend is disabled (DSH_CUA_VM_WINDOWS=0)')
   // `ltsc11` is an accepted spelling of the Windows 11 IoT LTSC version.
   spec.windowsVersion = canonicalWindowsVersion(spec.windowsVersion)
+  // S3: refuse a malformed key BEFORE the 5 GB download and before setup.img is
+  // built. Empty is valid: every pinned ISO is an EVALUATION image.
+  spec.windowsKey = normaliseProductKey(spec.windowsKey)
   if (spec.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer (create the Windows computer without it, or use a Linux computer)')
   if (spec.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest')
   const caps = windowsHostCaps()
@@ -3369,8 +3377,13 @@ async function windowsCreateManaged(spec) {
       fallbackDirs: WINDOWS_OEM_FALLBACK_DIRS,
       pythonUrl: WINDOWS_PYTHON_URL,
       dshCuaSpec: WINDOWS_DSH_CUA_SPEC,
+      windowsKey: spec.windowsKey,
       log
     })
+    // S1: build the FAT32 answer-file disk and PROVE it (mdir listing + byte
+    // compare) before QEMU is started. This is the step the old vvfat stick did
+    // not have: a medium whose root is known to hold Autounattend.xml.
+    buildSetupImage({ paths, log })
 
     const qemuSpec = {
       name: spec.name,

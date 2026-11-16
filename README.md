@@ -880,11 +880,32 @@ fixed, the computer never became ready. `windowsQmpAdapter` joins the two, and
 `tools/check-cua-vm.mjs` + `tests/modules-unit.mjs` prove it with a faithful stub
 (the test first reproduces the throw, then shows the adapter fixing it).
 
-**Belt and braces (5):** the OEM stick's root now also gets a `startup.nsh` that
-tries `\efi\boot\bootx64.efi` on every mapped filesystem (`FS0`..`FS5`). If a key
-press is ever missed, the EFI Shell chain-loads the install media instead of
+**Belt and braces (6):** the answer medium's root now also gets a `startup.nsh`
+that tries `\efi\boot\bootx64.efi` on every mapped filesystem (`FS0`..`FS5`). If a
+key press is ever missed, the EFI Shell chain-loads the install media instead of
 stopping at a prompt. It is a fallback, not the mechanism — the key press is what
 gets an install onto the CD.
+
+**The answer file rides on a real disk (dockur/windows layout).** Setup no longer
+sees a `vvfat` USB stick: a FAT32 hard-disk image `$STORE/windows/<name>/setup.img`
+is built with `mtools` (`mformat -F` + `mcopy -s`) and attached READ-ONLY after
+the system disk. Its ordering is the contract:
+
+| QEMU bus | Device | Windows sees |
+|---|---|---|
+| `ide.0` | `disk.qcow2` | **Disk 0** — what `Autounattend.xml`'s `<DiskID>0</DiskID>` targets |
+| `ide.1` | install CD-ROM | boot device during install |
+| `ide.2` | `setup.img` (FAT32, ro) | Disk 1 — the answer medium |
+| `ide.3` | virtio-win CD-ROM (optional) | not a disk |
+
+`buildSetupImage()` immediately reads the image back (`mdir` must list
+`Autounattend.xml` at the root; `mtype` must return bytes identical to the staged
+file) before QEMU starts. The root also holds `startup.nsh`, and
+`$OEM$/$$/Setup/Scripts/` carries `setupcomplete.cmd`, `cua-firstboot.ps1` and
+`Unattend.vbs` (the hidden launcher both Setup passes use, with exit passthrough).
+A licensed operator ISO may pass `windowsKey`; it becomes a `<ProductKey>` block
+with `<WillShowUI>Never</WillShowUI>`. The pinned media are EVALUATION images and
+need no key (they ignore it).
 
 ### What the panel shows, and how you know a Windows install finished
 
@@ -938,23 +959,24 @@ container/QEMU, swtpm, websockify, disks, ports and registry row are all removed
 
 ### `the OEM payload is missing from this image` when creating a Windows computer
 
-The unattended install is three data files that ship **inside the image** at
-`/usr/local/share/cua-vm/windows-oem/`: `Autounattend.xml`, `setupcomplete.cmd`
-and `cua-firstboot.ps1`. The create path copies them into
-`/cua-vm/windows/<name>/oem/` (a read-only vvfat USB stick) before QEMU starts,
-so a missing file stops the computer before the first boot — it is an **image**
-problem, not a setting:
+The unattended install is four data files that ship **inside the image** at
+`/usr/local/share/cua-vm/windows-oem/`: `Autounattend.xml`, `setupcomplete.cmd`,
+`cua-firstboot.ps1` and `Unattend.vbs`. The create path stages them into
+`/cua-vm/windows/<name>/oem/`, builds them into a FAT32 `setup.img` (mtools) and
+attaches that image as a read-only hard disk before QEMU starts, so a missing file
+stops the computer before the first boot — it is an **image** problem, not a
+setting:
 
 * your image was built **before the Windows backend existed** (a `main`-branch
   build: `main` has no Windows code at all), or
 * the image's `COPY` and the supervisor's `DSH_CUA_WINDOWS_OEM_DIR` disagree.
 
-The stick itself is a **read-only** medium, and that is deliberate twice over:
-nothing in the guest writes to it, and the image's rootfs is read-only, so vvfat
-in `rw` mode is not an option (it wants a temp dir under `/var/tmp`, which is
-`EROFS`). The argv therefore carries `read-only=on` on the `-drive` — QEMU's
-`usb-storage` needs a writable **node**, and without that token it refuses the
-read-only vvfat node with `Block node is read-only` during init.
+The medium itself is **read-only**, and that is deliberate: nothing in the guest
+writes it. The image is a plain FAT32 hard disk, so QEMU does not need a writable
+block node (the old `usb-storage`/vvfat pairing did, which is why it was fragile
+and, in practice, invisible to Setup). The image needs **mtools in the image**;
+without it a create refuses with a message naming the package, not a QEMU that
+cannot boot.
 
 Pull or build a newer image from this branch with the virgl QEMU, then recreate
 the container **keeping the `/cua-vm` volume** (the store and every existing

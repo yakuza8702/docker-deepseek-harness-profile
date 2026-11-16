@@ -59,7 +59,8 @@ recorded in `$STORE/registry.json` (schema v2) — never in the workspace.
 
 `registry.json` is `{ "version": 2, "vms": { … } }`. Every row carries `kind`
 (`linux` | `windows`) and `backend`; a Windows row also carries
-`windowsVersion` / `windowsIso`.
+`windowsVersion` / `windowsIso` / `windowsKey` (optional; evaluation ISOs need
+none).
 
 A v1 file (`{ "name": { … } }`, no version) is **migrated on read**: rows are
 upgraded, a row that already said `backend: "windows"` keeps its kind, the result
@@ -190,7 +191,8 @@ $STORE/iso/                              downloaded install media (one per versi
 $STORE/windows/<name>/disk.qcow2          the system disk (plain qcow2 → checkpointable)
 $STORE/windows/<name>/efi-vars.qcow2      OVMF NVRAM, per computer
 $STORE/windows/<name>/tpm/                swtpm TPM2 state, per computer
-$STORE/windows/<name>/oem/                Autounattend.xml + $OEM$ scripts (a vvfat USB stick)
+$STORE/windows/<name>/oem/                Autounattend.xml + $OEM$ scripts (staging)
+$STORE/windows/<name>/setup.img          FAT32 answer disk (mtools; attached ro on ide.2)
 $STORE/windows/<name>/credentials.json    generated password + key path, mode 0600
 $STORE/windows/<name>/id_ed25519          the SSH key the supervisor uses
 $STORE/windows/<name>/serial.log          the console — the install progress

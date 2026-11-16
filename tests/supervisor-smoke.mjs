@@ -7,7 +7,7 @@
  */
 import { spawn } from 'node:child_process'
 import net from 'node:net'
-import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, statSync, readdirSync, chmodSync, truncateSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync, rmSync, statSync, readdirSync, chmodSync, truncateSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
@@ -163,6 +163,80 @@ writeFileSync(SSH_KEYGEN_STUB, [
 ].join('\n'))
 chmodSync(SSH_KEYGEN_STUB, 0o755)
 const STUB_BIN = path.dirname(QEMU_IMG_STUB)
+
+/**
+ * MTOOLS STUBS — the suite must not require the image's mtools, but the Windows
+ * create path now calls buildSetupImage() and verifySetupImage() on EVERY
+ * create. The fakes model the parts the code depends on:
+ *
+ *   mformat  create the image file and empty its manifest
+ *   mcopy    record each source (recursively for $OEM$) as VIRTUAL<TAB>HOST
+ *   mdir     print `::/VIRTUAL` for every recorded entry
+ *   mtype    cat the HOST file a VIRTUAL path maps to
+ *
+ * so a create exercises the REAL build/verify contract (mdir must list
+ * Autounattend.xml at the root, mtype must return the staged bytes) without a
+ * 64 MiB FAT32 write per case. The real mtools build is covered by
+ * tests/modules-unit.mjs when the host has mtools, and by the image itself.
+ */
+// NOT under STORE: the main suite removes STORE before the F3 case runs, and
+// these stubs must survive for that second supervisor too.
+const MTOOLS_STUB = mkdtempSync(path.join(os.tmpdir(), 'cua-mtools-stub-'))
+const mformat = path.join(MTOOLS_STUB, 'mformat')
+writeFileSync(mformat, `#!/bin/sh
+case "$1" in --version) exit 0 ;; esac
+IMG=""; prev=""
+for a in "$@"; do [ "$prev" = "-i" ] && IMG="$a"; prev="$a"; done
+[ -n "$IMG" ] || exit 1
+: > "$IMG"
+: > "$IMG.manifest"
+exit 0
+`, { mode: 0o755 })
+const mcopy = path.join(MTOOLS_STUB, 'mcopy')
+writeFileSync(mcopy, `#!/bin/sh
+IMG=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-i" ]; then IMG="$a"; fi
+  prev="$a"
+done
+[ -n "$IMG" ] || exit 1
+for src in "$@"; do
+  case "$src" in -*) continue ;; ::*) continue ;; esac
+  [ "$src" = "$IMG" ] && continue
+  [ -e "$src" ] || continue
+  if [ -d "$src" ]; then
+    base="$(basename "$src")"
+    find "$src" -type f | while IFS= read -r f; do
+      rel="\${f#"$src"/}"
+      printf '::/%s/%s\\t%s\\n' "$base" "$rel" "$f" >> "$IMG.manifest"
+    done
+  else
+    printf '::/%s\\t%s\\n' "$(basename "$src")" "$src" >> "$IMG.manifest"
+  fi
+done
+exit 0
+`, { mode: 0o755 })
+const mdir = path.join(MTOOLS_STUB, 'mdir')
+writeFileSync(mdir, `#!/bin/sh
+IMG=""; prev=""
+for a in "$@"; do [ "$prev" = "-i" ] && IMG="$a"; prev="$a"; done
+[ -f "$IMG.manifest" ] || exit 1
+cut -f1 "$IMG.manifest" | sort -u
+exit 0
+`, { mode: 0o755 })
+const mtype = path.join(MTOOLS_STUB, 'mtype')
+writeFileSync(mtype, `#!/bin/sh
+IMG=""; prev=""; VIRT=""
+for a in "$@"; do
+  if [ "$prev" = "-i" ]; then IMG="$a"; fi
+  case "$a" in ::*) VIRT="$a" ;; esac
+  prev="$a"
+done
+[ -f "$IMG.manifest" ] || exit 1
+HOST="$(awk -F '\\t' -v key="$VIRT" '$1 == key { print $2; exit }' "$IMG.manifest")"
+[ -n "$HOST" ] || exit 1
+cat "$HOST"
+`, { mode: 0o755 })
 /**
  * THE WINDOWS QEMU STUB, AND THE THREE STARTS IT CAN SIMULATE.
  *
@@ -234,7 +308,7 @@ const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervi
     // in a checkout it is right there in the repository.
     DSH_CUA_WINDOWS_OEM_DIR: path.join(REPO, 'docker', 'windows-oem'),
     DSH_CUA_WINDOWS_QEMU: path.join(STUB_BIN, 'qemu-system-x86_64'),
-    PATH: `${STUB_BIN}:${process.env.PATH ?? ''}`,
+    PATH: `${MTOOLS_STUB}:${STUB_BIN}:${process.env.PATH ?? ''}`,
     DSH_CUA_VM_WINDOWS: '1',
     // SHORT WINDOWS: the same code runs, without the suite paying 15 s + 5 s per
     // case. The numbers are the production defaults in `qemuBootWindowMs` /
@@ -812,6 +886,16 @@ try {
       /-device ide-cd,drive=cd0,bus=ide\.1,bootindex=1/u.test(installArgv), installArgv.slice(0, 160))
     check('R4: ...and the still-empty disk second (bootindex=2)',
       /ide-hd,drive=disk0,bus=ide\.0,bootindex=2/u.test(installArgv), installArgv.slice(0, 160))
+    // S1: the create built setup.img (through mtools) and the install argv
+    // attaches it AFTER the system disk, so the qcow2 remains Windows Disk 0.
+    check('S1: the create built the answer disk at $STORE/windows/<name>/setup.img',
+      existsSync(path.join(STORE, 'windows', bootName, 'setup.img')))
+    check('S1: the install argv attaches setup.img read-only on ide.2',
+      /-drive file=[^ ]*\/setup\.img,format=raw,if=none,id=setup0,readonly=on/u.test(installArgv)
+      && /ide-hd,drive=setup0,bus=ide\.2/u.test(installArgv), installArgv.slice(0, 200))
+    check('S1: ...after the system disk, and with no usb-storage OEM stick',
+      installArgv.indexOf('id=setup0') > installArgv.indexOf('id=disk0')
+      && !/usb-storage|fat:ro:/u.test(installArgv))
 
     // R1: the cdboot presses were SCHEDULED for the install boot. The stub serves
     // no QMP, so each one fails and is logged — never fatal, never a failed
@@ -1173,7 +1257,7 @@ try {
       DSH_CUA_WINDOWS_OEM_DIR: path.join(REPO, 'docker', 'windows-oem'),
       // The REAL system tools this host has: the point of this block is the
       // DEVICE, so qemu/OVMF/swtpm must not be the first thing to fail.
-      PATH: `${STUB_BIN}:${process.env.PATH ?? ''}`,
+      PATH: `${MTOOLS_STUB}:${STUB_BIN}:${process.env.PATH ?? ''}`,
       PNG_SOURCE
     },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -1267,7 +1351,7 @@ exec sleep 120
         DSH_CUA_WINDOWS_OEM_DIR: path.join(REPO, 'docker', 'windows-oem'),
         DSH_CUA_WINDOWS_QEMU: SLOW_QEMU,
         DSH_CUA_VM_WINDOWS: '1',
-        PATH: `${slowBin}:${STUB_BIN}:${process.env.PATH ?? ''}`,
+        PATH: `${MTOOLS_STUB}:${slowBin}:${STUB_BIN}:${process.env.PATH ?? ''}`,
         PNG_SOURCE
       }
       // UNSET, not merely short: this is the production shape.

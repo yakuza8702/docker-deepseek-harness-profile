@@ -132,6 +132,11 @@ RUN set -eux; \
 # the supervisor points cua's wrapper at this binary when DSH_CUA_VM_GPU=virgl.
 # Off by default: it costs ~200 MB and needs /dev/dri (or the NVIDIA toolkit)
 # on the host to be worth anything.
+# mtools builds the FAT32 answer-file disk (`setup.img`) Windows Setup reads
+# from — the dockur/windows mechanism. It is a RUNTIME dependency, not a build
+# convenience: every Windows create runs mformat/mcopy, and verifySetupImage
+# runs mdir/mtype before QEMU starts. The base image has no ISO authoring tool
+# and does not need one, but it does need mtools.
 # The Windows computer is a DIRECT QEMU here (see docker/cua-vm-windows-qemu.mjs):
 # it needs the firmware, a software TPM and qemu-img, and no container runtime at
 # all. On by default because DSH_CUA_VM_WINDOWS=0 is the switch that removes the
@@ -141,7 +146,8 @@ RUN set -eux; \
     if [ "$WITH_WINDOWS_QEMU" = "1" ]; then \
       apt-get update; \
       apt-get install -y --no-install-recommends \
-        qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools; \
+        qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools \
+        mtools; \
       rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -1005,7 +1011,7 @@ RUN set -eux; \
 # ---------------------------------------------------------------------
 RUN install -d -m 0755 /opt/seek-harness/cua-check
 COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-guest-android.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-kvm.mjs docker/cua-vm-windows-qemu.mjs docker/cua-guest-provision.sh Dockerfile /opt/seek-harness/cua-check/
-COPY --chmod=0644 docker/windows-oem/Autounattend.xml docker/windows-oem/setupcomplete.cmd docker/windows-oem/cua-firstboot.ps1 /opt/seek-harness/cua-check/
+COPY --chmod=0644 docker/windows-oem/Autounattend.xml docker/windows-oem/setupcomplete.cmd docker/windows-oem/cua-firstboot.ps1 docker/windows-oem/Unattend.vbs /opt/seek-harness/cua-check/
 COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js plugins/dsh-cua-vm/win-mcp.js /opt/seek-harness/cua-check/
 COPY --chmod=0644 docker/proxy.mjs compose.yaml compose.windows.yaml .env.example /opt/seek-harness/cua-check/
 # THE PERMISSION PROOF, AS THE RUNTIME USER. This is what the needle list cannot
@@ -1021,7 +1027,7 @@ RUN set -eux; \
       setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -x '$dir' && test -r '$dir'" \
         || { echo "EACCES: $dir is not traversable by uid 1000 (dir mode $(stat -c '%a %U:%G' "$dir"))"; exit 1; }; \
     done; \
-    for f in Autounattend.xml setupcomplete.cmd cua-firstboot.ps1; do \
+    for f in Autounattend.xml setupcomplete.cmd cua-firstboot.ps1 Unattend.vbs; do \
       setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/usr/local/share/cua-vm/windows-oem/$f' && test -s '/usr/local/share/cua-vm/windows-oem/$f'" \
         || { echo "EACCES: /usr/local/share/cua-vm/windows-oem/$f is unreadable by uid 1000"; exit 1; }; \
       setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/opt/seek-harness/cua-check/$f'" \

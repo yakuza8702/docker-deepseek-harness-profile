@@ -224,7 +224,7 @@ window.__ModuleLoader__.load({
       // "off", which is what made a GPU host create llvmpipe computers.
       const [draft, setDraft] = useState({
         name: '', kind: 'linux', cpu: 2, memory: 4, image: 'linux', gpu: null, diskGb: 20,
-        android: false, rea: false, windowsVersion: '11', windowsIso: ''
+        android: false, rea: false, windowsVersion: '11', windowsIso: '', windowsKey: ''
       })
       const [pending, setPending] = useState(null)
       const [exec, setExec] = useState(null)
@@ -368,7 +368,10 @@ window.__ModuleLoader__.load({
                 // form cannot even offer them for a Windows computer.
                 gpu: draft.gpu === null ? undefined : draft.gpu,
                 windowsVersion: draft.windowsVersion,
-                windowsIso: draft.windowsIso.trim() === '' ? undefined : draft.windowsIso.trim()
+                windowsIso: draft.windowsIso.trim() === '' ? undefined : draft.windowsIso.trim(),
+                // S3: optional, for a licensed operator ISO. The pinned media
+                // are EVALUATION images and ignore it.
+                windowsKey: draft.windowsKey.trim() === '' ? undefined : draft.windowsKey.trim()
               }
             : {
                 name: draft.name,
@@ -384,7 +387,7 @@ window.__ModuleLoader__.load({
           setShowNew(false)
           setDraft({
             name: '', kind: 'linux', cpu: 2, memory: 4, image: 'linux', gpu: null, diskGb: 20,
-            android: false, rea: false, windowsVersion: '11', windowsIso: ''
+            android: false, rea: false, windowsVersion: '11', windowsIso: '', windowsKey: ''
           })
           await load()
           setNote(`${draft.name} is up.`)
@@ -597,6 +600,13 @@ window.__ModuleLoader__.load({
               placeholder: 'ISO: http(s) URL, or a path under the VM store (e.g. windows/11.iso) — optional',
               value: draft.windowsIso, style: S.input,
               onChange: (event) => setDraft({ ...draft, windowsIso: event.target.value })
+            }),
+            // S3: the pinned ISOs are EVALUATION media and need no key. This is
+            // for a licensed operator ISO; empty means "no <ProductKey> block".
+            draft.kind === 'windows' && h('input', {
+              placeholder: 'Product key (optional; EVALUATION ISOs need none)',
+              value: draft.windowsKey, style: S.input,
+              onChange: (event) => setDraft({ ...draft, windowsKey: event.target.value })
             }),
             h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr auto', gap: 8, alignItems: 'end' } },
               h('label', { style: { display: 'grid', gap: 4 } }, h('span', { style: S.muted }, 'vCPU'),
