@@ -530,9 +530,9 @@ which looks like a corrupt download, not a sizing decision. So:
 
 The **store quota is deliberately not raised**. `diskQuotaGb` is the user's
 budget for the whole volume, and silently spending another 20 GB of their disk
-would be the wrong fix. The panel refuses instead, with the exact sentence:
-"The VM store quota is N GB, so a 40 GB REA disk cannot be created. Raise Disk
-Size in the Policy tab first."
+would be the wrong fix. On a small policy the 40 GB disk is still created (it is
+sparse) and carries `warnings[code: disk-over-policy]`; the panel explains that
+the guest may hit the real disk ceiling — see 15.10.
 
 ### Awareness is gated, so a non-REA workspace pays nothing
 
@@ -633,10 +633,13 @@ trap, and it is why `cua_vm_start` exists as its own tool.
 
 `du -sb $CUA_HOME/.cua` was the whole story when the store held one image and one
 delta. It is not any more: a checkpoint is a flattened 6 GB disk, screenshots
-accumulate, and a Windows container keeps 64 GB under `$STORE/windows`. The line
-now adds four disjoint roots, and the quota test is `used + requested > quota`,
-refused before anything is created — the old `used > quota` let the last create
-discover the overrun as ENOSPC inside a download.
+accumulate, and a Windows computer keeps its sparse disk under `$STORE/windows`.
+The line adds five disjoint roots (`Windows` and the ISO cache included), and the
+quota is charged on **real bytes**: a transient write whose real size is known
+(the ISO download, a checkpoint convert) is `used + requested > quota`, refused
+before it is written — the old `used > quota` let the last create discover the
+overrun as ENOSPC inside a download. Create-time is different: a qcow2 disk is
+sparse, so the virtual size is never charged; see 15.10.
 
 ### 15.3 The coordinate contract, in one sentence
 
@@ -830,9 +833,11 @@ before the real patches in the Dockerfile.
 `windowsCreateManaged` no longer clamps or refuses a below-floor Windows computer.
 64 GB / 6 GB / 2 vCPU are the **defaults**; asking for less creates it anyway and
 carries `warnings[]` (`disk-below-floor` / `memory-below-floor` /
-`cpu-below-floor`) in the result and in the registry row. The quota still refuses
-a disk that does not fit, Linux is untouched, and the REA 40 GB clamp and the
-Windows REA/Android refusals are unchanged. The advice is one pure function
+`cpu-below-floor`) in the result and in the registry row. The quota was described
+here as "refuses a disk that does not fit" — that part is superseded by 15.10:
+the create refuses only real usage over the policy, and a virtual disk bigger
+than it is created with `disk-over-policy`. The REA 40 GB clamp and the Windows
+REA/Android refusals are unchanged. The advice is one pure function
 (`windowsCapacityWarnings`), and the smoke covers both directions (below-floor
 create warns; omitted create returns the defaults with no warnings).
 
@@ -854,3 +859,38 @@ wholesale, and the gate asserts both the producer and the reader. The reasoning 
 in REPORT.md §9.4 and five of the seven are covered by new assertions — `runCua` and
 `assertVmName` and `mutateRegistry` and the abandoned-shutdown branch are now
 gate needles, so none of them can be refactored away silently.
+
+### 15.10 A sparse disk is not bytes: the create-time quota regression
+
+User report: creating a Windows computer on a 15 GB policy failed with "a 64 GB
+disk does not fit the VM store quota (15 GB)" while the store held a few hundred
+MB. The create paths charged the **virtual** requested size
+(`reserveStoreBytes(name, diskGb * 1024 ** 3)` and
+`reserveStoreBytes(name, effectiveDiskGb * 1024 ** 3)`), and `refuseOverQuota`
+compares `used + requested > quota` — so the 64 GB default refused every Windows
+create on the shipped 20 GB policy, contradicting the branch's own "the quota
+counts real bytes" rule and the warnings-not-refusals change in 15.8.7.
+
+Now, on **both** create paths:
+
+* the disk reservation is `reserveStoreBytes(name, 0)` — no virtual bytes are
+  charged, and the call still runs under the store lock, so a store whose **real**
+  usage already exceeds the policy is refused with a sentence that names the real
+  bytes (`16.0 GB of real store data > 15 GB`), not the virtual request;
+* a requested disk bigger than the policy is **created** with
+  `warnings[{ code: "disk-over-policy", message }]` (result, registry row, tool
+  text), built by one pure helper `diskPolicyWarnings(diskGb, config)`; Linux
+  gets the same warning (a 40 GB REA disk on a 20 GB policy);
+* `reserveStoreBytes` remains for transient writes whose real bytes are known
+  (the Windows ISO download), and the shutdown/checkpoint guards keep calling
+  `refuseOverQuota` with the real disk delta — unchanged;
+* the Windows 64 GB default is still the requested value, it is just no longer
+  mistaken for consumption.
+
+The old sentence is a **forbidden** pattern in `tools/check-cua-vm.mjs`, and new
+needles pin the helper, the warning code, both zero-byte reservations and the
+real-bytes refusal text. The gate total moved 315 → **325** assertions in the
+checkout (**324** in the flat image tree), and `tests/supervisor-smoke.mjs`
+carries the reported case end to end: quota 15 + real usage low + default 64 GB
+→ created with `disk-over-policy`; real usage over the quota → refused without
+creating a row.

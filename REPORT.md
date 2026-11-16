@@ -52,8 +52,9 @@ Components:
 * **Enable REA** — third checkbox in New computer: installs Node 22,
   rea-agents, JDK 21, Ghidra 12.1.4, JADX and the pinned jadx-headless-mcp jar,
   roughly 3.5 GB installed on a 40 GB disk; the Disk field rises to 40 when
-  ticked and the card warns when the store quota is below it. Computers carry an
-  **REA** badge.
+  ticked and the card warns when the store quota is below it — the create still
+  proceeds (the disk is sparse) and carries `warnings[code: disk-over-policy]`.
+  Computers carry an **REA** badge.
 * **Policy**: auto-suspend, idle minutes, **Disk Size (GB)**, max running.
   "Shutdown frees a slot, disks are untouched."
 * **Viewer**: `Video` (cua stream, HTTPS) or `Frames (http)`; the agent's cursor
@@ -308,7 +309,7 @@ green. This section is the delta a reader of the older sections needs.
 | Item | Change |
 |---|---|
 | W1 | Registry **v2** (`{version:2, vms:{}}`) with a read-migration of v1 rows; four new policy keys (`shutdownTimeoutSec`, `checkpointPolicy`, `shotsKeepDays`, `windowsInstallTimeoutMinutes`); Windows credentials in `$STORE/windows/<name>/credentials.json`, mode 0600, never in the registry |
-| W2 | Accounting = `.cua` + checkpoints + shots + windows, and `used + requested > quota` refused on both create paths; a delete **manifest** (sandbox, checkpoints incl. `.restore.qcow2`/`.tmp`, shots, ports + child procs, views, trajectories, `vmm/qemu/<name>`, Windows container + storage, registry row, each reported, cleanup continues when `sb rm` fails); `cua_vm_gc`; boot reconciliation of `ports.json` |
+| W2 | Accounting = `.cua` + checkpoints + shots + windows + the ISO cache, with the quota charged on **real bytes**: a create refuses only when the store's real usage is already over the policy (a sparse virtual disk is a `disk-over-policy` warning), while a transient write (ISO download) is `used + requested > quota`; a delete **manifest** (sandbox, checkpoints incl. `.restore.qcow2`/`.tmp`, shots, ports + child procs, views, trajectories, `vmm/qemu/<name>`, Windows container + storage, registry row, each reported, cleanup continues when `sb rm` fails); `cua_vm_gc`; boot reconciliation of `ports.json` |
 | W3 | Real `vmShutdown`: close ports → QMP `system_powerdown` (socket parsed from `vmm/qemu/<name>/cmdline`) → wait for exit/`query-status=shutdown` up to `shutdownTimeoutSec` → `quit` → flatten to a checkpoint (`mayBeTorn` on timeout) → `sb rm --force` → `powered-off` + `restoreFrom`; `start` cold-boots from the checkpoint and deletes the restore temp; `stop` = shutdown (`DSH_CUA_VM_LEGACY_STOP=1` restores the suspend alias); an ACPI refusal falls back to suspend *explicitly* |
 | W4 | New `docker/cua-vm-space.mjs`: display from the guest, capture from the PNG's own IHDR, `scale = display/screenshot`, 30 s cache invalidated on resume/restart/zoom; clicks prime one capture then `cua do click` in screenshot pixels, xdotool fallback at `round(x*scale)`; the `sqrt` guess is gone; every pointer/typing result prints `screenshot WxH · display WxH · scale N` plus "do not rescale" when scaled; >900k px refused unless `DSH_CUA_VM_RESOLUTION_ALLOW_SCALE=1`; guest provision **v7** (`apt_ok=`, `display=`, `space_helper=1`, marker written on a broken apt too, exit 2); ImageMagick in the image; shots now under `$STORE/shots` |
 | W5 | `DSH_CUA_VM_GPU` is live: `virgl` makes virgl the default for a create that omits `gpu` (explicit `false` wins, gated on `systemQemuSupportsVirgl`); one `normaliseSpec` + shared `createManaged` so `ensure` carries image/gpu/diskGb/android/rea and a rebuild restores them; `cua_vm_start` tool; `cua_vm_port` prints the URL **and** the loopback port (`result.target` was always `undefined`) |
@@ -352,7 +353,7 @@ regression tests where the bug was testable without a VM.
 | D4 | `space.capture` captured whatever `cua do` was last pointed at | it now runs `do switch local:<name>` before the screenshot (and drops the cached space + prime flag on a switch), exactly like the gui path |
 | D5 | registry read-modify-write across `await`s: a finishing `exec` could write a pre-shutdown snapshot back and resurrect `state: "ready"` | every mutation goes through `mutateRegistry()` — a tiny critical section under `withLock('@registry')` that **re-reads** inside the lock |
 | D6 | a failure between container-create and start left an orphan container holding the name, with no registry row | both failure paths `DELETE` the container before the error travels |
-| D7 | docs claimed 117 assertions and "21/21" needles | gates now print their own totals (**216** assertions, **67** needles) and the docs quote those; the Windows 64 GB quota requirement is stated in README §Personal VM and here |
+| D7 | docs claimed 117 assertions and "21/21" needles | gates now print their own totals (**325** assertions in the checkout, **324** in the flat image tree; **67** REA needles) and the docs quote those; the store-quota rule (real bytes; a sparse disk is never refused) is stated in README §Personal VM and here |
 
 A residual from that round: the `stale` flag was read by `startFromCheckpoint` but
 **written nowhere** (the first fix aborted the shutdown before touching the row),
@@ -364,10 +365,11 @@ stale with a reason → Start boots the base image and says why → marking clea
 `tools/check-cua-vm.mjs` gained needles for the producer (`row.restoreFrom?.kind
 ===`, `staleReason:`), so a reader can no longer exist without a writer.
 
-The Windows quota requirement is not cosmetic: `diskQuotaGb` defaults to 20 GB
-and a Windows disk floors at 64 GB, so a fresh install must raise the policy
-first. The create now refuses with that exact sentence (and the field to change)
-instead of the generic "store quota reached".
+**Superseded in 9.6.9.** This round made the Windows create refuse a 64 GB disk on
+a 20 GB policy with an explicit sentence. That refusal charged the *virtual* size
+of a sparse disk and was itself the regression reported by a user on a 15 GB
+policy; 9.6.9 replaces it with a warning. The sentence it introduced is now
+forbidden by `tools/check-cua-vm.mjs`.
 
 ### 9.5 Round 3: depth review (supervisor) and Windows source audit
 
@@ -388,7 +390,7 @@ are covered in the smoke suite.
 | S7 | the base-image fallback after a failed checkpoint boot had no `sb rm`, unlike the first attempt | both fallbacks (start and ensure) remove the half-created record first |
 | S8 | `readRegistry` swallowed every error as an empty map, and the next mutation persisted it — one EACCES wiped the store | only ENOENT means empty; anything else throws, and the throw happens before any write |
 | S9 | the v1→v2 migration wrote outside the registry lock | migration runs once at boot through `mutateRegistry` |
-| S10 | quota check-then-act: two creates could both pass `used + requested` | `reserveStoreBytes` holds the claim under `withLock('@store')` for the whole create (both kinds) and releases it in `finally` |
+| S10 | quota check-then-act: two creates could both pass `used + requested` | `reserveStoreBytes` holds a claim under `withLock('@store')` and releases it in `finally`; after 9.6.9 a create reserves **0** virtual bytes (the disk is sparse) and the claim protects the real transient writes (an ISO download), while the real-usage refusal is evaluated under the same lock |
 | S11 | shutdown could convert a checkpoint into a store with no room for it | the requirement (new file minus the one it replaces) is checked first; a skip is recorded in `lastShutdown.checkpointSkipped` and the notes |
 | S12 | after a `quit` timeout the path converted and removed the sandbox without re-checking QEMU | a QEMU that survives `quit` is treated exactly like an unreachable monitor: no convert, no `sb rm`, no clean restore point |
 | S13 | previews were closed before the outcome and never restored on the abandoned path | the preview is snapshotted and reopened when the shutdown aborts |
@@ -619,7 +621,7 @@ recommendations**:
 | `diskGb: 8` | 8 GB, created, with `warnings[code: disk-below-floor]` |
 | `memory: 2` | 2 GB, created, with `warnings[code: memory-below-floor]` |
 | `cpu: 1` | 1 vCPU, created, with `warnings[code: cpu-below-floor]` |
-| the quota | unchanged: real bytes, and a disk that does not fit is still refused |
+| the quota | real bytes only: a virtual disk over the policy is created with `warnings[code: disk-over-policy]`; only a store whose real usage is already over the quota is refused (see 9.6.9) |
 
 `warnings` is the one shape (`[{ code, message }]`) and it appears in the create
 result, in the registry row (so the panel shows it after a reload) and in the
@@ -651,6 +653,65 @@ Because it answers directly it is **pinned** (`windowsVersion: "11ltsc"`,
 alias **`ltsc11`**), unlike 11/10/ltsc10/2022 (which return 400 and refuse with a
 remediation). The vhdx/ARM64 media on the same page is a separate link and is not
 pinned.
+
+### 9.6.9 The create-time quota counts real bytes — a sparse disk is never refused
+
+**Reported regression.** Creating a Windows computer on a store with a 15 GB
+policy failed with:
+
+> a 64 GB disk does not fit the VM store quota (15 GB). Raise Disk Size under
+> Plugins → Personal VM (CUA) → Policy, or create the computer with a smaller
+> disk.
+
+while the store held a few hundred MB. Root cause: the create-time check called
+`reserveStoreBytes(name, diskGb * 1024 ** 3)` (Windows) and
+`reserveStoreBytes(name, effectiveDiskGb * 1024 ** 3)` (Linux), and
+`refuseOverQuota` compares `used + requested > quota`. A qcow2 disk is created
+**sparse** — `qemu-img create -f qcow2 disk 64G` writes metadata, and the guest
+consumes bytes only as it writes — so the REQUESTED size was charged as if it
+were consumption. On the shipped 20 GB policy (`diskQuotaGb: 20`) that refused
+*every* Windows create, and it contradicted both the branch's own accounting
+("the quota counts real bytes") and 9.6.7's warnings-not-refusals semantics.
+
+**Fix (one rule, both platforms).**
+
+* A create reserves **zero** bytes: `reserveStoreBytes(name, 0)` /
+  `reserveStoreBytes(spec.name, 0)`. The call still runs under the store lock, so
+  a store whose **real** usage is already over the policy is refused with the
+  same message — which now names real usage:
+  `VM store quota reached: 16.0 GB of real store data > 15 GB …`.
+* A virtual disk bigger than the policy is **created** and carries
+  `warnings[{ code: "disk-over-policy" }]`:
+  `requested 64 GB exceeds the 15 GB store quota policy; the disk is sparse so
+  creation proceeds, but the guest will hit the real disk ceiling and may fail
+  to install — raised policy is recommended`.
+  The warning is produced by one pure helper (`diskPolicyWarnings(diskGb,
+  config)`), reaches the create result, the registry row and the tool text
+  (Windows and Linux), and is gated.
+* `reserveStoreBytes` stays for **transient writes whose real bytes are known**:
+  the Windows ISO download still reserves `expectedBytes`, and the
+  checkpoint-convert guards in the shutdown paths still call `refuseOverQuota`
+  with the real disk delta. Those are unchanged.
+* The Windows 64 GB default is untouched — it is the requested size; it is just
+  no longer charged as real bytes. The REA 40 GB floor is unchanged; on a small
+  policy it warns instead of refusing.
+
+**Verified** (`tests/supervisor-smoke.mjs`, 112 assertions):
+
+| Case | Result |
+|---|---|
+| quota 15, real usage low, Windows default 64 GB | created (`ok:true`, `diskGb:64`) with `disk-over-policy`, row keeps it |
+| quota 1, Linux 40 GB REA disk | created with `disk-over-policy` |
+| quota 45, two concurrent 50 GB Linux creates | both created, both warn (the virtual size no longer serialises creates) |
+| 1.5 GB real file on a 1 GB quota | refused: `1.5 GB of real store data > 1 GB` (no "does not fit") |
+| 16 GB real file on a 15 GB quota, Windows create | refused with the same real-bytes sentence; no row half-created |
+
+The offending sentence is now a **forbidden** pattern in
+`tools/check-cua-vm.mjs`, and new needles pin `diskPolicyWarnings`, the
+`disk-over-policy` code, both `reserveStoreBytes(…, 0)` call sites and the
+real-bytes refusal text. Gate totals: **325** assertions in the checkout
+(**324** in the flat image tree, where the checkout-only assertion is reported
+`n/a`), **67** REA needles, `ci-gates` **8 passed / 0 failed / 3 skipped**.
 
 ### 9.7 What is still open (TBC)
 

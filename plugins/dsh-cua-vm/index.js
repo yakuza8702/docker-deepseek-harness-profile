@@ -493,6 +493,10 @@ export function apply(ctx, config = {}) {
       }
       const answer = await call({ op: 'vmCreate', ...input })
       const parts = [`${answer.name} is ${answer.state}${input.gpu === true ? ' with a GPU (virgl)' : ''}.`]
+      // A SPARSE DISK BIGGER THAN THE QUOTA IS CREATED, NOT REFUSED: the
+      // supervisor sends `disk-over-policy` here (Linux and Windows alike), so
+      // the sentence says what will actually go wrong instead of a refusal.
+      for (const warning of answer.warnings ?? []) parts.push(`WARNING: ${warning.message}`)
       if (answer.renderer) parts.push(`Renderer: ${answer.renderer}.`)
       if (answer.disk && answer.disk.ok === false) parts.push(`Disk: ${answer.disk.error}`)
       else if (answer.disk && answer.disk.changed) parts.push(`Disk grown to ${answer.disk.sizeGb} GB (guest: ${answer.disk.guest || 'unknown'}).`)

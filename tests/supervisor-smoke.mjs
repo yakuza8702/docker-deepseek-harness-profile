@@ -7,7 +7,7 @@
  */
 import { spawn } from 'node:child_process'
 import net from 'node:net'
-import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, statSync, readdirSync, chmodSync } from 'node:fs'
+import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, statSync, readdirSync, chmodSync, truncateSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
@@ -287,11 +287,36 @@ try {
   check('delete removed the registry row', JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[NAME] === undefined)
   check('delete still reports a failed sb rm as an item, not a throw', deleted.failures === 0, `failures=${deleted.failures}`)
 
-  // ---- W2: quota refuses used + requested ----
+  // ---- W2: the quota counts REAL bytes; a sparse disk is a WARNING ----
   const setQuota = await call({ op: 'configSet', config: { diskQuotaGb: 1 } })
   check('configSet clamps and stores the quota', setQuota.ok && setQuota.config.diskQuotaGb === 1)
-  const refused = await call({ op: 'vmCreate', name: 'too-big', diskGb: 40, rea: true })
-  check('a create that would exceed the quota is refused before it starts', refused.ok === false, String(refused.error).slice(0, 160))
+  // THE USER'S CASE. A 40 GB (and the Windows default 64 GB) qcow2 is sparse:
+  // it costs a few hundred KB until the guest writes. On a store with almost
+  // nothing in it the create must proceed and carry `disk-over-policy` — it
+  // used to be refused for charging the VIRTUAL size against the quota.
+  const sparse = await call({ op: 'vmCreate', name: 'too-big', diskGb: 40, rea: true })
+  check('a virtual disk larger than the quota is created, not refused', sparse.ok === true, JSON.stringify(sparse).slice(0, 200))
+  const sparseCodes = (sparse.warnings ?? []).map((warning) => warning.code)
+  check('...and it carries the disk-over-policy warning', sparseCodes.includes('disk-over-policy'), sparseCodes.join(',') || 'no warnings')
+  check('the policy warning says the disk is sparse and the guest may hit the ceiling',
+    (sparse.warnings ?? []).some((warning) => warning.code === 'disk-over-policy'
+      && /sparse/u.test(warning.message) && /real disk ceiling/u.test(warning.message)))
+  const sparseRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms['too-big']
+  check('the row keeps the policy warning for the panel', sparseRow?.warnings?.[0]?.code === 'disk-over-policy')
+  await call({ op: 'vmDelete', name: 'too-big' })
+  // REAL BYTES still refuse: 1.5 GB in the accounted store on a 1 GB policy is
+  // over the quota before anything is asked for, and the sentence names the
+  // real usage instead of the virtual request.
+  const heavy = path.join(STORE, 'shots', 'heavy.bin')
+  mkdirSync(path.dirname(heavy), { recursive: true })
+  writeFileSync(heavy, '')
+  truncateSync(heavy, 1536 * 1024 * 1024)
+  const refused = await call({ op: 'vmCreate', name: 'really-too-big', diskGb: 8, image: 'linux' })
+  check('a create on a store whose REAL usage exceeds the quota is refused', refused.ok === false, String(refused.error).slice(0, 200))
+  check('the refusal names real store data, not the virtual disk size',
+    /real store data/u.test(refused.error ?? '') && !/does not fit the VM store quota/u.test(refused.error ?? ''),
+    String(refused.error).slice(0, 200))
+  rmSync(heavy, { force: true })
 
   // ---- W6: windows create is refused without an engine ----
   const win = await call({ op: 'vmWindowsCreate', name: 'win-box', kind: 'windows' })
@@ -417,18 +442,30 @@ try {
     check('Start explains the torn image', /force-quit|may be torn/u.test(tornStart.detail ?? ''), String(tornStart.detail).slice(0, 110))
   }
 
-  // ---- S10: two creates cannot both pass the quota check ----
+  // ---- S10: SPARSE DISKS ARE NOT CHARGED, so they do not serialise; REAL
+  // bytes are what a reservation protects (the ISO download still reserves) ----
   {
     await call({ op: 'configSet', config: { diskQuotaGb: 45, maxRunning: 4 } })
     writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify({ version: 2, vms: {} }, null, 2)}\n`)
     const [a, b] = await Promise.all([
-      call({ op: 'vmCreate', name: 'ws-q1', diskGb: 40, image: 'linux' }),
-      call({ op: 'vmCreate', name: 'ws-q2', diskGb: 40, image: 'linux' })
+      call({ op: 'vmCreate', name: 'ws-q1', diskGb: 50, image: 'linux' }),
+      call({ op: 'vmCreate', name: 'ws-q2', diskGb: 50, image: 'linux' })
     ])
+    // Two 50 GB sparse disks on a 45 GB policy: qcow2 metadata is all they
+    // occupy, and the quota no longer pretends the virtual sizes are bytes.
+    // (The old assertion here was "exactly one of two 40 GB creates is
+    // admitted" — that refusal was the same virtual-size charge the user
+    // reported, on the Linux path.)
     const okCount = [a, b].filter((answer) => answer.ok === true).length
     const refused = [a, b].filter((answer) => answer.ok === false && /quota/u.test(answer.error ?? '')).length
-    check('the store reservation admits exactly one of two 40 GB creates on a 45 GB quota', okCount === 1 && refused === 1, `ok=${okCount} refused=${refused}`)
-    await call({ op: 'vmDelete', name: a.ok ? 'ws-q1' : 'ws-q2' })
+    check('two sparse 50 GB creates both proceed on a 45 GB quota', okCount === 2 && refused === 0, `ok=${okCount} refused=${refused}`)
+    check('...and each carries the over-policy warning instead of a refusal',
+      [a, b].every((answer) => (answer.warnings ?? []).some((warning) => warning.code === 'disk-over-policy')))
+    const cleared = await Promise.all([
+      call({ op: 'vmDelete', name: 'ws-q1' }),
+      call({ op: 'vmDelete', name: 'ws-q2' })
+    ])
+    check('...and both deletes clean up', cleared.every((answer) => answer.ok === true))
   }
 
   // ---- S5/S15: a failed `sb rm` keeps the row and reports a partial delete ----
@@ -496,6 +533,37 @@ try {
     const lowRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms['ws-win-low']
     check('the row keeps the warnings for the panel', Array.isArray(lowRow?.warnings) && lowRow.warnings.length === 3)
     await call({ op: 'vmDelete', name: 'ws-win-low' })
+
+    // ---- THE USER-REPORTED REGRESSION ----
+    // Quota 15 GB (the reported policy), real usage low, Windows default disk
+    // 64 GB. The old check charged the VIRTUAL 64 GB and refused with "a 64 GB
+    // disk does not fit the VM store quota (15 GB)". The disk is sparse, so the
+    // create must proceed and warn.
+    await call({ op: 'configSet', config: { diskQuotaGb: 15 } })
+    const overPolicy = await call({ op: 'vmWindowsCreate', name: 'ws-win-policy', kind: 'windows', windowsIso: 'iso/tiny.iso' })
+    check('a 64 GB Windows disk on a 15 GB quota is CREATED, not refused', overPolicy.ok === true, JSON.stringify(overPolicy).slice(0, 220))
+    check('...the requested 64 GB default is untouched', overPolicy.diskGb === 64, `disk=${overPolicy.diskGb}`)
+    check('...and it carries disk-over-policy naming both numbers',
+      (overPolicy.warnings ?? []).some((warning) => warning.code === 'disk-over-policy'
+        && /requested 64 GB/u.test(warning.message) && /15 GB/u.test(warning.message) && /sparse/u.test(warning.message)),
+      JSON.stringify(overPolicy.warnings ?? []).slice(0, 220))
+    const policyRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms['ws-win-policy']
+    check('...the row keeps the policy warning for the panel',
+      (policyRow?.warnings ?? []).some((warning) => warning.code === 'disk-over-policy'))
+    await call({ op: 'vmDelete', name: 'ws-win-policy' })
+    // Real bytes over the policy STILL refuse, and the sentence names them.
+    const heavyWin = path.join(STORE, 'shots', 'heavy-win.bin')
+    mkdirSync(path.dirname(heavyWin), { recursive: true })
+    writeFileSync(heavyWin, '')
+    truncateSync(heavyWin, 16 * 1024 ** 3)
+    const refusedWin = await call({ op: 'vmWindowsCreate', name: 'ws-win-heavy', kind: 'windows', diskGb: 8, windowsIso: 'iso/tiny.iso' })
+    check('a Windows create on a store whose REAL usage exceeds the quota is refused', refusedWin.ok === false, String(refusedWin.error).slice(0, 200))
+    check('the Windows refusal names real store data, not the virtual disk',
+      /real store data/u.test(refusedWin.error ?? '') && !/does not fit the VM store quota/u.test(refusedWin.error ?? ''),
+      String(refusedWin.error).slice(0, 200))
+    check('nothing was half-created by the refused Windows create',
+      JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms['ws-win-heavy'] === undefined)
+    rmSync(heavyWin, { force: true })
 
     // The default path is unchanged: omit everything → 64 GB / 6 GB / 2 vCPU,
     // no warnings.

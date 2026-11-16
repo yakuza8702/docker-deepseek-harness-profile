@@ -219,21 +219,23 @@ async function storeUsage() {
 }
 
 /**
- * The quota rule: `used + requested > quota` is refused, BEFORE anything is
- * created. The old check (`used > quota`) let the last computer start huge and
- * then discover the overrun as ENOSPC in the middle of a download. Both create
- * paths (Linux and Windows) call this one function.
+ * The quota rule for a TRANSIENT WRITE: `used + requested > quota` is refused,
+ * BEFORE the bytes are written. `requested` must be a REAL size the next write
+ * will consume (an ISO download, a checkpoint convert) — never the virtual size
+ * of a sparse disk. `diskPolicyWarnings` carries the create-time rule, which
+ * refuses only when the store's real usage is already over the policy.
  */
 /**
  * QUOTA RESERVATIONS — check-then-act is not a check.
  *
  * `used + requested > quota` was evaluated twice, minutes apart: once before the
- * create and once (implicitly) when the disk appeared. Two creates that both
- * start at 18 GB of a 20 GB quota both pass, and the second one dies at ENOSPC
- * halfway through an image download. A reservation makes the boundary
- * serialised: the check and the claim happen under one store lock, in-flight
- * bytes count against the quota, and the claim is released when the create
- * finishes (success or failure).
+ * write and once (implicitly) when it appeared. Two writes that both start at
+ * 5 GB of a 20 GB quota both pass, and the second one dies at ENOSPC halfway
+ * through a download. A reservation makes the boundary serialised: the check and
+ * the claim happen under one store lock, in-flight bytes count against the
+ * quota, and the claim is released when the write finishes (success or failure).
+ * Creates reserve 0 bytes on purpose: their disk is sparse, so the only real
+ * consumption is the ISO download, which reserves its own size.
  */
 const RESERVED_BYTES = new Map()
 
@@ -259,8 +261,48 @@ async function refuseOverQuota(config, requestedBytes) {
   const quota = config.diskQuotaGb * 1024 ** 3
   if (used + Math.max(0, requestedBytes) <= quota) return null
   const freeGb = Math.max(0, (quota - used) / 1024 ** 3).toFixed(1)
-  return `VM store quota reached: ${(used / 1024 ** 3).toFixed(1)} GB used + ${(Math.max(0, requestedBytes) / 1024 ** 3).toFixed(1)} GB requested `
+  const requested = Math.max(0, requestedBytes)
+  // NAME THE REAL BYTES. A create reserves ZERO (its disk is sparse), so a
+  // refusal here always means "the store already holds more than the policy";
+  // only a transient write (an ISO download, a checkpoint convert) adds a real
+  // size on top. The old wording printed the VIRTUAL request as if it were
+  // consumption, which is the sentence that refused every Windows create.
+  const requestedText = requested > 0 ? ` + ${(requested / 1024 ** 3).toFixed(1)} GB to be written` : ''
+  return `VM store quota reached: ${(used / 1024 ** 3).toFixed(1)} GB of real store data${requestedText} `
     + `> ${config.diskQuotaGb} GB. The store has ${freeGb} GB free. Delete a computer, run cua_vm_gc, or raise the quota under Plugins → Personal VM (CUA) → Policy.`
+}
+
+/**
+ * THE CREATE-TIME QUOTA RULE COUNTS REAL BYTES, NEVER A SPARSE DISK'S VIRTUAL
+ * SIZE.
+ *
+ * `qemu-img create -f qcow2 disk 64G` writes a few hundred KB of metadata: the
+ * guest only consumes store bytes as it writes. Charging the REQUESTED size
+ * against `diskQuotaGb` therefore refused every Windows create on the shipped
+ * 20 GB policy ("a 64 GB disk does not fit the store quota") while the store
+ * held almost nothing — the exact opposite of what the sparse design buys, and
+ * inconsistent with the branch's own rule that the quota counts real bytes.
+ *
+ * So a create now:
+ *   * reserves NO virtual bytes (`reserveStoreBytes(name, 0)`), which still
+ *     refuses when the store's REAL usage is already over the policy, and
+ *   * reports "this disk is bigger than the policy" as a WARNING, not a refusal
+ *     (`disk-over-policy`, same `[{ code, message }]` shape as the Windows
+ *     floors). It applies to Linux too: a 40 GB REA disk on a 20 GB policy is
+ *     created, with the same warning.
+ *
+ * `reserveStoreBytes` remains the tool for a TRANSIENT write whose real bytes
+ * are known up front (the ISO download, and — through `refuseOverQuota` — the
+ * checkpoint convert, which genuinely writes a full disk).
+ */
+function diskPolicyWarnings(diskGb, config) {
+  const requested = Number(diskGb)
+  const quota = Number(config.diskQuotaGb)
+  if (!(requested > 0) || !(quota > 0) || requested <= quota) return []
+  return [{
+    code: 'disk-over-policy',
+    message: `requested ${requested} GB exceeds the ${quota} GB store quota policy; the disk is sparse so creation proceeds, but the guest will hit the real disk ceiling and may fail to install — raised policy is recommended`
+  }]
 }
 
 /* ------------------------------------------------------------------ *
@@ -2148,27 +2190,25 @@ async function createManaged(spec) {
   // minimum is a property of the workload, not of what the caller typed.
   const wantedDiskGb = Number(spec.diskGb) > 0 ? Number(spec.diskGb) : 20
   const effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb
-  // FAIL FAST, NEVER RAISE. `used + requested > quota` is the rule on both
-  // create paths: 40 GB of RE kit on a 20 GB quota would otherwise be discovered
-  // as ENOSPC in the middle of the Ghidra download.
-  const over = await reserveStoreBytes(name, effectiveDiskGb * 1024 ** 3)
-  if (over !== null) {
-    return fail(rea === true
-      ? `${over} A REA computer is at least ${effectiveDiskGb} GB (Ghidra + JDK + jadx); delete a computer or raise the quota under Plugins → Personal VM (CUA) → Policy — the quota is yours to change, not the plugin's.`
-      : over)
-  }
+  // THE DISK IS SPARSE, SO ITS VIRTUAL SIZE IS NOT A WRITE. The create reserves
+  // ZERO bytes (which still refuses when the store's real usage is ALREADY over
+  // the policy) and carries a `disk-over-policy` warning when the requested disk
+  // is bigger than the policy. A 40 GB REA disk on a 20 GB quota is created; it
+  // used to be refused here, which contradicted the real-bytes accounting.
+  const warnings = diskPolicyWarnings(effectiveDiskGb, config)
+  const over = await reserveStoreBytes(name, 0)
+  if (over !== null) return fail(over)
   // The claim is held for the whole create, so a SECOND create sees it.
   try {
-    return await createLinuxNow(spec)
+    return await createLinuxNow(spec, warnings)
   } finally {
     releaseStoreBytes(name)
   }
 }
 
 /** The create itself, with the store quota already reserved for this name. */
-async function createLinuxNow(spec) {
+async function createLinuxNow(spec, warnings = []) {
   const { name, rea } = spec
-  const config = readConfig()
   const wantedDiskGb = Number(spec.diskGb) > 0 ? Number(spec.diskGb) : 20
   const effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb
   const blocked = resolutionProblem(DESKTOP_RESOLUTION, RESOLUTION_ALLOW_SCALE)
@@ -2192,6 +2232,9 @@ async function createLinuxNow(spec) {
       rea: rea === true,
       // The disk this computer was actually given, after the REA floor.
       diskGb: effectiveDiskGb,
+      // `disk-over-policy` travels with the row too, so the panel can still
+      // explain the sparse-disk risk after a reload (Windows does the same).
+      warnings: warnings.length > 0 ? warnings : undefined,
       cpu: spec.cpu,
       memory: spec.memory,
       createdAt: new Date().toISOString(),
@@ -2221,6 +2264,9 @@ async function createLinuxNow(spec) {
     // The panel says "disk raised to 40 GB" from this, instead of
     // discovering the floor by reading the registry.
     diskGbRaised: effectiveDiskGb > wantedDiskGb ? effectiveDiskGb : undefined,
+    // A sparse disk bigger than the quota is CREATED (never refused); the
+    // warning says the guest may hit the real ceiling.
+    warnings: warnings.length > 0 ? warnings : undefined,
     rea: reaResult ? reaResult.ok : undefined,
     android: androidResult ? androidResult.ok : undefined,
     gpu: spec.gpu,
@@ -2958,8 +3004,8 @@ async function windowsCreateManaged(spec) {
   // THE FLOORS ARE DEFAULTS, NOT MINIMUMS. A smaller computer is created when it
   // is asked for — the user may be testing an install failure, or running a tiny
   // workload — and the result carries a WARNING instead of a refusal. What is
-  // still refused is anything that cannot exist: a zero disk, or a disk that does
-  // not fit the store quota.
+  // still refused is anything that cannot exist: a zero disk, or a create on a
+  // store whose REAL usage is already over the policy.
   // `normaliseSpec` fills the LINUX defaults (memory 4), so "omitted" has to be
   // carried explicitly — otherwise an omitted memory would become 4 GB + a
   // warning instead of the Windows default of 6.
@@ -2969,10 +3015,14 @@ async function windowsCreateManaged(spec) {
   const cpu = given.cpu ? spec.cpu : WINDOWS_DEFAULT_CPU
   // One pure builder, so the same advice reaches the result, the row and the panel.
   const warnings = windowsCapacityWarnings({ diskGb, memory, cpu })
-  if (config.diskQuotaGb < diskGb) {
-    return fail(`a ${diskGb} GB disk does not fit the VM store quota (${config.diskQuotaGb} GB). Raise Disk Size under Plugins → Personal VM (CUA) → Policy, or create the computer with a smaller disk.`)
-  }
-  const over = await reserveStoreBytes(spec.name, diskGb * 1024 ** 3)
+  // THE 64 GB DEFAULT IS A SPARSE DISK, NOT 64 GB OF STORE. It used to be
+  // refused (`a 64 GB disk does not fit the store quota`) before QEMU was
+  // ever asked to create the qcow2 — so no Windows computer could be created on
+  // the shipped quota, and the branch's "the quota counts real bytes" rule did
+  // not hold on the one path that needed it most. The virtual size is now a
+  // WARNING; the refusal below is about bytes that are really on disk.
+  warnings.push(...diskPolicyWarnings(diskGb, config))
+  const over = await reserveStoreBytes(spec.name, 0)
   if (over !== null) return fail(over)
 
   let booted = null

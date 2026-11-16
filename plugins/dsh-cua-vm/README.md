@@ -134,11 +134,29 @@ Bytes counted against `diskQuotaGb`:
 | `$CUA_HOME/.cua` | base image, per-workspace deltas, QEMU |
 | `$STORE/checkpoints` | one flattened disk per computer (`<name>.qcow2`) plus boot temps |
 | `$STORE/shots` | screenshots (`<name>-<stamp>.png`, `-crop`) |
-| `$STORE/windows` | a Windows container's `/storage` (64 GB+) and its credentials |
+| `$STORE/windows` | a Windows computer's `disk.qcow2`, TPM state, credentials |
+| `$STORE/iso` | install media, downloaded once and shared by every computer |
 
-The rule is `used + requested > quota → refuse, before anything is created`, on
-**both** create paths. The old check (`used > quota`) let the last computer start
-at any size and discover the overrun as ENOSPC inside a download.
+The quota counts **real bytes on disk**, never the *virtual* size of a disk. A
+qcow2 disk is sparse: `qemu-img create -f qcow2 disk 64G` writes metadata, and
+the guest consumes store bytes only as it writes. So a create:
+
+* **reserves nothing** for the disk (`reserveStoreBytes(name, 0)`), which still
+  runs under the store lock and refuses when the store's **real usage is already
+  over the quota** — `VM store quota reached: 16.0 GB of real store data > 15 GB …`;
+* **creates** a disk bigger than the policy and carries
+  `warnings[{ code: "disk-over-policy", message }]` (result, registry row and the
+  tool text): "requested 64 GB exceeds the 15 GB store quota policy; the disk is
+  sparse so creation proceeds, but the guest will hit the real disk ceiling and
+  may fail to install — raised policy is recommended".
+
+The `used + requested > quota → refuse` rule is still what protects a
+**transient write whose real bytes are known**: the Windows ISO download reserves
+its expected size, and the shutdown/checkpoint path reserves the real disk delta
+before flattening (a skipped checkpoint is recorded, never fatal). It previously
+also charged the *virtual* disk size at create, which refused every Windows
+computer on the shipped policy; that sentence ("a 64 GB disk does not fit the VM
+store quota") is now forbidden by the gate.
 
 `cua_vm_destroy` removes a **manifest**, not just a sandbox: `sb rm --force`,
 every `checkpoints/<name>.qcow2*` (`-restore`, `.tmp`), `shots/<name>-*`, the
@@ -341,9 +359,10 @@ mistake. So the floor exists in three places: the panel raises the Disk field to
 40 when the box is ticked, the supervisor clamps `effectiveDiskGb` to
 `REA_MIN_DISK_GB` and reports `diskGbRaised`, and the tool schema says so. The
 store quota is *not* raised automatically — if `$STORE/config.json` still has
-`diskQuotaGb: 20`, the create is refused and the panel says: "The VM store quota
-is N GB, so a 40 GB REA disk cannot be created. Raise Disk Size in the Policy
-tab first."
+`diskQuotaGb: 20`, the 40 GB disk is created anyway (it is sparse) and carries
+`warnings[code: disk-over-policy]`; the panel says the guest may hit the real
+disk ceiling and recommends raising Disk Size in the Policy tab. Only a store
+whose real usage is already over the quota refuses the create.
 
 **The environment reaches the guest three ways.** `/etc/profile.d/rea.sh` for
 login shells (`JAVA_HOME`, `GHIDRA_INSTALL_DIR`, `REA_ANALYSIS_PROVIDER=ghidra`,

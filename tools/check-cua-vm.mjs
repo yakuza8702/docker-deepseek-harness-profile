@@ -207,6 +207,20 @@ const NEEDLES = {
     ['function reserveStoreBytes(name, bytes)', 1],
     ['releaseStoreBytes(name)', 1],
     ['releaseStoreBytes(spec.name)', 2],
+    // Q1: THE CREATE-TIME QUOTA IS REAL BYTES. A sparse disk's VIRTUAL size is
+    // never charged: the create reserves 0 and reports `disk-over-policy`
+    // instead of refusing (the report was "a 64 GB disk does not fit the VM
+    // store quota (15 GB)"; the store held a few hundred MB).
+    ['function diskPolicyWarnings(diskGb, config)', 1],
+    ["code: 'disk-over-policy'", 1],
+    ['the disk is sparse so creation proceeds', 1],
+    ['diskPolicyWarnings(effectiveDiskGb, config)', 1],
+    ['diskPolicyWarnings(diskGb, config)', 1],
+    ['reserveStoreBytes(name, 0)', 1],
+    ['reserveStoreBytes(spec.name, 0)', 1],
+    // The refusal that survives names REAL usage, never the virtual request.
+    ['of real store data', 1],
+    ['warnings: warnings.length > 0 ? warnings : undefined', 2],
     // S11/S12/S13: a checkpoint needs room, a QEMU that survives `quit` is not
     // off, and a failed shutdown puts the preview back.
     ['diskBytesFor(name)', 1],
@@ -602,6 +616,11 @@ const FORBIDDEN = [
     key: 'supervisor',
     pattern: 'Math.sqrt(900000',
     reason: 'the capture scale is MEASURED from the PNG (space.measure); a budget guess is the 6%-off click'
+  },
+  {
+    key: 'supervisor',
+    pattern: 'does not fit the VM store quota',
+    reason: 'the create-time quota counts REAL bytes: a sparse virtual disk is never refused, it carries a disk-over-policy warning (the offending sentence refused every Windows create on a 15 GB policy)'
   }
 ]
 

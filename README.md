@@ -864,9 +864,14 @@ rescale" when the two differ.
 
 ### The store
 
-`diskQuotaGb` (default 20) counts cua's own tree **plus** checkpoints, screenshots
-and Windows storage, and a create whose `used + requested` exceeds it is refused
-before it starts. **Clean up** in the panel (or `cua_vm_gc`) removes orphan
+`diskQuotaGb` (default 20) counts **real bytes**: cua's own tree, checkpoints,
+screenshots, Windows storage and the ISO cache. A disk is a sparse qcow2, so its
+*virtual* size is never charged — a Windows computer created with the default
+64 GB disk on a 15 GB policy is **created**, with
+`warnings[code: disk-over-policy]`, because the bytes only appear as the guest
+writes. Only a store whose real usage is already over the quota refuses a create;
+a transient write (the ISO download, a checkpoint convert) still has to fit and
+is checked first. **Clean up** in the panel (or `cua_vm_gc`) removes orphan
 checkpoints (newest kept), boot temps, screenshots older than `shotsKeepDays`
 (7), stale viewer rows and dead port rows.
 
