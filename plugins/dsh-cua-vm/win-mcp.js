@@ -52,7 +52,63 @@ import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 
 export const MCP_PROTOCOL_VERSION = '2024-11-05'
-export const DEFAULT_SERVER_NAME = 'cua_win'
+
+/** The MCP server name a Windows computer registers under. */
+export const DEFAULT_SERVER_NAME = 'windows'
+
+/**
+ * NAMING (WP-3): the harness sees `mcp__<server>__<tool>`. Before this the
+ * plugin invented `cua_win__tool_click_at`, which is not an MCP name at all and
+ * made a Windows tool indistinguishable from a plugin tool of the same shape.
+ * Everything the model touches now goes through windowsToolName().
+ */
+export const TOOL_PREFIX = 'mcp__windows__'
+
+/** Reveal the desktop: a screenshot plus the live noVNC hand-off URL. */
+export const REVEAL_TOOL_NAME = 'windows_desktop'
+
+/** Diagnostics: reachability, SSH argv, guest handshake, last error. */
+export const DOCTOR_TOOL_NAME = 'windows_mcp_doctor'
+
+/** `tool_click_at` → `mcp__windows__tool_click_at` (sanitised, never doubled). */
+export function windowsToolName(tool) {
+  const bare = String(tool)
+  const stripped = bare.startsWith(TOOL_PREFIX) ? bare.slice(TOOL_PREFIX.length) : bare
+  return `${TOOL_PREFIX}${stripped.replace(/[^A-Za-z0-9_]/gu, '_')}`
+}
+
+/** The reverse mapping: what the guest's own MCP server answers to. */
+export function windowsGuestToolName(tool) {
+  const bare = String(tool)
+  return bare.startsWith(TOOL_PREFIX) ? bare.slice(TOOL_PREFIX.length) : bare
+}
+
+/**
+ * Keepalive options for every SSH attach.
+ *
+ * ServerAliveInterval=15 alone is too slow for a suspended QEMU guest: the
+ * socket can sit half-open for the kernel's TCP timeout (minutes), and every
+ * tool call in that window hangs instead of failing. 10s × 2 unanswered probes
+ * drops a dead or suspended link within ~20s, so the upper layer can unregister
+ * the tools and say "the computer is not online" instead of waiting.
+ * ForwardAgent/ForwardX11/PermitLocalCommand are off because this channel only
+ * ever carries one stdio MCP server — no agent socket, no X11, no local escape.
+ */
+export const SSH_KEEPALIVE = Object.freeze([
+  '-o', 'ServerAliveInterval=10',
+  '-o', 'ServerAliveCountMax=2',
+  '-o', 'TCPKeepAlive=yes',
+  '-o', 'ForwardAgent=no',
+  '-o', 'ForwardX11=no',
+  '-o', 'PermitLocalCommand=no'
+])
+
+/** An Error that carries a stable machine-readable `.code`. */
+export function mcpError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
 
 /** The kill switch, read at call time so a test can flip it. */
 export function windowsMcpEnabled() {
@@ -82,7 +138,7 @@ export function sshArgv({ host = '127.0.0.1', port, user = 'cua', keyPath, remot
     '-o', 'StrictHostKeyChecking=no',
     '-o', 'UserKnownHostsFile=/dev/null',
     '-o', 'ConnectTimeout=10',
-    '-o', 'ServerAliveInterval=15',
+    ...SSH_KEEPALIVE,
     '-p', String(port),
     `${user}@${host}`,
     remoteCommand
@@ -98,12 +154,36 @@ export function sshArgv({ host = '127.0.0.1', port, user = 'cua', keyPath, remot
  * flight at a time (MCP servers answer in order anyway), a per-request timeout,
  * and a `closed` state that the plugin can observe to unregister tools.
  */
-export function createDshCuaClient({ name, sshPort, host = '127.0.0.1', keyPath, user = 'cua', timeoutMs = 60000, log = () => {} }) {
+export function createDshCuaClient({
+  name,
+  sshPort,
+  host = '127.0.0.1',
+  keyPath,
+  user = 'cua',
+  timeoutMs = 60000,
+  isOnline,
+  onClosed,
+  log = () => {}
+}) {
   let child = null
   let buffer = ''
   let nextId = 1
   const pending = new Map()
-  const state = { connected: false, serverInfo: null, tools: [], lastError: '' }
+  const state = { connected: false, online: false, serverInfo: null, tools: [], lastError: '' }
+
+  /**
+   * Ask the upper layer whether the computer is reachable AT ALL before opening
+   * a pipe. A suspended/stopped guest has no sshd: spawning anyway buys a
+   * ConnectTimeout and a "connection refused" that reads like a credentials
+   * problem. `undefined` input (no probe supplied) means "don't judge".
+   */
+  const assertOnline = async () => {
+    const online = await isOnline?.()
+    if (online === false) {
+      throw mcpError('vm-offline', 'the Windows computer is not online; start it or pick another target')
+    }
+    return online !== false
+  }
 
   const failAll = (error) => {
     for (const [, entry] of pending) {
@@ -114,20 +194,22 @@ export function createDshCuaClient({ name, sshPort, host = '127.0.0.1', keyPath,
   }
 
   const write = (message) => {
-    if (child === null || child.stdin.destroyed) throw new Error('the Windows MCP bridge is not connected')
+    if (child === null || child.stdin.destroyed || child.stdin.writable === false) {
+      throw mcpError('not-connected', 'the Windows MCP bridge is not connected')
+    }
     child.stdin.write(`${JSON.stringify(message)}\n`)
   }
 
   const request = (method, params = {}) => new Promise((resolve, reject) => {
     if (child === null) {
-      reject(new Error('the Windows MCP bridge is not connected'))
+      reject(mcpError('not-connected', 'the Windows MCP bridge is not connected'))
       return
     }
     const id = nextId
     nextId += 1
     const timer = setTimeout(() => {
       pending.delete(id)
-      reject(new Error(`the guest did not answer ${method} within ${timeoutMs} ms`))
+      reject(mcpError('timeout', `the guest did not answer ${method} within ${timeoutMs} ms`))
     }, timeoutMs)
     timer.unref?.()
     pending.set(id, { resolve, reject, timer, method })
@@ -174,12 +256,28 @@ export function createDshCuaClient({ name, sshPort, host = '127.0.0.1', keyPath,
       state.lastError = String(chunk).trim().slice(-400)
       log(`mcp-win: ${state.lastError}`)
     })
+    // A dead/suspended link makes the next write fail with EPIPE. Without a
+    // listener that is an UNCAUGHT 'error' event, i.e. the whole harness
+    // process exits — the exact failure the fast keepalive would now trigger
+    // more often. Record it and let the pending requests fail on exit/timeout.
+    child.stdin.on('error', (error) => {
+      state.lastError = `stdin: ${error?.message ?? error}`.slice(-400)
+      log(`mcp-win: ${state.lastError}`)
+    })
     child.on('exit', (code) => {
       const wasConnected = state.connected
       state.connected = false
-      failAll(new Error(`the guest MCP session ended (exit ${code})`))
+      state.online = false
+      failAll(mcpError('session-ended', `the guest MCP session ended (exit ${code})`))
       if (wasConnected) log(`mcp-win: session for ${name} closed (exit ${code})`)
       child = null
+      // Immediate upper-layer teardown: dispose the registered tools now rather
+      // than leaving 19 dead entries until the next list/refresh.
+      try {
+        onClosed?.(code ?? null)
+      } catch (error) {
+        log(`mcp-win: onClosed handler failed: ${error?.message ?? error}`)
+      }
     })
   }
 
@@ -189,7 +287,8 @@ export function createDshCuaClient({ name, sshPort, host = '127.0.0.1', keyPath,
     /** Start the SSH child and complete the MCP handshake. */
     async connect() {
       if (!windowsMcpEnabled()) throw new Error('the Windows MCP bridge is disabled (DSH_CUA_VM_WIN_MCP=0)')
-      if (existsSync('/usr/bin/ssh') === false) throw new Error('ssh is not in this image, so the Windows MCP bridge cannot start')
+      await assertOnline()
+      if (existsSync('/usr/bin/ssh') === false) throw mcpError('ssh-missing', 'ssh is not in this image, so the Windows MCP bridge cannot start')
       const argv = sshArgv({ host, port: sshPort, user, keyPath })
       child = spawn('/usr/bin/ssh', argv, { stdio: ['pipe', 'pipe', 'pipe'] })
       attach(child)
@@ -203,20 +302,31 @@ export function createDshCuaClient({ name, sshPort, host = '127.0.0.1', keyPath,
       const listed = await request('tools/list', {})
       state.tools = Array.isArray(listed?.tools) ? listed.tools : []
       state.connected = true
+      state.online = true
       log(`mcp-win: ${name} connected (${state.tools.length} tool(s) from ${state.serverInfo?.name ?? 'dsh-cua'})`)
       return { serverInfo: state.serverInfo, tools: state.tools }
     },
     listTools() {
       return state.tools
     },
+    /** The guest's tools under the public `mcp__windows__*` names. */
+    publicTools() {
+      return state.tools.map((tool) => ({ ...tool, name: windowsToolName(tool.name) }))
+    },
+    /** The ssh argv this client would use — for the doctor tool. */
+    sshArgv() {
+      return sshArgv({ host, port: sshPort, user, keyPath })
+    },
     async callTool(toolName, args = {}) {
-      const result = await request('tools/call', { name: toolName, arguments: args })
+      await assertOnline()
+      const result = await request('tools/call', { name: windowsGuestToolName(toolName), arguments: args })
       return result
     },
     close() {
       try { child?.kill('SIGTERM') } catch {}
       child = null
       state.connected = false
+      state.online = false
     }
   }
 }

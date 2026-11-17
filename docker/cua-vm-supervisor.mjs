@@ -53,7 +53,11 @@ import {
 } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createSpace, formatSpace, formatSpaceWarning, pngSize, relativeToPixels, resolutionProblem, toDisplayPixels, SPACE_CACHE_MS } from './cua-vm-space.mjs'
+// `spaceLine` IS PART OF THE IMPORT: every successful Linux gui answer ends with
+// it, and a missing name here made each of those answers throw
+// "spaceLine is not defined" AFTER the action had already been performed — the
+// worst shape of failure (the click lands, the caller gets an error).
+import { createSpace, formatSpace, formatSpaceWarning, pngSize, relativeToPixels, resolutionProblem, spaceLine, toDisplayPixels, SPACE_CACHE_MS } from './cua-vm-space.mjs'
 import {
   createWindowsBackend, windowsEnabled, windowsHostCaps, windowsQmpAdapter,
   WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
@@ -74,7 +78,10 @@ import {
   qemuStderrExcerpt, qemuStderrReason,
   // U4: the free-space sentence and its below-floor warning are the module's
   // (pure, tested) formatters; the supervisor only supplies the measurement.
-  parseFreeSpaceProbe, formatWindowsFreeSpace
+  parseFreeSpaceProbe, formatWindowsFreeSpace,
+  // J1-4: the CREATE preflight must ask the same firmware question the boot
+  // path does, or it demands OVMF/swtpm from a version that boots on SeaBIOS.
+  windowsFirmwareProfile
 } from './cua-vm-windows-qemu.mjs'
 import { kvmDoctorFacts, kvmPreflightError, kvmStatus } from './cua-vm-kvm.mjs'
 
@@ -353,7 +360,12 @@ function writePorts() {
       localPort: entry.localPort,
       url: `/vm/port/${name}/`,
       backend: entry.backend ?? 'linux',
-      ...(entry.target ? { target: entry.target } : {})
+      ...(entry.target ? { target: entry.target } : {}),
+      // WP-7: the proxy and the panel read these two from ports.json. `view` is
+      // which front door the relay points at ('novnc-clip' has a clipboard),
+      // `clipboard` is the capability triple, never a guess.
+      ...(entry.view ? { view: entry.view } : {}),
+      ...(entry.clipboard ? { clipboard: entry.clipboard } : {})
     }
   }
   writeFileSync(PORTS_FILE, `${JSON.stringify(out, null, 2)}\n`)
@@ -407,7 +419,7 @@ async function openPort(name, guestPort) {
  * TCP proxy this process owns; it is torn down with the computer and by
  * cua_vm_gc when its upstream stops answering.
  */
-async function openRelay(name, guestPort, target, { backend = 'relay' } = {}) {
+async function openRelay(name, guestPort, target, { backend = 'relay', view = '', clipboard = null } = {}) {
   closePorts(name)
   const localPort = await firstFreePort()
   const sockets = new Set()
@@ -435,6 +447,8 @@ async function openRelay(name, guestPort, target, { backend = 'relay' } = {}) {
     guestPort,
     localPort,
     backend,
+    ...(view !== '' ? { view } : {}),
+    ...(clipboard !== null ? { clipboard } : {}),
     target: { host: target.host || '127.0.0.1', port: target.port },
     alive: () => server.listening,
     stop: () => {
@@ -445,7 +459,16 @@ async function openRelay(name, guestPort, target, { backend = 'relay' } = {}) {
     }
   })
   writePorts()
-  return { name, guestPort, localPort, backend, url: `/vm/port/${name}/`, target: { host: target.host || '127.0.0.1', port: target.port } }
+  return {
+    name,
+    guestPort,
+    localPort,
+    backend,
+    url: `/vm/port/${name}/`,
+    target: { host: target.host || '127.0.0.1', port: target.port },
+    ...(view !== '' ? { view } : {}),
+    ...(clipboard !== null ? { clipboard } : {})
+  }
 }
 
 /** Stop every preview of one computer; returns how much there was to stop. */
@@ -473,7 +496,15 @@ function snapshotPorts(name) {
   return {
     guestPort: entry.guestPort,
     backend: entry.backend ?? 'linux',
-    target: entry.target ?? null
+    target: entry.target ?? null,
+    // J22-12: THE CAPABILITIES ARE PART OF THE SHAPE. `view` says which front
+    // door the relay points at and `clipboard` is the triple the panel reads;
+    // without them a restore could only reopen a dumb TCP forward and wrote a
+    // ports.json row that had lost both — the live view came back, the paste
+    // buttons did not. They are still SHAPE (strings and booleans), never a
+    // socket, so the snapshot stays as cheap and disposable as before.
+    ...(entry.view ? { view: entry.view } : {}),
+    ...(entry.clipboard ? { clipboard: entry.clipboard } : {})
   }
 }
 
@@ -482,7 +513,21 @@ async function restorePorts(name, snapshot) {
   if (!snapshot) return false
   try {
     if (snapshot.backend === 'relay' && snapshot.target) {
-      await openRelay(name, snapshot.guestPort, snapshot.target, { backend: 'relay' })
+      // J22-12: RECOMPUTE THE TRIPLE, DO NOT DROP IT. A relay is transport only;
+      // `openRelay` records what it is told, so a reopen that told it nothing
+      // erased `view` and `clipboard` from ports.json. The answer comes from the
+      // front door the snapshot recorded, computed by the same rules a fresh
+      // ensureWindowsConsoleRelay uses (bridge → clipboard up; websockify/noVNC →
+      // page without clipboard; raw VNC → neither).
+      let rawVncPort = 0
+      try {
+        rawVncPort = Number(readRegistry().vms?.[name]?.ports?.vnc) || 0
+      } catch {
+        // A corrupt registry must not cost the user their preview: the recorded
+        // `view` still answers, only the raw-port sniff is unavailable.
+      }
+      const capabilities = relayCapabilities(snapshot, rawVncPort)
+      await openRelay(name, snapshot.guestPort, snapshot.target, { backend: 'relay', view: capabilities.view, clipboard: capabilities.clipboard })
     } else {
       await openPort(name, snapshot.guestPort)
     }
@@ -686,15 +731,181 @@ function writeRegistry(registry) {
  * a re-read, a field, a write — so a five-minute provisioning run never holds it.
  */
 function mutateRegistry(mutator) {
+  return mutateRegistryWith(mutator, {})
+}
+
+/**
+ * The same write, with a name for WHY it happened. `mutateRegistry` stays a
+ * one-argument function (tools/check-cua-vm.mjs anchors that signature, and it
+ * is the form every existing caller uses); the reason only matters to the state
+ * stream, so the few call sites that KNOW the reason — the install watcher, the
+ * QMP hook — say it here instead of teaching every other call site about it.
+ */
+function mutateRegistryWith(mutator, { reason = 'registry' } = {}) {
   // `readRegistry` THROWS on an unreadable file, and the throw happens before
   // `writeRegistry`, so a failing read can never be persisted as an empty store.
   return withLock('@registry', async () => {
     const registry = readRegistry()
+    // WP-4.4: ONE EMIT POINT. Every state the registry gains (or loses) is
+    // compared here, after the write, so a caller cannot forget to publish a
+    // transition — the hook runs for the watcher, a start, a shutdown, the idle
+    // timer and a status poll alike. `reason` is the caller's one chance to name
+    // WHY (the second argument is optional, so every existing call site keeps
+    // working with the default).
+    const before = new Map(Object.entries(registry.vms).map(([key, row]) => [key, String(row?.state ?? '')]))
     const result = await mutator(registry)
+    // A transition is also a timestamp: `vmWindowsMcpState` reports `since`, and
+    // "when did it become ready" has to come from the ONE place that knows.
+    const at = new Date().toISOString()
+    for (const [name, row] of Object.entries(registry.vms ?? {})) {
+      const state = String(row?.state ?? '')
+      if (state === '' || before.get(name) === state) continue
+      row.stateSince = at
+    }
     writeRegistry(registry)
+    publishRegistryChanges(before, registry, reason)
     return result
   })
 }
+
+/* ------------------------------------------------------------------ *
+ * WP-4: THE STATE BUS (supervisor → plugin)
+ *
+ * The plugin used to learn a computer's state from a 5 s HTTP poll. That is a
+ * second, lossy copy of the truth: a transition shorter than the poll interval
+ * (a boot that failed and recovered, a stop/start pair) simply never happened
+ * as far as the panel was concerned. This is the push half — one socket per
+ * subscriber, one event per REAL transition, and a 25 s ping so a dead client
+ * is reaped by TCP instead of leaking a handler for the lifetime of the
+ * process.
+ *
+ * The framing is newline-delimited JSON, the same as every request:
+ *   → {"op":"subscribe","events":["vm-state"]}
+ *   ← {"event":"ready","events":["vm-state"]}
+ *   ← {"event":"vm-state","name":"…","kind":"windows","state":"ready",
+ *      "reason":"windows-install-ready","at":"2026-…Z"}
+ *   ← {"event":"vm-removed","name":"…","at":"2026-…Z"}      (delete/destroy)
+ *   ← {"event":"ping","at":"2026-…Z"}                        (every 25 s)
+ * The socket is the caller's: it is closed when the client closes it, and the
+ * subscription is dropped with it (no timers, no rows, no references left).
+ * ------------------------------------------------------------------ */
+const SUBSCRIBERS = new Set()
+const SUBSCRIBE_PING_MS = 25000
+/** Every state each computer was last announced in, so only changes travel. */
+const VM_STATE_LAST = new Map()
+/** How long a `vm-removed` is remembered, so a double delete emits once. */
+const VM_REMOVED_AT = new Map()
+
+/** Write one JSON line; false when the socket cannot take it any more. */
+function pushLine(socket, payload) {
+  try {
+    if (socket.destroyed === true || socket.writableEnded === true) return false
+    socket.write(`${JSON.stringify(payload)}\n`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Adopt one subscriber socket: announce the stream, then heartbeat it. */
+function subscribeStream(socket, requested) {
+  const wanted = new Set(
+    (Array.isArray(requested) ? requested : ['vm-state'])
+      .map((entry) => String(entry ?? '').trim())
+      .filter((entry) => entry !== '')
+  )
+  // An empty (or nonsense-only) request is the default stream, never "nothing":
+  // a caller that asked to subscribe has already said what it wants.
+  if (wanted.size === 0) wanted.add('vm-state')
+  const entry = { socket, events: wanted, timer: null }
+  SUBSCRIBERS.add(entry)
+  socket.setNoDelay?.(true)
+  pushLine(socket, { event: 'ready', events: [...wanted] })
+  entry.timer = setInterval(() => {
+    if (pushLine(socket, { event: 'ping', at: new Date().toISOString() }) !== true) detachSubscriber(entry)
+  }, SUBSCRIBE_PING_MS)
+  entry.timer.unref?.()
+  const done = () => detachSubscriber(entry)
+  socket.on('close', done)
+  socket.on('end', done)
+  socket.on('error', done)
+  return entry
+}
+
+function detachSubscriber(entry) {
+  if (entry === null || entry === undefined) return
+  if (entry.timer !== null) clearInterval(entry.timer)
+  entry.timer = null
+  SUBSCRIBERS.delete(entry)
+  try { entry.socket.destroy() } catch {}
+}
+
+/** Does this subscriber want that event? `vm-removed` rides the state stream. */
+function wantsEvent(entry, name) {
+  if (entry.events.has(name)) return true
+  return name === 'vm-removed' && entry.events.has('vm-state')
+}
+
+function broadcastVmEvent(event) {
+  if (SUBSCRIBERS.size === 0) return 0
+  const payload = { ...event, at: event.at ?? new Date().toISOString() }
+  let sent = 0
+  for (const entry of [...SUBSCRIBERS]) {
+    if (wantsEvent(entry, payload.event) !== true) continue
+    if (pushLine(entry.socket, payload)) sent += 1
+    else detachSubscriber(entry)
+  }
+  return sent
+}
+
+/**
+ * THE state transition. Called from the registry hook (the common case), the
+ * install watcher (ready/error), the QMP watcher, and the delete path.
+ * A repeat of the state already announced is NOT a transition and writes
+ * nothing — that is what keeps a 5 s poll of a booting computer from becoming
+ * a 5 s event stream.
+ */
+function emitVmState(name, state, reason = '') {
+  const key = String(name ?? '').trim()
+  const next = String(state ?? '').trim()
+  if (key === '' || next === '') return false
+  if (VM_STATE_LAST.get(key) === next) return false
+  VM_STATE_LAST.set(key, next)
+  broadcastVmEvent({ event: 'vm-state', name: key, kind: 'windows', state: next, reason: String(reason ?? '') })
+  return true
+}
+
+/** A computer left the store. Emitted once per delete, never per retry. */
+function emitVmRemoved(name, reason = '') {
+  const key = String(name ?? '').trim()
+  if (key === '') return false
+  const at = Date.now()
+  const previous = VM_REMOVED_AT.get(key) ?? 0
+  if (at - previous < 5000) return false
+  VM_REMOVED_AT.set(key, at)
+  VM_STATE_LAST.delete(key)
+  broadcastVmEvent({ event: 'vm-removed', name: key, kind: 'windows', reason: String(reason ?? '') })
+  return true
+}
+
+/**
+ * Compare a registry before/after one mutation and publish the difference:
+ * a changed `state` is a `vm-state`, a row that disappeared is `vm-removed`.
+ * Rows whose state is unchanged stay silent (see emitVmState).
+ */
+function publishRegistryChanges(before, registry, reason = 'registry') {
+  const after = registry?.vms ?? {}
+  for (const [name, row] of Object.entries(after)) {
+    const state = String(row?.state ?? '')
+    if (state === '') continue
+    if (before.get(name) === state) continue
+    emitVmState(name, state, reason)
+  }
+  for (const name of before.keys()) {
+    if (after[name] === undefined) emitVmRemoved(name, 'registry-row-removed')
+  }
+}
+
 
 /**
  * The v1→v2 migration is a WRITE, so it happens under the same lock as every
@@ -849,15 +1060,35 @@ function runCua(args, { timeoutMs = 180000, signal } = {}) {
 }
 
 function ok(result) {
-  return { ok: true, ...result }
+  // THE ENVELOPE WINS: a payload field called `ok` (a nested backend result
+  // spread into the answer) must not be able to turn a success into a refusal.
+  return { ...result, ok: true }
 }
 
+/**
+ * THE STRUCTURED REFUSAL (WP-8.5).
+ *
+ * A refusal used to be prose only, so a caller could not act on it without
+ * pattern-matching the sentence. `code` is the machine-readable half and is a
+ * CLOSED set — the plugin passes `answer.code` straight through to the model:
+ *
+ *   stale-capture            the frame changed since the capture the click named
+ *   vm-offline               the computer is not running (nothing to drive)
+ *   no-ssh                   the guest's SSH surface is off, so an op needs it
+ *   clipboard-agent-missing  the guest has no clipboard task/agent to ask
+ *   element-not-locatable    the a11y tree has no leaf with that exact name
+ *
+ * `extra` still carries diagnostics (a partial result, a changed port triple)
+ * on an answer that is otherwise a plain refusal, and it may now also carry
+ * `{ code }` — the message stays the human half of the same answer.
+ */
 function fail(error, extra = null) {
   const message = error instanceof Error ? error.message : String(error)
-  // `extra` carries diagnostics (a partial result, a changed port triple) on an
-  // answer that is otherwise a plain refusal; every existing caller passes one
-  // argument, so nothing else changes.
-  return { ok: false, error: message, ...(extra ?? {}) }
+  const details = extra !== null && typeof extra === 'object' ? extra : {}
+  const code = typeof details.code === 'string' && details.code !== '' ? details.code : ''
+  // Same rule as ok(): the refusal envelope is written LAST so a nested result
+  // cannot overwrite `ok`/`error` on its way through.
+  return { ...details, ...(code !== '' ? { code } : {}), ok: false, error: message }
 }
 
 /**
@@ -866,6 +1097,31 @@ function fail(error, extra = null) {
  * share/seabios, not share/qemu), and QEMU then dies with
  * "could not load PC BIOS 'bios-256k.bin'". Repair them once, idempotently.
  */
+/**
+ * WP-9.5: THE PROVENANCE OF THE TOOLCHAIN, NOT JUST ITS PATH.
+ *
+ * "which QEMU is this?" is a question two different failures ask (a virtio-gpu
+ * device that is missing, a firmware file that moved). A path answers neither
+ * after an image rebuild, so the doctor reports the SHA-256 of the binary it is
+ * actually going to exec. Cached by (path,size,mtime) so a doctor poll does not
+ * re-hash 30 MB every call.
+ */
+const SHA256_FILE_CACHE = new Map()
+
+function sha256OfFile(file) {
+  try {
+    const info = statSync(file)
+    const key = `${file}:${info.size}:${info.mtimeMs}`
+    const cached = SHA256_FILE_CACHE.get(key)
+    if (cached !== undefined) return cached
+    const digest = createHash('sha256').update(readFileSync(file)).digest('hex')
+    SHA256_FILE_CACHE.set(key, digest)
+    return digest
+  } catch {
+    return ''
+  }
+}
+
 function repairQemuData() {
   const share = path.join(CUA_HOME, '.cua', 'qemu', 'usr', 'share')
   const seabios = path.join(share, 'seabios')
@@ -1073,6 +1329,331 @@ async function guiContext(name) {
   const title = lines.find((line) => !/^(X|Y|WINDOW|SCREEN)=/u.test(line)) || 'none'
   return `focus: ${title}, pointer: ${x ?? '?'},${y ?? '?'}`
 }
+
+/* ------------------------------------------------------------------ *
+ * WP-8: CAPTURE IDS, EFFECTS, AND VERIFIED ACTIONS
+ *
+ * A gui action used to answer with prose and a hope. Two things were missing:
+ *
+ *   captureId   WHICH frame the coordinates came from. The model reads a
+ *               screenshot, thinks, and clicks — and if anything repainted the
+ *               desktop in between, the click lands on the new frame at the old
+ *               pixel. Naming the capture lets a click say "the frame I decided
+ *               on", and the supervisor refuse when that frame is gone.
+ *   effect      WHAT THE ACTION CHANGED, measured, not asserted. A pointer move
+ *               is provable (the cursor position before/after), a window focus
+ *               change is provable (the active window title), a typed character
+ *               is NOT provable on X11 without the app's cooperation — and the
+ *               answer says which of the two it is instead of implying success.
+ *
+ * Everything here is gated by DSH_CUA_VM_EFFECTS=0, which turns the extra
+ * round-trips off and marks every answer `unverifiable` rather than lying.
+ * ------------------------------------------------------------------ */
+const EFFECTS_ENABLED = String(process.env.DSH_CUA_VM_EFFECTS ?? '1') !== '0'
+/** name → { id, at, width, height }: the last frame this process handed out. */
+const LAST_CAPTURE = new Map()
+/** How long a capture id stays "the latest" without a new screenshot. */
+const CAPTURE_TTL_MS = 15 * 60 * 1000
+
+/**
+ * Name one frame: `<name>:<epochMs>:<sha1(png)8>`. The hash is what makes it a
+ * CAPTURE id and not a timestamp: two screenshots of an unchanged desktop have
+ * different ids (different frames handed out) but the same pixels, which is
+ * exactly the distinction a caller debugging "did it even repaint" needs.
+ */
+function captureIdFor(name, pngBytes, width, height) {
+  const at = Date.now()
+  const digest = createHash('sha1').update(pngBytes).digest('hex').slice(0, 8)
+  const id = `${name}:${at}:${digest}`
+  LAST_CAPTURE.set(name, { id, at, width: Number(width) || 0, height: Number(height) || 0 })
+  return id
+}
+
+/** The capture a caller's coordinates are supposed to belong to, or null. */
+function latestCapture(name) {
+  const record = LAST_CAPTURE.get(name)
+  if (!record) return null
+  if (Date.now() - record.at > CAPTURE_TTL_MS) return null
+  return record
+}
+
+/**
+ * A capture id that is not the latest frame is a REFUSAL, not a warning: the
+ * click the caller computed no longer refers to anything on the screen.
+ */
+function staleCaptureRefusal(name, captureId) {
+  if (typeof captureId !== 'string' || captureId.trim() === '') return null
+  const latest = latestCapture(name)
+  if (latest !== null && latest.id === captureId.trim()) return null
+  return fail('the frame changed since that capture; take a screenshot and retry', {
+    code: 'stale-capture',
+    detail: 'the frame changed since that capture; take a screenshot and retry',
+    given: captureId.trim(),
+    captureId: latest?.id ?? null
+  })
+}
+
+const EFFECT_NONE = () => ({
+  effect: { kind: 'none', before: null, after: null, changed: false, source: 'disabled' },
+  verified: 'unverifiable',
+  evidence: [{ kind: 'note', detail: 'DSH_CUA_VM_EFFECTS=0: the post-action read-back is off' }]
+})
+
+/**
+ * The pointer channel. `before`/`after` are "x,y" strings as cua reports them;
+ * an unreadable side is null and the answer is `unverifiable` — never `changed:
+ * false`, which would claim the pointer did not move when nobody looked.
+ */
+function pointerEffectResult(before, after, source, note = '') {
+  if (EFFECTS_ENABLED !== true) return EFFECT_NONE()
+  const readable = typeof before === 'string' && before !== '' && typeof after === 'string' && after !== ''
+  const changed = readable && before !== after
+  return {
+    effect: { kind: 'pointer', before: before || null, after: after || null, changed, source },
+    verified: changed ? 'confirmed' : 'unverifiable',
+    evidence: [
+      { kind: 'pointer', before: before || null, after: after || null, readable },
+      ...(note === '' ? [] : [{ kind: 'note', detail: note }])
+    ]
+  }
+}
+
+/**
+ * The window/focus channel: the active window title before and after. `expect`
+ * makes it a real assertion — `expect.window` confirms when the new title
+ * contains it; `expect.text` can only be confirmed when the app puts the typed
+ * text in its title, so anything else is honestly unverifiable.
+ */
+function windowEffectResult(before, after, source, expect = null) {
+  if (EFFECTS_ENABLED !== true) return EFFECT_NONE()
+  const readable = typeof after === 'string' && after !== ''
+  const changed = readable && before !== after
+  const wantWindow = typeof expect?.window === 'string' && expect.window !== '' ? expect.window : ''
+  const wantText = typeof expect?.text === 'string' && expect.text !== '' ? expect.text : ''
+  const windowMatched = wantWindow !== '' && readable && after.includes(wantWindow)
+  const textMatched = wantText !== '' && readable && after.includes(wantText)
+  const confirmed = (wantWindow !== '' || wantText !== '') ? (windowMatched || textMatched) : changed
+  const notes = []
+  if (wantText !== '' && textMatched !== true) {
+    notes.push('expect.text can only be confirmed when the app puts the text in its window title; X11 has no generic read-back')
+  }
+  if (wantWindow !== '' && windowMatched !== true && readable) notes.push(`the active window is "${after}", not "${wantWindow}"`)
+  return {
+    effect: { kind: 'window', before: before || null, after: after || null, changed, source },
+    verified: confirmed ? 'confirmed' : 'unverifiable',
+    evidence: [
+      { kind: 'window', before: before || null, after: after || null, readable },
+      ...(wantWindow === '' ? [] : [{ kind: 'expect.window', value: wantWindow, matched: windowMatched }]),
+      ...(wantText === '' ? [] : [{ kind: 'expect.text', value: wantText, matched: textMatched }]),
+      ...notes.map((detail) => ({ kind: 'note', detail }))
+    ]
+  }
+}
+
+/** The frame channel (Windows): a QMP screendump hash before and after. */
+function frameEffectResult(before, after, source, note = '') {
+  if (EFFECTS_ENABLED !== true) return EFFECT_NONE()
+  const readable = typeof before === 'string' && before !== '' && typeof after === 'string' && after !== ''
+  const changed = readable && before !== after
+  return {
+    effect: { kind: 'frame', before: before || null, after: after || null, changed, source },
+    verified: changed ? 'confirmed' : 'unverifiable',
+    evidence: [
+      { kind: 'frame', before: before || null, after: after || null, readable },
+      ...(note === '' ? [] : [{ kind: 'note', detail: note }])
+    ]
+  }
+}
+
+function pngDigest(png) {
+  try {
+    return createHash('sha1').update(png).digest('hex').slice(0, 8)
+  } catch {
+    return ''
+  }
+}
+
+/** The active window title inside the Linux guest, or '' when it cannot be read. */
+async function activeWindowTitle(name) {
+  try {
+    const read = await guestExec(name, 'DISPLAY=${DISPLAY:-:1} xdotool getactivewindow getwindowname 2>/dev/null', 30000)
+    return read.code === 0 ? read.stdout.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+/** The visible window titles, for a launch/close diff. */
+async function guestWindowTitles(name) {
+  try {
+    const read = await guestExec(name, 'DISPLAY=${DISPLAY:-:1} xdotool search --name "." getwindowname %@ 2>/dev/null', 30000)
+    return cleanWindowList(read.stdout)
+  } catch {
+    return []
+  }
+}
+
+/** QMP's own power status for a Windows computer, or '' when it cannot answer. */
+async function windowsQmpStatus(meta) {
+  const port = Number(meta?.ports?.qmp ?? 0)
+  if (!(port > 0)) return ''
+  try {
+    const answer = await qmpCommands(port, [{ execute: 'query-status' }], { timeoutMs: 8000 })
+    return String(answer?.[0]?.return?.status ?? '')
+  } catch {
+    return ''
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/* ------------------------- the accessibility tree ------------------------- */
+
+/**
+ * WP-8.4: ONE NODE, WHATEVER SPELLING IT USES.
+ *
+ * `cua do a11y tree --json` has been seen with `bounds`, `rect`, `geometry` and
+ * `position`, as an object or a 4-array, and with `width/height` or `right/
+ * bottom`. Normalising here means the click path has ONE rect shape and a new
+ * AT-SPI spelling is a one-line change instead of a silent "not locatable".
+ */
+function a11yRect(node) {
+  if (!node || typeof node !== 'object') return null
+  const raw = node.bounds ?? node.rect ?? node.geometry ?? node.position ?? node.bbox ?? node.box ?? null
+  if (raw === null || raw === undefined) return null
+  const num = (value) => {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  const finish = (x, y, w, h) => {
+    if (x === null || y === null || w === null || h === null) return null
+    if (w <= 0 || h <= 0) return null
+    return { x: Math.round(x), y: Math.round(y), width: Math.round(w), height: Math.round(h) }
+  }
+  if (Array.isArray(raw) && raw.length >= 4) {
+    return finish(num(raw[0]), num(raw[1]), num(raw[2]), num(raw[3]))
+  }
+  if (typeof raw === 'string') {
+    // "x,y wxh" (cua's own window line) or "x,y,w,h".
+    const wxh = /^(-?\d+),(-?\d+)\s+(\d+)x(\d+)$/u.exec(raw.trim())
+    if (wxh !== null) return finish(num(wxh[1]), num(wxh[2]), num(wxh[3]), num(wxh[4]))
+    const comma = raw.split(',').map((part) => num(part.trim()))
+    if (comma.length >= 4) return finish(comma[0], comma[1], comma[2], comma[3])
+    return null
+  }
+  if (typeof raw === 'object') {
+    const x = num(raw.x ?? raw.left ?? raw.X)
+    const y = num(raw.y ?? raw.top ?? raw.Y)
+    const right = num(raw.right ?? raw.x2 ?? raw.maxX)
+    const bottom = num(raw.bottom ?? raw.y2 ?? raw.maxY)
+    const w = num(raw.width ?? raw.w) ?? (x !== null && right !== null ? right - x : null)
+    const h = num(raw.height ?? raw.h) ?? (y !== null && bottom !== null ? bottom - y : null)
+    return finish(x, y, w, h)
+  }
+  return null
+}
+
+function a11yName(node) {
+  const raw = node?.name ?? node?.label ?? node?.title ?? node?.text ?? null
+  return typeof raw === 'string' ? raw.trim() : ''
+}
+
+function a11yFocused(node) {
+  if (node?.focused === true || node?.selected === true) return true
+  const state = node?.state
+  if (state && typeof state === 'object') {
+    if (state.focused === true || state.selected === true || state.active === true) return true
+    if (Array.isArray(state) && (state.includes('focused') || state.includes('selected'))) return true
+  }
+  const states = node?.states
+  if (Array.isArray(states) && (states.includes('focused') || states.includes('selected'))) return true
+  return false
+}
+
+const a11yArea = (rect) => rect.width * rect.height
+
+/**
+ * Flatten a tree into addressable entries. `leaf` is computed from the entries
+ * themselves (a node with an addressable descendant is not a leaf), so the
+ * smallest-area rule picks the real target: a list item, not the panel that
+ * contains it.
+ */
+export function normaliseA11yNode(tree) {
+  const entries = []
+  const visit = (node, parent) => {
+    if (node === null || node === undefined || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, parent)
+      return
+    }
+    const rect = a11yRect(node)
+    const name = a11yName(node)
+    let index = -1
+    if (rect !== null && name !== '') {
+      index = entries.length
+      entries.push({
+        name,
+        role: String(node.role ?? node.type ?? node.kind ?? ''),
+        rect,
+        focused: a11yFocused(node),
+        parent,
+        leaf: true,
+        depth: 0
+      })
+    }
+    const children = Array.isArray(node.children)
+      ? node.children
+      : Array.isArray(node.items)
+        ? node.items
+        : Array.isArray(node.nodes)
+          ? node.nodes
+          : []
+    for (const child of children) visit(child, index === -1 ? parent : index)
+    // A wrapper (`{root:…}` / `{tree:…}`) has no rect of its own.
+    for (const nested of [node.root, node.tree]) {
+      if (nested && typeof nested === 'object') visit(nested, index === -1 ? parent : index)
+    }
+  }
+  visit(tree, -1)
+  const parents = new Set(entries.map((entry) => entry.parent).filter((value) => value >= 0))
+  for (let index = 0; index < entries.length; index += 1) entries[index].leaf = parents.has(index) !== true
+  entries.sort((left, right) => a11yArea(left.rect) - a11yArea(right.rect))
+  return entries
+}
+
+/**
+ * JSON from a CLI that may print a banner first. `cua do a11y tree --json` has
+ * been seen with a leading log line, and a strict JSON.parse then reported "no
+ * tree" for a tree that was right there.
+ */
+function parseJsonLoose(text) {
+  const raw = String(text ?? '').trim()
+  if (raw === '') return null
+  try { return JSON.parse(raw) } catch {}
+  const starts = [raw.indexOf('{'), raw.indexOf('[')].filter((index) => index >= 0).sort((left, right) => left - right)
+  if (starts.length === 0) return null
+  const start = starts[0]
+  const end = raw.lastIndexOf(raw[start] === '{' ? '}' : ']')
+  if (end <= start) return null
+  try { return JSON.parse(raw.slice(start, end + 1)) } catch { return null }
+}
+
+/** A rect's centre, rounded. */
+function rectCentre(rect) {
+  return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }
+}
+
+/**
+ * A DISPLAY point in SCREENSHOT pixels — the inverse of `toDisplayPixels`.
+ * a11y bounds are screen points; every input verb this module uses takes
+ * screenshot pixels, and the measured scale is the only bridge between them.
+ */
+function displayPointToScreenshot(space, point) {
+  const scale = Number(space?.scale)
+  const factor = Number.isFinite(scale) && scale > 0 ? scale : 1
+  return { x: Math.round((Number(point.x) || 0) / factor), y: Math.round((Number(point.y) || 0) / factor) }
+}
+
 
 /** sb exec, but patient: the guest daemon restarts with the desktop. */
 async function guestExec(name, command, timeoutMs = 60000, attempts = 3) {
@@ -1343,7 +1924,11 @@ async function regrowDiskAfterRebuild(name, meta) {
   if (meta?.rea !== true || needGb <= 20) return null
   try {
     const grown = await growGuestDisk(name, needGb)
-    log(`disk: ${name} ${grown && grown.changed ? `regrown to ${grown.sizeGb} GB` : `already ${grown?.sizeGb ?? 'unknown'} GB`}`)
+    // A refusal is not "already big enough" (WP-9.1 made the difference
+    // observable): say which one it was, with the guest's own reason.
+    log(`disk: ${name} ${grown?.ok === false
+      ? `regrow refused (${grown.reason}${grown.detail ? `: ${grown.detail.slice(0, 200)}` : ''})`
+      : grown?.changed ? `regrown to ${grown.sizeGb} GB` : `already ${grown?.sizeGb ?? 'unknown'} GB`}`)
     return grown
   } catch (error) {
     log(`disk: ${name} regrow failed (${error.message}); provisioning continues`)
@@ -1437,6 +2022,11 @@ function installQemuShim() {
     '  if [ "$skip" = 1 ]; then skip=0; continue; fi',
     '  case "$a" in',
     '    -virtfs) skip=1 ;;',
+    // WP-9.4: QEMU accepts BOTH spellings, and a caller that used the
+    // `-virtfs=local,path=…` form used to slip past this filter — the share was
+    // then declared twice (this shim's own and the inherited one), and QEMU
+    // picked whichever mount_tag it saw last. One token, same rule.
+    '    -virtfs=*) ;;',
     '    *) args+=("$a") ;;',
     '  esac',
     'done'
@@ -1458,6 +2048,105 @@ function installQemuShim() {
     log(`qemu: could not write the shim: ${error && error.message}`)
     return false
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * WP-9.3 / WP-9.4 — WHAT THE GUEST AND THE CMDLINE ACTUALLY SAY
+ *
+ * Both of these exist because the supervisor used to report the REQUEST instead
+ * of the RESULT: `gpu: true` in the row while the guest rendered on llvmpipe,
+ * and `share: dshworkspace` in the doctor while the QEMU that booted carried no
+ * `-virtfs` at all. Neither is a crash — both are a promise the user acts on
+ * (Blender will be fast; the project is at /workspace) that was never kept.
+ * ------------------------------------------------------------------ */
+
+/** The renderers that mean "the guest never got a GPU". */
+const SOFTWARE_RASTERISER = /llvmpipe|softpipe|swrast|Xvfb/iu
+
+/**
+ * A GPU computer that provisioned on a software rasteriser is DEGRADED, not
+ * broken: it works, slowly. `unknown` counts as degraded too — an unmeasured
+ * claim is not evidence of a working GPU, and the panel must not show a green
+ * GPU badge for a renderer nobody read.
+ */
+function noteGpuRenderer(name, { gpu = false, renderer = '' } = {}) {
+  if (gpu !== true) return null
+  const text = String(renderer ?? '').trim()
+  const measured = text === '' ? 'unknown' : text
+  if (measured !== 'unknown' && SOFTWARE_RASTERISER.test(measured) !== true) return null
+  log(`gpu: ${name} stayed on the software rasteriser (${measured})`)
+  return { renderer: measured, at: new Date().toISOString() }
+}
+
+/** Put a degraded-GPU note on the row (the answer also carries it). */
+async function recordGpuRenderer(name, note) {
+  if (note === null) return note
+  try {
+    await mutateRegistry((fresh) => {
+      const row = fresh.vms[name]
+      if (!row) return
+      row.gpuDegraded = note
+    })
+  } catch (error) {
+    log(`gpu: could not record the renderer for ${name} (${error?.message ?? error})`)
+  }
+  return note
+}
+
+/**
+ * DID THIS BOOT GET THE 9p SHARE? The cmdline cua wrote for THIS process is the
+ * only honest source: the shim's `-virtfs` is appended by the wrapper, so a
+ * guest booted from the cua bundle (no shim) or with DSH_CUA_VM_SHARE_WORKSPACE
+ * off at boot time has no mount no matter what the row says.
+ */
+function guestShareState(name) {
+  if (SHARE_WORKSPACE !== true) return { state: 'off' }
+  const cmdlinePath = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', assertVmName(name), 'cmdline')
+  let text = ''
+  try {
+    text = readFileSync(cmdlinePath, 'utf8')
+  } catch {
+    return { state: 'unknown', detail: 'no QEMU cmdline to read (the computer is not running)' }
+  }
+  if (/-virtfs\b|-virtfs=|mount_tag=[^,\s]+|\b9p\b/u.test(text)) return { state: 'attached' }
+  return {
+    state: 'missing',
+    detail: `the QEMU cmdline for ${name} carries no -virtfs/9p mount, so ${WORKSPACE_ROOT} is NOT visible in the guest`
+  }
+}
+
+/** Record it on the row; `missing` is also a log line, because it is a regression. */
+async function recordGuestShare(name) {
+  const verdict = guestShareState(name)
+  if (verdict.state !== 'attached' && verdict.state !== 'missing') return verdict
+  try {
+    await mutateRegistry((fresh) => {
+      const row = fresh.vms[name]
+      if (!row) return
+      row.share = verdict.state
+      if (verdict.state === 'missing') row.shareDetail = verdict.detail
+      else delete row.shareDetail
+    })
+  } catch (error) {
+    log(`share: could not record the 9p state for ${name} (${error?.message ?? error})`)
+  }
+  if (verdict.state === 'missing') log(`share: ${name} ${verdict.detail}`)
+  return verdict
+}
+
+/**
+ * The "this computer works but not as promised" summary. Both facts are already
+ * on the rows; this is the shape `status`/`vmList` publish so a caller does not
+ * have to walk the registry to find them.
+ */
+function degradedSummary(rows) {
+  const gpu = {}
+  const share = {}
+  for (const [name, row] of Object.entries(rows ?? {})) {
+    if (row?.gpuDegraded && typeof row.gpuDegraded === 'object') gpu[name] = row.gpuDegraded
+    if (row?.share === 'missing') share[name] = String(row.shareDetail ?? 'no -virtfs in the QEMU cmdline')
+  }
+  return { gpu, share }
 }
 
 /**
@@ -1529,36 +2218,130 @@ function qmpCommands(port, commands, { timeoutMs = 15000, host = '127.0.0.1' } =
 }
 
 /**
- * Grow a computer's disk. QMP grows the qcow2 under the running QEMU, then
- * growpart + resize2fs grow the guest filesystem online. Called at create
- * time (android) and by the cua_vm_disk tool.
+ * WP-9.1: THE GUEST'S OWN ANSWER ABOUT ITS FILESYSTEM.
+ *
+ * `df -B1 --output=size,avail /` prints one header line and one row of raw
+ * bytes, which is the only shape that survives a locale and a spacing change:
+ * no unit suffix to parse, no `1K-blocks` arithmetic, no human rounding. The
+ * header is skipped by matching the LAST line that is exactly two integers, so
+ * a guest that prefixes a warning (`df: /: …`) still answers.
+ *
+ * Exported because it is the whole contract of the measurement and it is worth
+ * a unit test that never boots a VM.
+ */
+export function parseGuestDf(stdout) {
+  const lines = String(stdout ?? '').split('\n').map((line) => line.trim()).filter((line) => line !== '')
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const matched = /^(\d+)\s+(\d+)$/u.exec(lines[index])
+    if (matched === null) continue
+    const sizeBytes = Number(matched[1])
+    const availBytes = Number(matched[2])
+    if (Number.isFinite(sizeBytes) && Number.isFinite(availBytes) && sizeBytes > 0) {
+      return { sizeBytes, availBytes }
+    }
+  }
+  return null
+}
+
+const GUEST_DF_COMMAND = 'df -B1 --output=size,avail /'
+
+/** One measurement of the guest's root filesystem, with its raw output. */
+async function guestDiskUsage(name, timeoutMs = 60000) {
+  const read = await guestExec(name, GUEST_DF_COMMAND, timeoutMs)
+  return {
+    measured: parseGuestDf(read.stdout),
+    code: read.code,
+    output: `${read.stdout}${read.stderr}`.trim()
+  }
+}
+
+/**
+ * WP-9.1: Grow a computer's disk, AND PROVE IT.
+ *
+ * QMP grows the qcow2 under the running QEMU, then growpart + resize2fs grow the
+ * guest filesystem online. The old version ended both commands with `|| true`
+ * and reported `sizeGb: <what was asked for>`: a guest whose growpart failed
+ * still answered "grew to 40 GB", the registry recorded 40 GB, and the panel
+ * showed a 20 GB filesystem that would die with ENOSPC later. Nothing here is
+ * allowed to claim a size that was not MEASURED after the fact.
+ *
+ *   * growpart exit 1 + "NOCHANGE" is SUCCESS: the partition already fills the
+ *     block device (the normal case for a disk grown from outside).
+ *   * resize2fs non-zero is `guest-resize-failed` with its own output.
+ *   * a measured size below 95% of the request is `short-grow` — the block
+ *     device grew but the filesystem did not, which is exactly the silent case.
  */
 async function growGuestDisk(name, sizeGb) {
-  const bytes = Math.round(Number(sizeGb) * 1024 ** 3)
+  assertVmName(name)
+  const requestedGb = Number(sizeGb)
+  const bytes = Math.round(requestedGb * 1024 ** 3)
   if (!Number.isFinite(bytes) || bytes < 8 * 1024 ** 3) throw new Error('disk size must be at least 8 GB')
   const cmdlinePath = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name, 'cmdline')
-  if (!existsSync(cmdlinePath)) return { ok: false, error: 'this computer has no QEMU cmdline (is it running?)' }
+  if (!existsSync(cmdlinePath)) {
+    return { ok: false, reason: 'not-running', error: 'this computer has no QEMU cmdline (is it running?)', requestedGb }
+  }
   const cmdline = readFileSync(cmdlinePath, 'utf8')
   const port = Number((/-qmp tcp:127\.0\.0\.1:(\d+)/u.exec(cmdline) || [])[1])
-  if (!port) return { ok: false, error: 'no QMP socket in the QEMU cmdline' }
-  const before = await qmpCommands(port, [{ execute: 'query-block' }])
-  const block = (before[0]?.return || []).find((entry) => entry.device === 'disk0')
-  const current = Number(block?.inserted?.image?.['virtual-size'] || 0)
-  if (current >= bytes) {
-    return { ok: true, sizeGb: Math.round(current / 1024 ** 3), changed: false }
+  if (!port) return { ok: false, reason: 'no-qmp', error: 'no QMP socket in the QEMU cmdline', requestedGb }
+  // THE "BEFORE" IS A MEASUREMENT, not the size the row claims: a rebuild can
+  // leave a row and a disk disagreeing, and the delta is what a caller sees.
+  const beforeRead = await guestDiskUsage(name)
+  const before = beforeRead.measured
+  const block = (await qmpCommands(port, [{ execute: 'query-block' }]))[0]?.return
+  const current = Number((Array.isArray(block) ? block : []).find((entry) => entry.device === 'disk0')?.inserted?.image?.['virtual-size'] || 0)
+  let changed = false
+  if (current < bytes) {
+    const resized = await qmpCommands(port, [{ execute: 'block_resize', arguments: { device: 'disk0', size: bytes } }])
+    if (resized[0]?.error) throw new Error(`block_resize refused: ${resized[0].error.desc || 'unknown'}`)
+    changed = true
   }
-  const resized = await qmpCommands(port, [{ execute: 'block_resize', arguments: { device: 'disk0', size: bytes } }])
-  if (resized[0]?.error) throw new Error(`block_resize refused: ${resized[0].error.desc || 'unknown'}`)
-  // The guest has to notice the bigger block device before the filesystem
-  // can. growpart issues BLKPG itself; partprobe is the fallback.
-  const grown = await guestExec(name, `sudo -n growpart /dev/vda 3 >/dev/null 2>&1 || sudo -n partprobe /dev/vda >/dev/null 2>&1 || true
-sudo -n resize2fs /dev/vda3 >/dev/null 2>&1 || true
-df -BG --output=size,avail / | tail -1`, 180000)
+  // The guest has to notice the bigger block device before the filesystem can.
+  // growpart issues BLKPG itself; partprobe re-reads the table. NO `|| true`:
+  // a failure here is the reason the filesystem never grew, and hiding it was
+  // the whole defect.
+  const partition = await guestExec(name, 'sudo -n growpart /dev/vda 3 || sudo -n partprobe /dev/vda', 180000)
+  const partitionText = `${partition.stdout}${partition.stderr}`.trim()
+  const partitionOk = partition.code === 0 || /NOCHANGE/iu.test(partitionText)
+  if (partitionOk !== true) {
+    return { ok: false, changed, requestedGb, reason: 'guest-growpart-failed', detail: partitionText.slice(-600), before, after: before }
+  }
+  const resize = await guestExec(name, 'sudo -n resize2fs /dev/vda3', 180000)
+  const resizeText = `${resize.stdout}${resize.stderr}`.trim()
+  if (resize.code !== 0) {
+    return { ok: false, changed, requestedGb, reason: 'guest-resize-failed', detail: resizeText.slice(-600), before, after: before }
+  }
+  const afterRead = await guestDiskUsage(name)
+  const after = afterRead.measured
+  const measured = Number(after?.sizeBytes ?? 0)
+  if (measured <= 0) {
+    return { ok: false, changed, requestedGb, reason: 'guest-measure-failed', detail: afterRead.output.slice(-600), before, after: null }
+  }
+  if (measured < bytes * 0.95) {
+    // 95% and not 100%: ext4 loses a little to metadata and a requested GiB is
+    // not exactly a df GiB. A 5% band is far wider than that and far narrower
+    // than "half the disk did not arrive".
+    return {
+      ok: false,
+      changed,
+      requestedGb,
+      reason: 'short-grow',
+      measured,
+      requested: bytes,
+      sizeGb: Math.round(measured / 1024 ** 3),
+      bytes: measured,
+      before,
+      after
+    }
+  }
   return {
     ok: true,
-    sizeGb: Math.round(bytes / 1024 ** 3),
-    changed: true,
-    guest: grown.stdout.trim()
+    changed,
+    requestedGb,
+    sizeGb: Math.round(measured / 1024 ** 3),
+    bytes: measured,
+    before,
+    after,
+    detail: partitionText === '' ? undefined : partitionText.slice(-300)
   }
 }
 
@@ -1576,8 +2359,19 @@ function checkpointSandbox(name) {
  * checkpoint"` — a checkpoint path that existed only in the docs. One writer,
  * one output name, two callers.
  */
+/**
+ * WP-9.2: A CHECKPOINT EITHER RETURNS ITS FILE **AND ITS SIZE**, OR SAYS WHY.
+ *
+ * The old contract was "path or null", and null is indistinguishable between
+ * "this kind of computer has no disk here", "the store has no room" and
+ * "qemu-img refused" — so every one of them was recorded as the same silent
+ * `no disk to checkpoint`, and a user whose checkpoint had never existed for ten
+ * runs had nothing to read. The caller now gets a reason it can put on the row.
+ */
 function checkpointDiskFile(name, disk) {
-  if (!existsSync(disk)) return null
+  if (typeof disk !== 'string' || disk === '' || !existsSync(disk)) {
+    return { ok: false, reason: 'no-disk', detail: `no disk at ${typeof disk === 'string' && disk !== '' ? disk : '(no path given)'}` }
+  }
   const target = path.join(CHECKPOINT_DIR, `${name}.qcow2`)
   try {
     mkdirSync(CHECKPOINT_DIR, { recursive: true })
@@ -1588,13 +2382,29 @@ function checkpointDiskFile(name, disk) {
     // needs.
     execFileSync(qemuImgPath(), ['convert', '-O', 'qcow2', disk, `${target}.tmp`], { timeout: 180000 })
     renameSync(`${target}.tmp`, target)
-    log(`checkpoint ${name}: ${(statSync(target).size / 1024 ** 2).toFixed(1)} MB (flattened)`)
-    return target
+    const bytes = statSync(target).size
+    log(`checkpoint ${name}: ${(bytes / 1024 ** 2).toFixed(1)} MB (flattened)`)
+    return { path: target, bytes }
   } catch (error) {
     log(`checkpoint ${name} failed: ${error && error.message}`)
     try { unlinkSync(`${target}.tmp`) } catch {}
-    return null
+    return { ok: false, reason: 'convert-failed', detail: String(error?.message ?? error).slice(-600) }
   }
+}
+
+/**
+ * The checkpoint file a successful capture produced, or null. Every caller that
+ * only needs "was there one, and where" goes through this so the object contract
+ * above has exactly one reader per meaning.
+ */
+function checkpointPathOf(captured) {
+  if (!captured || typeof captured !== 'object' || captured.ok === false) return null
+  return typeof captured.path === 'string' && captured.path !== '' ? captured.path : null
+}
+
+/** The row field a skipped checkpoint writes (WP-9.2), never a bare null. */
+function checkpointSkipRecord(reason, detail) {
+  return { reason: String(reason || 'unknown'), detail: String(detail || ''), at: new Date().toISOString() }
 }
 
 /** cua's own qemu-img, or the distro one; never a hard failure. */
@@ -1657,6 +2467,10 @@ async function destroyVm(name, { reason = 'delete', deleteContainer = true, forc
 async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true, force = false } = {}) {
   // First statement, before any path is built.
   assertVmName(name)
+  // WP-4.5: nothing is watching a computer that is about to stop existing, and
+  // a QMP close event from the kill below would otherwise write `error` over the
+  // removal.
+  dismantleQmpStateWatcher(name)
   const items = []
   // THE ROW DECIDES WHAT KIND OF COMPUTER THIS IS, before anything is removed:
   // a `kind: 'windows'` row has NO cua sandbox, so `cua sb rm --local <name>` is
@@ -1918,6 +2732,15 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
   // and unreachable (the row had been dropped).
   const skipped = items.filter((item) => item.status === 'skipped')
   const complete = failures.length === 0 && skipped.length === 0 && sandboxGone
+  // WP-4.4: THE DELETE IS ITS OWN EVENT. The registry hook already emits when a
+  // row disappears, but this is the COMPLETION of the manifest (and the only
+  // place that knows the reason). `emitVmRemoved` de-duplicates a second call
+  // within 5 s, so the hook's event and this one cannot double-fire.
+  try {
+    if (!readRegistry().vms[name]) emitVmRemoved(name, reason)
+  } catch {
+    // An unreadable registry is not evidence the computer is gone; stay silent.
+  }
   log(`destroy ${name} (${reason}${forced.requested ? ', FORCE' : ''}): ${items.filter((item) => item.status === 'removed').length}/${items.length} item(s) removed${failures.length ? `, ${failures.length} failed` : ''}${skipped.length ? `, ${skipped.length} kept` : ''}${complete ? '' : ' (INCOMPLETE)'}`)
   return {
     name,
@@ -2417,6 +3240,10 @@ async function createLinuxNow(spec, warnings = []) {
   // frequently used half — a failure there must not be hidden behind an
   // 8 GB emulator download.
   const provisioned = await provisionGuest(name, { gpu: spec.gpu })
+  // WP-9.3: the GPU the guest REPORTED, not the one that was requested.
+  const gpuDegraded = await recordGpuRenderer(name, noteGpuRenderer(name, { gpu: spec.gpu, renderer: provisioned.renderer }))
+  // WP-9.4: the 9p mount this boot actually carries.
+  await recordGuestShare(name)
   let disk = null
   if (effectiveDiskGb > 20) disk = await growGuestDisk(name, effectiveDiskGb)
   const reaResult = rea === true ? await provisionReaGuest(name) : null
@@ -2429,6 +3256,9 @@ async function createLinuxNow(spec, warnings = []) {
     created: true,
     renderer: provisioned.renderer,
     provisioned: provisioned.ok,
+    // WP-9.3: present ONLY when the renderer was software/unknown, so a healthy
+    // GPU create answers exactly as it did before.
+    gpuDegraded: gpuDegraded ?? undefined,
     disk,
     // The panel says "disk raised to 40 GB" from this, instead of
     // discovering the floor by reading the registry.
@@ -2495,7 +3325,19 @@ async function suspendVmLocked(name) {
   // recoverable as a shutdown. `never` skips it, `shutdown` leaves suspends
   // alone (the sandbox stays resumable, so there is nothing to protect).
   let checkpoint = null
-  if (config.checkpointPolicy === 'always') checkpoint = checkpointSandbox(name)
+  let checkpointSkipped = null
+  if (config.checkpointPolicy === 'always') {
+    // The CAPTURE is now a record ({path,bytes} or {ok:false,reason,detail}), so
+    // it is taken here and unwrapped below into the path restoreFrom stores. The
+    // call stays in this shape because tools/check-cua-vm.mjs anchors the
+    // suspend/shutdown checkpoint hop on it.
+    checkpoint = checkpointSandbox(name)
+    const captured = checkpoint
+    checkpoint = checkpointPathOf(captured)
+    // WP-9.2: a suspend that WANTED a checkpoint and did not get one records
+    // why, instead of looking exactly like `checkpointPolicy: shutdown`.
+    if (checkpoint === null) checkpointSkipped = checkpointSkipRecord(captured?.reason ?? 'unknown', captured?.detail ?? '')
+  }
   const result = await runCua(['sb', 'suspend', '--local', name], { timeoutMs: 180000 })
   closePorts(name)
   await mutateRegistry((registry) => {
@@ -2503,9 +3345,11 @@ async function suspendVmLocked(name) {
     registry.vms[name].state = 'suspended'
     registry.vms[name].lastUsed = new Date().toISOString()
     if (checkpoint !== null) registry.vms[name].restoreFrom = { kind: 'checkpoint', file: checkpoint }
+    if (checkpointSkipped !== null) registry.vms[name].checkpointSkipped = checkpointSkipped
+    else delete registry.vms[name].checkpointSkipped
   })
   if (result.code !== 0) return fail((result.stderr || result.stdout).trim().slice(-800))
-  return ok({ name, state: 'suspended', checkpoint: checkpoint ?? undefined })
+  return ok({ name, state: 'suspended', checkpoint: checkpoint ?? undefined, checkpointSkipped: checkpointSkipped ?? undefined })
 }
 
 async function resumeVm(name) {
@@ -2716,8 +3560,10 @@ async function shutdownVmLocked(name, { reason = 'shutdown' } = {}) {
   // image because a convert of a live qcow2 is not guaranteed consistent.
   let checkpoint = null
   let checkpointSkipped = ''
+  let checkpointSkippedRecord = null
   if (config.checkpointPolicy === 'never') {
     checkpointSkipped = 'checkpointPolicy=never'
+    checkpointSkippedRecord = checkpointSkipRecord('policy', checkpointSkipped)
   } else {
     // A CHECKPOINT COSTS A FULL DISK. Writing one into a store that has no room
     // for it either fails halfway (leaving a `.tmp`) or fills the volume and
@@ -2729,12 +3575,23 @@ async function shutdownVmLocked(name, { reason = 'shutdown' } = {}) {
     const over = await refuseOverQuota(config, needed)
     if (over !== null) {
       checkpointSkipped = `the checkpoint needs ~${(needed / 1024 ** 3).toFixed(1)} GB and the store quota does not allow it`
+      checkpointSkippedRecord = checkpointSkipRecord('quota', `${checkpointSkipped} (${over})`)
       notes.push(`${checkpointSkipped} (${over})`)
     } else {
-      // LINUX: the guest disk is the cua sandbox's own qcow2.
+      // LINUX: the guest disk is the cua sandbox's own qcow2. Same two steps and
+      // the same anchored call shape as the suspend path above.
       checkpoint = checkpointSandbox(name)
-      if (checkpoint === null) checkpointSkipped = 'no disk to checkpoint'
+      const captured = checkpoint
+      checkpoint = checkpointPathOf(captured)
+      if (checkpoint === null) {
+        checkpointSkipped = 'no disk to checkpoint'
+        // WP-9.2: `no-disk` vs `convert-failed` — the two used to be one null.
+        checkpointSkippedRecord = checkpointSkipRecord(captured?.reason ?? 'no-disk', captured?.detail ?? '')
+      }
     }
+  }
+  if (checkpoint === null && checkpointSkippedRecord === null) {
+    checkpointSkippedRecord = checkpointSkipRecord('unknown', checkpointSkipped)
   }
   if (checkpoint === null) {
     notes.push(checkpointSkipped === 'no disk to checkpoint'
@@ -2764,6 +3621,11 @@ async function shutdownVmLocked(name, { reason = 'shutdown' } = {}) {
     fresh.vms[name].restoreFrom = checkpoint !== null
       ? { kind: 'checkpoint', file: checkpoint }
       : { kind: 'image', image: fresh.vms[name].image || 'linux' }
+    // WP-9.2: THE SKIP IS A RECORD, NOT A NULL. `{reason,detail,at}` is what the
+    // panel and cua_vm_doctor read; the string in `lastShutdown` stays for the
+    // sentence it already renders.
+    if (checkpointSkippedRecord !== null) fresh.vms[name].checkpointSkipped = checkpointSkippedRecord
+    else delete fresh.vms[name].checkpointSkipped
     if (timedOut) fresh.vms[name].mayBeTorn = true
     else delete fresh.vms[name].mayBeTorn
     return fresh.vms[name].restoreFrom
@@ -2774,6 +3636,7 @@ async function shutdownVmLocked(name, { reason = 'shutdown' } = {}) {
     state: 'powered-off',
     method,
     checkpoint: checkpoint ?? undefined,
+    checkpointSkipped: checkpointSkippedRecord ?? undefined,
     mayBeTorn: timedOut || undefined,
     restoreFrom,
     notes: notes.length > 0 ? notes : undefined,
@@ -2840,8 +3703,14 @@ async function startFromCheckpoint(name, meta) {
     delete registry.vms[name].mayBeTorn
   })
   space.invalidate(name)
+  // WP-9.4: the cmdline of the QEMU that just booted is the only honest answer
+  // to "is the workspace shared into this guest".
+  await recordGuestShare(name)
   await regrowDiskAfterRebuild(name, meta)
   const provisioned = await provisionGuest(name, { gpu: meta.gpu === true })
+  // WP-9.3: a cold boot re-provisions, so it can degrade the GPU just like a
+  // create can — and this is the path a user takes after a shutdown.
+  const gpuDegraded = await recordGpuRenderer(name, noteGpuRenderer(name, { gpu: meta.gpu === true, renderer: provisioned.renderer }))
   const rea = meta.rea === true ? await provisionReaGuest(name) : null
   return ok({
     name,
@@ -2851,6 +3720,7 @@ async function startFromCheckpoint(name, meta) {
     provisioned: provisioned.ok,
     rea: rea ? rea.ok : undefined,
     renderer: provisioned.renderer,
+    gpuDegraded: gpuDegraded ?? undefined,
     detail: from === 'checkpoint'
       ? 'cold-booted from its checkpoint (the sandbox was removed at shutdown, so there was nothing to resume)'
       : stale
@@ -2919,6 +3789,210 @@ async function replaceLiveView(name, preview) {
   }
 }
 
+/**
+ * WP-7: THE CONSOLE BRIDGE, AND WHY IT IS PREFERRED.
+ *
+ * Raw websockify forwards RFB bytes and nothing else: a Windows guest drops
+ * ClientCutText (there is no clipboard agent listening on that channel), so the
+ * live view has never had a clipboard. `cua-vnc-clip.mjs` is an RFB-aware bridge
+ * that ALSO serves the same noVNC page and talks to this supervisor over the
+ * existing 0600 unix socket for clipboard in/out — no new TCP listener, no new
+ * dependency, and the guest side is the schtasks/agent pair the panel already
+ * uses.
+ *
+ * It is feature-detected in BOTH directions:
+ *   * `DSH_CUA_VNC_CLIP=0` disables it outright,
+ *   * a missing /usr/local/bin/cua-vnc-clip.mjs keeps today's websockify path,
+ *   * a bridge that exits or never listens is replaced by websockify in the same
+ *     call, so a broken bridge can never cost the user their console.
+ */
+const VNC_CLIP_BIN = String(process.env.DSH_CUA_VNC_CLIP_BIN || '/usr/local/bin/cua-vnc-clip.mjs')
+const VNC_CLIP_DISABLED = String(process.env.DSH_CUA_VNC_CLIP ?? '1') === '0'
+const NOVNC_WEB_CANDIDATES = ['/usr/share/novnc', '/usr/share/novnc-python', '/usr/local/share/novnc']
+
+/**
+ * J20-1c: `DSH_CUA_VNC_CLIP_POLL_MS` IS A KNOB, NOT A COMMENT.
+ *
+ * The bridge polls `vmWindowsClipboardGet` every `--poll-ms`; the supervisor
+ * documented the variable but never passed it, so the documented interval and
+ * the real one could not disagree more silently (the env was dead, the bridge
+ * always used its own 1200 ms default). Read it here, clamp it to a range that
+ * is a poll interval and not a busy loop (200 ms) or a dead channel (60 s), and
+ * keep it an integer: `--poll-ms 12.5` would schedule a fractional timer.
+ */
+const VNC_CLIP_POLL_DEFAULT_MS = 1200
+const VNC_CLIP_POLL_MIN_MS = 200
+const VNC_CLIP_POLL_MAX_MS = 60000
+
+function vncClipPollMs() {
+  const raw = String(process.env.DSH_CUA_VNC_CLIP_POLL_MS ?? '').trim()
+  if (raw === '') return VNC_CLIP_POLL_DEFAULT_MS
+  const value = Number(raw)
+  // A non-numeric / non-finite value is not "0 = fastest": it is a typo, and
+  // the documented default is the only safe reading of it.
+  if (!Number.isFinite(value)) return VNC_CLIP_POLL_DEFAULT_MS
+  return Math.min(VNC_CLIP_POLL_MAX_MS, Math.max(VNC_CLIP_POLL_MIN_MS, Math.round(value)))
+}
+
+function novncWebDir() {
+  return NOVNC_WEB_CANDIDATES.find((dir) => existsSync(path.join(dir, 'vnc.html')))
+}
+
+const CLIPBOARD_UP = { in: true, out: true, transport: 'agent' }
+function clipboardDown(reason) {
+  return { in: false, out: false, transport: 'schtasks', reason }
+}
+
+// The two down-reasons that are ALSO written by `restorePorts` (J22-12): one
+// string each, so a restored row and a fresh `ensureWindowsConsoleRelay` row
+// cannot describe the same state differently.
+const CLIPBOARD_NO_VIEW_REASON = 'the live view is not up, so the console clipboard has no channel yet'
+const CLIPBOARD_RAW_VNC_REASON = 'no noVNC page is served for this computer: raw VNC has no clipboard channel (use the panel Clipboard section)'
+
+/** Why the websockify (no bridge) front door has no clipboard, exactly as a fresh ensure says it. */
+function consoleBridgeDownReason() {
+  return VNC_CLIP_DISABLED
+    ? 'the console clipboard bridge is disabled (DSH_CUA_VNC_CLIP=0); use the panel Clipboard section'
+    : existsSync(VNC_CLIP_BIN)
+      ? 'the console clipboard bridge did not start (see the supervisor log); use the panel Clipboard section'
+      : 'the console clipboard bridge is not installed; use the panel Clipboard section'
+}
+
+/**
+ * J22-12: THE CAPABILITY TRIPLE OF A RELAY THAT IS BEING REOPENED.
+ *
+ * `restorePorts` re-establishes the TCP relay after an aborted shutdown, but a
+ * relay is only the transport: `view` (which front door it points at) and
+ * `clipboard` ({in, out, transport}) are the capabilities `ports.json` carries
+ * for the panel. Reopening with neither wrote a row that had just been
+ * "clipboard out: true" as "no channel yet", and the panel's paste controls
+ * went dead after a shutdown that FAILED — the one moment the user is still
+ * looking at the console.
+ *
+ * It is derived from the recorded front door, with the same reasons a fresh
+ * `ensureWindowsConsoleRelay` would give, so a restore never upgrades or
+ * downgrades the truth: the RFB bridge has the clipboard, websockify/noVNC has
+ * the page but not the clipboard, raw VNC has neither.
+ */
+function relayCapabilities(snapshot = {}, rawVncPort = 0) {
+  const view = typeof snapshot?.view === 'string' ? snapshot.view : ''
+  if (view === 'novnc-clip' || view === 'novnc-clip-bare') return { view, clipboard: { ...CLIPBOARD_UP } }
+  if (view === 'novnc' || view === 'websockify') return { view, clipboard: clipboardDown(consoleBridgeDownReason()) }
+  if (view === 'vnc-raw') return { view, clipboard: clipboardDown(CLIPBOARD_RAW_VNC_REASON) }
+  // NO RECORDED FRONT DOOR (a snapshot from an older build): the TARGET PORT is
+  // the remaining fact. A relay that points straight at this computer's VNC port
+  // is the raw-VNC shape; anything else is a front door whose kind is unknown,
+  // and the honest answer is "no channel established yet" rather than a
+  // clipboard nobody can vouch for.
+  if (rawVncPort > 0 && Number(snapshot?.target?.port) === rawVncPort) {
+    return { view: 'vnc-raw', clipboard: clipboardDown(CLIPBOARD_RAW_VNC_REASON) }
+  }
+  return { view, clipboard: clipboardDown(CLIPBOARD_NO_VIEW_REASON) }
+}
+
+/**
+ * Spawn the RFB+clipboard bridge and wait for it to LISTEN. `null` means "not
+ * used" — the caller then does exactly what it did before (websockify), and the
+ * reason is already in the log.
+ */
+async function startConsoleBridge(name, vncPort) {
+  if (VNC_CLIP_DISABLED === true) return null
+  if (!existsSync(VNC_CLIP_BIN)) return null
+  const web = novncWebDir() ?? '/usr/share/novnc'
+  const httpPort = await firstFreePort()
+  let child
+  try {
+    child = spawn(process.execPath || 'node', [
+      VNC_CLIP_BIN,
+      '--http-port', `127.0.0.1:${httpPort}`,
+      '--vnc-port', `127.0.0.1:${vncPort}`,
+      '--web', web,
+      // THE CONTROL CHANNEL IS THE SUPERVISOR'S OWN SOCKET: 0600, unix, inside
+      // the container's /tmp — the bridge never opens a TCP control port.
+      '--control-sock', SOCK,
+      '--name', name,
+      // J20-1c: PASS THE INTERVAL THE ENV ASKS FOR. Without this the documented
+      // `DSH_CUA_VNC_CLIP_POLL_MS` never reached the bridge and every install
+      // polled at the bridge's own default whatever the operator configured.
+      '--poll-ms', String(vncClipPollMs())
+    ], { stdio: ['ignore', 'ignore', 'pipe'], env: CUA_ENV })
+  } catch (error) {
+    log(`windows: ${name} console bridge could not spawn (${error?.message ?? error}); using websockify`)
+    return null
+  }
+  LIVE_VIEWS.set(name, child)
+  let exited = null
+  let stderr = ''
+  // J22-8: THE KIND IS READ, NOT ASSUMED.
+  //
+  // The bridge prints its REAL front door on stderr as soon as its listener is
+  // up: `[cua-vnc-clip] novnc-clip on http://127.0.0.1:<p>/ -> …` (or
+  // `novnc-clip-bare` when it found no noVNC tree to serve). The supervisor used
+  // to report kind 'novnc-clip' the instant the port answered, so an image
+  // without noVNC served a WS-only bridge the panel then rendered as a page that
+  // 404s, and a clipboard triple claimed a channel the page did not have. The
+  // ready line is the announcement: it is captured here, over the whole window,
+  // because a chunk split across writes must not hide it.
+  const BRIDGE_KIND_LINE = /\[cua-vnc-clip\]\s+(novnc-clip(?:-bare)?)\s+on\s+\S+/u
+  let kind = null
+  child.stderr?.on('data', (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-2000)
+    if (kind === null) {
+      const announced = BRIDGE_KIND_LINE.exec(stderr)
+      if (announced !== null) kind = announced[1]
+    }
+  })
+  child.on('exit', (code, signal) => {
+    exited = { code, signal }
+    if (LIVE_VIEWS.get(name) === child) LIVE_VIEWS.delete(name)
+  })
+  // ONE WINDOW, TWO FACTS: "it is listening" and "it said which front door it
+  // is". The loop breaks the moment BOTH are true, so the normal path is still
+  // two ticks; the 80 × 100 ms budget is unchanged.
+  let listening = false
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    if (exited !== null) break
+    if (!(await portIsFree(httpPort))) {
+      listening = true
+      if (kind !== null) break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  // A HEALTHY BRIDGE, AT REPORT TIME: the listener is re-probed (one that
+  // appeared and then went away during the window is NOT a view), the process
+  // is still alive, and the announced kind is one of the two the bridge can be.
+  // Anything else returns null, and the caller spawns websockify — the honest
+  // fallback shape instead of a relay to a port nobody serves.
+  const kindKnown = kind === 'novnc-clip' || kind === 'novnc-clip-bare'
+  const healthy = listening
+    && kindKnown
+    && exited === null
+    && child.exitCode === null
+    && child.signalCode === null
+    && !(await portIsFree(httpPort))
+  if (healthy) return { port: httpPort, kind, clipboard: { ...CLIPBOARD_UP } }
+  // NOT USABLE = NOT THE VIEW. Kill it before the fallback spawns, or the
+  // half-dead child holds a port nobody will ever use.
+  const because = exited !== null
+    ? `exit ${exited.code ?? exited.signal}`
+    : !listening
+      ? 'timed out'
+      : !kindKnown
+        ? 'the ready line never named a supported kind'
+        : 'the listener went away'
+  try { child.kill('SIGTERM') } catch {}
+  if (LIVE_VIEWS.get(name) === child) LIVE_VIEWS.delete(name)
+  log(`windows: ${name} console bridge did not come up (${because}${stderr.trim() === '' ? '' : `: ${stderr.trim().slice(-200)}`}); falling back to websockify`)
+  return null
+}
+
+/** What the live view can do about the clipboard, as the row currently stands. */
+function consoleClipboard(name) {
+  const entry = ports.get(name)
+  if (entry?.clipboard) return entry.clipboard
+  return clipboardDown(CLIPBOARD_NO_VIEW_REASON)
+}
+
 async function ensureWindowsConsoleRelay(name) {
   // A live view that is already up is reused; a STALE child (or one from a
   // previous boot) is killed before a new one is spawned, otherwise the old
@@ -2949,12 +4023,25 @@ async function ensureWindowsConsoleRelay(name) {
     stopLiveView(name)
   }
   try {
+    // WP-7: PREFER THE CLIPBOARD BRIDGE. Its http port replaces the websockify
+    // front door; the noVNC page is the same tree, so the panel's URL and every
+    // coordinate stay identical.
+    const bridged = await startConsoleBridge(name, meta.ports.vnc)
+    if (bridged !== null) {
+      try {
+        return await openRelay(name, 5900, { host: '127.0.0.1', port: bridged.port }, { backend: 'relay', view: bridged.kind, clipboard: bridged.clipboard })
+      } catch (error) {
+        stopLiveView(name)
+        throw error
+      }
+    }
     const websockify = '/usr/bin/websockify'
     let targetPort = meta.ports.vnc
     let kind = 'vnc-raw'
+    let clipboard = clipboardDown(CLIPBOARD_RAW_VNC_REASON)
     if (existsSync(websockify)) {
       targetPort = await firstFreePort()
-      const novnc = ['/usr/share/novnc', '/usr/share/novnc-python', '/usr/local/share/novnc'].find((dir) => existsSync(path.join(dir, 'vnc.html')))
+      const novnc = novncWebDir()
       const argv = novnc !== undefined
         ? [websockify, '--web', novnc, `127.0.0.1:${targetPort}`, `127.0.0.1:${meta.ports.vnc}`]
         : [websockify, `127.0.0.1:${targetPort}`, `127.0.0.1:${meta.ports.vnc}`]
@@ -2968,9 +4055,12 @@ async function ensureWindowsConsoleRelay(name) {
         await new Promise((resolve) => setTimeout(resolve, 100))
       }
       kind = novnc !== undefined ? 'novnc' : 'websockify'
+      if (novnc !== undefined) {
+        clipboard = clipboardDown(consoleBridgeDownReason())
+      }
     }
     try {
-      return await openRelay(name, 5900, { host: '127.0.0.1', port: targetPort }, { backend: 'relay', view: kind })
+      return await openRelay(name, 5900, { host: '127.0.0.1', port: targetPort }, { backend: 'relay', view: kind, clipboard })
     } catch (error) {
       // `openRelay` can reject AFTER websockify was spawned (no free relay port,
       // a listen failure); without this the child outlives the failure and the
@@ -2984,7 +4074,7 @@ async function ensureWindowsConsoleRelay(name) {
   }
 }
 
-/** websockify children, one per computer, killed with it. */
+/** websockify / console-bridge children, one per computer, killed with it. */
 const LIVE_VIEWS = new Map()
 
 /**
@@ -2996,6 +4086,132 @@ function stopLiveView(name) {
   const child = LIVE_VIEWS.get(name)
   LIVE_VIEWS.delete(name)
   try { child?.kill('SIGTERM') } catch {}
+}
+
+/* ------------------------------------------------------------------ *
+ * WP-4.5: THE QMP STATE HOOK (defect 3)
+ *
+ * The supervisor used to learn a Windows computer's power state only when
+ * somebody asked (the plugin's 5 s status poll) or from its own write. A guest
+ * that shut itself down, a `stop` issued inside the guest, a QEMU that died at
+ * 03:00 — all of that was invisible until the next poll, and a short-lived
+ * transition never showed up at all.
+ *
+ * `windowsBackend.watchEvents(spec, { onChange })` is the backend's long-lived
+ * QMP subscription (added by the Windows-backend work). It is FEATURE-DETECTED
+ * here: a supervisor running against an older backend keeps working exactly as
+ * before (no watcher, the poll is still the answer), because a missing method
+ * must never be a crash in a process that owns every computer.
+ *
+ * Event → row mapping, debounced 250 ms so a burst (STOP, then RESUME from a
+ * reboot loop) cannot write the registry twice for one user-visible change:
+ *   SHUTDOWN → powered-off      STOP → suspended
+ *   RESUME   → running          RESET → booting
+ *   socket close / error → error
+ * ------------------------------------------------------------------ */
+const QMP_WATCHERS = new Map()
+const QMP_STATE_PENDING = new Map()
+const QMP_STATE_DEBOUNCE_MS = 250
+
+/** One QMP event (or close) to the row state it means. Null means "ignore". */
+function mapQmpStateEvent(event) {
+  // A close is a LOSS OF THE GUEST, not a transition: the backend may report it
+  // as null, as {event:'close'} or as a string.
+  if (event === null || event === undefined) return { state: 'error', reason: 'qmp-socket-closed' }
+  const raw = typeof event === 'string'
+    ? event
+    : String(event?.event ?? event?.type ?? event?.name ?? event?.reason ?? '')
+  const word = raw.trim().toUpperCase()
+  if (word === '') return null
+  const normalised = word.replace(/^QMP[_\s-]*/u, '').replace(/^EVENT[_\s-]*/u, '')
+  if (/^(SHUTDOWN|POWERDOWN|POWER_DOWN)$/u.test(normalised)) return { state: 'powered-off', reason: 'qmp-shutdown' }
+  if (/^(STOP|PAUSE|PAUSED|SUSPEND)$/u.test(normalised)) return { state: 'suspended', reason: 'qmp-stop' }
+  if (/^(RESUME|RESUMED|CONTINUE|CONT|RUN|RUNNING)$/u.test(normalised)) return { state: 'running', reason: 'qmp-resume' }
+  if (/^(RESET|REBOOT)$/u.test(normalised)) return { state: 'booting', reason: 'qmp-reset' }
+  if (/^(CLOSE|CLOSED|DISCONNECT|DISCONNECTED|EOF|ERROR|SOCKET[-_]?CLOSE)$/u.test(normalised)) {
+    return { state: 'error', reason: 'qmp-socket-closed' }
+  }
+  return null
+}
+
+/** Write the state the monitor reported. Never guesses, never fights a lock. */
+async function applyQmpState(name, mapped) {
+  try {
+    const meta = readRegistry().vms[name]
+    if (!meta || meta.kind !== 'windows') return
+    // THE INSTALL OWNS THE ROW UNTIL IT IS READY. A RESUME during Setup is QEMU
+    // acknowledging its own boot, not "the computer is usable": demoting
+    // `installing` to `running` would stop the install watcher mid-install
+    // (its guard only ticks on installing/booting) and freeze the panel.
+    if ((meta.state === 'installing' || meta.state === 'booting') && mapped.state === 'running') return
+    // `running` is the monitor's word for "not paused"; a row that is already
+    // `ready` (QMP running AND the endpoint answering) says strictly more, so a
+    // RESUME must not demote it to the weaker fact.
+    if (meta.state === 'ready' && mapped.state === 'running') return
+    if (meta.state === mapped.state) return
+    await mutateRegistryWith((fresh) => {
+      const row = fresh.vms[name]
+      if (!row || row.state === mapped.state) return
+      row.state = mapped.state
+      row.stateFrom = 'qmp'
+    }, { reason: mapped.reason })
+    log(`windows: ${name} → ${mapped.state} (${mapped.reason}, from the QMP monitor)`)
+  } catch (error) {
+    log(`windows: ${name} state hook skipped a ${mapped?.state ?? '?'} transition (${error?.message ?? error})`)
+  }
+}
+
+function scheduleQmpState(name, event) {
+  const mapped = mapQmpStateEvent(event)
+  if (mapped === null) return
+  const pending = QMP_STATE_PENDING.get(name)
+  if (pending?.timer !== undefined) clearTimeout(pending.timer)
+  const timer = setTimeout(() => {
+    QMP_STATE_PENDING.delete(name)
+    void applyQmpState(name, mapped)
+  }, QMP_STATE_DEBOUNCE_MS)
+  timer.unref?.()
+  QMP_STATE_PENDING.set(name, { timer, mapped })
+}
+
+/**
+ * Install (or replace) the watcher for one computer. Called on every successful
+ * Windows start. Returns false — never throws — when the backend has no
+ * `watchEvents`, because that is a supported configuration, not a failure.
+ */
+function installQmpStateWatcher(name) {
+  if (typeof windowsBackend?.watchEvents !== 'function') return false
+  dismantleQmpStateWatcher(name)
+  try {
+    const handle = windowsBackend.watchEvents(readRegistry().vms[name] ?? { name }, {
+      onChange: (event) => scheduleQmpState(name, event)
+    })
+    const stop = () => {
+      try {
+        if (typeof handle === 'function') handle()
+        else if (typeof handle?.stop === 'function') handle.stop()
+        else if (typeof handle?.close === 'function') handle.close()
+        else if (typeof handle?.unwatch === 'function') handle.unwatch()
+        else if (typeof handle?.dispose === 'function') handle.dispose()
+      } catch {}
+    }
+    QMP_WATCHERS.set(name, { stop })
+    return true
+  } catch (error) {
+    log(`windows: ${name} QMP state watch could not start (${error?.message ?? error}); the status poll still reports state`)
+    return false
+  }
+}
+
+/** Called BEFORE shutdown, delete and kill: a watcher outliving its QEMU would
+ *  write `error` over the `powered-off` the shutdown is about to record. */
+function dismantleQmpStateWatcher(name) {
+  const pending = QMP_STATE_PENDING.get(name)
+  if (pending?.timer !== undefined) clearTimeout(pending.timer)
+  QMP_STATE_PENDING.delete(name)
+  const watcher = QMP_WATCHERS.get(name)
+  QMP_WATCHERS.delete(name)
+  try { watcher?.stop?.() } catch {}
 }
 
 /**
@@ -3255,21 +4471,22 @@ function watchWindowsInstall(name) {
               const errorLog = stderrTail === ''
                 ? (serialTail === '' ? '(no QEMU stderr and an empty serial log: the guest never spoke)' : serialTail.slice(-4000))
                 : stderrTail.slice(-4000)
-              await mutateRegistry((fresh) => {
+              await mutateRegistryWith((fresh) => {
                 const row = fresh.vms[name]
                 if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
                 row.state = 'error'
                 row.error = `the Windows computer did not start: ${errorText}`
                 row.errorLog = errorLog
                 row.installDetail = `error: ${errorText} (see $STORE/windows/${name}/qemu-stderr.log)`
-              })
+              }, { reason: 'windows-install-error' })
+              emitVmState(name, 'error', 'windows-install-error')
               log(`windows: ${name} died before it could install: ${errorText}`)
               if (stderrTail !== '') log(`windows: ${name} qemu-stderr.log tail:\n${stderrTail}`)
               return { stop: true, died: true }
             }
           }
           if (verdict.ready) {
-            await mutateRegistry((fresh) => {
+            await mutateRegistryWith((fresh) => {
               const row = fresh.vms[name]
               if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
               row.state = 'ready'
@@ -3286,7 +4503,10 @@ function watchWindowsInstall(name) {
               // answering a finished row with an install sentence.
               delete row.installStage
               delete row.bootedAt
-            })
+            }, { reason: 'windows-install-ready' })
+            // WP-4.4: the ready transition is the one the bridge MUST hear, even
+            // if it joined the stream mid-install.
+            emitVmState(name, 'ready', 'windows-install-ready')
             return { stop: true, ready: true }
           }
           // D3: THE DEADLINE FOLLOWS THE STAGE.
@@ -3301,7 +4521,7 @@ function watchWindowsInstall(name) {
           const overDeadline = bootedStage ? bootedMinutes > sshGraceMinutes : elapsedMinutes > timeoutMinutes
           if (overDeadline) {
             const tail = windowsLogTail(name, 40)
-            await mutateRegistry((fresh) => {
+            await mutateRegistryWith((fresh) => {
               const row = fresh.vms[name]
               if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
               row.state = 'error'
@@ -3316,7 +4536,8 @@ function watchWindowsInstall(name) {
                 row.error = `the Windows install did not become ready within ${timeoutMinutes} minutes and the installed disk never booted (${verdict.error ?? 'SSH did not answer'}); Windows Setup did not finish — see the serial log tail and the noVNC view`
               }
               row.errorLog = tail.slice(-4000)
-            })
+            }, { reason: 'windows-install-timeout' })
+            emitVmState(name, 'error', 'windows-install-timeout')
             return { stop: true, timedOut: true }
           }
           // THE PROGRESS SENTENCE IS BUILT BY `formatWindowsInstallDetail`, NOT
@@ -3395,10 +4616,24 @@ async function windowsCreateManaged(spec) {
   log(`windows: ${spec.name} will install ${imageSelection.key}=${imageSelection.value} (${imageSelection.source}${imageSelection.verified === false ? ', UNVERIFIED' : ''})`)
   if (spec.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer (create the Windows computer without it, or use a Linux computer)')
   if (spec.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest')
+  // J1-4: THE PREFLIGHT FOLLOWS THE FIRMWARE, NOT THE VERSION'S AGE.
+  //
+  // It used to demand qemu + OVMF (both files) + swtpm from EVERY Windows
+  // create, while the backend boots a catalog entry with `bios: 'seabios'`
+  // (7u — xp is listed only to be refused by resolveWindowsIso before a byte
+  // moves) on pc/SeaBIOS: no pflash, no TPM. A host that could run Windows 7 was
+  // therefore refused for two files the boot spec never opens. The required set
+  // now comes from the SAME `windowsFirmwareProfile()` the boot path resolves
+  // (empty version = the operator-ISO shape = the modern profile), so the
+  // refusal and the QEMU command line cannot disagree about the firmware.
+  const firmware = windowsFirmwareProfile(spec.windowsVersion)
   const caps = windowsHostCaps()
-  const missing = ['qemu', 'ovmfCode', 'ovmfVars', 'swtpm'].filter((key) => caps[key] !== true)
+  const requiredCaps = firmware.bios === 'seabios' ? ['qemu'] : ['qemu', 'ovmfCode', 'ovmfVars', 'swtpm']
+  const missing = requiredCaps.filter((key) => caps[key] !== true)
   if (missing.length > 0) {
-    throw new Error(`the Windows backend needs ${missing.join(', ')} on the host (install qemu-system-x86, ovmf and swtpm in the image: ${WINDOWS_QEMU})`)
+    throw new Error(firmware.bios === 'seabios'
+      ? `the Windows backend needs ${missing.join(', ')} on the host (install qemu-system-x86 in the image: ${WINDOWS_QEMU}); this computer boots on a legacy BIOS (pc/SeaBIOS), so OVMF and swtpm are not required`
+      : `the Windows backend needs ${missing.join(', ')} on the host (install qemu-system-x86, ovmf and swtpm in the image: ${WINDOWS_QEMU})`)
   }
   // THE DEVICE, BEFORE 5.5 GB OF ISO. `boot()` refuses too, but by then the
   // download and the qcow2 have already happened. This is the SAME preflight
@@ -3620,6 +4855,8 @@ async function windowsCreateManaged(spec) {
   } catch (error) {
     // Nothing half-created survives: kill the QEMU we started, stop its TPM (a
     // leaked swtpm holds the TPM state directory) and release the port claim.
+    // WP-4.5: a failed create kills its QEMU, so nothing may still be watching it.
+    dismantleQmpStateWatcher(spec.name)
     windowsBackend.kill(spec.name)
     windowsBackend.stopSwtpm(spec.name)
     // Release THIS create's claim only.
@@ -3892,15 +5129,20 @@ const WINDOWS_NO_AGENT = (tool) => `cua_vm_${tool} needs the guest SSH server, w
  * guest draws, and nothing equivalent exists on Windows — the real pointer is
  * what the frame shows (and what VNC draws for a human).
  */
-async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relative, region = null, scale = 1 }) {
+async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relative, region = null, scale = 1, captureId = '', expect = null }) {
   if (typeof save === 'string' && save !== '') {
     return fail('`save` is not available for Windows computers: the frame is written into the workspace, and there is no guest filesystem to save a path into. Use the returned workspace path or the live view.')
   }
   const meta = readRegistry().vms[name]
   if (!meta) return fail(`no computer named "${name}"`)
   let measured
+  // The frame is taken ONCE, at the top: it is the measurement AND the "before"
+  // hash for the effect read-back below, so hoisting its bytes out of the try
+  // is what lets the pointer branch compare against the frame the caller saw.
+  let framePng = null
   try {
     const frame = await windowsBackend.screenshot(meta)
+    framePng = frame.png
     measured = frameSpace(frame.png)
     if (action === 'screenshot') {
       const stamp = Date.now()
@@ -3932,9 +5174,18 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
         }
       }
       copyFileSync(hostFile, artifact)
+      // WP-8.1: the Windows branch names its frame exactly like the Linux one, so
+      // a click can be bound to the frame it was computed from.
+      const captured = captureIdFor(name, frame.png, measured.display.width, measured.display.height)
       return ok({
         name,
         action,
+        // WP-8.3: a screenshot's effect is the frame it produced; it is confirmed
+        // by the PNG existing, which is the whole observable.
+        effect: { kind: 'frame', before: null, after: captured, changed: false, source: 'qmp' },
+        verified: 'confirmed',
+        evidence: [{ kind: 'frame', captureId: captured, artifact }],
+        captureId: captured,
         png: pngOut.toString('base64'),
         output: `${formatSpace(measured)} (QMP screendump: the PNG IS the display, no capture budget)\n`
           + mapping
@@ -3946,7 +5197,7 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
       })
     }
   } catch (error) {
-    return fail(`${error?.message ?? error}. A Windows computer answers its display only while it is running.`)
+    return fail(`${error?.message ?? error}. A Windows computer answers its display only while it is running.`, { code: 'vm-offline' })
   }
   const width = measured.display.width
   const height = measured.display.height
@@ -3964,6 +5215,13 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
     case 'drag': {
       const fromX = toPixels(x, width)
       const fromY = toPixels(y, height)
+      // WP-8.3: the Windows read-back. QMP has NO pointer telemetry (the guest
+      // owns the cursor), so the channel is the VM's own status plus, for a
+      // click, the frame before and after: a changed PNG is proof that something
+      // repainted — not proof of WHERE the click landed, which is why the note
+      // says exactly that.
+      const statusBefore = EFFECTS_ENABLED === true ? await windowsQmpStatus(meta) : ''
+      const frameBefore = framePng === null ? '' : pngDigest(framePng)
       try {
         if (action === 'move') await windowsBackend.move(meta, fromX, fromY, { width, height })
         else if (action === 'drag') await windowsBackend.drag(meta, fromX, fromY, toPixels(x2, width), toPixels(y2, height), { width, height })
@@ -3974,10 +5232,25 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
       } catch (error) {
         return fail(`${error?.message ?? error}`)
       }
+      let readBack = pointerEffectResult(statusBefore, await windowsQmpStatus(meta), 'qmp-status', 'QMP reports the VM power state, not the pointer: the guest owns the cursor')
+      if (EFFECTS_ENABLED === true && action !== 'move') {
+        try {
+          const frameAfter = pngDigest((await windowsBackend.screenshot(meta)).png)
+          readBack.evidence.push({ kind: 'frame', before: frameBefore, after: frameAfter, changed: frameBefore !== frameAfter })
+          if (readBack.verified !== 'confirmed' && frameBefore !== '' && frameAfter !== '' && frameBefore !== frameAfter) {
+            readBack.verified = 'confirmed'
+          }
+        } catch {
+          readBack.evidence.push({ kind: 'note', detail: 'the post-action frame could not be read, so no visual change was observed' })
+        }
+      }
       return ok({
         name,
         action,
-        output: `${action} at ${action === 'drag' ? `${fromX},${fromY} → ${toPixels(x2, width)},${toPixels(y2, height)}` : `${fromX},${fromY}`} (QMP abs pointer, usb-tablet)\n${spaceLine(measured)}\n${limits}`
+        output: `${action} at ${action === 'drag' ? `${fromX},${fromY} → ${toPixels(x2, width)},${toPixels(y2, height)}` : `${fromX},${fromY}`} (QMP abs pointer, usb-tablet)\n${spaceLine(measured)}\n${limits}`,
+        effect: readBack.effect,
+        verified: readBack.verified,
+        evidence: readBack.evidence
       })
     }
     case 'type':
@@ -3991,14 +5264,23 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
       return ok({
         name,
         action,
-        output: `${action} sent over QMP\n${spaceLine(measured)}\n${limits}${action === 'type' ? '\nASCII only: the QMP keyboard sends physical keys, so there is no clipboard for anything else.' : ''}`
+        output: `${action} sent over QMP\n${spaceLine(measured)}\n${limits}${action === 'type' ? '\nASCII only: the QMP keyboard sends physical keys, so there is no clipboard for anything else.' : ''}`,
+        // WP-8.3: THERE IS NO KEYBOARD READ-BACK ON THIS BACKEND. Saying so is
+        // the contract: the keys were sent, whether the app took them is not
+        // observable without the guest's own agent.
+        effect: { kind: 'none', before: null, after: null, changed: false, source: 'qmp' },
+        verified: 'unverifiable',
+        evidence: [{ kind: 'note', detail: 'QMP keyboard has no read-back' }]
       })
     }
     case 'geometry':
       return ok({
         name,
         action,
-        output: `${spaceLine(measured)}\nThe frame is the whole display: no separately-scaled capture, no window list and no a11y tree on this backend.`
+        output: `${spaceLine(measured)}\nThe frame is the whole display: no separately-scaled capture, no window list and no a11y tree on this backend.`,
+        effect: { kind: 'none', before: null, after: null, changed: false, source: 'qmp' },
+        verified: 'confirmed',
+        evidence: [{ kind: 'frame', width: measured.display.width, height: measured.display.height }]
       })
     default:
       return fail(`"${action}" is not available for a Windows computer (QMP gives frames and input only: no a11y, no window list, no clipboard, no launch). Use screenshot + click + type, or the live view at /vm/port/${name}/.`)
@@ -4076,6 +5358,8 @@ async function windowsStart(name, meta) {
         })
         // M6: a suspended computer lost its live view with the relay; rebuild it.
         await ensureWindowsConsoleRelay(name)
+        // WP-4.5: the QMP hook travels with the process it watches.
+        installQmpStateWatcher(name)
         return ok({ name, state: 'ready', kind: 'windows', detail: 'unpaused (suspend kept the guest exactly as it was)' })
       }
       const ready = await windowsBackend.ready(current, { ssh: current.ssh !== false })
@@ -4091,9 +5375,11 @@ async function windowsStart(name, meta) {
           row.installDetail = `ready (${ready.endpoint} accepting, QMP running)`
         })
         await ensureWindowsConsoleRelay(name)
+        installQmpStateWatcher(name)
         return ok({ name, state: 'ready', kind: 'windows', console: `/vm/port/${name}/`, detail: ready.endpoint })
       }
       watchWindowsInstall(name)
+      installQmpStateWatcher(name)
       await ensureWindowsConsoleRelay(name)
       // R2 SIDE EFFECT: NOW THAT `probe(row)` ACTUALLY FINDS THE PIDFILE, this
       // branch is reachable for a live QEMU whose guest is still booting (it used
@@ -4208,6 +5494,9 @@ async function windowsStart(name, meta) {
       return fail(`${name} did not start: QEMU exited or never answered QMP. The restore point was kept.`, { ports: reconciled.ports, portsChanged: reconciled.changed })
     }
     watchWindowsInstall(name)
+    // WP-4.5: installed on the SAME success path that starts the install
+    // watcher, so a booted computer always has its monitor subscribed.
+    installQmpStateWatcher(name)
     await ensureWindowsConsoleRelay(name)
     return ok({
       name,
@@ -4233,6 +5522,10 @@ async function windowsEnsure(name, meta) {
  */
 async function windowsShutdown(name, meta) {
   assertVmName(name)
+  // WP-4.5: the watcher goes BEFORE the powerdown. A QMP `SHUTDOWN` event that
+  // lands after the row is written would otherwise race the `powered-off` this
+  // function records — same state, different writer, and the last one wins.
+  dismantleQmpStateWatcher(name)
   const config = readConfig()
   const preview = snapshotPorts(name)
   closePorts(name)
@@ -4259,8 +5552,10 @@ async function windowsShutdown(name, meta) {
   }
   let checkpoint = null
   let checkpointSkipped = ''
+  let checkpointSkippedRecord = null
   if (config.checkpointPolicy === 'never') {
     checkpointSkipped = 'checkpointPolicy=never'
+    checkpointSkippedRecord = checkpointSkipRecord('policy', checkpointSkipped)
   } else {
     const paths = windowsPaths(STORE, name)
     const diskBytes = (() => { try { return statSync(paths.disk).size } catch { return 0 } })()
@@ -4268,10 +5563,15 @@ async function windowsShutdown(name, meta) {
     const over = await refuseOverQuota(config, Math.max(0, diskBytes - existing))
     if (over !== null) {
       checkpointSkipped = 'the checkpoint does not fit the store quota'
+      checkpointSkippedRecord = checkpointSkipRecord('quota', `${checkpointSkipped} (${over})`)
     } else {
       // WINDOWS: its disk is under $STORE/windows/<name>/, not the cua vmm tree.
-      checkpoint = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
-      if (checkpoint === null) checkpointSkipped = 'no disk to checkpoint'
+      const captured = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
+      checkpoint = checkpointPathOf(captured)
+      if (checkpoint === null) {
+        checkpointSkipped = 'no disk to checkpoint'
+        checkpointSkippedRecord = checkpointSkipRecord(captured?.reason ?? 'no-disk', captured?.detail ?? '')
+      }
     }
   }
   await mutateRegistry((registry) => {
@@ -4291,15 +5591,20 @@ async function windowsShutdown(name, meta) {
     row.restoreFrom = checkpoint !== null
       ? { kind: 'checkpoint', file: checkpoint }
       : { kind: 'image', image: 'windows' }
+    // WP-9.2: the same structured record the Linux path writes.
+    if (checkpointSkippedRecord !== null) row.checkpointSkipped = checkpointSkippedRecord
+    else delete row.checkpointSkipped
     if (outcome.forced) row.mayBeTorn = true
     else delete row.mayBeTorn
   })
+  emitVmState(name, 'powered-off', 'windows-shutdown')
   log(`shutdown ${name} (${outcome.method}${outcome.forced ? ', forced' : ''}): ${checkpoint !== null ? 'checkpoint captured' : 'no checkpoint'}`)
   return ok({
     name,
     state: 'powered-off',
     method: outcome.method,
     checkpoint: checkpoint ?? undefined,
+    checkpointSkipped: checkpointSkippedRecord ?? undefined,
     mayBeTorn: outcome.forced || undefined,
     detail: `powered off via ${outcome.method}${checkpoint !== null ? '; its disk is checkpointed and Start cold-boots from it' : '; Start boots the disk it already has'}.${outcome.installInProgress === true ? ' The install was still in progress: this ABORTED it, its disk is marked mayBeTorn, and Start will not resume Setup.' : ''}`
   })
@@ -4337,6 +5642,81 @@ async function doctorReport() {
   const config = readConfig()
   const usage = await storeUsage()
   const sandboxList = await listSandboxes()
+  /* ------------------------------------------------------------------ *
+   * WP-9: THE FOUR FACTS THIS PROCESS CAN SEE AND THE PANEL COULD NOT.
+   *
+   *   provenance          which `cua` and which QEMU binary (by hash) is this
+   *   linux-checkpoint-layout  does the vmm directory a checkpoint needs exist
+   *   gpu-degraded        a `gpu: true` row whose renderer is software
+   *   9p-share-not-attached  a boot whose cmdline carries no share
+   * ------------------------------------------------------------------ */
+  const registryRows = (() => {
+    try {
+      return readRegistry().vms
+    } catch {
+      return {}
+    }
+  })()
+  const linuxRows = Object.entries(registryRows).filter(([, row]) => row?.kind !== 'windows')
+  const vmmRoot = path.join(CUA_HOME, '.cua', 'vmm', 'qemu')
+  const linuxLayout = linuxRows.map(([name]) => ({
+    name,
+    dir: path.join(vmmRoot, name),
+    found: existsSync(path.join(vmmRoot, name))
+  }))
+  const layoutMissing = linuxLayout.filter((row) => row.found !== true)
+  const gpuDegradedRows = Object.entries(registryRows)
+    .filter(([, row]) => row?.gpuDegraded && typeof row.gpuDegraded === 'object')
+    .map(([name, row]) => ({ name, renderer: String(row.gpuDegraded.renderer ?? 'unknown'), at: row.gpuDegraded.at ?? null }))
+  const shareMissingRows = Object.entries(registryRows)
+    .filter(([, row]) => row?.share === 'missing')
+    .map(([name, row]) => ({ name, detail: String(row.shareDetail ?? '') }))
+  const checks = [
+    {
+      id: 'linux-checkpoint-layout',
+      status: layoutMissing.length === 0 ? 'found' : 'missing',
+      detail: linuxRows.length === 0
+        ? `no Linux computer in the store; the layout is ${vmmRoot}/<name>/`
+        : layoutMissing.length === 0
+          ? linuxRows.map(([name]) => `${vmmRoot}/${name}/`).join(', ')
+          : `missing: ${layoutMissing.map((row) => row.dir).join(', ')}`,
+      // The EFFECTIVE policy, not the default: a `never` store is not broken.
+      checkpointPolicy: config.checkpointPolicy
+    },
+    {
+      id: '9p-share-not-attached',
+      status: SHARE_WORKSPACE !== true ? 'off' : shareMissingRows.length === 0 ? 'attached' : 'missing',
+      detail: SHARE_WORKSPACE !== true
+        ? 'DSH_CUA_VM_SHARE_WORKSPACE=0: the workspace is deliberately not shared'
+        : shareMissingRows.length === 0
+          ? `every running computer carries -virtfs mount_tag=${SHARE_TAG}`
+          : `no -virtfs/9p in the cmdline of: ${shareMissingRows.map((row) => row.name).join(', ')}`,
+      tag: SHARE_WORKSPACE ? SHARE_TAG : '',
+      root: WORKSPACE_ROOT,
+      computers: shareMissingRows
+    },
+    {
+      id: 'gpu-degraded',
+      status: gpuDegradedRows.length === 0 ? 'ok' : 'degraded',
+      detail: gpuDegradedRows.length === 0
+        ? 'no GPU computer reported a software rasteriser'
+        : gpuDegradedRows.map((row) => `${row.name}: ${row.renderer}`).join('; '),
+      computers: gpuDegradedRows
+    }
+  ]
+  const realQemuPath = existsSync(SYSTEM_QEMU)
+    ? SYSTEM_QEMU
+    : path.join(CUA_HOME, '.cua', 'qemu', 'usr', 'bin', 'qemu-system-x86_64')
+  const cliVersion = await runCua(['--version'], { timeoutMs: 20000 })
+  const provenance = {
+    cliVersion: cliVersion.stdout.trim() || cliVersion.stderr.trim() || 'unknown',
+    qemuPath: existsSync(realQemuPath) ? realQemuPath : 'absent',
+    qemuSha256: sha256OfFile(realQemuPath) || 'unavailable',
+    // There is no digest to pin: `cua sb create <alias>` resolves the alias
+    // inside the CLI, and the resolved image lives in cua's own store. Saying
+    // "no digest pin" is the honest answer, not an omission.
+    baseImage: 'cua-managed (no digest pin: cua sb create resolves it)'
+  }
   return ok({
     hostCaps: {
       kvm,
@@ -4376,7 +5756,26 @@ async function doctorReport() {
     vms: Object.keys(readRegistry().vms).length,
     sandboxes: Array.isArray(sandboxList.parsed) ? sandboxList.parsed.length : null,
     checkpointPolicy: config.checkpointPolicy,
-    shutdownTimeoutSec: config.shutdownTimeoutSec
+    shutdownTimeoutSec: config.shutdownTimeoutSec,
+    // WP-9: the new observability. `checks` is the machine-readable half (an id
+    // and a status a caller can branch on), `linux` the evidence behind it.
+    checks,
+    linux: {
+      checkpointLayout: {
+        root: vmmRoot,
+        status: layoutMissing.length === 0 ? 'found' : 'missing',
+        computers: linuxLayout
+      },
+      checkpointPolicy: config.checkpointPolicy,
+      share: {
+        enabled: SHARE_WORKSPACE,
+        tag: SHARE_WORKSPACE ? SHARE_TAG : '',
+        root: WORKSPACE_ROOT,
+        missing: shareMissingRows
+      },
+      gpuDegraded: gpuDegradedRows
+    },
+    provenance
   })
 }
 
@@ -4395,7 +5794,10 @@ const handlers = {
   async status() {
     const registry = readRegistry()
     const { parsed, raw } = await listSandboxes()
-    return ok({ registry: registry.vms, listed: parsed ?? raw })
+    // WP-9.3 / WP-9.4: a degraded GPU or a boot without the 9p share is a fact
+    // about a computer that is otherwise "ready", so it cannot live only in the
+    // row: it is summed here, where every status caller looks.
+    return ok({ registry: registry.vms, listed: parsed ?? raw, degraded: degradedSummary(registry.vms) })
   },
 
   /**
@@ -4438,7 +5840,9 @@ const handlers = {
               // the workspace keeps a computer, and say that the previous disk
               // did not survive.
               log(`recovering ${name}: ${(restarted.stderr || restarted.stdout).trim().slice(-200)}`)
-              const snapshot = checkpointSandbox(name)
+              // WP-9.2: checkpointSandbox now answers {path,bytes}|{ok:false,…}; the
+              // rebuild only needs the file, and only when one was captured.
+              const snapshot = checkpointPathOf(checkpointSandbox(name))
               await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
               await ensureRuntime()
               const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : (known?.image || 'linux')
@@ -4543,7 +5947,8 @@ const handlers = {
         // Same reality as ensure: a QEMU VM whose process is gone cannot start.
         // Rebuild it from its recorded spec so the Start button is never a dead end.
         log(`start: recreating ${name} after "${(result.stderr || result.stdout).trim().slice(-160)}"`)
-        const snapshot = checkpointSandbox(name)
+        // WP-9.2: same unwrap as the recovery path above.
+        const snapshot = checkpointPathOf(checkpointSandbox(name))
         await runCua(['sb', 'rm', '--local', name, '--force'], { timeoutMs: 180000 })
         await ensureRuntime()
         const bootImage = snapshot !== null ? `${snapshot}.restore.qcow2` : (meta.image || 'linux')
@@ -4577,12 +5982,16 @@ const handlers = {
       // so a plain computer returns from it in one exec as well.
       const provisioned = await provisionGuest(name, { gpu: meta.gpu === true })
       const rea = meta.rea === true ? await provisionReaGuest(name) : null
+      // WP-9.4: Start is a boot, so the cmdline exists now.
+      await recordGuestShare(name)
+      const gpuDegraded = await recordGpuRenderer(name, noteGpuRenderer(name, { gpu: meta.gpu === true, renderer: provisioned.renderer }))
       return ok({
         name,
         state: 'ready',
         provisioned: provisioned.ok,
         rea: rea ? rea.ok : undefined,
         renderer: provisioned.renderer,
+        gpuDegraded: gpuDegraded ?? undefined,
         output: provisioned.ok ? (rea && !rea.ok ? rea.output.slice(-1200) : undefined) : provisioned.output.slice(-1200)
       })
     })
@@ -4626,7 +6035,7 @@ const handlers = {
       // remote shell is cmd.exe by default and `cwd` is passed to `cd /d`.
       const started = Date.now()
       if (meta.state !== 'ready') {
-        return ok({ exit: 126, stdout: '', stderr: WINDOWS_NO_AGENT('exec'), ms: 0, available: false })
+        return ok({ exit: 126, stdout: '', stderr: WINDOWS_NO_AGENT('exec'), ms: 0, available: false, code: 'no-ssh' })
       }
       const remote = cwd ? `cd /d ${quoteForWindows(cwd)} && ${cmd}` : cmd
       const result = await sshRun(meta, remote, { timeoutMs: (Number(timeout) || 300) * 1000 + 30000 })
@@ -4667,7 +6076,7 @@ const handlers = {
     if (!name) throw new Error('name is required')
     const putMeta = readRegistry().vms[name]
     if (putMeta?.kind === 'windows') {
-      if (putMeta.state !== 'ready') return ok({ available: false, name, local, guest, message: WINDOWS_NO_AGENT('put') })
+      if (putMeta.state !== 'ready') return ok({ available: false, name, local, guest, message: WINDOWS_NO_AGENT('put'), code: 'no-ssh' })
       const source = workspacePath(local, { mustExist: true })
       // scp speaks POSIX paths; Windows OpenSSH accepts forward slashes and
       // `/c/...`-style is NOT valid, so a drive path is normalised here.
@@ -4686,7 +6095,7 @@ const handlers = {
     if (!name) throw new Error('name is required')
     const getMeta = readRegistry().vms[name]
     if (getMeta?.kind === 'windows') {
-      if (getMeta.state !== 'ready') return ok({ available: false, name, guest, local, message: WINDOWS_NO_AGENT('get') })
+      if (getMeta.state !== 'ready') return ok({ available: false, name, guest, local, message: WINDOWS_NO_AGENT('get'), code: 'no-ssh' })
       const root = realpathSync(WORKSPACE_ROOT)
       const absolute = path.isAbsolute(local) ? path.normalize(local) : path.join(root, local)
       if (absolute !== root && !absolute.startsWith(root + path.sep)) throw new Error(`path escapes the workspace: ${local}`)
@@ -4755,6 +6164,7 @@ const handlers = {
     return ok({
       registry: registry.vms,
       listed: parsed ?? raw,
+      degraded: degradedSummary(registry.vms),
       windows: {
         ok: windowsEnabled(),
         backend: 'qemu',
@@ -4778,13 +6188,16 @@ const handlers = {
       const meta = registry.vms[name]
       if (!meta) return fail(`no computer named "${name}"`)
       const result = await provisionGuest(name, { gpu: meta.gpu === true })
+      // WP-9.3: a re-provision is the second chance for the renderer, so it is
+      // also the second place it can be recorded as degraded.
+      const gpuDegraded = await recordGpuRenderer(name, noteGpuRenderer(name, { gpu: meta.gpu === true, renderer: result.renderer }))
       const rea = meta.rea === true ? await provisionReaGuest(name) : null
       const both = result.ok && (rea === null || rea.ok)
       if (!both) {
         const reaPart = rea !== null && !rea.ok ? `\nrea:\n${rea.output.slice(-900)}` : ''
         return fail(`provisioning failed:\n${result.output.slice(-1200)}${reaPart}`)
       }
-      return ok({ name, renderer: result.renderer, rea: rea ? rea.ok : undefined, output: `${result.output.slice(-1500)}${rea ? `\n${rea.output.slice(-900)}` : ''}` })
+      return ok({ name, renderer: result.renderer, gpuDegraded: gpuDegraded ?? undefined, rea: rea ? rea.ok : undefined, output: `${result.output.slice(-1500)}${rea ? `\n${rea.output.slice(-900)}` : ''}` })
     })
   },
   /**
@@ -5012,6 +6425,11 @@ const handlers = {
       // never fatal: a probe that cannot answer says `available: false` and why.
       freeSpace: state === 'ready' ? await windowsFreeSpace(meta) : { available: false, reason: `not running (${state}): the disk free space is measured inside the guest, so it needs the guest up` },
       console: state === 'ready' ? `/vm/port/${name}/` : undefined,
+      // WP-7: the capability triple, so the panel can enable/disable its
+      // clipboard controls from the same poll that draws the badge.
+      clipboard: state === 'ready'
+        ? consoleClipboard(name)
+        : clipboardDown(`the computer is ${state}, not ready: the console clipboard needs the live view`),
       ports: meta.ports,
       logTail: windowsLogTail(name, Math.max(1, Math.min(200, Number(tail) || 20))).slice(-4000)
     })
@@ -5049,12 +6467,24 @@ const handlers = {
         ...WINDOWS_CLIPBOARD_HINT
       })
     }
-    const result = await windowsBackend.clipboardSet({ ...meta, name })
+    // THE TEXT IS THE SECOND POSITIONAL ARGUMENT. The backend's signature is
+    // `clipboardSet(rawSpec, text)` and it refuses anything else with
+    // "clipboardSet needs the text to paste": this call used to pass ONE object
+    // (`{ ...meta, name }`), so every host→guest paste — the panel route AND the
+    // noVNC bridge's control-socket write — failed after the whole SSH task was
+    // prepared. The spec stays an object the backend normalises (`namedSpec`).
+    const result = await windowsBackend.clipboardSet({ ...meta, name }, text)
     // A no-ssh answer is a DISABLED state, not a failure: the panel says why.
     if (result.ok !== true && result.reason === 'no-ssh') {
       return ok({ available: false, reason: result.detail, ...WINDOWS_CLIPBOARD_HINT })
     }
-    if (result.ok !== true) return fail(`the clipboard was NOT set: ${result.detail ?? result.reason ?? 'unknown'}`, { name, ...result })
+    if (result.ok !== true) {
+      // WP-8.5: "the guest has no clipboard agent" is the one clipboard failure
+      // a caller can act on differently from a transport error, so it gets the
+      // code instead of another sentence to pattern-match.
+      const code = result.reason === 'no-agent' || result.reason === 'agent-stale' ? 'clipboard-agent-missing' : undefined
+      return fail(`the clipboard was NOT set: ${result.detail ?? result.reason ?? 'unknown'}`, { name, ...result, ...(code === undefined ? {} : { code }) })
+    }
     return ok({ name, ...result, note: result.detail })
   },
 
@@ -5101,7 +6531,10 @@ const handlers = {
     if (result.ok !== true && result.reason === 'no-ssh') {
       return ok({ available: false, reason: result.detail, ...WINDOWS_CLIPBOARD_HINT })
     }
-    if (result.ok !== true) return fail(`the clipboard was NOT read: ${result.detail ?? result.reason ?? 'unknown'}`, { name, ...result })
+    if (result.ok !== true) {
+      const code = result.reason === 'no-agent' || result.reason === 'agent-stale' ? 'clipboard-agent-missing' : undefined
+      return fail(`the clipboard was NOT read: ${result.detail ?? result.reason ?? 'unknown'}`, { name, ...result, ...(code === undefined ? {} : { code }) })
+    }
     return ok({ name, ...result, chars: [...String(result.text ?? '')].length })
   },
 
@@ -5136,28 +6569,129 @@ const handlers = {
    * The facts the harness needs to attach the guest's dsh-cua MCP server, and
    * nothing more: host, SSH port, key path, user. The password never travels
    * here — the plugin speaks SSH with the per-computer key.
+   *
+   * WP-4.1: `name` IS REQUIRED, AND THE "FIRST READY ROW" FALLBACK IS GONE.
+   *
+   * The old code answered for `Object.entries(registry.vms).find(row.state ===
+   * 'ready')` when the caller passed no name — so a session that asked about
+   * ITS computer attached whatever else happened to be ready, and every
+   * `cua_win__*` tool then drove a different machine. The bridge binds to one
+   * computer by name or it refuses; it never guesses.
    */
   async vmWindowsMcp({ name = '' } = {}) {
-    const registry = readRegistry()
-    const entries = name === ''
-      ? Object.entries(registry.vms).filter(([, row]) => row?.kind === 'windows')
-      : [[name, registry.vms[name]]]
-    const ready = entries.find(([, row]) => row?.kind === 'windows' && row.state === 'ready')
-    if (ready === undefined) return ok({ available: false, reason: 'no ready Windows computer' })
-    const [targetName, meta] = ready
-    const verdict = await windowsBackend.ready(meta, { ssh: true })
-    if (!verdict.ready) {
-      return ok({ available: false, reason: `not ready (${verdict.endpoint === 'none' ? 'no endpoint answers' : verdict.endpoint})` })
+    const wanted = String(name ?? '').trim()
+    if (wanted === '') {
+      return fail('name is required; the bridge binds to one Windows computer, not the first ready row')
     }
+    const registry = readRegistry()
+    const meta = registry.vms[wanted]
+    if (!meta || meta.kind !== 'windows') {
+      return ok({ available: false, reason: `no computer named "${wanted}"` })
+    }
+    const state = String(meta.state ?? 'unknown')
+    const sshPort = Number(meta.ports?.ssh ?? 0)
+    const keyPath = windowsPaths(STORE, wanted).sshKey
+    const running = state === 'ready' || state === 'running'
+    // THE ROW IS NOT THE ENDPOINT. `state: ready` plus a dead sshd must not
+    // answer "available": the caller attaches an MCP client over SSH, and a
+    // refusal it can retry beats a socket that hangs.
+    let verdict = null
+    if (running && meta.ssh !== false) {
+      try {
+        verdict = await windowsBackend.ready(meta, { ssh: true })
+      } catch (error) {
+        verdict = { ready: false, endpoint: 'none', error: error?.message ?? String(error) }
+      }
+    }
+    const online = running && meta.ssh !== false && verdict?.ready === true
     return ok({
-      available: true,
-      name: targetName,
+      available: online,
+      online,
+      state,
+      name: wanted,
+      kind: 'windows',
       host: '127.0.0.1',
-      sshPort: meta.ports?.ssh ?? 0,
-      keyPath: windowsPaths(STORE, targetName).sshKey,
+      sshPort,
+      keyPath,
       user: WINDOWS_USERNAME,
-      endpoint: verdict.endpoint
+      endpoint: online ? String(verdict?.endpoint || 'ssh') : 'none',
+      ...(online ? {} : {
+        reason: meta.ssh === false
+          ? 'SSH is disabled for this computer (ssh: false), so the agent surface does not exist'
+          : running
+            ? `not ready (${verdict?.error ?? (verdict?.endpoint === 'none' ? 'no endpoint answers' : verdict?.endpoint)})`
+            : `the computer is ${state}, not online`
+      })
     })
+  },
+
+  /**
+   * WP-4.2: THE CHEAP STATE READ — REGISTRY AND PORTS, NEVER SSH.
+   *
+   * `vmWindowsMcp` proves the endpoint by answering it, which costs an SSH
+   * handshake and can take seconds on a cold guest. A panel polling every 10 s,
+   * or a bridge deciding whether to keep its tools registered, needs the row —
+   * so this op reads the registry and the allocated ports and stops there.
+   * `online` is therefore a POLICY answer (the row says ready, SSH is enabled),
+   * not a probe: it can be optimistic for the few seconds a hung guest takes to
+   * die, and `vmWindowsMcp` is the call that settles it.
+   */
+  async vmWindowsMcpState({ name = '' } = {}) {
+    const wanted = String(name ?? '').trim()
+    if (wanted === '') throw new Error('name is required')
+    const registry = readRegistry()
+    const meta = registry.vms[wanted]
+    const ssh = meta ? meta.ssh !== false : false
+    const state = String(meta?.state ?? 'absent')
+    const sshPort = Number(meta?.ports?.ssh ?? 0)
+    const since = meta ? (meta.stateSince || meta.startedAt || meta.lastUsed || meta.createdAt || null) : null
+    if (!meta) {
+      return ok({
+        name: wanted,
+        kind: 'unknown',
+        online: false,
+        state: 'absent',
+        ssh,
+        sshPort,
+        keyPath: '',
+        since: null,
+        available: false,
+        reason: `no computer named "${wanted}"`
+      })
+    }
+    const online = (state === 'ready' || state === 'running') && ssh === true && sshPort > 0
+    return ok({
+      name: wanted,
+      kind: meta.kind ?? 'linux',
+      online,
+      state,
+      ssh,
+      sshPort,
+      keyPath: meta.kind === 'windows' ? windowsPaths(STORE, wanted).sshKey : '',
+      since,
+      host: '127.0.0.1',
+      ...(meta.kind === 'windows' ? {} : { reason: `${wanted} is a ${meta.kind ?? 'linux'} computer, and only a Windows one speaks dsh-cua` })
+    })
+  },
+
+  /**
+   * WP-4.3: THE PUSH STREAM.
+   *
+   * The socket stays open for as long as the caller keeps it: one ready line,
+   * one line per real transition, a ping every 25 s, and a `vm-removed` when the
+   * computer is deleted. Cleanup is the socket's own close — no leak, no timer
+   * left behind by a client that vanished.
+   */
+  async subscribe({ events = ['vm-state'], socket = null } = {}) {
+    if (socket === null || typeof socket.write !== 'function') {
+      // A one-shot caller (a probe, a curl) gets the protocol description instead
+      // of a hang: the stream is only meaningful on a socket that stays open.
+      return fail('subscribe keeps the connection open; it must be the request on a streaming client', {
+        protocol: { event: 'vm-state', pingMs: SUBSCRIBE_PING_MS, events: ['vm-state', 'vm-removed', 'ping'] }
+      })
+    }
+    const entry = subscribeStream(socket, events)
+    return { streaming: true, events: [...entry.events] }
   },
 
   async vmWindowsStart({ name }) {
@@ -5178,7 +6712,11 @@ const handlers = {
       // would get, base64 for the <img> element.
       try {
         const frame = await windowsBackend.screenshot(readRegistry().vms[name])
-        return ok({ name, png: frame.png.toString('base64'), source: 'qmp' })
+        const measured = frameSpace(frame.png)
+        // WP-8.1: the panel's frame view names its capture too, so a click that
+        // cites it is refused when the frame has moved on.
+        const captureId = captureIdFor(name, frame.png, measured.display.width, measured.display.height)
+        return ok({ name, png: frame.png.toString('base64'), source: 'qmp', captureId })
       } catch (error) {
         return fail(`${error?.message ?? error}`)
       }
@@ -5190,8 +6728,10 @@ const handlers = {
       return fail((result.stderr || result.stdout).trim().slice(-500))
     }
     try {
-      const png = readFileSync(file).toString('base64')
-      return ok({ name, png })
+      const bytes = readFileSync(file)
+      const size = pngSize(bytes) ?? { width: 0, height: 0 }
+      const captureId = captureIdFor(name, bytes, size.width, size.height)
+      return ok({ name, png: bytes.toString('base64'), captureId })
     } finally {
       try { unlinkSync(file) } catch {}
     }
@@ -5278,20 +6818,39 @@ const handlers = {
    * arithmetic and no fractional guesswork. Pair this with a 1200x750
    * desktop (cua-guest-provision.sh) and image pixels are display pixels too.
    */
-  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, window: windowName, path: target, save, region = null, scale = 1, relative = false, smooth = true, steps = 6, durationMs = 200 }) {
+  async gui({ name, action, x, y, x2, y2, text, key, direction, amount, app, window: windowName, path: target, save, region = null, scale = 1, relative = false, smooth = true, steps = 6, durationMs = 200, captureId = '', element = null, expect = null }) {
     const num = (value) => {
       const parsed = Math.round(Number(value))
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('coordinates must be positive numbers')
       return parsed
     }
     const pointer = ['click', 'dclick', 'move', 'drag'].includes(action)
+    // WP-8.2: A CLICK BOUND TO A FRAME THAT NO LONGER EXISTS IS REFUSED.
+    //
+    // The model reads a screenshot, decides, and clicks; anything that repainted
+    // the desktop in between (an app finishing a load, a dialog appearing) makes
+    // those coordinates point at something else. `captureId` is the caller
+    // saying WHICH frame it read, and an id that is no longer the latest is a
+    // refusal it can recover from (take a new screenshot) instead of a click
+    // that silently lands on the wrong control. Omitting it keeps the old
+    // behaviour exactly.
+    const stale = pointer ? staleCaptureRefusal(name, captureId) : null
+    if (stale !== null) return stale
     const registry = readRegistry()
-    if (registry.vms[name]?.kind === 'windows') return windowsGui({ name, action, x, y, x2, y2, text, key, save, app, window: windowName, path: target, relative, region, scale })
+    if (registry.vms[name]?.kind === 'windows') {
+      if (element !== null && element !== undefined) {
+        return fail('element-driven clicks need the accessibility tree, and a Windows guest exposes none (no AT-SPI over QMP). Take a screenshot and click its pixels, or use the dsh-cua tools once the guest is ready.', { code: 'element-not-locatable' })
+      }
+      // The capture binding and `expect` are enforced in `gui` (the stale gate
+      // runs before this dispatch), and windowsGui needs neither: QMP has no
+      // keyboard read-back, so its answer is `unverifiable` by construction.
+      return windowsGui({ name, action, x, y, x2, y2, text, key, save, app, window: windowName, path: target, relative, region, scale })
+    }
     // A powered-off computer has no sandbox to drive: `sb resume` would answer
     // "not found" for two minutes and then the action would be applied to
     // nothing. Say what to do instead.
     if (registry.vms[name]?.state === 'powered-off') {
-      return fail(`${name} is powered off. Start it with cua_vm_start (it cold-boots from its checkpoint) before driving its desktop.`)
+      return fail(`${name} is powered off. Start it with cua_vm_start (it cold-boots from its checkpoint) before driving its desktop.`, { code: 'vm-offline' })
     }
     await runCua(['sb', 'resume', '--local', name], { timeoutMs: 120000 })
 
@@ -5306,6 +6865,9 @@ const handlers = {
       // "cua already knows this capture" flag) belong to the previous one.
       if (DO_TARGET !== '') space.clear()
       SHOT_STATE.delete(name)
+      // A different desktop is a different frame space: every id handed out for
+      // this computer belongs to the capture it was taken from.
+      LAST_CAPTURE.delete(name)
       DO_TARGET = name
     }
 
@@ -5332,6 +6894,103 @@ const handlers = {
       return matched ? `${matched[1]},${matched[2]}` : ''
     }
 
+    /**
+     * The measured space, PRIMED on first use: cua maps screenshot pixels to the
+     * display only after it has seen a capture, so its first click in a fresh
+     * daemon session is 1:1. One screenshot per computer makes every later
+     * coordinate scaled by the image/display ratio — deterministic, so the model
+     * never gets a 6%-off click because it skipped looking first.
+     */
+    const measuredSpace = async () => {
+      let measured = await space.measure(name)
+      if (measured === null) return null
+      if (!SHOT_STATE.has(name)) {
+        await doAct(['screenshot', '-s', `/tmp/cua-prime-${process.pid}.png`, '--json'])
+        SHOT_STATE.add(name)
+        const primed = await space.measure(name, { force: true })
+        if (primed !== null) measured = primed
+      }
+      return measured
+    }
+
+    /**
+     * WP-8.4: CLICK BY NAME — the accessibility tree, not a guessed pixel.
+     *
+     * `element: {name, role?}` resolves to the SMALLEST-AREA LEAF whose name
+     * matches exactly (a list item over the panel that contains it), takes its
+     * centre, converts DISPLAY points to SCREENSHOT pixels with the measured
+     * scale (the same number every other click uses), and clicks there.
+     *
+     * It is not "verified" because the click returned 0: it is confirmed only
+     * when the node reported itself focused/selected OR the active window
+     * changed. Anything less is `unverifiable`, and a name with no match is a
+     * structured refusal carrying the first ten candidates it DID see — the
+     * difference between "the tree is empty" and "you have the wrong label".
+     */
+    if (element !== null && element !== undefined) {
+      if (action !== 'click' && action !== 'dclick') {
+        return fail(`element computes its own coordinates, so it only works with action "click" or "dclick" (got "${action}")`, { code: 'element-not-locatable' })
+      }
+      const wanted = typeof element === 'string' ? { name: element } : element
+      const label = String(wanted?.name ?? '').trim()
+      if (label === '') return fail('element needs a name (the accessibility label of the control to click)', { code: 'element-not-locatable' })
+      const role = String(wanted?.role ?? '').trim()
+      const tree = await doAct(['a11y', 'tree', '--json'])
+      if (tree.code !== 0) {
+        return fail(`the accessibility tree is unavailable, so "${label}" cannot be located: ${tree.output.slice(-300)}`, {
+          code: 'element-not-locatable',
+          detail: 'the guest did not answer an a11y tree (AT-SPI missing for this app)'
+        })
+      }
+      const entries = normaliseA11yNode(parseJsonLoose(tree.output))
+      const scoped = role === '' ? entries : entries.filter((entry) => entry.role === role)
+      const matches = scoped.filter((entry) => entry.name === label)
+      if (matches.length === 0) {
+        const candidates = (scoped.length > 0 ? scoped : entries).slice(0, 10).map((entry) => entry.name)
+        return fail(`no accessibility element is named "${label}"${role === '' ? '' : ` with role ${role}`}`, {
+          code: 'element-not-locatable',
+          detail: `candidates: ${candidates.join(', ') || '(the tree has no addressable nodes)'}`,
+          candidates
+        })
+      }
+      // entries are sorted by area, so a leaf-first pick is the smallest target.
+      const leaves = matches.filter((entry) => entry.leaf === true)
+      const pick = (leaves.length > 0 ? leaves : matches)[0]
+      const measured = await measuredSpace()
+      if (measured === null) {
+        return fail('the guest did not report its display geometry, so the element bounds cannot be converted to screenshot pixels', { code: 'element-not-locatable' })
+      }
+      const centre = rectCentre(pick.rect)
+      const point = displayPointToScreenshot(measured, centre)
+      const beforeWindow = await activeWindowTitle(name)
+      const beforePointer = await pointerNow()
+      const clicked = await doAct([action === 'dclick' ? 'dclick' : 'click', String(point.x), String(point.y)])
+      if (clicked.code !== 0) {
+        return fail(`"${label}" was located at screen ${centre.x},${centre.y} but the click failed: ${clicked.output.slice(-300)}`, { code: 'element-not-locatable' })
+      }
+      // A click is asynchronous in the app: give the focus change a moment to
+      // happen before it is read, or every confirmed click looks unverifiable.
+      await sleep(300)
+      const afterWindow = await activeWindowTitle(name)
+      const afterPointer = await pointerNow()
+      const focusMoved = beforeWindow !== afterWindow
+      const pointerMoved = beforePointer !== '' && afterPointer !== '' && beforePointer !== afterPointer
+      const confirmed = pick.focused === true || focusMoved === true
+      return ok({
+        name,
+        action,
+        output: `clicked "${label}"${pick.role === '' ? '' : ` (${pick.role})`} at screen ${centre.x},${centre.y} → screenshot ${point.x},${point.y}${pick.focused ? '; the node was already focused/selected' : ''}\n${spaceLine(measured)}`,
+        element: { name: label, role: pick.role, rect: pick.rect, focused: pick.focused, leaf: pick.leaf, centre, screenshot: point },
+        effect: { kind: 'element', before: beforeWindow || null, after: afterWindow || null, changed: focusMoved || pointerMoved, source: 'a11y' },
+        verified: confirmed ? 'confirmed' : 'unverifiable',
+        evidence: [
+          { kind: 'element', name: label, role: pick.role, rect: pick.rect, area: a11yArea(pick.rect) },
+          { kind: 'window', before: beforeWindow || null, after: afterWindow || null, changed: focusMoved },
+          { kind: 'pointer', before: beforePointer || null, after: afterPointer || null, changed: pointerMoved }
+        ]
+      })
+    }
+
     if (pointer) {
       // THE MEASURED SPACE, not an assumption.
       //
@@ -5341,21 +7000,11 @@ const handlers = {
       // guess the capture size. space.measure() reads the display geometry from
       // the guest and the capture size from cua's own PNG (IHDR), so the ratio
       // is a measurement, cached for 30 s and dropped on resume/restart/zoom.
-      let measured = await space.measure(name)
-      if (measured === null) return fail('the guest did not report its display geometry, so the click space is unknown; take a screenshot first')
-      // cua maps screenshot pixels to the display only once it knows the
-      // capture size: its first click in a fresh daemon session is 1:1 screen
-      // coordinates, every later one is scaled by image/display. Priming one
-      // screenshot per VM makes the mapping deterministic, so the model never
-      // gets a 6%-off click because it skipped looking first.
-      if (!SHOT_STATE.has(name)) {
-        await doAct(['screenshot', '-s', `/tmp/cua-prime-${process.pid}.png`, '--json'])
-        SHOT_STATE.add(name)
-        // The prime IS a capture: re-measure from it so the scale is the one
-        // cua just learned, not a number from before the restart.
-        const primed = await space.measure(name, { force: true })
-        if (primed !== null) measured = primed
-      }
+      const measured = await measuredSpace()
+      if (measured === null) return fail('the guest did not report its display geometry, so the click space is unknown; take a screenshot first', { code: 'vm-offline' })
+      // WP-8.3: THE POINTER BEFORE. One `cua do cursor` read, taken after the
+      // measure (which may have primed a capture) and before the action.
+      const pointerBefore = EFFECTS_ENABLED === true ? await pointerNow() : ''
       let toX = num(x)
       let toY = num(y)
       // A fractional coordinate (0..1) is invariant across the image→display
@@ -5410,19 +7059,32 @@ const handlers = {
         const tried = await guestExec(name, fallback)
         if (tried.code !== 0) return fail(`${result.output.slice(-400)}\nthe xdotool fallback also failed: ${(tried.stderr || tried.stdout).trim().slice(-200)}`)
         const context = await guiContext(name)
+        const afterPointer = EFFECTS_ENABLED === true ? await pointerNow() : ''
+        const readBack = pointerEffectResult(pointerBefore, afterPointer, 'xdotool')
         return ok({
           name,
           action,
           fellBack: 'xdotool',
-          output: `${action} via xdotool at display pixel ${toDisplayPixels(measured, toX, toY).x},${toDisplayPixels(measured, toX, toY).y} (cua's own verb failed)\n${spaceLine(measured)}\n${context}`
+          output: `${action} via xdotool at display pixel ${toDisplayPixels(measured, toX, toY).x},${toDisplayPixels(measured, toX, toY).y} (cua's own verb failed)\n${spaceLine(measured)}\n${context}`,
+          effect: readBack.effect,
+          verified: readBack.verified,
+          evidence: readBack.evidence
         })
       }
       const at = await pointerNow()
       const context = await guiContext(name)
+      // WP-8.3: a pointer action is CONFIRMED only when the cursor read back at a
+      // different place. Clicking the pixel the pointer already sat on is a
+      // legitimate no-change, and it answers `unverifiable` rather than
+      // pretending the click was proven by its own return code.
+      const readBack = pointerEffectResult(pointerBefore, at, 'cua-do')
       return ok({
         name,
         action,
-        output: `${action} at screenshot pixel ${toX},${toY} (cua maps it to the display)${at ? `\npointer now at screen ${at}` : ''}\n${spaceLine(measured)}\n${context}`
+        output: `${action} at screenshot pixel ${toX},${toY} (cua maps it to the display)${at ? `\npointer now at screen ${at}` : ''}\n${spaceLine(measured)}\n${context}`,
+        effect: readBack.effect,
+        verified: readBack.verified,
+        evidence: readBack.evidence
       })
     }
 
@@ -5475,10 +7137,26 @@ const handlers = {
       const head = measured === null
         ? `screenshot ${dimensions} — these are the pixels every pointer action takes (cua maps them).`
         : spaceLine(measured)
-      if (copied.code !== 0) {
-        return ok({ name, action, output: `${mapping}${head}\nscreenshot on the host: ${source} (copy into the guest failed; use this host path only from the panel)` })
+      // WP-8.1: NAME THIS FRAME. The id is derived from the PNG the model is
+      // about to look at (sha1 of its bytes), so "the frame changed since that
+      // capture" is a fact about pixels, not about time. The dimensions come
+      // from the same IHDR read as `dimensions` above.
+      let captureId = ''
+      try {
+        const png = readFileSync(source)
+        const size = pngSize(png)
+        if (size !== null) captureId = captureIdFor(name, png, size.width, size.height)
+      } catch {}
+      const capture = {
+        captureId: captureId || undefined,
+        effect: { kind: 'frame', before: null, after: captureId || null, changed: false, source: 'cua' },
+        verified: captureId === '' ? 'unverifiable' : 'confirmed',
+        evidence: [{ kind: 'frame', captureId: captureId || null, file: source }]
       }
-      return ok({ name, action, output: `${mapping}${head}\nscreenshot saved in the guest: ${guestFile}
+      if (copied.code !== 0) {
+        return ok({ name, action, ...capture, output: `${mapping}${head}\nscreenshot on the host: ${source} (copy into the guest failed; use this host path only from the panel)` })
+      }
+      return ok({ name, action, ...capture, output: `${mapping}${head}\nscreenshot saved in the guest: ${guestFile}
 fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}` })
     }
 
@@ -5497,7 +7175,10 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
       return ok({
         name,
         action,
-        output: `${measured === null ? `display: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}` : spaceLine(measured)}\npointer: ${at || `${px ?? '?'},${py ?? '?'}`} (screen points)\nwindows:\n${bounds.length > 0 ? bounds.map((w) => `- "${w.title}" at [${w.rect}]${w.app && w.app !== w.title ? ` (app: ${w.app})` : ''}`).join('\n') : (windows.map((w) => `- ${w}`).join('\n') || '- none')}\nuse \`zoom\` with one of these titles to crop the desktop to that window (coordinates stay correct).`
+        output: `${measured === null ? `display: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}` : spaceLine(measured)}\npointer: ${at || `${px ?? '?'},${py ?? '?'}`} (screen points)\nwindows:\n${bounds.length > 0 ? bounds.map((w) => `- "${w.title}" at [${w.rect}]${w.app && w.app !== w.title ? ` (app: ${w.app})` : ''}`).join('\n') : (windows.map((w) => `- ${w}`).join('\n') || '- none')}\nuse \`zoom\` with one of these titles to crop the desktop to that window (coordinates stay correct).`,
+        effect: { kind: 'none', before: null, after: null, changed: false, source: 'xdotool' },
+        verified: 'confirmed',
+        evidence: [{ kind: 'pointer', at: at || null, windows: bounds.length }]
       })
     }
 
@@ -5509,15 +7190,27 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
         : await doAct(['unzoom'])
       if (result.code !== 0) return fail(result.output.slice(-500))
       // A zoom changes the capture (and therefore the image→display scale), so
-      // the cached space and the primed-capture flag are both dropped.
+      // the cached space and the primed-capture flag are both dropped — and so
+      // is the last capture id (WP-8.2): a click citing the pre-zoom frame would
+      // otherwise pass the staleness check and land in the NEW space.
       space.invalidate(name)
       SHOT_STATE.delete(name)
+      LAST_CAPTURE.delete(name)
       const shot = await doAct(['screenshot', '-s', `/tmp/cua-zoom-${process.pid}.png`, '--json'])
       let size = ''
       try {
         size = execFileSync('/usr/bin/identify', ['-format', '%w %h', `/tmp/cua-zoom-${process.pid}.png`], { timeout: 20000 }).toString().trim()
       } catch {}
-      return ok({ name, action, output: `${result.output}\n${action === 'zoom' ? `zoomed to "${target_}"` : 'back to the full screen'}${size ? `; screenshots are now ${size} and coordinates are relative to that image` : ''}. Take a screenshot to see it.` })
+      return ok({
+        name,
+        action,
+        output: `${result.output}\n${action === 'zoom' ? `zoomed to "${target_}"` : 'back to the full screen'}${size ? `; screenshots are now ${size} and coordinates are relative to that image` : ''}. Take a screenshot to see it.`,
+        // A zoom CHANGES THE SPACE: the next capture is a different frame, so the
+        // old capture ids are dropped along with the cached measurement.
+        effect: { kind: 'none', before: null, after: null, changed: true, source: 'cua' },
+        verified: 'confirmed',
+        evidence: [{ kind: 'frame', size: size || null, note: 'the capture space changed; earlier capture ids are stale by construction' }]
+      })
     }
 
     const argv = (() => {
@@ -5545,6 +7238,16 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
       }
     })()
 
+    // WP-8.3: THE BEFORE-READ. Keyboard actions prove themselves through the
+    // ACTIVE WINDOW (typing into the wrong window is the failure mode that
+    // matters); a launch proves itself through a window that did not exist
+    // before. Both are one cheap xdotool read, taken before the action.
+    // The read-back is exactly the round-trips DSH_CUA_VM_EFFECTS=0 turns off:
+    // without it, no before-read is taken at all and the answer says so.
+    const keyboard = EFFECTS_ENABLED === true && ['type', 'key', 'hotkey'].includes(action)
+    const launching = EFFECTS_ENABLED === true && (action === 'launch' || action === 'open')
+    const beforeFocus = keyboard ? await activeWindowTitle(name) : ''
+    const beforeTitles = launching ? await guestWindowTitles(name) : []
     const acted = await doAct(argv)
     let output = acted.output
     if (acted.code !== 0) {
@@ -5554,7 +7257,14 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
         const fallback = await runCua(['sb', 'exec', '--local', name, '--timeout', '20',
           'DISPLAY=${DISPLAY:-:1} xdotool getdisplaygeometry; DISPLAY=${DISPLAY:-:1} xdotool getactivewindow getwindowname 2>/dev/null; DISPLAY=${DISPLAY:-:1} xdotool search --name "." getwindowname %@ 2>/dev/null | head -12'], { timeoutMs: 60000 })
         const geometry = /^(\d+)\s+(\d+)$/mu.exec(fallback.stdout)
-        return ok({ name, action, output: `accessibility tree is unavailable for this app (AT-SPI not exposed).\ndisplay: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}\nwindows:\n${cleanWindowList(fallback.stdout).map((w) => `- ${w}`).join('\n') || '- none'}\nUse zoom + screenshot + screenshot pixels, or drive the app from its own scripting API.` })
+        return ok({
+          name,
+          action,
+          output: `accessibility tree is unavailable for this app (AT-SPI not exposed).\ndisplay: ${geometry ? `${geometry[1]}x${geometry[2]}` : 'unknown'}\nwindows:\n${cleanWindowList(fallback.stdout).map((w) => `- ${w}`).join('\n') || '- none'}\nUse zoom + screenshot + screenshot pixels, or drive the app from its own scripting API.`,
+          effect: { kind: 'none', before: null, after: null, changed: false, source: 'xdotool' },
+          verified: 'unverifiable',
+          evidence: [{ kind: 'note', detail: 'the a11y tree could not be read, so nothing about the tree was observed' }]
+        })
       }
       return fail(output.slice(-600))
     }
@@ -5567,7 +7277,56 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
       const measured = await space.measure(name)
       if (measured !== null) output = `${output}\n${spaceLine(measured)}`
     }
-    return ok({ name, action, output })
+
+    // ---- WP-8.3: the read-back for the non-pointer verbs ----
+    if (keyboard === true) {
+      // X11 has no text read-back: the honest observable is the FOCUS. An
+      // `expect.window` turns that into a real assertion; without it a keystroke
+      // is `unverifiable` even though it was delivered.
+      await sleep(200)
+      const afterFocus = await activeWindowTitle(name)
+      const readBack = windowEffectResult(beforeFocus, afterFocus, 'xdotool', expect)
+      return ok({ name, action, output, effect: readBack.effect, verified: readBack.verified, evidence: readBack.evidence })
+    }
+    if (launching === true) {
+      // A launched app is a window that did not exist before it was asked for.
+      await sleep(600)
+      const afterTitles = await guestWindowTitles(name)
+      const afterFocus = await activeWindowTitle(name)
+      const opened = afterTitles.filter((title) => beforeTitles.includes(title) !== true)
+      const wantWindow = typeof expect?.window === 'string' && expect.window !== '' ? expect.window : ''
+      const matched = wantWindow !== '' && afterTitles.some((title) => title.includes(wantWindow))
+      const confirmed = opened.length > 0 || matched
+      return ok({
+        name,
+        action,
+        output,
+        effect: {
+          kind: 'window',
+          before: beforeTitles.length === 0 ? null : beforeTitles.join(' | '),
+          after: afterTitles.length === 0 ? null : afterTitles.join(' | '),
+          changed: opened.length > 0,
+          source: 'xdotool'
+        },
+        verified: confirmed ? 'confirmed' : 'unverifiable',
+        evidence: [
+          { kind: 'windows', opened, before: beforeTitles, after: afterTitles },
+          ...(wantWindow === '' ? [] : [{ kind: 'expect.window', value: wantWindow, matched }]),
+          { kind: 'window', before: beforeFocus || null, after: afterFocus || null, changed: afterFocus !== beforeFocus }
+        ]
+      })
+    }
+    // Everything else (windows/a11y/clipboard/scroll/zoom/unzoom/geometry) is a
+    // READ or an action with no observable channel: say `none`/`unverifiable`
+    // instead of borrowing the confidence of a pointer click.
+    return ok({
+      name,
+      action,
+      output,
+      effect: { kind: 'none', before: null, after: null, changed: false, source: 'cua' },
+      verified: 'unverifiable',
+      evidence: [{ kind: 'note', detail: `"${action}" has no read-back channel on the Linux desktop; its output is the observation` }]
+    })
   },
 
   /**
@@ -5610,11 +7369,25 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
       }
       try {
         const result = await growGuestDisk(name, Number(sizeGb))
-        if (result.changed) {
-          log(`disk: ${name} grew to ${result.sizeGb} GB`)
+        // WP-9.1: THE REGISTRY ONLY RECORDS A GROW THAT HAPPENED. Writing
+        // `diskGb: <requested>` after a resize2fs that failed is how the panel
+        // came to show a 40 GB computer with a 20 GB filesystem, and why the
+        // next ENOSPC had no explanation. `changed` alone is not enough either:
+        // a short grow changed the block device and not the filesystem.
+        if (result.ok === true && result.changed === true) {
+          log(`disk: ${name} grew to ${result.sizeGb} GB (measured)`)
           await mutateRegistry((fresh) => {
             if (fresh.vms[name]) fresh.vms[name].diskGb = result.sizeGb
           })
+        }
+        // `result` carries its own `ok`, and spreading it into an ok() answer
+        // would flip the envelope — so a refusal is a refusal.
+        if (result.ok === false) {
+          // `ok` is DESTRUCTURED OUT, not overwritten later: spreading it into
+          // fail()'s details would put `ok: false` where the envelope's refusal
+          // is, and `ok: undefined` would drop the key entirely.
+          const { ok: _refused, ...diagnostics } = result
+          return fail(`the disk of ${name} was NOT grown (${result.reason ?? 'unknown'}${result.detail ? `: ${result.detail}` : ''})`, { name, ...diagnostics })
         }
         return ok({ name, ...result })
       } catch (error) {
@@ -5660,7 +7433,9 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
     if (readRegistry().vms[name]?.kind === 'windows') {
       const relayed = await ensureWindowsConsoleRelay(name)
       if (relayed === null) return fail('the live view is not up yet: the display has not started, or websockify is missing from the image')
-      return ok({ name, kind: 'windows', url: `/vm/port/${name}/`, hash: '', console: true })
+      // WP-7: what the console can actually do about the clipboard, from the
+      // relay row (not from a guess about which bridge spawned).
+      return ok({ name, kind: 'windows', url: `/vm/port/${name}/`, hash: '', console: true, view: relayed.view ?? '', clipboard: consoleClipboard(name) })
     }
     const result = await runCua(['sb', 'view', '--no-open', '--json', '--local', name], { timeoutMs: 60000 })
     if (result.code !== 0) return fail((result.stderr || result.stdout).trim().slice(-600))
@@ -5741,9 +7516,28 @@ const server = createServer((socket) => {
     }
     handled = true
     const line = buffer.slice(0, newline)
+    let request = null
+    try {
+      request = JSON.parse(line)
+    } catch (error) {
+      socket.end(`${JSON.stringify(fail(error))}\n`)
+      return
+    }
+    // WP-4.3: `subscribe` OWNS THE SOCKET. It is the one op that does not answer
+    // one line and close: the subscription writes the ready line itself and then
+    // streams until the client goes away, so the generic path below (which ends
+    // the socket with the answer) must never run for it.
+    if (request?.op === 'subscribe') {
+      try {
+        subscribeStream(socket, request.events)
+      } catch (error) {
+        log(`subscribe: could not start the stream (${error?.message ?? error})`)
+        try { socket.destroy() } catch {}
+      }
+      return
+    }
     let response
     try {
-      const request = JSON.parse(line)
       // EVERY op that carries a name has it validated here, once: the name is a
       // path segment in the store, and a destructive handler that forgets to check
       // is one `"../.."` away from deleting something that is not a computer.
@@ -5829,6 +7623,73 @@ server.listen(SOCK, () => {
   }
 })
 
-const shutdown = () => server.close(() => process.exit(0))
+/**
+ * J22-7: A SIGTERM MUST TAKE THE LIVE VIEWS WITH IT.
+ *
+ * `server.close()` closes the unix socket and nothing else. The websockify and
+ * `cua-vnc-clip.mjs` children live in LIVE_VIEWS and were left running when the
+ * container stopped: they keep their loopback ports bound, so the NEXT process
+ * either loses the port race or relays to a bridge whose supervisor socket is
+ * gone (every clipboard write then fails with a control-socket error the user
+ * sees as "paste does nothing"). The relay servers themselves die with this
+ * process (they are its own handles); the children do not.
+ *
+ * The sweep is best-effort and BOUNDED: SIGTERM each child, wait at most
+ * SHUTDOWN_LIVE_VIEW_DEADLINE_MS for them to go, then exit regardless — a
+ * container stop must never hang because one child ignored its signal. The
+ * timer is unref'd so an already-idle event loop can exit immediately.
+ */
+const SHUTDOWN_LIVE_VIEW_DEADLINE_MS = 2000
+
+function sweepLiveViews() {
+  const children = []
+  for (const name of [...LIVE_VIEWS.keys()]) {
+    const child = LIVE_VIEWS.get(name)
+    // stopLiveView deletes the map entry AND SIGTERMs the child; the handle is
+    // kept here so the wait below can observe its exit.
+    stopLiveView(name)
+    if (child !== undefined && child !== null) children.push(child)
+  }
+  return children
+}
+
+const shutdown = () => {
+  const children = sweepLiveViews()
+  if (children.length > 0) {
+    log(`shutdown: stopping ${children.length} live view child(ren) so no bridge/websockify keeps a loopback port after this process`)
+  }
+  let exited = false
+  const finish = () => {
+    if (exited) return
+    exited = true
+    process.exit(0)
+  }
+  // EXIT WHEN BOTH ARE DONE — the socket is closed AND the children are reaped —
+  // so a response already being written is not truncated and a child that is
+  // still closing its listener does not race the next process for the port.
+  let pending = 2
+  const settled = () => {
+    pending -= 1
+    if (pending <= 0) finish()
+  }
+  try {
+    server.close(settled)
+  } catch {
+    settled()
+  }
+  void Promise.all(children.map((child) => new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) { resolve(); return }
+    try {
+      child.once('exit', () => resolve())
+    } catch {
+      resolve()
+    }
+  }))).then(settled)
+  // THE DEADLINE IS THE ONLY THING THAT CANNOT BE WAITED FOR: a client that pins
+  // the server open, or a child that ignores SIGTERM, must not hang a container
+  // stop. unref'd, so an idle loop exits immediately instead of idling here.
+  const deadline = setTimeout(finish, SHUTDOWN_LIVE_VIEW_DEADLINE_MS)
+  deadline.unref?.()
+}
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)

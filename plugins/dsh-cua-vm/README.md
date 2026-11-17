@@ -8,8 +8,10 @@ harness keeps `workspace-write`. Two kinds exist:
 * **Windows** — **direct QEMU** (OVMF + swtpm + a qcow2 disk under `/cua-vm`, no
   container runtime), driven over QMP with a noVNC live view at
   `/vm/port/<name>/`. OpenSSH is installed by the answer file, so exec / put /
-  get work over SSH like the Linux computer; there is no clipboard, no
-  accessibility tree and no window list on the QMP path.
+  get work over SSH like the Linux computer. The clipboard is bidirectional
+  through a guest agent (`cua-clip-agent.ps1`) and the noVNC bridge
+  (`cua-vnc-clip.mjs`); there is no accessibility tree and no window list on the
+  QMP path — element work goes through the guest's dsh-cua tools.
 
 ## Why a supervisor
 
@@ -184,7 +186,12 @@ the same supervisor that runs the Linux guest: the same `/dev/kvm`, the same
 `/cua-vm` store, the same lifecycle locks, the same shutdown/checkpoint/delete
 machinery. There is no Docker Engine, no DinD sidecar and no second runtime —
 `docker/cua-vm-windows-qemu.mjs` builds the command line and
-`docker/windows-oem/` holds the unattended install.
+`docker/windows-oem/` holds the unattended install. Both the QEMU argv and the
+**swtpm argv** escape every interpolated path through `qemuEscapeOptionValue()`
+(a comma doubles: `a,b` → `a,,b`): `--ctrl path=`, `--tpmstate dir=`, `--pid
+file=` and `--log file=` are parsed by swtpm's own comma-splitting grammar, so an
+unescaped store path used to mean a truncated socket/state path and "could not
+open pid file".
 
 ```
 $STORE/iso/                              downloaded install media (one per version)
@@ -222,32 +229,46 @@ context of the display device, **not** acceleration inside the guest.
 
 ### Install media
 
-**An operator-supplied ISO is the primary path, and that is deliberate.** Of the
-five Microsoft evaluation URLs this module originally pinned, only **Server 2025**
-still answered (probed 2026-11-15: HTTP 206; the other four return HTTP 400 —
-those editions are behind a session-token download page). A sixth, **Windows 11
-IoT Enterprise LTSC 2024**, was added from Microsoft's own Evaluation Center
-(`microsoft.com/en-us/evalcenter/download-windows-11-iot-enterprise-ltsc-eval`):
-its x64 button is `go.microsoft.com/fwlink/?linkid=2270353`, which resolves to a
-static `software-static.download.prss.microsoft.com` object that answered
-**HTTP 206** with 5,060,020,224 bytes — so it is pinned and installs without an
-operator ISO. So:
+**Sixteen codes, one ordered source chain each.** The five-version list is gone:
+`windowsVersion` is the dockur/windows vocabulary (`11`, `11l`, `11e`, `10`,
+`10l`, `10e`, `7u`, `xp`, `2025`, `2022`, `2019`, `2016`, `2012`, `core11`,
+`tiny11`, `tiny10`), so "Windows 11 Enterprise" or "Server 2019" has a spelling
+instead of forcing an operator ISO. The full table — disk size, firmware profile,
+image selection — is in the repository README; the per-code URLs, byte counts and
+SHA-256s are in `docs/windows-iso-sources.md`.
 
-* `windowsVersion` lists six, but only **`2025`** and **`11ltsc`** (Windows 11 IoT
-  Enterprise LTSC 2024, alias `ltsc11`) have pinned URLs — both were probed with a
-  live ranged GET (HTTP 206). Selecting another one **refuses immediately**,
-  naming the version and both remediations — it does not fail inside a 5.5 GB
-  download.
-* `windowsIso` is how you install 11/10/ltsc10/2022: an `http(s)` URL (downloaded
-  into `$STORE/iso/` with progress and a timeout, `DSH_CUA_WINDOWS_ISO_TIMEOUT_MS`
-  default 1 h) or a local `.iso` inside `$STORE` or the workspace, attached
-  directly as a QEMU drive.
-* The download is verified: a short read aborts and removes the `.part` file, the
-  rename into place is atomic, and a stale `.part` is cleared first — so a
-  truncated ISO can never be reused as "cached".
-* The cache is **shared** by every computer and **counted by the store quota**
-  (`$STORE/iso/` is part of the accounted store). `cua_vm_gc` prunes ISOs no row
-  references once they are older than the screenshot retention policy.
+**A version is a CHAIN, not a pinned URL.** One pinned object per version was a
+bet on a Microsoft CDN object staying alive, and four of the five lost it (HTTP
+400 on 2026-11-15: those editions moved behind a session-token page). Each code
+now carries an ordered list:
+
+| strategy | what it is |
+|---|---|
+| `mido` | Microsoft's own live download page, driven by the four calls its JavaScript makes (`tags` → `mdt` → `reply` → `sku` → `link`) — the only strategy that yields an official, current media URL |
+| `esd` | the ESD catalog CAB behind `go.microsoft.com/fwlink` — read ONLY when `7z`/`cabextract` is already in `PATH`; otherwise `skipped: no cab extractor` and the chain moves on |
+| `link1`/`link2`/`link6` | pinned mirrors (`dl.bobpony.com`, `files.dog/MSDN`, `archive.org/download`), each with its byte count and SHA-256 |
+| `midoDirect` | the static `software-static.download.prss.microsoft.com` object the page resolves to |
+
+**Verification:** the `Content-Length` and the streaming SHA-256 of every pinned
+entry are checked before the file is booted; a mismatch is
+`code: iso-digest-mismatch` and the ISO is not used. A verified download writes a
+`.sha256` sidecar, so the next create re-uses it without re-hashing 5.5 GB; a
+sidecar that disagrees with the pin makes the file NOT a cache.
+`DSH_CUA_WIN_ISO_SHA256=0` switches the DIGEST comparison off (the size is still
+checked, only `'0'` does it, and the answer then says `verified: false` with a
+`note` naming the switch — a skipped check is visible, never silent). A cache
+with no pin and no sidecar is refused as `unpinned-cache` and downloaded again.
+
+`windowsIso` still takes an `http(s)` URL (downloaded into `$STORE/iso/` with
+progress and a timeout derived from the version's size) or a local `.iso` inside
+`$STORE` or the workspace, attached directly as a QEMU drive. The cache is shared
+by every computer and is part of the accounted store; `cua_vm_gc` prunes ISOs no
+row references once they are older than the screenshot retention policy.
+
+`xp` is **listed and refused** (`code: legacy-installer-unsupported`) before
+anything is downloaded: XP has no UEFI and its Setup reads `winnt.sif` from a
+floppy/ISO root, which this OEM payload does not build. A refused code is not an
+unknown code — the difference is the sentence you get.
 
 An optional `virtio-win.iso` (`$STORE/iso/virtio-win.iso` or
 `DSH_CUA_WINDOWS_VIRTIO_ISO`) switches the disk and NIC to virtio; without it
@@ -367,23 +388,35 @@ itself.
 | `cua_vm_exec` | SSH → `cmd.exe` (the SSH key is per computer; `cwd` is `cd /d`) |
 | `cua_vm_put` / `cua_vm_get` | `scp` over the same key and port |
 | `cua_vm_gui` | QMP: `screendump` for a frame, `input-send-event` for clicks/keys |
-| `cua_vm_port` / Show VM | the **live view**: noVNC + websockify relayed at `/vm/port/<name>/` |
+| `cua_vm_port` / Show VM | the **live view**: noVNC served by `cua-vnc-clip` (websockify as the fallback) and relayed at `/vm/port/<name>/` |
 | `cua_vm_suspend` | QMP `stop` (the VM pauses with its RAM); Start `cont`s it |
 | `cua_vm_shutdown` | QMP `system_powerdown` → wait → `quit` → checkpoint → `powered-off` |
 | `cua_vm_disk`, Android, REA | not available (Linux-only), refused by name |
 
 **Ceilings, stated plainly:** QMP typing is **ASCII-only** (physical keycodes —
-no `é`, no `中`) and there is **no clipboard**, no accessibility tree and no
-window list on this path. There is also **no cursor overlay**: the CUA agent
-cursor is an X11 overlay on the Linux guest and nothing equivalent exists here,
-so the pointer you see in a frame is the real one (VNC draws it for a human).
+no `é`, no `中`), there is no accessibility tree and no window list on this path,
+and the clipboard does **not** ride QMP: it goes through the guest agent and the
+RFB bridge (or, forced, the panel's Clipboard section — see
+[the clipboard, both ways](#the-clipboard-both-ways)). There is also **no cursor
+overlay**: the CUA agent cursor is an X11 overlay on the Linux guest and nothing
+equivalent exists here, so the pointer you see in a frame is the real one (VNC
+draws it for a human).
 
 ### Live view
 
-The display is QEMU VNC on `127.0.0.1:<allocated>`. The supervisor starts
-`websockify` in front of it serving the image's own noVNC page and relays THAT
-port through the existing preview pipeline, so **Show VM** streams the same
-screen the model drives and a human can take over. Nothing is published raw.
+The display is QEMU VNC on `127.0.0.1:<allocated>`. The supervisor starts a front
+door in front of it and relays THAT port through the existing preview pipeline, so
+**Show VM** streams the same screen the model drives and a human can take over.
+Nothing is published raw, and the front door is loopback-only.
+
+The preferred front door is the image's own **`cua-vnc-clip.mjs`** — static noVNC,
+the WebSocket handshake, the TCP client to QEMU and the RFB clipboard path, in one
+Node process with no Python and no `websockify`. It is feature-detected in both
+directions: `DSH_CUA_VNC_CLIP=0`, a missing binary, or a child that never listens
+falls back to `websockify` (or to the raw VNC relay when even that is absent), so a
+broken bridge can never cost you the console. The relay row records what it got:
+`view: "novnc-clip" | "novnc" | "websockify" | "vnc-raw"` and a `clipboard`
+object saying whether the console clipboard is up and why not.
 
 ### Networking
 
@@ -404,56 +437,181 @@ list through `ssh … python -m dsh_cua.server --stdio`
 tools**. There is no shared pipe server: upstream `dsh_cua.server main()` takes no
 `--pipe` argument, so one long-lived session-2 server cannot be reached from
 Session 0 yet (see [The interactive session, and what does not exist yet](#the-interactive-session-and-what-does-not-exist-yet)).
-The tools appear as `cua_win__<name>` and are
-**disposed** within ~5 s of the computer stopping, being switched away from, or
-being deleted (the attach check runs on a 5 s beat, not the 30 s cache beat —
-a stale `cua_win__*` call against a stopped computer is a confusing SSH error).
 **Nothing is written to the profile.**
+
+#### The namespace is the harness's
+
+| name | what it is |
+|---|---|
+| `mcp__windows__<guest tool>` | one per guest tool — `tool_click_at`, `find_elements`, `tool_type_text`, … The prefix is `TOOL_PREFIX = "mcp__windows__"` and `windowsToolName()` is the only place it is added (a name that arrives prefixed is not prefixed twice) |
+| `windows_desktop` | **reveal** — no arguments; unhides this session's bridged tools and returns their names, descriptions and parameters |
+| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` surface on the global registry (`leaks`), the grants, the keepalive and the last error |
 
 Why it is worth its cost: `find_elements` + `type_text` return a compact JSON
 receipt (`action_sent`, `effect_verified`) in a few hundred bytes, where the
 screenshot loop costs a PNG per attempt. The cost is the schema: **~3-8k tokens
 while attached**, zero when no Windows computer is active.
 
-**It attaches only when the row is `ready` over SSH**, so it needs D1 fixed: a
-computer whose firstboot never ran has no `sshd`, never answers the banner, never
-becomes ready, and the MCP stays detached by design (the tool call says the guest
-SSH server is not answering). Fixing `$OEM$`/`UseConfigurationSet` is what makes
-this surface appear — it is not an MCP configuration problem.
+#### The gate: grant → reveal → guard
+
+Cost and consent are two different problems, so there are three layers and every
+one of them lives in the plugin's process (module-level state, not per-mount):
+
+1. **the grant** — Computer Use is **off** by default, in memory, per session.
+   The user turns it on in Personal VM → **Computer Use**, or with
+   `POST /dsh-cua-vm/cua-grant {"grant": true, "sessionId": "…"}`;
+   `GET /dsh-cua-vm/cua-grant` reports the state. Mutating the grant is
+   same-origin only, and a restart forgets it.
+2. **the reveal** — with the grant on, the names are still hidden until
+   `windows_desktop` is called for that session. `restrict({ deny })` is what
+   hides them, and the deny set is every name this bridge registered.
+3. **the guard** — `tools.guard` vetoes the CALL at dispatch time, so a name that
+   is still visible (a race, a step admission captured before a teardown) is
+   **refused, never run**, with a structured `code:` line the model can branch on:
+   `vm-offline`, `grant-off`, `reveal-required`.
+
+#### Which computer, and which session
+
+One process attaches ONE Windows computer (one SSH session, one set of 19 tools);
+the attachment is global, but the RIGHT to use it is per session, and the rule is
+re-checked on every call and on every gate application:
+
+* the session that bound the attached computer may use it;
+* a session bound to a DIFFERENT computer is refused with a structured
+  `code: not-the-target` whose text names both computers and the fix — and its 19
+  names are put back into the deny set, so the mismatch is a list, not one failed
+  call at a time;
+* a session that never bound anything is refused the same way
+  (`this session is bound to nothing; the Windows bridge is attached to …`);
+* the ONE declared relaxation — `implicit-single-target`: when exactly one Windows
+  computer is known to the bridge (the supervisor's `vmList` registry, refreshed by
+  the same 30 s call that keeps the REA cache warm), a never-bound session may use
+  it. The doctor records it (`viewer.via`, `implicitTarget.sessions`), so it is
+  never silent, and a second computer withdraws it immediately.
+
+#### Offline means GONE, not dead — and the stream is why it is fast
+
+A delete, a shutdown, a switch to another computer or a dead SSH session all funnel
+into one idempotent `teardown()`: the registration map is emptied **before** the
+disposers run, every disposer is called, and the gate is re-applied to an empty
+deny set. So no `mcp__windows__*` schema survives on the host-global registry and
+**every session's** tool list shrinks at once.
+
+The fast path is a real subscription, not a hope: the plugin keeps ONE long-lived
+connection on the supervisor's socket and sends
+`{"op":"subscribe","events":["vm-state","vm-removed"]}`; the supervisor answers
+`{"event":"ready",…}` and then one line per transition. A shutdown or a delete
+therefore reaches `teardown()` in **milliseconds** (the observed latency on a
+local socket is single-digit ms, not "up to 10 s"), and the client reconnects with
+backoff after a socket error. A supervisor that does not implement the op answers
+`unknown op` (or closes without `ready`): the plugin records
+`stream.supported: false`, stops asking, and the poll below is the belt — the same
+behaviour as before this change. `windows_mcp_doctor` reports `stream.live`,
+`stream.supported`, `stream.events`, `stream.lastEvent` and `stream.error`.
+
+Four things can trigger the teardown, and all four are the same code: the state
+stream, the state poll (`DSH_CUA_MCP_STATE_POLL_MS`, default 10000 ms, floor 1000
+— still running behind the stream), the guest client's own `onClosed`, and the
+per-agent `agent/pre-step` self-heal (which never swallows the step — `next()`
+runs on every path).
+
+#### Online gate and keepalive
+
+`win-mcp.js` asks the plugin `isOnline()` **before every call** (10 s cache): a
+suspended or stopped computer fails with `code: vm-offline` instead of paying an
+SSH timeout. The SSH channel is opened with `ServerAliveInterval=10` and
+`ServerAliveCountMax=2`, so a half-open socket (a suspended QEMU) is dropped in
+~20 s and the next call is refused by name. `ForwardAgent`, `ForwardX11` and
+`PermitLocalCommand` are off — this channel only ever carries one stdio MCP
+server.
+
+`windows_mcp_doctor` is the one call that answers "which side is broken": target,
+`online`, `registered`, the raw prefix surface (`schemas`, `leaks`), the grants,
+the revealed sessions, the keepalive and `gateError`. Offline, `leaks` MUST be
+empty; anything else is `status: "leaking"` and is exactly the bug this gate
+exists for.
+
+**It attaches only when the row is `ready` over SSH**, so it needs firstboot fixed:
+a computer whose `$OEM$` copy never ran has no `sshd`, never answers the banner,
+never becomes ready, and the MCP stays detached by design (the tool call says the
+guest SSH server is not answering). Fixing `$OEM$`/`UseConfigurationSet` is what
+makes this surface appear — it is not an MCP configuration problem.
 
 Kill switch: `DSH_CUA_VM_WIN_MCP=0` disables the whole path (no SSH bridge, no
 tools, no tokens). The same bridge can also be used as a plain MCP stdio server
 (`node plugins/dsh-cua-vm/win-mcp.js --stdio --port <sshPort> --key <path>`) if
 you prefer a `dsh-mcp-client` row.
 
-### The clipboard (and why the noVNC paste box does nothing)
+### The clipboard, both ways
 
-**Use the panel's Clipboard section.** It is the only path that works.
+A Windows clipboard belongs to the **interactive session**. Two obvious routes are
+dead, and both were tried on a live VM:
 
-A human's instinct is the noVNC paste box in the live view. On a Windows
-computer that box delivers **nothing**: it sends an RFB `ClientCutText`, QEMU
-accepts it, and the guest drops it because a bare Windows desktop has no
-clipboard agent to receive it. The live symptom is worse than a failure — the
-paste "succeeds" and pastes the guest's **previous** clipboard. That box lives in
-the image's own `/usr/share/novnc`, not in this plugin, so it cannot be patched
-from here; the fix is the Clipboard section, and this paragraph.
+* **RFB `ClientCutText`** — QEMU's VNC server accepts it and drops it, because the
+  guest runs no clipboard agent. noVNC's paste box therefore "succeeds" and pastes
+  the guest's **previous** clipboard, which is worse than a failure.
+* **`Set-Clipboard` over SSH** — `sshd` runs in **Session 0**, which owns a
+  different (empty) clipboard than the session a human sees. The command exits 0
+  and nothing changes.
 
-`Set-Clipboard` over SSH does not work either: `sshd` runs in **Session 0**,
-which owns a different (empty) clipboard than the interactive session the user
-sees. The command exits 0 and nothing changes.
+So the guest side is a real agent in the user's session, and the host side is a
+bridge in front of noVNC:
 
-So the clipboard is moved by **two on-demand scheduled tasks that run in the
-interactive session** (`/sc ondemand /it /rl LIMITED`), registered by
-`cua-firstboot.ps1`:
-
-| task | direction | body |
+| piece | session | what it does |
 |---|---|---|
-| `cua-clip-set` | panel → guest | `Set-Clipboard -Value ([IO.File]::ReadAllText('C:\ProgramData\cua\clip.txt'))` |
-| `cua-clip-get` | guest → panel | `[IO.File]::WriteAllText('C:\ProgramData\cua\clip-read.txt', (Get-Clipboard -Raw))` |
+| `cua-clip-agent.ps1` | the user's, registered by firstboot as `cua-clip-agent` (`/sc onlogon /it /rl LIMITED`) | the ambient LOOP: watches the clipboard, writes `C:\ProgramData\cua\clip-current.txt`, polls `outbox\clip-<seq>.json`, puts the text on the clipboard and writes `clip-ack.json` with the seq, the SHA-256 and `equal` |
+| `cua-clip-set` / `cua-clip-get` | the user's, on demand | the original contract and the FALLBACK: `clip.txt` → `Set-Clipboard`, `Get-Clipboard -Raw` → `clip-read.txt`, with the task's own `Last Result` as the exit code |
+| `cua-vnc-clip.mjs` | the container, `127.0.0.1` only | the noVNC front door + RFB clipboard: `ClientCutText` → `vmWindowsClipboardSet`, and a guest copy → `ServerCutText` to the browser |
 
-The supervisor writes/reads those files over the SSH/scp channel it already has
-and runs the task with `schtasks /run`. Three details make it honest rather than
-apparently-working:
+#### What the model and the panel call
+
+| op | panel route | answer |
+|---|---|---|
+| `vmWindowsClipboardSet` | `POST /cua/windowsClipboardSet {"name","text"}` | `{ ok, verified, via: "agent"\|"task", bytes, seq, sha256, readBackEqual, fastPathReason?, detail }` |
+| `vmWindowsClipboardGet` | `POST /cua/windowsClipboardGet {"name"}` | `{ ok, verified, via, text, sha256, state, detail }` |
+
+`available: false` with a reason means the computer is not `ready` or SSH is
+switched off — the panel renders that as a **disabled** section, not as an error.
+
+#### The agent path is verified, not hoped
+
+The fast path drops a job carrying the digest of the text, waits for the agent's
+ack and checks **all three** facts — `seq`, `sha256`, and the agent's own `equal`
+— then reads `clip-current.txt` back and hashes THAT (`readBackEqual`). A partial
+match is a mismatch (`reason: "ack-mismatch"`; the answer says `verified: false`).
+The old ack is deleted before the job is written, so a surviving ack from the
+previous sequence cannot answer for this one.
+
+With no agent (an older guest, a failed firstboot, `DSH_CUA_CLIP_AGENT=0`) the call
+falls back to `cua-clip-set` and reports `fastPathReason` — "pasted, slowly" and
+"pasted, verified" are different facts about the guest and both are named.
+
+Three answers that used to be one generic failure are now their own:
+
+* `reason: "agent-error:<code>"` — the agent reported `ok: false` and/or a
+  non-empty `error`. That is not a digest mismatch, and the reason says so with
+  the agent's code (or a one-line message) instead of sending the reader to
+  hashing;
+* `reason: "too-large"` — the agent's limit is the JOB FILE. The outbox budget is
+  `1 MiB − 2048` bytes (`CLIP_OUTBOX_WRAPPER_BUDGET`), checked before ANY round
+  trip, and the serialized job is re-checked after escaping. The fast path
+  declines; the schtasks fallback (text limit 1 MiB) still delivers, and the
+  answer names the decline;
+* `nulTruncated: { landed, total }` — a U+0000 truncates the Windows clipboard.
+  The paste is `ok: true` (the prefix landed) but `verified: false`, and the
+  answer says how many characters survived.
+
+**Order and files.** The agent writes `clip-current.txt` **before** the ack; the
+backend re-reads the ack and the copy up to three times, 250 ms apart, and keeps
+the LAST matching ack (one immediate read could describe the previous payload on
+a paste that actually worked). `seq` is a `Date.now()` stamp, so it is `[long]`
+everywhere in PowerShell — an `[int]` overflowed. The files are per-session
+(`clip-state-<id>.json`, `clip-ack-<id>.json`, `clip-current-<id>.txt`,
+`outbox-<id>\`) with the canonical un-suffixed copies written by the same owner,
+byte-for-byte; a single-owner lock (60 s window) stops two logons from serving
+each other's payload.
+
+Three details make the fallback honest rather than apparently-working:
 
 1. **the file is written BEFORE the task runs** — otherwise the task reads the
    previous paste, which is the same "old clipboard" symptom one layer up;
@@ -467,9 +625,39 @@ Text is never placed on a command line (a `&`, `|`, `;` or quote would be
 re-parsed by `cmd.exe`); it travels as a file, and the payload is capped at 1 MiB
 — a bigger paste is a file transfer, so use `cua_vm_put`.
 
-The panel section renders **disabled with the reason** whenever the computer is
-not `ready` or SSH is down. It is the same answer the model gets: not an error,
-a state.
+#### Encoding, and turning the bridge off
+
+The RFB wire is bytes: `encodeCutText` sends **latin1** when every code point fits
+in one byte (the decode on the other side is then exact) and **UTF-8** otherwise,
+with the length header counting BYTES, not characters. `parseClientCutText`
+decodes UTF-8 when the bytes are valid UTF-8 and latin1 otherwise — reversible
+either way. `DSH_CUA_VNC_CLIP_POLL_MS` (default 1200) is how often the bridge reads
+the guest clipboard.
+
+`DSH_CUA_VNC_CLIP=0` reverts the console to plain websockify: the screen is
+unchanged, the RFB clipboard is gone, and the panel's Clipboard section is the only
+path.
+
+**The three environment knobs are LIVE, and these are their exact contracts:**
+`DSH_CUA_CLIP_AGENT=0` is a **staging variable that becomes a file**, because the
+guest cannot read the host's environment. The backend writes
+`clip-agent-disabled` beside the OEM payload and into
+`$OEM$/$$/Setup/Scripts` (and `buildSetupImage` carries it into `setup.img`'s
+root) with the log line `clip agent disabled by DSH_CUA_CLIP_AGENT=0 (sentinel
+staged)`; an unset knob unlinks a stale root sentinel, so a re-created computer
+does not stay off. `cua-firstboot.ps1` then searches `$PSScriptRoot`,
+`C:\Windows\Setup\Scripts`, `C:\ProgramData\cua` and the removable roots and
+COPIES a staged sentinel to `C:\ProgramData\cua\` BEFORE its off-switch check —
+the hop that turns "a file on the medium" into the path the consumers test. Both
+consumers use that path: the registrar does not register the task and reports
+`skipped: true, reason: 'clip-agent-disabled'` (the sentinel is an OPTIONAL entry,
+so an unset knob is never "incomplete payload"), and the agent exits early, with
+its embedded copy running the same search-then-stage hop. `DSH_CUA_WIN_ISO_SHA256=0` disables the digest comparison only —
+the byte count is still enforced, `'0'` is the only value with that effect, and
+every skipped download answers `verified: false` plus
+`note: "digest check disabled by DSH_CUA_WIN_ISO_SHA256=0"`. `DSH_CUA_VNC_CLIP_POLL_MS`
+is read by the supervisor and passed to the bridge as `--poll-ms`, clamped to
+200–60000 ms and rounded; a non-numeric value is the default 1200, never 0.
 
 ### Disk free space, on the spec line
 

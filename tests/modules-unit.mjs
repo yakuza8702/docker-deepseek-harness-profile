@@ -7,15 +7,18 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { spawn, spawnSync } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
+import http from 'node:http'
 import zlib from 'node:zlib'
 import {
   pngSize, formatSpace, formatSpaceWarning, spaceLine, relativeToPixels, toDisplayPixels, resolutionProblem, createSpace
 } from '../docker/cua-vm-space.mjs'
 import {
-  WINDOWS_VERSIONS, WINDOWS_ISO_SOURCES, resolveWindowsIso, canonicalWindowsVersion, windowsCapacityWarnings,
+  WINDOWS_VERSIONS, WINDOWS_CATALOG, WINDOWS_ISO_SOURCES, resolveWindowsIso, resolveWindowsIsoSources,
+  canonicalWindowsVersion, windowsCapacityWarnings, windowsFirmwareProfile, windowsFirmwareForSpec, verifyIsoDigest,
+  isoFileName, clipAckMatches, clipAckVerdict, clipSha256, ensureIso, qemuEscapeOptionValue,
   charToKey, parseKeySpec, generatePassword, windowsEnabled,
   buildQemuArgs, vncDisplayFor, vncPortFor, windowsPaths, frameSpace,
-  OEM_PAYLOAD_FILES, oemPayloadDir, oemPayloadDirStatus, oemPayloadDeniedDir, resolveOemSourceDir, writeOemPayload,
+  OEM_PAYLOAD_FILES, OEM_PAYLOAD_REQUIRED, OEM_CLIP_AGENT_FILE, CLIP_AGENT_SENTINEL_FILE, SETUP_IMAGE_OPTIONAL, oemPayloadDir, oemPayloadDirStatus, oemPayloadDeniedDir, resolveOemSourceDir, writeOemPayload,
   oemPayloadMissingError, oemPayloadDeniedError, windowsKvmPreflight,
   SETUP_IMAGE_ENTRIES, SETUP_IMAGE_LABEL, buildSetupImage, verifySetupImage, answerFileDiskIds,
   assertAnswerFileTargetsSystemDisk, normaliseProductKey,
@@ -33,6 +36,11 @@ import {
 import {
   KVM_GID_COMMAND, deviceNodePresent, formatKvmStatus, kvmDoctorFacts, kvmPreflightError, kvmStatus
 } from '../docker/cua-vm-kvm.mjs'
+import { wsAccept, isClientCutText, parseClientCutText, serverCutTextFrame, encodeCutText } from '../docker/cua-vnc-clip.mjs'
+import {
+  DEFAULT_SERVER_NAME, TOOL_PREFIX, REVEAL_TOOL_NAME, DOCTOR_TOOL_NAME,
+  windowsToolName, windowsGuestToolName, sshArgv, SSH_KEEPALIVE
+} from '../plugins/dsh-cua-vm/win-mcp.js'
 
 /** The checkout root — the source of `docker/windows-oem/` in these tests. */
 const REPO = path.resolve(import.meta.dirname, '..')
@@ -127,7 +135,16 @@ await space.measure('vm')
 check('invalidate() forces a fresh measurement (resume/restart/zoom)', displayCalls === 3)
 
 // ---- windows: the spec contract ----
-check('the six Windows versions are the pinned ones', WINDOWS_VERSIONS.join(',') === '11,11ltsc,10,ltsc10,2022,2025', WINDOWS_VERSIONS.join(','))
+// WP-2: SIXTEEN CODES, the dockur/windows vocabulary. This list is the ONLY
+// table: the catalog, the firmware profiles and the image selections are all
+// derived from it, so a code added here without a row fails the very next check.
+check('the sixteen Windows codes are the catalog set', WINDOWS_VERSIONS.join(',') === '11,11l,11e,10,10l,10e,7u,xp,2025,2022,2019,2016,2012,core11,tiny11,tiny10', WINDOWS_VERSIONS.join(','))
+check('every code has a catalog row with a size, a firmware profile and a label', WINDOWS_VERSIONS.every((code) => {
+  const entry = WINDOWS_CATALOG[code]
+  return entry !== undefined && entry.sizeGb > 0 && (entry.bios === 'ovmf' || entry.bios === 'seabios') && typeof entry.label === 'string'
+}), WINDOWS_VERSIONS.filter((code) => WINDOWS_CATALOG[code] === undefined).join(',') || 'all rows present')
+check('xp is the only refused code, and its refusal is data', WINDOWS_VERSIONS.filter((code) => WINDOWS_CATALOG[code].refusal !== undefined).join(',') === 'xp'
+  && WINDOWS_CATALOG.xp.refusal === 'legacy-installer-unsupported')
 check('charToKey maps ASCII to physical qcodes', charToKey('a')?.qcode === 'a' && charToKey('A')?.shift === true && charToKey('!')?.qcode === '1' && charToKey(' ')?.qcode === 'spc' && charToKey('.')?.qcode === 'dot')
 check('charToKey refuses non-ASCII (no clipboard)', charToKey('é') === null && charToKey('中') === null)
 check('parseKeySpec handles named keys and modifiers', parseKeySpec('enter').qcode === 'ret' && parseKeySpec('ctrl+c').ctrl === true && parseKeySpec('shift+tab').shiftModifier === true)
@@ -261,23 +278,416 @@ check('no install ISO is attached once the disk owns the boot', !buildQemuArgs({
 
 check('the VNC display number is port - 5900', vncDisplayFor(5931) === 31 && vncPortFor(31) === 5931)
 check('a frame IS the display for the QMP path', frameSpace(png).scale === 1 && frameSpace(png).source === 'qmp')
-// K2: exactly one source has a probed public URL; the others refuse by name
-// instead of 400ing mid-download.
-check('exactly two pinned ISO sources have a public URL', Object.keys(WINDOWS_ISO_SOURCES).length === 6
-  && Object.values(WINDOWS_ISO_SOURCES).filter((entry) => typeof entry.url === 'string').length === 2)
-check('the pinned URL is the probed Microsoft one', WINDOWS_ISO_SOURCES['2025'].url.startsWith('https://software-static.download.prss.microsoft.com/'))
-check('a version without a public link refuses with its name and the remediation', (() => {
-  try { resolveWindowsIso('11'); return false } catch (error) {
-    return /windowsVersion "11" has no public direct ISO link/.test(error.message) && /windowsIso/.test(error.message)
+// WP-3: THE ISO SOURCE IS A CHAIN, NOT A PINNED URL.
+//
+// The five-version era pinned one object per version and the bet lost: four of
+// the five URLs answered 400 on 2026-11-15. What is asserted now is the SHAPE
+// that replaced it — sixteen rows, a non-empty ordered chain for every code that
+// can install, and the compatibility `url` naming the first STATIC entry (a
+// `mido`/`esd` strategy has no URL until it has been resolved online).
+check('the ISO source table has one row per catalog code', Object.keys(WINDOWS_ISO_SOURCES).length === 16
+  && WINDOWS_VERSIONS.every((code) => WINDOWS_ISO_SOURCES[code]?.code === code))
+check('every installable code has a NON-EMPTY ordered source chain',
+  WINDOWS_VERSIONS.filter((code) => code !== 'xp').every((code) => {
+    const sources = WINDOWS_ISO_SOURCES[code].sources
+    return Array.isArray(sources) && sources.length > 0 && sources.every((source) => typeof source.strategy === 'string')
+  }),
+  WINDOWS_VERSIONS.map((code) => `${code}:${(WINDOWS_ISO_SOURCES[code].sources ?? []).length}`).join(' '))
+check('the compatibility url is the FIRST STATIC link in the chain (never a live mido/esd entry)',
+  WINDOWS_VERSIONS.every((code) => {
+    const entry = WINDOWS_ISO_SOURCES[code]
+    const statics = entry.sources.filter((source) => typeof source.url === 'string' && source.live !== true && source.catalog !== true)
+    if (entry.url === null) return statics.length === 0
+    return entry.url === statics[0]?.url
+  }))
+check('the pinned URL is a Microsoft prss object where one exists',
+  WINDOWS_ISO_SOURCES['2025'].url.startsWith('https://software-static.download.prss.microsoft.com/')
+  && WINDOWS_ISO_SOURCES['11l'].url.includes('CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso'))
+// XP IS LISTED AND REFUSED — with the real obstacle, not "unknown version".
+check('xp is a CODE that refuses with legacy-installer-unsupported', (() => {
+  try { resolveWindowsIsoSources('xp'); return false } catch (error) {
+    return error.code === 'legacy-installer-unsupported'
+      && /winnt\.sif/u.test(error.message)
+      && Array.isArray(error.sources) && error.sources.length > 0
   }
 })())
+check('resolveWindowsIso refuses xp the same way (the cheap gate every create passes)', (() => {
+  try { resolveWindowsIso('xp'); return false } catch (error) { return error.code === 'legacy-installer-unsupported' }
+})())
+// TINY10 IS AN ARCHIVE.ORG ARTEFACT ONLY: it has no Microsoft page and no
+// marketplace mirror, and pretending otherwise would 400 the first create.
+check('tiny10 is served only by archive.org', (() => {
+  const sources = WINDOWS_ISO_SOURCES.tiny10.sources
+  return sources.length === 1 && sources[0].strategy === 'link6' && sources[0].url.startsWith('https://archive.org/download/')
+})())
+check('the tiny11 family is pinned by byte count and SHA-256',
+  ['core11', 'tiny11', 'tiny10'].every((code) => {
+    const source = WINDOWS_ISO_SOURCES[code].sources[0]
+    return source.bytes > 0 && /^[0-9a-f]{64}$/u.test(source.sha256)
+  }))
+check('11l resolves to its first (IoT LTSC, verified by NAME) source',
+  resolveWindowsIso('11l').url.includes('CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso'))
 check('the probed version resolves', resolveWindowsIso('2025').url.startsWith('https://'))
-// LTSC: pinned from Microsoft's Evaluation Center link, probed 206.
-check('Windows 11 IoT LTSC 2024 is a pinned, probed source', WINDOWS_ISO_SOURCES['11ltsc'].url.includes('CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso')
-  && /2026-11-15: HTTP 206/u.test(WINDOWS_ISO_SOURCES['11ltsc'].probed))
-check('the ltsc11 alias resolves to 11ltsc', canonicalWindowsVersion('ltsc11') === '11ltsc'
-  && resolveWindowsIso('ltsc11').url === WINDOWS_ISO_SOURCES['11ltsc'].url)
-check('exactly two versions have a probed public URL', WINDOWS_VERSIONS.filter((v) => WINDOWS_ISO_SOURCES[v].url !== null).join(',') === '11ltsc,2025')
+// THE ALIASES: the old spellings still answer, and they canonicalise to the
+// SIXTEEN-CODE vocabulary (a spelling that dies is a regression dressed as a typo).
+check('the old spellings canonicalise: ltsc11→11l, ltsc10→10l, 2022→2022',
+  canonicalWindowsVersion('ltsc11') === '11l'
+  && canonicalWindowsVersion('ltsc10') === '10l'
+  && canonicalWindowsVersion('2022') === '2022'
+  && canonicalWindowsVersion(' Win11 ') === '11'
+  && canonicalWindowsVersion('') === '')
+check('an unknown spelling throws with the sixteen codes, never a silent default', (() => {
+  try { canonicalWindowsVersion('windows-3000'); return false } catch (error) {
+    return /catalog has 16 codes/u.test(error.message) || /expected one of/u.test(error.message)
+  }
+})())
+check('exactly two versions carry a live mido strategy (11 and 10, the two pages that still publish one)',
+  WINDOWS_VERSIONS.filter((code) => WINDOWS_ISO_SOURCES[code].sources.some((source) => source.strategy === 'mido')).join(',') === '11,10')
+
+// ------------------------------------------------------------------ *
+// WP-2/WP-3: THE FIRMWARE PROFILES, THE IMAGE SELECTION AND THE ISO CACHE
+// ------------------------------------------------------------------ *
+//
+// These are the PURE decisions a create makes before a byte moves: which
+// firmware this code boots on, which image inside the media Setup installs,
+// what a URL's cache file is called, and whether a downloaded file is the one
+// that was pinned. Every one of them used to be inferred from something else
+// (an argv, a hand-written table, a random suffix) — the checks below pin the
+// decision itself.
+{
+  const ovmf = windowsFirmwareProfile('11')
+  const seabios = windowsFirmwareProfile('7u')
+  check('WP-2: 11 boots on the OVMF profile (q35, TPM2, virtio disk)',
+    ovmf.bios === 'ovmf' && ovmf.machine === 'q35' && ovmf.tpm === true && ovmf.efiVars === true && ovmf.disk === 'virtio-blk' && ovmf.legacy === false,
+    JSON.stringify(ovmf))
+  check('WP-2: 7u boots on SeaBIOS (pc, no TPM, IDE disk, e1000e) — the only shape Windows 7 Setup can install on',
+    seabios.bios === 'seabios' && seabios.machine === 'pc' && seabios.tpm === false && seabios.efiVars === false
+    && seabios.disk === 'ide-hd' && seabios.nic === 'e1000e' && seabios.legacy === true,
+    JSON.stringify(seabios))
+  check('WP-2: an empty version takes the modern profile (the operator-ISO shape)', windowsFirmwareProfile('').bios === 'ovmf'
+    && windowsFirmwareProfile('').legacy === false)
+  // A row that records neither a version nor a marker still has the FILE NAME:
+  // that is what stops a Windows 7 computer from coming back on q35/OVMF after
+  // a restart (a failure that only appears on the SECOND boot).
+  check('WP-2: the media file name decides the firmware when nothing else does',
+    windowsFirmwareForSpec({ isoPath: '/iso/en_windows_7_with_sp1_x64.iso' }).bios === 'seabios'
+    && windowsFirmwareForSpec({ isoPath: '/iso/en-us_windows_11_25h2_x64.iso' }).bios === 'ovmf'
+    && windowsFirmwareForSpec({}).bios === 'ovmf')
+  check('WP-2: a 7u argv carries NO pflash and NO TPM, and an IDE disk',
+    (() => {
+      const args = buildQemuArgs({
+        name: 'win-7', cpu: 2, memory: 4, gpu: false, paths: windowsPaths('/cua-vm', 'win-7'),
+        isoPath: '/cua-vm/iso/w7.iso', driverIso: null, sshPort: 47100, vncPort: 5931, qmpPort: 46100,
+        installPending: true, virtio: false, windowsVersion: '7u'
+      }).join(' ')
+      return !args.includes('if=pflash') && !args.includes('tpm-crb') && args.includes('ide-hd,drive=disk0') && args.includes('e1000e,netdev=net0')
+        && !args.includes('virtio-blk') && !args.includes('virtio-net')
+    })())
+  check('WP-2: an 11 argv keeps the OVMF pair, the TPM and virtio',
+    (() => {
+      const args = buildQemuArgs({
+        name: 'win-11', cpu: 2, memory: 4, gpu: false, paths: windowsPaths('/cua-vm', 'win-11'),
+        isoPath: '/cua-vm/iso/w11.iso', driverIso: null, sshPort: 47100, vncPort: 5931, qmpPort: 46100,
+        installPending: true, virtio: false, windowsVersion: '11'
+      }).join(' ')
+      return args.includes('if=pflash,format=raw,readonly=on,file=') && args.includes('tpm-crb,tpmdev=tpm0') && args.includes('q35,accel=kvm,smm=off')
+    })())
+
+  // THE SELECTION PRECEDENCE: caller name → caller index → the SOURCE's own
+  // selection (the link that will actually serve the bytes) → the catalog.
+  check('WP-2: sourceSelection wins over the catalog (link1 pins SERVERSTANDARD by NAME)',
+    (() => {
+      const picked = resolveWindowsImageSelection({ version: '2025', sourceSelection: { key: '/IMAGE/NAME', value: 'Windows Server 2025 SERVERSTANDARD', verified: true } })
+      return picked.key === '/IMAGE/NAME' && picked.value === 'Windows Server 2025 SERVERSTANDARD' && picked.source === 'source'
+    })())
+  check('WP-2: the selection table is DERIVED from the catalog, one row per selecting code',
+    Object.keys(WINDOWS_IMAGE_SELECTIONS).length === WINDOWS_VERSIONS.filter((code) => WINDOWS_CATALOG[code].selection !== undefined).length
+    && WINDOWS_IMAGE_SELECTIONS['11l'].note.includes('read from the media')
+    && WINDOWS_IMAGE_SELECTIONS['11'].note.includes('index reasoned'))
+
+  // THE CACHE FILE NAME IS A FUNCTION OF THE URL AGAIN. The old name appended
+  // randomBytes(4), so isoTargetPath() (the quota reservation and the keep-list)
+  // and ensureIso's own write named DIFFERENT paths and every restart
+  // re-downloaded 5.5 GB.
+  const urlA = 'https://dl.bobpony.com/windows/11/en-us_windows_11_25h2_x64.iso'
+  const urlB = 'https://archive.org/download/x/en-us_windows_11_25h2_x64.iso'
+  check('WP-3: isoFileName is stable for one URL and different across URLs',
+    isoFileName(urlA) === isoFileName(urlA) && isoFileName(urlA) !== isoFileName(urlB)
+    && isoFileName(urlA).endsWith('.iso') && /^[\w.-]+-[0-9a-f]{8}\.iso$/u.test(isoFileName(urlA)),
+    `${isoFileName(urlA)} vs ${isoFileName(urlB)}`)
+  check('WP-3: isoFileName keeps the readable base name', isoFileName(urlA).startsWith('en-us_windows_11_25h2_x64-'))
+
+  // DIGEST VERIFICATION: a mismatch is a THROW, not a boolean a caller ignores.
+  const digestDir = mkdtempSync(path.join(os.tmpdir(), 'iso-digest-'))
+  try {
+    const file = path.join(digestDir, 'media.iso')
+    writeFileSync(file, 'hello')
+    const good = '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'
+    const verified = await verifyIsoDigest(file, good.toUpperCase())
+    check('WP-3: verifyIsoDigest accepts the pinned SHA-256 (case-insensitive)', verified.verified === true && verified.sha256 === good)
+    let threwDigest = null
+    try { await verifyIsoDigest(file, '0'.repeat(64)) } catch (error) { threwDigest = error }
+    check('WP-3: verifyIsoDigest REFUSES a substituted file with iso-digest-mismatch',
+      threwDigest?.code === 'iso-digest-mismatch' && /refusing to install an image nobody verified/u.test(threwDigest.message),
+      String(threwDigest?.message ?? 'no throw').slice(0, 120))
+    check('WP-3: an unknown digest (empty pin) verifies nothing and claims nothing',
+      (await verifyIsoDigest(file, '')).verified === false)
+  } finally {
+    rmSync(digestDir, { recursive: true, force: true })
+  }
+
+  // THE CLIPBOARD AGENT'S ACK IS THE CONTRACT with a separately shipped guest
+  // agent: seq, digest and the agent's own `equal` must ALL agree.
+  const sha = clipSha256('hello')
+  check('WP-6: clipAckMatches accepts only a full, matching ack',
+    clipAckMatches({ seq: 7, sha256: sha }, { seq: 7, sha256: sha, equal: true }) === true
+    && clipAckMatches({ seq: 7, sha256: sha }, { seq: 6, sha256: sha, equal: true }) === false
+    && clipAckMatches({ seq: 7, sha256: sha }, { seq: 7, sha256: 'deadbeef', equal: true }) === false
+    && clipAckMatches({ seq: 7, sha256: sha }, { seq: 7, sha256: sha, equal: false }) === false
+    && clipAckMatches({ seq: 7, sha256: sha }, null) === false)
+}
+
+// ------------------------------------------------------------------ *
+// J21/J1/J22 — THE FIX-ROUND REGRESSIONS (pure halves)
+//
+// Each check below is one defect from the jury round, asserted against the
+// SHIPPED export (no copy of the logic): the verdict's reason, the comma
+// escape, the agent's three clock spellings, the unpinned cache, the outbox
+// budget and the NUL truncation. The end-to-end halves live in
+// supervisor-smoke.mjs; these are the parts a module can prove alone.
+// ------------------------------------------------------------------ *
+{
+  // J21-2: AN AGENT THAT SAYS "I FAILED" IS NOT A DIGEST MISMATCH. The old code
+  // looked only at equal/seq/sha256, so `{ ok: false, error: 'locked' }` fell
+  // through to the generic ack-mismatch — sending an operator to look at hashing
+  // and encoding instead of at the agent's real complaint.
+  const sha = clipSha256('hello')
+  const locked = clipAckVerdict({ seq: 7, sha256: sha }, { ok: false, code: 'E_LOCK', error: 'clipboard is locked by another process' })
+  check('J21-2: an ack with ok:false + a code answers agent-error:<code>, not ack-mismatch',
+    locked.ok === false && locked.reason === 'agent-error:E_LOCK'
+    && /the agent reported a failure/u.test(locked.detail) && /locked by another process/u.test(locked.detail),
+    JSON.stringify(locked))
+  const noCode = clipAckVerdict({ seq: 7, sha256: sha }, { ok: false, error: 'Set-Clipboard threw\r\nat line 4' })
+  check('J21-2: ...a message with no code becomes the (one-line, truncated) agent-error text',
+    noCode.reason === 'agent-error:Set-Clipboard threw at line 4', noCode.reason)
+  // AGENTS THAT PREDATE THE FIELD SEND NO `ok` AT ALL: `undefined` is NOT false.
+  const legacy = clipAckVerdict({ seq: 7, sha256: sha }, { seq: 7, sha256: sha, equal: true })
+  check('J21-2: an ack with NO ok field is still a pass when seq+sha+equal agree (undefined ≠ false)',
+    legacy.ok === true && legacy.reason === '', JSON.stringify(legacy))
+  const emptyError = clipAckVerdict({ seq: 7, sha256: sha }, { seq: 7, sha256: sha, equal: true, error: '   ' })
+  check('J21-2: ...and a whitespace-only error string is not a failure either', emptyError.ok === true)
+
+  // J1-3: `,,` IS THE ONLY ESCAPE QEMU'S OPTION SPLITTER UNDERSTANDS.
+  check("J1-3: qemuEscapeOptionValue('a,b') is 'a,,b' (and leaves a clean path alone)",
+    qemuEscapeOptionValue('a,b') === 'a,,b'
+    && qemuEscapeOptionValue('/store/windows/win1/disk.qcow2') === '/store/windows/win1/disk.qcow2'
+    && qemuEscapeOptionValue('a,b,c') === 'a,,b,,c'
+    && qemuEscapeOptionValue('') === '',
+    qemuEscapeOptionValue('a,b'))
+
+  // J21-1 + J21-6: THE AGENT-FIRST PATH, DRIVEN WITH A STUB TRANSPORT. `state`
+  // is whatever the guest's clip-state.json holds; `agent:false` makes the file
+  // unreadable (the schtasks fallback).
+  const makeClipStub = ({ agent = true, state = { at: Date.now(), seq: 5 }, readBack = '' } = {}) => {
+    const calls = []
+    const files = new Map()
+    let job = null
+    return {
+      calls,
+      transport: {
+        async sshRun(_spec, command) {
+          calls.push({ kind: 'ssh', command })
+          if (/type "[^"]*clip-state\.json"/u.test(command)) {
+            return agent ? { code: 0, stdout: JSON.stringify(state), stderr: '' } : { code: 1, stdout: '', stderr: 'File Not Found' }
+          }
+          if (/type "[^"]*clip-ack\.json"/u.test(command)) {
+            if (job === null) return { code: 1, stdout: '', stderr: 'File Not Found' }
+            return { code: 0, stdout: JSON.stringify({ seq: job.seq, sha256: job.sha256, equal: true }), stderr: '' }
+          }
+          if (/type "[^"]*clip-current\.txt"/u.test(command)) return { code: 0, stdout: readBack, stderr: '' }
+          if (/schtasks \/run/u.test(command)) return { code: 0, stdout: 'SUCCESS: Attempted to run', stderr: '' }
+          if (/schtasks \/query/u.test(command)) return { code: 0, stdout: 'Status: Ready\r\nLast Result: 0\r\n', stderr: '' }
+          return { code: 0, stdout: '', stderr: '' }
+        },
+        async putText(_spec, guestPath, text) {
+          calls.push({ kind: 'put', guestPath, text })
+          files.set(guestPath, text)
+          if (guestPath.endsWith('.json')) { try { job = JSON.parse(text) } catch { job = null } }
+          return { code: 0, stderr: '' }
+        },
+        async getText(_spec, guestPath) {
+          calls.push({ kind: 'get', guestPath })
+          return { code: 0, stderr: '', text: files.get(guestPath) ?? readBack }
+        }
+      }
+    }
+  }
+
+  // J21-1a: `at`, `ts` AND `updatedAt` ALL NAME A LIVE AGENT. Reading only `ts`
+  // made the shipped agent (which writes `at`) evaluate as age 0 → Infinity →
+  // stale, so the fast path never ran.
+  for (const key of ['at', 'ts', 'updatedAt']) {
+    const stub = makeClipStub({ state: { [key]: Date.now(), seq: 5 } })
+    const backend = createWindowsBackend({ store: os.tmpdir(), qmp: async () => [], log: () => {}, transport: stub.transport })
+    const answer = await backend.clipboardSet({ name: 'clip-clock' }, 'hello')
+    check(`J21-1: readClipState accepts \`${key}\` as the agent's clock (fast path taken)`,
+      answer.ok === true && answer.via === 'agent', JSON.stringify(answer).slice(0, 180))
+  }
+  // NO STAMP AT ALL IS 0, and 0 is `stampMissing` + `agent-stale`, never
+  // invented freshness: the backend declines the fast path and says why.
+  {
+    const stub = makeClipStub({ state: { seq: 5 } })
+    const backend = createWindowsBackend({ store: os.tmpdir(), qmp: async () => [], log: () => {}, transport: stub.transport })
+    const answer = await backend.clipboardSet({ name: 'clip-clock' }, 'hello')
+    check('J21-1: a state file with NO clock stamp is agent-stale (missing = 0, never fresh)',
+      answer.ok === true && answer.via === 'task' && answer.fastPathReason === 'agent-stale',
+      JSON.stringify(answer).slice(0, 200))
+  }
+
+  // J21-5c: THE OUTBOX BUDGET IS CHECKED BEFORE ANY ROUND TRIP. The agent refuses
+  // a JOB FILE, and 1 MiB − 2048 is the text budget; a text just over it must not
+  // cost an SSH call that can only end in `agent-error:too-large`.
+  {
+    const stub = makeClipStub()
+    const backend = createWindowsBackend({ store: os.tmpdir(), qmp: async () => [], log: () => {}, transport: stub.transport })
+    const answer = await backend.clipboardSet({ name: 'clip-big' }, 'x'.repeat(1_047_000))
+    // THE JOB NEVER LEAVES THE HOST. 1 MiB − 2048 is the outbox text budget, and
+    // the text (1 047 000 bytes) is legal for the TASK path but not as a job FILE.
+    // The fast path therefore declines with `too-large` before any clip-state /
+    // clip-ack / outbox round trip, and the documented schtasks fallback — whose
+    // limit is the 1 MiB text — still delivers. What must NOT happen is a job file
+    // being uploaded only for the agent to refuse it, or a silent downgrade.
+    const agentCalls = stub.calls.filter((call) => call.kind === 'ssh' && /clip-state|clip-ack/u.test(call.command))
+    const jobUploads = stub.calls.filter((call) => call.kind === 'put' && /outbox/u.test(String(call.guestPath)))
+    check('J21-5: an over-budget text declines the fast path as too-large with ZERO agent round trips',
+      answer.ok === true && answer.via === 'task' && answer.fastPathReason === 'too-large'
+      && agentCalls.length === 0 && jobUploads.length === 0,
+      `via=${answer.via} fastPathReason=${answer.fastPathReason} agentCalls=${agentCalls.length} jobUploads=${jobUploads.length}`)
+  }
+
+  // J21-6: A NUL IS A TRUNCATION. Windows' clipboard stops at U+0000, so the
+  // task path stays ok:true but must say `verified:false` and how much landed.
+  {
+    const stub = makeClipStub({ agent: false })
+    const backend = createWindowsBackend({ store: os.tmpdir(), qmp: async () => [], log: () => {}, transport: stub.transport })
+    const answer = await backend.clipboardSet({ name: 'clip-nul' }, 'a\u0000bc')
+    check('J21-6: a NUL in the text reports nulTruncated{landed,total} and verified:false',
+      answer.ok === true && answer.via === 'task' && answer.verified === false
+      && answer.nulTruncated?.landed === 1 && answer.nulTruncated?.total === 4
+      && /stops at the first NUL \(1 of 4 characters landed\)/u.test(answer.detail ?? ''),
+      JSON.stringify(answer.nulTruncated ?? null) + ' ' + String(answer.detail ?? '').slice(0, 120))
+  }
+}
+
+// ------------------------------------------------------------------ *
+// J1-5: AN UNPINNED CACHE IS NOT A PASS
+//
+// The old hit test was `exists && size > 1 MB`, and with no pin
+// (`wantSha === ''`) it returned ok:true having verified nothing. Now the only
+// claim available is the sidecar, and it is checked against the FILE; without
+// one the cache is refused as `unpinned-cache` and downloaded again. A local
+// HTTP server stands in for the CDN so the re-download is real but instant.
+// ------------------------------------------------------------------ *
+{
+  const body = Buffer.from('a re-downloaded medium\n')
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-length': String(body.length), 'content-type': 'application/octet-stream' })
+    res.end(body)
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const url = `http://127.0.0.1:${server.address().port}/unpinned-media.iso`
+  const cacheDir = mkdtempSync(path.join(os.tmpdir(), 'iso-unpinned-'))
+  try {
+    // 2 MiB with NO `.sha256` sidecar: the old code called this a cache hit.
+    writeFileSync(path.join(cacheDir, isoFileName(url)), Buffer.alloc(2 * 1024 * 1024, 0x5a))
+    const logs = []
+    const answer = await ensureIso({ url, isoDir: cacheDir, log: (line) => logs.push(String(line)) })
+    check('J1-5: a cached ISO with no pin and no sidecar is refused as unpinned-cache',
+      logs.some((line) => /rejected \(unpinned-cache\)/u.test(line)),
+      logs.find((line) => /rejected/u.test(line)) ?? logs.join(' | ').slice(0, 160))
+    check('J1-5: ...and the refusal costs a real re-download (never a silent pass)',
+      answer.downloaded === true && answer.verified === false && answer.bytes === body.length,
+      JSON.stringify({ downloaded: answer.downloaded, verified: answer.verified, bytes: answer.bytes }))
+  } finally {
+    rmSync(cacheDir, { recursive: true, force: true })
+    await new Promise((resolve) => server.close(resolve))
+  }
+}
+
+// ------------------------------------------------------------------ *
+// WP-5: THE PUBLIC TOOL NAMESPACE AND THE SSH KEEPALIVE
+// ------------------------------------------------------------------ *
+{
+  check('WP-5: the server name and prefix are the harness vocabulary',
+    DEFAULT_SERVER_NAME === 'windows' && TOOL_PREFIX === 'mcp__windows__'
+    && REVEAL_TOOL_NAME === 'windows_desktop' && DOCTOR_TOOL_NAME === 'windows_mcp_doctor')
+  check('WP-5: windowsToolName produces the public name and never doubles the prefix',
+    windowsToolName('tool_click_at') === 'mcp__windows__tool_click_at'
+    && windowsToolName('mcp__windows__tool_click_at') === 'mcp__windows__tool_click_at'
+    && windowsToolName('some tool/x') === 'mcp__windows__some_tool_x')
+  check('WP-5: windowsGuestToolName is the reverse mapping', windowsGuestToolName('mcp__windows__find_elements') === 'find_elements'
+    && windowsGuestToolName('find_elements') === 'find_elements')
+  const argv = sshArgv({ port: 47100, keyPath: '/cua-vm/windows/win-1/id_ed25519' })
+  check('WP-5: sshArgv carries -T (no pty), the per-computer key and ServerAliveCountMax=2',
+    argv.includes('-T') && argv.includes('-i') && argv.includes('/cua-vm/windows/win-1/id_ed25519')
+    && argv.includes('ServerAliveInterval=10') && argv.includes('ServerAliveCountMax=2')
+    && argv.includes('BatchMode=yes') && argv.at(-1).includes('dsh_cua.server --stdio'),
+    argv.join(' ').slice(0, 160))
+  check('WP-5: SSH_KEEPALIVE disables agent/X11/local-command forwarding',
+    SSH_KEEPALIVE.includes('ForwardAgent=no') && SSH_KEEPALIVE.includes('ForwardX11=no') && SSH_KEEPALIVE.includes('PermitLocalCommand=no'))
+}
+
+// ------------------------------------------------------------------ *
+// WP-7: THE RFB CLIPBOARD WIRE FORMAT (noVNC talks exactly this)
+// ------------------------------------------------------------------ *
+{
+  const frame = serverCutTextFrame('hi')
+  check('WP-7: a ServerCutText is type 3 + 3 pad bytes + BE length + the bytes',
+    frame.length === 10 && frame.equals(Buffer.from([3, 0, 0, 0, 0, 0, 0, 2, 104, 105])),
+    frame.toString('hex'))
+  const client = Buffer.from([6, 0, 0, 0, 0, 0, 0, 3, 65, 66, 67])
+  check('WP-7: a ClientCutText is recognised by type 6 and parsed as ABC',
+    isClientCutText(client) === true && parseClientCutText(client).text === 'ABC' && parseClientCutText(client).length === 3)
+  check('WP-7: a non-cut-text frame is NOT swallowed (the rest is a passthrough)',
+    isClientCutText(Buffer.from([0, 0, 0, 0])) === false && isClientCutText(Buffer.from([2, 0, 0, 0, 0, 0, 0, 1, 65])) === false)
+  check('WP-7: the WebSocket handshake is base64(sha1(key + GUID))',
+    wsAccept('dGhlIHNhbXBsZSBub25jZQ==') === 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=')
+  // THE ENCODING LABEL: latin1 only when every code point fits in a byte, so a
+  // decode on the other side reproduces the string exactly.
+  const latin = encodeCutText('café')
+  const wide = encodeCutText('中文')
+  check('WP-7: encodeCutText labels latin1 for Latin-1 text and utf-8 for CJK',
+    latin.encoding === 'latin1' && wide.encoding === 'utf-8' && wide.length === 6, `${latin.encoding}/${wide.encoding}`)
+  check('WP-7: encodeCutText strips NUL (both the wire and the Windows clipboard stop at one)',
+    encodeCutText('a\u0000b').length === 2)
+}
+
+// ------------------------------------------------------------------ *
+// WP-9.1: THE GUEST DISK MEASUREMENT (the supervisor's own parser)
+// ------------------------------------------------------------------ *
+{
+  // Imported in a CHILD with a throwaway store so this suite never binds the
+  // supervisor's socket; the parser itself is pure and is the whole contract.
+  const store = mkdtempSync(path.join(os.tmpdir(), 'cua-df-'))
+  try {
+    const supervisorUrl = new URL('../docker/cua-vm-supervisor.mjs', import.meta.url).href
+    const program = `const m = await import(${JSON.stringify(supervisorUrl)});`
+      + `process.stdout.write(JSON.stringify(m.parseGuestDf(process.argv[1])));process.exit(0)`
+    const sample = '         50450432     40845232'
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', program, sample], {
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, CUA_VM_STORE: path.join(store, 'store'), CUA_VM_HOME: path.join(store, 'home'), CUA_SUPERVISOR_SOCK: path.join(store, 's.sock') }
+    })
+    let parsed = null
+    try { parsed = JSON.parse(result.stdout ?? 'null') } catch { parsed = null }
+    check('WP-9.1: parseGuestDf reads the LAST two-integer line as size/avail bytes',
+      parsed?.sizeBytes === 50450432 && parsed?.availBytes === 40845232,
+      `status=${result.status} out=${String(result.stdout ?? '').slice(0, 80)} ${String(result.stderr ?? '').slice(0, 80)}`)
+  } finally {
+    rmSync(store, { recursive: true, force: true })
+  }
+}
 
 // Floors are warnings, not clamps.
 check('the Windows defaults produce no warnings', windowsCapacityWarnings({ diskGb: 64, memory: 6, cpu: 2 }).length === 0)
@@ -294,7 +704,13 @@ check('the Windows store paths are all under $STORE', Object.values(paths).every
 // These four checks pin the three properties that make it recoverable.
 {
   const repoOem = path.join(REPO, 'docker', 'windows-oem')
-  check('the OEM file list is the four files the writer needs (S4 adds the hidden launcher)', OEM_PAYLOAD_FILES.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1,Unattend.vbs')
+  // WP-6: THE CLIPBOARD AGENT IS THE FIFTH PAYLOAD FILE. The four original
+  // files still make a directory a payload directory (OEM_PAYLOAD_REQUIRED);
+  // the agent is staged because firstboot can only copy what is in the medium.
+  check('the OEM payload list is the four required files plus the clipboard agent',
+    OEM_PAYLOAD_FILES.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1,Unattend.vbs,cua-clip-agent.ps1'
+    && OEM_PAYLOAD_REQUIRED.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1,Unattend.vbs',
+    OEM_PAYLOAD_FILES.join(','))
   check('a complete payload directory is recognised, an incomplete one is not', (() => {
     const partial = mkdtempSync(path.join(os.tmpdir(), 'oem-partial-'))
     try {
@@ -1198,6 +1614,93 @@ check('windowsKvmPreflight is the shared module (no second message)',
       check('S3: no windowsKey = no <ProductKey> block (evaluation media need none)',
         !/<ProductKey><Key>/u.test(xml) && !xml.includes('{{PRODUCT_KEY}}'))
 
+      // ---- J22-6: THE PRIVACY OFF-SWITCH IS NOW A LIVE SENTINEL ----
+      //
+      // `DSH_CUA_CLIP_AGENT=0` means "do not run the ambient clipboard loop", but
+      // the GUEST CANNOT READ THE HOST ENVIRONMENT: the flag is a STAGING-time
+      // variable with no channel back from Windows. Both consumers (firstboot's
+      // task registrar and the agent itself) therefore test a PATH. Those readers
+      // existed while nothing wrote the file, so the switch was inert — this
+      // drives the shipped writer and the shipped optional-entry rules, on a real
+      // setup.img, with the two env states, and reads the result back.
+      {
+        const previous = process.env.DSH_CUA_CLIP_AGENT
+        const sentinelStore = mkdtempSync(path.join(os.tmpdir(), 'cua-clip-sentinel-'))
+        const writePayload = (paths, name, log = () => {}) => writeOemPayload({
+          paths, name, password: 'pw', sshPubKey: 'ssh-ed25519 AAAA x',
+          sourceDir: path.join(REPO, 'docker', 'windows-oem'), pythonUrl: 'https://python', dshCuaSpec: 'dsh-cua==1', log
+        })
+        const rootSentinel = (paths) => path.join(paths.oemDir, CLIP_AGENT_SENTINEL_FILE)
+        const scriptsSentinel = (paths) => path.join(paths.oemDir, '$OEM$', '$$', 'Setup', 'Scripts', CLIP_AGENT_SENTINEL_FILE)
+        try {
+          // PURE HALF: the table the build and the verify read. The sentinel is a
+          // ROOT ENTRY but never a required payload member — a payload directory
+          // must stay valid with the knob unset.
+          check('J22-6: clip-agent-disabled is a named root entry, OPTIONAL (never a required payload file)',
+            CLIP_AGENT_SENTINEL_FILE === 'clip-agent-disabled'
+            && SETUP_IMAGE_ENTRIES.includes(CLIP_AGENT_SENTINEL_FILE)
+            && SETUP_IMAGE_OPTIONAL.includes(CLIP_AGENT_SENTINEL_FILE)
+            // NOT a payload FILE: there is no source-side sentinel to copy. The
+            // writer CREATES it from the env, so a payload directory never has to
+            // carry one and `OEM_PAYLOAD_FILES` must not list it.
+            && !OEM_PAYLOAD_FILES.includes(CLIP_AGENT_SENTINEL_FILE)
+            && !OEM_PAYLOAD_REQUIRED.includes(CLIP_AGENT_SENTINEL_FILE))
+
+          // (a) DSH_CUA_CLIP_AGENT=0 STAGES IT, on BOTH routes the search uses.
+          process.env.DSH_CUA_CLIP_AGENT = '0'
+          const offPaths = windowsPaths(sentinelStore, 'win-sentinel-off')
+          const offLogs = []
+          writePayload(offPaths, 'win-sentinel-off', (line) => offLogs.push(String(line)))
+          check('J22-6: DSH_CUA_CLIP_AGENT=0 stages the sentinel at the payload root',
+            existsSync(rootSentinel(offPaths))
+            && /DSH_CUA_CLIP_AGENT=0/u.test(readFileSync(rootSentinel(offPaths), 'utf8')),
+            rootSentinel(offPaths))
+          check('J22-6: ...and into $OEM$/$$/Setup/Scripts (the path Setup copies to C:\\Windows\\Setup\\Scripts)',
+            existsSync(scriptsSentinel(offPaths)), scriptsSentinel(offPaths))
+          check('J22-6: ...and the writer LOGS why (an operator can see the switch took effect)',
+            offLogs.some((line) => /clip agent disabled by DSH_CUA_CLIP_AGENT=0 \(sentinel staged\)/u.test(line)),
+            offLogs.find((line) => /clip agent/u.test(line)) ?? offLogs.join(' | ').slice(0, 120))
+          buildSetupImage({ paths: offPaths })
+          const offVerified = verifySetupImage({ paths: offPaths })
+          check('J22-6: the built medium CARRIES it at the root and in the copied Scripts tree',
+            offVerified.entries.includes(CLIP_AGENT_SENTINEL_FILE)
+            && offVerified.oemScripts.includes(CLIP_AGENT_SENTINEL_FILE),
+            `root=${offVerified.entries.includes(CLIP_AGENT_SENTINEL_FILE)} scripts=${offVerified.oemScripts.includes(CLIP_AGENT_SENTINEL_FILE)}`)
+
+          // (b) UNSET STAGES NOTHING — and that is not "incomplete", because the
+          // entry is optional in BOTH the build and the verify.
+          delete process.env.DSH_CUA_CLIP_AGENT
+          const onPaths = windowsPaths(sentinelStore, 'win-sentinel-on')
+          writePayload(onPaths, 'win-sentinel-on')
+          check('J22-6: unset stages NO sentinel (neither root nor $OEM$ Scripts)',
+            !existsSync(rootSentinel(onPaths)) && !existsSync(scriptsSentinel(onPaths)))
+          buildSetupImage({ paths: onPaths })
+          const onVerified = verifySetupImage({ paths: onPaths })
+          check('J22-6: ...and the medium still builds and verifies (optional, never "incomplete")',
+            !onVerified.entries.includes(CLIP_AGENT_SENTINEL_FILE)
+            && onVerified.entries.includes('Autounattend.xml')
+            && onVerified.oemScripts.includes('cua-firstboot.ps1'),
+            `entries=${onVerified.entries.length} sentinel=${onVerified.entries.includes(CLIP_AGENT_SENTINEL_FILE)}`)
+
+          // (c) THE STALE GUARD ON THE ROOT COPY: the OEM directory lives in the
+          // store and survives, so a previous `=0` create must not keep the switch
+          // off for a machine re-staged with the knob unset.
+          writePayload(offPaths, 'win-sentinel-off')
+          check('J22-6: re-staging with the knob UNSET unlinks the root sentinel (stale guard)',
+            !existsSync(rootSentinel(offPaths)))
+
+          // (d) A GUEST COPY ALREADY IN PLACE IS NOT OVERWRITTEN BY THE TEST, but
+          // the sentinel's CONTENT is presence-only: the consumers test the path.
+          writeFileSync(path.join(offPaths.oemDir, 'clip-agent-disabled'), 'hand-written by an operator\n')
+          check('J22-6: presence is the contract — the file content is never parsed',
+            readFileSync(path.join(offPaths.oemDir, 'clip-agent-disabled'), 'utf8') === 'hand-written by an operator\n')
+        } finally {
+          if (previous === undefined) delete process.env.DSH_CUA_CLIP_AGENT
+          else process.env.DSH_CUA_CLIP_AGENT = previous
+          rmSync(sentinelStore, { recursive: true, force: true })
+        }
+      }
+
       // ---- F1: THE MEDIUM IS A PARTITIONED DISK ----
       //
       // The live-verified root cause: setup.img was a partitionless FAT32
@@ -1257,24 +1760,24 @@ check('windowsKvmPreflight is the shared module (no second message)',
 
       // ---- F2: THE EDITION IS NAMED ----
       {
-        const selection = resolveWindowsImageSelection({ version: '11ltsc' })
-        check('F2: 11ltsc resolves to /IMAGE/NAME with the name VERIFIED from the pinned ISO WIM XML',
+        const selection = resolveWindowsImageSelection({ version: '11l' })
+        check('F2: 11l resolves to /IMAGE/NAME with the name VERIFIED from the pinned ISO WIM XML',
           selection.key === '/IMAGE/NAME'
           && selection.value === 'Windows 11 IoT Enterprise LTSC 2024 Evaluation'
           && selection.verified === true,
           `${selection.key}=${selection.value} (${selection.source})`)
         check('F2: the table itself carries the verified value (single source of truth)',
-          WINDOWS_IMAGE_SELECTIONS['11ltsc'].key === '/IMAGE/NAME'
-          && WINDOWS_IMAGE_SELECTIONS['11ltsc'].value === 'Windows 11 IoT Enterprise LTSC 2024 Evaluation'
-          && WINDOWS_IMAGE_SELECTIONS['11ltsc'].verified === true)
+          WINDOWS_IMAGE_SELECTIONS['11l'].key === '/IMAGE/NAME'
+          && WINDOWS_IMAGE_SELECTIONS['11l'].value === 'Windows 11 IoT Enterprise LTSC 2024 Evaluation'
+          && WINDOWS_IMAGE_SELECTIONS['11l'].verified === true)
         check('F2: an operator ISO (no version) falls back to /IMAGE/INDEX 1',
           resolveWindowsImageSelection({ version: '' }).key === '/IMAGE/INDEX'
           && resolveWindowsImageSelection({ version: '' }).value === 1)
         check('F2: an explicit index wins over the version table',
-          resolveWindowsImageSelection({ version: '11ltsc', imageIndex: 3 }).value === 3
-          && resolveWindowsImageSelection({ version: '11ltsc', imageIndex: 3 }).key === '/IMAGE/INDEX')
+          resolveWindowsImageSelection({ version: '11l', imageIndex: 3 }).value === 3
+          && resolveWindowsImageSelection({ version: '11l', imageIndex: 3 }).key === '/IMAGE/INDEX')
         check('F2: an explicit name wins over the index',
-          resolveWindowsImageSelection({ version: '11ltsc', imageIndex: 3, imageName: 'Windows 11 Enterprise LTSC 2024 Evaluation' }).key === '/IMAGE/NAME')
+          resolveWindowsImageSelection({ version: '11l', imageIndex: 3, imageName: 'Windows 11 Enterprise LTSC 2024 Evaluation' }).key === '/IMAGE/NAME')
         check('F2: a malformed index is refused with the accepted shape', (() => {
           try { resolveWindowsImageSelection({ imageIndex: 'two' }); return false } catch (error) {
             return /windowsImageIndex/u.test(error.message)
@@ -1310,10 +1813,10 @@ check('windowsKvmPreflight is the shared module (no second message)',
         writeOemPayload({
           paths: named, name: 'win-named', password: 'pw', sshPubKey: 'ssh-ed25519 AAAA x',
           sourceDir: path.join(REPO, 'docker', 'windows-oem'), pythonUrl: 'https://python', dshCuaSpec: 'dsh-cua==1',
-          windowsVersion: '11ltsc'
+          windowsVersion: '11l'
         })
         const namedXml = readFileSync(path.join(named.oemDir, 'Autounattend.xml'), 'utf8')
-        check('F2: writeOemPayload(windowsVersion: 11ltsc) stages /IMAGE/NAME, not INDEX',
+        check('F2: writeOemPayload(windowsVersion: 11l) stages /IMAGE/NAME, not INDEX',
           namedXml.includes('<Key>/IMAGE/NAME</Key>')
           && namedXml.includes('<Value>Windows 11 IoT Enterprise LTSC 2024 Evaluation</Value>')
           && !namedXml.includes('{{IMAGE_INSTALL}}'))
@@ -1437,10 +1940,18 @@ check('windowsKvmPreflight is the shared module (no second message)',
         const backend = createWindowsBackend({ store, qmp: async () => [], log: () => {}, transport: stub.transport })
         const result = await backend.clipboardSet({ name: 'win-clip' }, 'a & b | c "quoted" ; semi')
         const order = stub.calls.map((call) => call.kind).join(',')
-        check('U2: clipboardSet writes clip.txt BEFORE the task runs',
-          order === 'ssh,put,ssh,ssh' && stub.calls[1].guestPath.endsWith('clip.txt') && /cua-clip-set/u.test(stub.calls[2].command), order)
+        // WP-6: THE AGENT IS TRIED FIRST, and its decline is REPORTED. The very
+        // first call is the `type clip-state.json` probe; with no agent the
+        // task path follows and the ORDER invariant (file before task) holds.
+        const putAt = stub.calls.findIndex((call) => call.kind === 'put')
+        const mkdirAt = stub.calls.findIndex((call) => call.kind === 'ssh' && /mkdir/u.test(call.command))
+        const runAt = stub.calls.findIndex((call) => call.kind === 'ssh' && /cua-clip-set/u.test(call.command))
+        check('U2: clipboardSet writes clip.txt BEFORE the task runs (after the agent probe declined)',
+          mkdirAt !== -1 && putAt > mkdirAt && runAt > putAt
+          && /clip-state\.json/u.test(stub.calls[0].command)
+          && stub.calls[putAt].guestPath.endsWith('clip.txt'), order)
         check('U2: ...it pastes into C:\\ProgramData\\cua\\clip.txt',
-          stub.calls[1].guestPath === 'C:\\ProgramData\\cua\\clip.txt', stub.calls[1].guestPath)
+          stub.calls[putAt].guestPath === 'C:\\ProgramData\\cua\\clip.txt', stub.calls[putAt].guestPath)
         check('U2: ...and reports the byte count only after the task exits 0',
           result.ok === true && result.bytes === Buffer.byteLength('a & b | c "quoted" ; semi') && result.task === 'cua-clip-set', JSON.stringify(result))
       }
@@ -1533,8 +2044,17 @@ check('windowsKvmPreflight is the shared module (no second message)',
     /Set-Clipboard -Value \(\[IO\.File\]::ReadAllText\('C:\\ProgramData\\cua\\clip\.txt'\)\)/u.test(firstboot))
   check('U2: the get task writes clip-read.txt from Get-Clipboard -Raw',
     /\[IO\.File\]::WriteAllText\('C:\\ProgramData\\cua\\clip-read\.txt', \[string\]\(Get-Clipboard -Raw\)\)/u.test(firstboot))
-  check('U2: both tasks run a HIDDEN powershell (no console flash on the desktop)',
-    (firstboot.match(/-WindowStyle Hidden -File/g) ?? []).length === 2)
+  check('U2: the two clipboard tasks run a HIDDEN powershell (no console flash on the desktop)',
+    (firstboot.match(/-WindowStyle Hidden -File/g) ?? []).length >= 2)
+  // WP-6: THE AMBIENT AGENT. One more interactive task, registered at logon and
+  // started immediately, so a copy in Notepad reaches the harness without the
+  // panel asking for it.
+  check('WP-6: firstboot registers cua-clip-agent at logon, interactive, hidden',
+    /schtasks \/create \/tn `"cua-clip-agent`" \/sc onlogon \/it \/rl LIMITED \/f \/tr `"\$agentTr`"/u.test(firstboot)
+    && /& schtasks \/run \/tn 'cua-clip-agent'/u.test(firstboot)
+    && /\$agentTr = "powershell\.exe[^"]*-WindowStyle Hidden -File \$agentScript"/u.test(firstboot))
+  check('WP-6: ...and the agent script comes from the OEM payload, with an embedded fallback',
+    /cua-clip-agent\.ps1/u.test(firstboot) && /OEM payload had no cua-clip-agent\.ps1; wrote the embedded copy/u.test(firstboot))
   // U3: WINDOWLESS, AND NO FICTIONAL PIPE.
   check('U3: the autostart task runs pythonw.exe (windowless), not python.exe',
     /New-ScheduledTaskAction -Execute \$pyw -Argument '-m dsh_cua\.server'/u.test(firstboot)

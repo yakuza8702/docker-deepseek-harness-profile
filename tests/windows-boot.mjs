@@ -112,7 +112,9 @@ const {
   createWindowsBackend, windowsPaths, waitForQemuBoot, qemuStderrExcerpt, classifyQemuInitFailure, qemuBootWindowMs,
   windowsBootedFromDisk, windowsInstallStageFromSerial, formatWindowsInstallDetail,
   WINDOWS_BOOTED_DETAIL, WINDOWS_SSH_MISSING_DETAIL, WINDOWS_SSH_MISSING_MINUTES,
-  assertAnswerFileUsesConfigurationSet, assertAnswerFileFirstbootLayers, FIRSTBOOT_FALLBACK_COMMAND
+  assertAnswerFileUsesConfigurationSet, assertAnswerFileFirstbootLayers, FIRSTBOOT_FALLBACK_COMMAND,
+  // WP-2: the firmware split and the legacy payload staging.
+  windowsFirmwareProfile, WINDOWS_CATALOG, writeOemPayload
 } = await import('../docker/cua-vm-windows-qemu.mjs')
 
 let failures = 0
@@ -151,7 +153,7 @@ const recordingQmp = async (port, commands, opts = {}) => {
   })
 }
 const backend = createWindowsBackend({ store: STORE, qmp: recordingQmp, log: () => {} })
-const NAMES = ['win-egl', 'win-kvm', 'win-clean', 'win-slow', 'win-keys', 'win-nokeys', 'win-nocd', 'win-detach', 'win-detach-none']
+const NAMES = ['win-egl', 'win-kvm', 'win-clean', 'win-slow', 'win-keys', 'win-nokeys', 'win-nocd', 'win-detach', 'win-detach-none', 'win-legacy', 'win-xp']
 
 /** A bootable-enough windows directory: the vars file must already exist. */
 function prepare(name) {
@@ -527,6 +529,83 @@ try {
     check('D2: ...while the system disk still boots first',
       /ide-hd,drive=disk0,bus=ide\.0,bootindex=1/u.test(argv), argv.slice(0, 200))
     backend.kill(spec.name)
+  }
+
+  // ---- WP-2: WINDOWS 7 BOOTS ON A LEGACY BIOS (pc/SeaBIOS) ----
+  //
+  // The backend was written for Windows 11 and hard-coded its firmware: q35 +
+  // OVMF + swtpm + virtio. Windows 7 x64 Setup boots under BIOS only — handed
+  // OVMF it reaches "Press any key", finds no bootable device, and drops into
+  // the EFI Shell. The profile rewrites FIVE decisions (machine, pflash, TPM,
+  // disk, NIC); the assertions below are the ones a diff cannot show.
+  {
+    writeFileSync(ARGV_LOG, '')
+    writeFileSync(ARGV_FULL, '')
+    writeFileSync(FAIL_MARKER, 'ok')
+    const spec = specFor('win-legacy', { windowsVersion: '7u' })
+    const p = spec.paths
+    const booted = await backend.boot(spec, { installPending: true })
+    const argv = readFileSync(ARGV_FULL, 'utf8').trim().split('\n').filter((line) => line !== '').at(-1) ?? ''
+    check('WP-2: a 7u start reports a live pid (the BIOS profile can boot)', typeof booted.pid === 'number' && booted.pid > 0, JSON.stringify(booted).slice(0, 120))
+    check('WP-2: ...with NO pflash drive (a BIOS guest handed one is "unsupported machine configuration")',
+      !/if=pflash/u.test(argv), argv.slice(0, 200))
+    // The literal in the task is `-machine pc`; the argv carries the accelerator
+    // suffix too, which is what QEMU accepts, so this is the closest exact form.
+    check('WP-2: ...the machine is pc (i440FX/PIIX) with kvm, not q35',
+      /-machine pc,accel=kvm(?: |$)/u.test(argv) && !/q35/u.test(argv), (/-machine \S+/u.exec(argv) ?? [''])[0])
+    check('WP-2: ...no TPM chardev and no swtpm socket was ever created',
+      !/tpm-crb|tpmdev/u.test(argv) && !existsSync(p.tpmSocket), `socket=${existsSync(p.tpmSocket)}`)
+    check('WP-2: ...the system disk is IDE and the NIC is e1000e (inbox Windows 7 drivers)',
+      /ide-hd,drive=disk0,bus=ide\.0/u.test(argv) && /e1000e,netdev=net0/u.test(argv)
+      && !/virtio-blk|virtio-net/u.test(argv), argv.slice(0, 260))
+    check('WP-2: the 7u firmware snapshot is the profile the table documents',
+      windowsFirmwareProfile('7u').bios === 'seabios' && windowsFirmwareProfile('7u').machine === 'pc')
+    // THE ANSWER FILE IS NOT OPTIONAL ON A LEGACY INSTALL: the firmware changed,
+    // the unattended contract did not, and writeOemPayload must still stage an
+    // <InstallFrom> (Setup asks which edition otherwise).
+    const oemPaths = windowsPaths(path.join(ROOT, 'oem-7u'), 'win-legacy')
+    mkdirSync(oemPaths.dir, { recursive: true })
+    writeOemPayload({
+      paths: oemPaths, name: 'win-legacy', password: 'pw', sshPubKey: 'ssh-ed25519 AAAA x',
+      sourceDir: path.join(ROOT, '..', 'docker', 'windows-oem'),
+      pythonUrl: 'https://example.invalid/python.exe', dshCuaSpec: 'dsh-cua==1.0', windowsVersion: '7u'
+    })
+    const staged = readFileSync(path.join(oemPaths.oemDir, 'Autounattend.xml'), 'utf8')
+    check('WP-2: ...and the staged answer file still names the image (<InstallFrom>)',
+      staged.includes('<InstallFrom>') && staged.includes('<Key>/IMAGE/NAME</Key>')
+      && staged.includes('<Value>Windows 7 Ultimate</Value>') && !staged.includes('{{IMAGE_INSTALL}}'),
+      (staged.match(/<InstallFrom>[\s\S]{0,120}/u) ?? [''])[0].replace(/\s+/gu, ' ').slice(0, 120))
+    backend.kill(spec.name)
+  }
+
+  // ---- WP-2: XP IS LISTED AND REFUSED — BEFORE ANY PROCESS IS SPAWNED ----
+  //
+  // Windows XP has no UEFI and no Autounattend path: its Setup reads winnt.sif
+  // from a floppy/ISO root, which this payload does not build. The refusal is
+  // cheap and NAMED, and it happens in buildQemuArgs — so no QEMU is exec'd, no
+  // swtpm is started and the argv log gains no line. A refusal that spawns
+  // first would leave a dead process and a half-created store behind.
+  {
+    writeFileSync(ARGV_LOG, '')
+    writeFileSync(ARGV_FULL, '')
+    writeFileSync(FAIL_MARKER, 'ok')
+    const spec = specFor('win-xp', { windowsVersion: 'xp' })
+    let caught = null
+    try {
+      await backend.boot(spec, { installPending: true })
+    } catch (error) {
+      caught = error
+    }
+    check('WP-2: xp boot REFUSES with code legacy-installer-unsupported',
+      caught?.code === 'legacy-installer-unsupported', String(caught?.code ?? caught?.message ?? 'no throw'))
+    check('WP-2: ...and the refusal names the real obstacle (winnt.sif), not "unknown version"',
+      /winnt\.sif/u.test(caught?.message ?? '') && /Windows XP/u.test(caught?.message ?? ''),
+      String(caught?.message ?? '').slice(0, 140))
+    check('WP-2: the refusal happens BEFORE spawn (no QEMU argv, no pidfile)',
+      readFileSync(ARGV_FULL, 'utf8').trim() === '' && !existsSync(spec.paths.qemuPid),
+      `argv=${JSON.stringify(readFileSync(ARGV_FULL, 'utf8').slice(0, 60))} pidfile=${existsSync(spec.paths.qemuPid)}`)
+    check('WP-2: ...and the catalog is what the refusal quotes',
+      WINDOWS_CATALOG.xp.refusal === 'legacy-installer-unsupported' && WINDOWS_CATALOG.xp.bios === 'seabios')
   }
 
   // ---- the pure helpers ----

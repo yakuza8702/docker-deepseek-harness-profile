@@ -31,8 +31,10 @@
  *   node tools/check-cua-vm.mjs --root DIR      # flat image layout
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 
 const { values } = parseArgs({
@@ -69,10 +71,18 @@ const FILES = {
   space: { label: 'docker/cua-vm-space.mjs', name: 'cua-vm-space.mjs' },
   kvm: { label: 'docker/cua-vm-kvm.mjs', name: 'cua-vm-kvm.mjs' },
   windows: { label: 'docker/cua-vm-windows-qemu.mjs', name: 'cua-vm-windows-qemu.mjs' },
+  // WP-2/WP-3: the same module, three different questions. The catalog, the
+  // firmware profiles and the ISO strategy chains are separate contracts, and a
+  // single 200-needle list hid which one a failure belonged to.
+  windowsCatalog: { label: 'docker/cua-vm-windows-qemu.mjs (catalog)', name: 'cua-vm-windows-qemu.mjs' },
+  windowsSources: { label: 'docker/cua-vm-windows-qemu.mjs (ISO sources)', name: 'cua-vm-windows-qemu.mjs' },
+  // WP-7: the RFB+clipboard bridge the live view prefers over raw websockify.
+  vncClip: { label: 'docker/cua-vnc-clip.mjs', name: 'cua-vnc-clip.mjs' },
   winMcp: { label: 'plugins/dsh-cua-vm/win-mcp.js', name: 'win-mcp.js' },
   oemAnswer: { label: 'docker/windows-oem/Autounattend.xml', name: 'Autounattend.xml' },
   oemSetup: { label: 'docker/windows-oem/setupcomplete.cmd', name: 'setupcomplete.cmd' },
   oemBoot: { label: 'docker/windows-oem/cua-firstboot.ps1', name: 'cua-firstboot.ps1' },
+  clipAgent: { label: 'docker/cua-clip-agent.ps1', name: 'cua-clip-agent.ps1' },
   oemLauncher: { label: 'docker/windows-oem/Unattend.vbs', name: 'Unattend.vbs' },
   provision: { label: 'docker/cua-guest-provision.sh', name: 'cua-guest-provision.sh' },
   android: { label: 'docker/cua-guest-android.sh', name: 'cua-guest-android.sh' },
@@ -102,7 +112,12 @@ const NEEDLES = {
     ['async vmWindowsClipboardSet({ name, text } = {})', 1],
     ['async vmWindowsClipboardGet({ name } = {})', 1],
     ['async vmWindowsFreeSpace({ name, force = false } = {})', 1],
-    ['windowsBackend.clipboardSet({ ...meta, name })', 1],
+    // J21-3: THE TEXT IS THE SECOND POSITIONAL ARGUMENT. This call passed ONE
+    // object (`{ ...meta, name }`), and the backend's `clipboardSet(rawSpec,
+    // text)` refuses anything else with "clipboardSet needs the text to paste":
+    // every host→guest paste (the panel route AND the noVNC bridge's control
+    // socket write) failed after the whole SSH task had been prepared.
+    ['windowsBackend.clipboardSet({ ...meta, name }, text)', 1],
     ['windowsBackend.clipboardGet({ ...meta, name })', 1],
     ['transport: windowsClipboardTransport()', 1],
     ['function windowsClipboardTransport()', 1],
@@ -314,8 +329,7 @@ const NEEDLES = {
     ['async function reconcileWindowsPorts(name, meta)', 1],
     // M1: the ISO cache is accounted for and GC'd.
     ['ISO_DIR', 3],
-    ['report.isos.push', 1],
-    // M6/X1: a genuine rebuild stops the old child; a live one is reused.
+    ['report.isos.push', 1],    // M6/X1: a genuine rebuild stops the old child; a live one is reused.
     ['stopLiveView(name)', 4],
     // M5: Windows guest paths are validated before they reach scp.
     ['function assertWindowsGuestPath(guest)', 1],
@@ -468,6 +482,76 @@ const NEEDLES = {
     ['async vmDelete({ name, force = false } = {})', 1],
     ['async destroy({ name, force = false } = {})', 1],
     ['force: force === true', 1]
+    ,
+    // WP-4: THE dsh-cua BRIDGE BINDS BY NAME, AND THE STREAM IS A REAL STREAM.
+    ["async vmWindowsMcp({ name = '' } = {})", 1],
+    ['name is required; the bridge binds to one Windows computer, not the first ready row', 1],
+    ["async vmWindowsMcpState({ name = '' } = {})", 1],
+    ["async subscribe({ events = ['vm-state'], socket = null } = {})", 1],
+    ["function emitVmState(name, state, reason = '')", 1],
+    ["function emitVmRemoved(name, reason = '')", 1],
+    ["function publishRegistryChanges(before, registry, reason = 'registry')", 1],
+    // the QMP watcher feeds the same bus, so a stop/start pair cannot be lost
+    ['function installQmpStateWatcher(name)', 1],
+    ['function mapQmpStateEvent(event)', 1],
+    // WP-7: THE LIVE VIEW PREFERS THE RFB+CLIPBOARD BRIDGE, AND MUST FALL BACK.
+    ['async function startConsoleBridge(name, vncPort)', 1],
+    ['async function ensureWindowsConsoleRelay(name)', 1],
+    ['cua-vnc-clip.mjs', 2],
+    // WP-9.1: THE MEASURED GROW — no `|| true`, and a short grow is a REFUSAL.
+    ['function parseGuestDf(stdout)', 1],
+    ['short-grow', 1],
+    ['guest-resize-failed', 1],
+    ['guest-growpart-failed', 1],
+    // WP-9.3/WP-9.4: the doctor's honest facts (no silent "works").
+    ['gpuDegraded', 2],
+    ['linux-checkpoint-layout', 1],
+    ['9p-share-not-attached', 1],
+    ['provenance', 2],
+    // WP-8: an effect is a READ-BACK, and a stale capture is a refusal.
+    ['function captureIdFor(name, pngBytes, width, height)', 1],
+    ['function latestCapture(name)', 1],
+    ['stale-capture', 1],
+    ["verified: changed ? 'confirmed' : 'unverifiable'", 1],
+    // J1-4: THE PREFLIGHT FOLLOWS THE FIRMWARE, NOT THE VERSION'S AGE. It used
+    // to demand qemu + OVMF (both files) + swtpm from EVERY Windows create, while
+    // the backend boots a seabios entry (7u) on pc/SeaBIOS with no pflash and no
+    // TPM: a host that could run Windows 7 was refused for two files the boot
+    // spec never opens. The required set comes from the SAME firmware profile.
+    ["const requiredCaps = firmware.bios === 'seabios' ? ['qemu'] : ['qemu', 'ovmfCode', 'ovmfVars', 'swtpm']", 1],
+    ['const firmware = windowsFirmwareProfile(spec.windowsVersion)', 1],
+    // J20-1c: `DSH_CUA_VNC_CLIP_POLL_MS` WAS DOCUMENTED, NEVER PASSED. The bridge
+    // has its own 1200 ms default, so the written interval and the real one could
+    // disagree silently. Read here, clamped to 200–60000 ms, rounded to an
+    // integer, and passed to the bridge on `--poll-ms`.
+    ['function vncClipPollMs()', 1],
+    ['const VNC_CLIP_POLL_MIN_MS = 200', 1],
+    ['const VNC_CLIP_POLL_MAX_MS = 60000', 1],
+    ['DSH_CUA_VNC_CLIP_POLL_MS', 1],
+    ["'--poll-ms', String(vncClipPollMs())", 1],
+    // J22-8: THE KIND IS READ FROM THE READY LINE, NOT ASSUMED. An image without
+    // noVNC used to serve a WS-only bridge the panel rendered as a 404 page, with
+    // a clipboard triple claiming a channel the page did not have.
+    ['const BRIDGE_KIND_LINE = /\\[cua-vnc-clip\\]\\s+(novnc-clip(?:-bare)?)\\s+on\\s+\\S+/u', 1],
+    ["const kindKnown = kind === 'novnc-clip' || kind === 'novnc-clip-bare'", 1],
+    ['&& !(await portIsFree(httpPort))', 1],
+    // J22-7: A SIGTERM MUST TAKE THE LIVE VIEWS WITH IT. `server.close()` closes
+    // the unix socket and nothing else; the websockify/bridge children kept their
+    // loopback ports, so the next process lost the port race or relayed to a
+    // bridge whose supervisor socket was gone.
+    ['const SHUTDOWN_LIVE_VIEW_DEADLINE_MS = 2000', 1],
+    ['function sweepLiveViews()', 1],
+    ['const children = sweepLiveViews()', 1],
+    // J22-12: A REOPENED RELAY KEEPS ITS CAPABILITIES. A relay is transport only;
+    // reopening it with neither `view` nor `clipboard` erased both from ports.json,
+    // and the panel's paste controls went dead after a shutdown that FAILED. The
+    // triple is recomputed from the recorded front door by the same rules a fresh
+    // ensure uses.
+    ['function relayCapabilities(snapshot = {}, rawVncPort = 0)', 1],
+    ['const capabilities = relayCapabilities(snapshot, rawVncPort)', 1],
+    ['view: capabilities.view, clipboard: capabilities.clipboard', 1],
+    ['const CLIPBOARD_NO_VIEW_REASON', 1],
+    ['const CLIPBOARD_RAW_VNC_REASON', 1]
   ],
   space: [
     ['export const CAPTURE_MAX_PIXELS = 900_000', 1],
@@ -534,18 +618,34 @@ const NEEDLES = {
     ['const kvmError = windowsKvmPreflight()', 1],
     // firmware: shared OVMF code + a per-computer vars store
     ["export const OVMF_CODE = process.env.DSH_CUA_WINDOWS_OVMF_CODE || '/usr/share/OVMF/OVMF_CODE_4M.fd'", 1],
-    ['if=pflash,format=raw,readonly=on,file=${OVMF_CODE}', 1],
-    ['if=pflash,format=qcow2,file=${p.efiVars}', 1],
+    // J1-3: EVERY INTERPOLATED PATH GOES THROUGH THE COMMA ESCAPE. QEMU's own
+    // QemuOpts splitter cuts an option value on commas, and `,,` is the only
+    // escape that works there (quoting does not: the splitter runs before any
+    // shell-like parsing). An operator medium named `win11,beta.iso`, or a store
+    // path with a comma, used to hand QEMU `file=win11` plus a mystery option.
+    // The needles below pin the ESCAPED form on all four file=/path= sites — the
+    // unescaped spelling is the bug.
+    ['if=pflash,format=raw,readonly=on,file=${qemuEscapeOptionValue(OVMF_CODE)}', 1],
+    ['if=pflash,format=qcow2,file=${qemuEscapeOptionValue(p.efiVars)}', 1],
+    // ...and the one function every interpolation calls, exported so a test can
+    // prove the escaping without a QEMU.
+    ['export function qemuEscapeOptionValue(value)', 1],
+    ["return String(value ?? '').replace(/,/gu, ',,')", 1],
     // TPM2 via swtpm on a unix socket
     ["export const SWTPM = process.env.DSH_CUA_WINDOWS_SWTPM || '/usr/bin/swtpm'", 1],
     ['-chardev', 1],
     ['tpm-crb,tpmdev=tpm0', 1],
     ['--ctrl', 1],
     // kvm + host cpu, and the q35 machine
-    ["'-machine', 'q35,accel=kvm,smm=off'", 1],
+    // WP-2: the machine SPEC comes from the firmware profile now, so the
+    // literal 'q35,accel=kvm,smm=off' alone could never appear again. The
+    // needle is the ONE expression both profiles flow through; the semantic
+    // assertion below proves '11' still gets q35+smm=off and '7u' gets pc.
+    ['const machine = legacyBios ? `${firmware.machine},accel=kvm` : `${firmware.machine},accel=kvm,smm=off`', 1],
+    ["'-machine', machine,", 1],
     ["'-cpu', 'host'", 1],
     // disks: plain qcow2 (checkpointing still applies)
-    ['file=${p.disk},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap', 1],
+    ['file=${qemuEscapeOptionValue(p.disk)},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap', 1],
     // R4: THE BOOT ORDER FOLLOWS THE PHASE. The old argv always put the disk at
     // bootindex 1 and the CD at 2 while its comment claimed the ISO booted
     // first: OVMF created Boot0002 for the unbootable HDD, tried it, said "HDD
@@ -572,7 +672,7 @@ const NEEDLES = {
     // RETARGETED, never deleted: it now pins the writable setup0 drive behind
     // usb-storage with `removable=on`, and the semantic assertion below rejects
     // ANY `readonly=on` reappearing on this drive and any `ide-hd` setup0 form.
-    ['file=${p.setupImg},format=raw,if=none,id=setup0', 1],
+    ['file=${qemuEscapeOptionValue(p.setupImg)},format=raw,if=none,id=setup0', 1],
     ['usb-storage,drive=setup0,removable=on,bus=xhci.0', 1],
     ["setupImg: path.join(dir, 'setup.img')", 1],
     ['export function buildSetupImage(', 1],
@@ -617,7 +717,9 @@ const NEEDLES = {
     // VERIFIED from the pinned 11ltsc ISO's own WIM XML (single image,
     // INDEX 1, NAME "Windows 11 IoT Enterprise LTSC 2024 Evaluation").
     ['{{IMAGE_INSTALL}}', 2],
-    ['export const WINDOWS_IMAGE_SELECTIONS = Object.freeze({', 1],
+    // WP-2: DERIVED, NOT DUPLICATED — the table is built from the catalog, so
+    // the hand-written map that still said `11ltsc` cannot drift again.
+    ['export const WINDOWS_IMAGE_SELECTIONS = Object.freeze(Object.fromEntries(', 1],
     ["    key: '/IMAGE/NAME',", 1],
     ["    value: 'Windows 11 IoT Enterprise LTSC 2024 Evaluation',", 1],
     ['export function resolveWindowsImageSelection({', 1],
@@ -630,7 +732,9 @@ const NEEDLES = {
     ['Unattend.vbs', 2],
     // networking: SLIRP + the SSH forward (no bridge, no tap)
     ['user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22', 1],
-    ['e1000e,netdev=net0', 1],
+    // The NIC follows the same profile as the disk and the firmware: a BIOS
+    // guest gets e1000e (an inbox Windows 7 driver), never virtio.
+    ['legacyBios ? `${firmware.nic},netdev=net0`', 1],
     // absolute pointer + keyboard: the QMP input path depends on both
     ["'-device', 'usb-tablet'", 1],
     ["'-device', 'usb-kbd'", 1],
@@ -643,17 +747,22 @@ const NEEDLES = {
     // D6: a failed boot stops the swtpm it started.
     ['stopSwtpm(spec.name)', 2],
     // the ISO sources are pinned and documented
-    ['export const WINDOWS_ISO_SOURCES = {', 1],
+    ['export const WINDOWS_ISO_SOURCES = Object.freeze(Object.fromEntries(', 1],
     // K2: TWO probed public URLs are pinned now — Server 2025 and Windows 11 IoT
     // Enterprise LTSC 2024 (both answered 206 to a live ranged GET); the rest
     // answer 400 and require `windowsIso`.
-    ['software-static.download.prss.microsoft.com', 2],
+    ['software-static.download.prss.microsoft.com', 4],
     ['export function resolveWindowsIso(version)', 1],
     ['has no public direct ISO link', 1],
     // The LTSC source, its alias, and the fact that the alias is canonicalised.
-    ["'11ltsc': {", 1],
+    // WP-2: the code is `11l`, and its chain is an ARRAY (two Microsoft objects,
+    // then the mirror pair), not the single pinned object of the five-version era.
+    ["'11l': Object.freeze([", 1],
     ['CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso', 1],
-    ['export const WINDOWS_VERSION_ALIASES = { ltsc11: \'11ltsc\' }', 1],
+    // The alias map is FROZEN and still answers every spelling the old list
+    // accepted — `11ltsc` now canonicalises to `11l` instead of naming a code.
+    ['export const WINDOWS_VERSION_ALIASES = Object.freeze({', 1],
+    ["'11ltsc': '11l', ltsc11: '11l',", 1],
     ['export function canonicalWindowsVersion(version)', 1],
     // FLOORS ARE WARNINGS. The create must produce advice, never a clamp.
     ['export function windowsCapacityWarnings({ diskGb, memory, cpu })', 1],
@@ -811,6 +920,190 @@ const NEEDLES = {
     ['export function assertAnswerFileFirstbootLayers(xml)', 1],
     ['assertAnswerFileFirstbootLayers(stagedXml)', 1],
     ['export const FIRSTBOOT_FALLBACK_COMMAND', 1]
+    ,
+    // WP-6: THE CLIPBOARD AGENT IS PAYLOAD, AND IT HAS ITS OWN SOURCE CHAIN.
+    // The on-demand schtasks pair stays the fallback; the agent is the fast,
+    // VERIFIED path (it hashes what it put on the clipboard and echoes `equal`).
+    ["export const OEM_CLIP_AGENT_FILE = 'cua-clip-agent.ps1'", 1],
+    ['export function resolveOemClipAgentSource(candidates = [])', 1],
+    ['export function clipAckMatches(expected = {}, ack = null)', 1],
+    ['export function clipSha256(text)', 1],
+    ['const CLIP_AGENT_STALE_MS = 5000', 1],
+    // J21-2: THE VERDICT CARRIES THE REASON. `clipAckMatches` is the boolean
+    // half; the backend needs to tell an agent that reported its own failure
+    // (`agent-error:<code>`) from a digest/seq mismatch, because the two send an
+    // operator to different places. The caller now RETURNS the verdict's reason
+    // and detail instead of re-spelling `ack-mismatch` at every site.
+    ['export function clipAckVerdict(expected = {}, ack = null)', 1],
+    ['function clipAgentErrorCode(ack = {})', 1],
+    ["return { ok: false, reason: `agent-error:${clipAgentErrorCode(ack)}`", 1],
+    ['if (!verdict.ok) return { ok: false, reason: verdict.reason, detail: verdict.detail, seq, sha256: digest, ack }', 2],
+    ['fastPathReason', 2],
+    ['clip-ack.json', 1],
+    ['outbox', 2],
+    ['cua-clip-agent', 2],
+    // J21-1: THE AGENT'S CLOCK HAS THREE SPELLINGS. `at` is what the shipped
+    // cua-clip-agent.ps1 writes, `ts` is what an earlier build and the backend's
+    // own stubs write, `updatedAt` is the JSON-idiomatic name. Reading only one
+    // made a live agent evaluate as stale and the fast path never ran; a MISSING
+    // stamp is 0 on purpose (the caller then says `agent-stale`, never freshness
+    // invented from `undefined`).
+    ['async function readClipState(spec, t)', 1],
+    ["for (const key of ['at', 'ts', 'updatedAt'])", 1],
+    ['if (Number.isFinite(value) && value > 0) { stamp = value; break }', 1],
+    ['stampMissing: stamp === 0', 1],
+    // J21-4: THE ACK IS WRITTEN BEFORE THE COPY, so one immediate read can catch
+    // the PREVIOUS payload. Three reads, 250 ms apart, and the LAST matching ack
+    // is the final word.
+    ['const CLIP_ACK_READ_ATTEMPTS = 3', 1],
+    ['for (let round = 0; round < CLIP_ACK_READ_ATTEMPTS; round += 1)', 1],
+    // J21-5: THE AGENT REFUSES A JOB FILE, NOT A TEXT. The outbox budget is the
+    // agent's file limit minus a conservative wrapper allowance, checked BEFORE
+    // the first round trip.
+    ['const CLIP_OUTBOX_WRAPPER_BUDGET = 2048', 1],
+    ['const CLIP_OUTBOX_MAX_TEXT_BYTES = CLIP_MAX_BYTES - CLIP_OUTBOX_WRAPPER_BUDGET', 1],
+    ["reason: 'too-large'", 2],
+    // J21-6: A NUL IS A TRUNCATION, NOT A PASTE. The paste stays ok, but it is
+    // explicitly unverified and says how many characters landed.
+    ['const nulIndex = payload.indexOf(\'\\u0000\')', 1],
+    ['nulTruncated: { landed, total }', 1],
+    // J20-1: THE DIGEST OPT-OUT IS THE STRING '0' ONLY (unset and '1' keep the
+    // full check), it disables the DIGEST and nothing else (size still applies),
+    // and every skipped result says `verified: false` plus this note — a skipped
+    // check is visible in the answer, never inferred from silence.
+    ['export const ISO_DIGEST_DISABLED_NOTE', 1],
+    ['export function isoDigestCheckDisabled()', 1],
+    ["return String(process.env.DSH_CUA_WIN_ISO_SHA256 ?? '') === '0'", 1],
+    // J1-5: AN UNPINNED CACHE IS NOT A PASS. Without a pin the sidecar is the
+    // only claim available and it is hashed against the file; otherwise the cache
+    // is refused with `unpinned-cache` and downloaded again.
+    ["return { ok: false, reason: 'unpinned-cache' }", 1],
+    // J1-1: A REDIRECT THE URL PARSER REJECTS FAILS THIS HOP, through fail()
+    // (which unlinks the .part), instead of throwing out of a socket callback.
+    ['bad-redirect', 2],
+    // J22-7: the boot-time residue sweep (a killed boot's swtpm outlives the
+    // process otherwise).
+    ['const stopBootResidue = (name) => {', 1],
+    ['stopBootResidue(spec.name)', 2],
+    // J1-3 FOR SWTPM TOO: `--ctrl path=`, `--tpmstate dir=`, `--pid file=` and
+    // `--log file=` go through swtpm's own comma-splitting option grammar, so an
+    // unescaped store path with a comma used to truncate the socket/state path
+    // and write the log somewhere else ("could not open pid file").
+    ["'--ctrl', `type=unixio,path=${qemuEscapeOptionValue(p.tpmSocket)}`", 1],
+    ["'--tpmstate', `dir=${qemuEscapeOptionValue(p.tpmDir)},mode=0600`", 1],
+    ["'--pid', `file=${qemuEscapeOptionValue(p.tpmPid)}`", 1],
+    ["'--log', `file=${qemuEscapeOptionValue(path.join(p.dir, 'swtpm.log'))},level=1`", 1],
+    // J22-6: THE PRIVACY OFF-SWITCH'S WRITER. The guest cannot read the host
+    // environment, so DSH_CUA_CLIP_AGENT=0 is MATERIALIZED as a file on the
+    // medium; both guests consume the path, and nothing else writes it.
+    ["export const CLIP_AGENT_SENTINEL_FILE = 'clip-agent-disabled'", 1],
+    ['export const SETUP_IMAGE_OPTIONAL = Object.freeze([CLIP_AGENT_SENTINEL_FILE])', 1],
+    ['CLIP_AGENT_SENTINEL_FILE,', 1],
+    ["const clipAgentDisabled = String(process.env.DSH_CUA_CLIP_AGENT ?? '').trim() === '0'", 1],
+    ["const sentinelPath = path.join(p.oemDir, CLIP_AGENT_SENTINEL_FILE)", 1],
+    ['clip agent disabled by DSH_CUA_CLIP_AGENT=0 (sentinel staged)', 1],
+    ['try { unlinkSync(sentinelPath) } catch {}', 1],
+    ['if (existsSync(sentinelPath)) copyFileSync(sentinelPath, path.join(setupDir, CLIP_AGENT_SENTINEL_FILE))', 1],
+    // the CONDITIONAL half: build/verify must not require an entry that the
+    // knob legitimately did not stage, while a staged one must still be carried
+    // and checked at BOTH firstboot search locations.
+    ['const isOptionalEntry = (name) => SETUP_IMAGE_OPTIONAL.includes(name)', 1],
+    ['.filter((name) => !isOptionalEntry(name) || existsSync(path.join(p.oemDir, name)))', 1],
+    ['if (SETUP_IMAGE_OPTIONAL.includes(required) && !existsSync(path.join(p.oemDir, required))) continue', 1],
+    ["if (existsSync(path.join(p.oemDir, CLIP_AGENT_SENTINEL_FILE)) && !oemScripts.includes(CLIP_AGENT_SENTINEL_FILE))", 1],
+    ['the clip-agent off-switch would not reach the guest', 1]
+  ],
+  /**
+   * WP-2: THE CATALOG AND THE FIRMWARE SPLIT.
+   *
+   * Sixteen codes with a size, a firmware profile and an image selection each;
+   * `xp` is LISTED and REFUSED (its Setup wants winnt.sif from a floppy/ISO
+   * root, which this payload does not build). The needles pin the table; the
+   * semantic assertion below calls the module and proves the SET.
+   */
+  windowsCatalog: [
+    ["export const WINDOWS_VERSIONS = ['11', '11l', '11e', '10', '10l', '10e', '7u', 'xp', '2025', '2022', '2019', '2016', '2012', 'core11', 'tiny11', 'tiny10']", 1],
+    ['export const WINDOWS_CATALOG = Object.freeze({', 1],
+    ["refusal: 'legacy-installer-unsupported'", 1],
+    ['its Setup reads winnt.sif from a floppy/ISO root', 1],
+    // THE FIRMWARE IS A PROFILE, NOT A BOOLEAN: a BIOS guest rewrites five
+    // decisions (machine, pflash, TPM, disk, NIC) and each one is wired below.
+    ['export const WINDOWS_FIRMWARE_PROFILES = Object.freeze({', 1],
+    ["seabios: Object.freeze({ machine: 'pc', bios: 'seabios', tpm: false, efiVars: false, disk: 'ide-hd', nic: 'e1000e' })", 1],
+    ['export function windowsFirmwareProfile(version)', 1],
+    ['export function windowsFirmwareForSpec(spec = {})', 1],
+    ['...(firmware.efiVars', 1],
+    ['...(firmware.tpm', 1],
+    ["? `${firmware.disk},drive=disk0,bus=ide.0,bootindex=${diskBootIndex}`", 1],
+    ['legacyBios ? `${firmware.nic},netdev=net0`', 1],
+    // THE SELECTION IS DERIVED FROM THE CATALOG, so a code rename cannot leave
+    // a hand-written table pointing at a spelling the catalog dropped.
+    ['export function resolveWindowsImageSelection({', 1],
+    ['export const WINDOWS_IMAGE_SELECTIONS = Object.freeze(Object.fromEntries(', 1],
+    ["['11ltsc': '11l', ltsc11: '11l',", 0]
+  ],
+  /**
+   * WP-3: WHERE THE INSTALL MEDIA COME FROM.
+   *
+   * One pinned URL per version was a bet on a Microsoft CDN object staying
+   * alive; on 2026-11-15 four of the five answered 400. A version is an ORDERED
+   * CHAIN now (mido → ESD → link1/link2/link6 → midoDirect), every entry
+   * carrying the byte count and SHA-256 it must have, and the cache is only a
+   * cache when the file matches the sidecar.
+   */
+  windowsSources: [
+    ['export function resolveWindowsIsoSources(version)', 1],
+    ['export async function ensureIsoForSource(sources, {', 1],
+    ['export async function ensureIso({', 1],
+    ['export async function verifyIsoDigest(file, expectedSha256)', 1],
+    ['export function isoFileName(url)', 1],
+    ['iso-digest-mismatch', 1],
+    ['const ISO_PINS_BY_URL = (() => {', 1],
+    // THE SIDECAR is what makes the next boot skip a 5.5 GB hash.
+    ['writeFileSync(sidecar, `${verified.sha256}\\n`)', 1],
+    ['iso-unavailable', 1],
+    // MICROSOFT'S OWN PAGE, driven by the four calls its JavaScript makes.
+    ["export const MIDO_PROFILE = '606624d44113'", 1],
+    ["export const MIDO_ORG_ID = 'y6jn8c31'", 1],
+    ['getskuinformationbyproductedition', 1],
+    ['GetProductDownloadLinksBySku', 1],
+    ['ov-df.microsoft.com/mdt.js?instanceId=', 1],
+    // THE PINNED MIRRORS, by host, so a source cannot be swapped silently.
+    ['linkid=2156292', 1],
+    ['LinkId=841361', 1],
+    ['dl.bobpony.com/windows', 1],
+    ['files.dog/MSDN', 1],
+    ['archive.org/download', 1],
+    ['archive.org/download/tiny11_25H2/tiny11core_25H2_Nov25.iso', 1],
+    ['archive.org/download/tiny11_25H2/tiny11_25H2_Nov25.iso', 1],
+    ['tiny-10-23-h2/tiny10%20x64%2023h2.iso', 1],
+    ['core11: Object.freeze([', 1],
+    ['tiny11: Object.freeze([', 1],
+    ['tiny10: Object.freeze([', 1],
+    ["isoSource('midoDirect',", 1],
+    ["isoSource('esd',", 1]
+  ],
+  /**
+   * WP-7: THE RFB + CLIPBOARD BRIDGE that serves the live view.
+   *
+   * It is the websockify for that port when it starts, it is LOOPBACK ONLY (it
+   * has no authentication), and its guest side is the supervisor's own control
+   * socket — never a new TCP listener.
+   */
+  vncClip: [
+    ['export function serverCutTextFrame(text)', 1],
+    ['export function isClientCutText(frame)', 1],
+    ['export function parseClientCutText(frame)', 1],
+    ['export function encodeCutText(text)', 1],
+    ['258EAFA5-E914-47DA-95CA-C5AB0DC85B11', 1],
+    ['export function wsAccept(key)', 1],
+    ['127.0.0.1', 2],
+    ["export function normaliseLoopbackHost(host, label = 'host')", 1],
+    ['vmWindowsClipboardSet', 1],
+    ['vmWindowsClipboardGet', 1],
+    ['export function startClipboardBridge(options = {})', 1],
+    ['export function parseArgs(argv)', 1],
+    ['async function main()', 1]
   ],
   winMcp: [
     ['export function windowsMcpEnabled()', 1],
@@ -827,6 +1120,23 @@ const NEEDLES = {
     ["'python -m dsh_cua.server --stdio'", 1],
     ['U3: THERE IS NO NAMED PIPE', 1],
     ['ONE shared session-2 server cannot be reached', 1]
+    ,
+    // WP-5: THE NAMESPACE IS THE HARNESS'S, NOT AN INVENTION. Everything the
+    // model touches is `mcp__windows__<guest tool>`; the two helpers that are
+    // never gated are the reveal and the doctor.
+    ["export const DEFAULT_SERVER_NAME = 'windows'", 1],
+    ["export const TOOL_PREFIX = 'mcp__windows__'", 1],
+    ["export const REVEAL_TOOL_NAME = 'windows_desktop'", 1],
+    ["export const DOCTOR_TOOL_NAME = 'windows_mcp_doctor'", 1],
+    ['export function windowsToolName(tool)', 1],
+    ['export function windowsGuestToolName(tool)', 1],
+    // The keepalive that turns a suspended guest into a FAST, NAMED failure
+    // instead of a call that hangs on a half-open socket.
+    ["'-o', 'ServerAliveCountMax=2'", 1],
+    // ...and the code the model branches on.
+    ['vm-offline', 1],
+    ['isOnline', 1],
+    ['onClosed', 1]
   ],
   oemAnswer: [
     ['<unattend xmlns="urn:schemas-microsoft-com:unattend">', 1],
@@ -916,7 +1226,63 @@ const NEEDLES = {
     ['-Settings $settings -Hidden -Force', 1],
     ['-WindowStyle Hidden', 1],
     ['U3: WHAT USED TO BE WRONG, TWICE', 1],
-    ['upstream `dsh_cua.server main()` takes no pipe option', 1]
+    ['upstream `dsh_cua.server main()` takes no pipe option', 1],
+    // J22-2/J22-3: THE FIRSTBOOT SCRIPTS SHARE THE AGENT'S CONTRACT. The seq the
+    // supervisor mints is a Date.now() stamp (~1.79e12), and an Int32 parameter
+    // cannot hold it: the first assignment is `[long]`, not an afterthought cast.
+    ['[long]$seq', 1],
+    // J22-6: THE PRIVACY OFF-SWITCH IS A SENTINEL, AND IT MUST READ AS `skipped`.
+    // A plain ok:true would report "registered" for a task nobody created; the
+    // step records `skipped = $true` with the reason.
+    ["clip-agent-disabled", 2],
+    ["return @{ skipped = $true; reason = 'clip-agent-disabled' }", 1],
+    // J22-9: A TASK THAT STARTED IS NOT A STATE THAT LANDED. `/run` followed by
+    // a freshness proof on clip-state.json, or the step fails with its own name
+    // instead of claiming the agent is live.
+    ["throw 'task-started-but-no-state'", 1],
+    // J22-6: THE SENTINEL'S GUEST HOP. The backend stages the file on the medium
+    // and in Setup\Scripts; the guest's copy lives in C:\ProgramData\cua, so
+    // firstboot SEARCHES THE SAME LOCATIONS AND STAGES IT BEFORE the off-switch
+    // check — otherwise "a file on the medium" never becomes "the path the two
+    // consumers test". Additive by construction: no staged copy anywhere means
+    // no write and the old behaviour exactly.
+    ["$sentinelName = 'clip-agent-disabled'", 1],
+    ["$sentinelPath = 'C:\\ProgramData\\cua\\clip-agent-disabled'", 1],
+    ["$sentinelDirs = @($PSScriptRoot, 'C:\\Windows\\Setup\\Scripts', 'C:\\ProgramData\\cua', 'C:\\', 'D:\\', 'E:\\', 'F:\\', 'G:\\', 'H:\\')", 1],
+    ['Copy-Item -LiteralPath $sentinelStaged -Destination $sentinelPath -Force', 1],
+    ['clip agent: staged sentinel $sentinelStaged -> $sentinelPath', 1],
+    // ...and the EMBEDDED agent carries the same hop, for a guest whose payload
+    // predates the file (it runs under $ErrorActionPreference = 'Stop', hence the
+    // SilentlyContinue probes).
+    ["$stagedSentinel = Join-Path $stagedDir 'clip-agent-disabled'", 1],
+    ["if (Test-Path -LiteralPath (Join-Path $Dir 'clip-agent-disabled')) { exit 0 }", 1]
+  ],
+  /**
+   * THE CLIP AGENT ITSELF (J22-1/2/4/5/11): a separate file, gated separately,
+   * because the supervisor copies it into the OEM payload and the firstboot
+   * registers the task — a rename in either place silently ships an older agent.
+   */
+  clipAgent: [
+    ['clip-agent-disabled', 2],
+    // J22-3: the seq is a [long] from the first assignment.
+    ['[long]$seq', 1],
+    // J22-11: ONE OWNER, TWO PATHS. The session-suffixed file is this session's
+    // own record; the un-suffixed file is what the backend already reads. Both
+    // get the SAME bytes, so either reader sees one truth.
+    ["$StatePath = Join-Path $Dir 'clip-state.json'", 1],
+    ["$StatePathSession = Join-Path $Dir ('clip-state' + $SessionTag + '.json')", 1],
+    ["$CurrentPathSession = Join-Path $Dir ('clip-current' + $SessionTag + '.txt')", 1],
+    ["$AckPathSession = Join-Path $Dir ('clip-ack' + $SessionTag + '.json')", 1],
+    ['function Write-JsonPair([string]$Canonical, [string]$Scoped, $Object)', 1],
+    ['function Write-TextPair([string]$Canonical, [string]$Scoped, [string]$Text)', 1],
+    // J22-11: a single owner, so two sessions cannot both write the canonical
+    // copy and serve each other's payload.
+    ['OwnerWindowSeconds', 1],
+    // J22-4: READ-BACK BEFORE THE ACK, so an ack whose seq matches proves
+    // clip-current.txt already holds the pasted text.
+    ['# TEXT FIRST, THEN THE STATE THAT VOUCHES FOR IT', 1],
+    // J22-5: the size test is on the TEXT (chars), not on the escaped JSON file.
+    ["$error = 'too-large'", 1]
   ],
   provision: [
     ['MARKER=/var/lib/cua-provision', 1],
@@ -976,7 +1342,13 @@ const NEEDLES = {
     ['unreadable by uid 1000', 2],
     ['ovmf swtpm', 1],
     ['tools/check-cua-vm.mjs /opt/seek-harness/check-cua-vm.mjs', 1],
-    ['node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check', 1]
+    ['node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check', 1],
+    // WP-6/WP-7: BOTH NEW FILES SHIP — at their RUNTIME paths and in the flat
+    // gate tree the build re-runs this very script against.
+    ['COPY --chmod=0755 docker/cua-vnc-clip.mjs /usr/local/bin/cua-vnc-clip.mjs', 1],
+    ['COPY --chown=1000:1000 --chmod=0644 docker/cua-clip-agent.ps1 /usr/local/share/cua-vm/windows-oem/cua-clip-agent.ps1', 1],
+    ['docker/cua-vnc-clip.mjs Dockerfile /opt/seek-harness/cua-check/', 1],
+    ['docker/cua-clip-agent.ps1 /opt/seek-harness/cua-check/', 1]
   ],
   client: [
     // the four labels are a contract: automation reads them
@@ -1087,7 +1459,10 @@ const NEEDLES = {
     // F2: the create result must not describe the container backend either.
     ['runs commands over SSH in cmd.exe', 1],
     // D11: a stop/delete takes the guest's tools away within 5 s.
-    ['}, 5000)', 1],
+    // WP-5: THE STATE POLL IS THE PUSH (10 s, `DSH_CUA_MCP_STATE_POLL_MS`), and
+    // the bind-triggered sync is throttled so an exec cannot become a poll.
+    ['const WIN_MCP_DEFAULT_POLL_MS = 10_000', 1],
+    ['now - WIN_MCP_AUX.lastBindSyncAt > 5000', 1],
     ['- FAILED ${item.target}: ${item.detail}', 1],
     // the port answer is url + localPort; `target` was never in the payload
     ['result.url', 1],
@@ -1113,7 +1488,51 @@ const NEEDLES = {
     // the prompt carries the invariants
     ['SPACE:', 1],
     ['SHUTDOWN vs SUSPEND:', 1],
-    ['WINDOWS (`kind: "windows"`', 1]
+    ['WINDOWS (`kind: "windows"`', 1],
+    // WP-5: THE GATE IS FOUR LAYERS, AND ALL OF THEM LIVE IN THIS FILE.
+    ['mcp__windows__', 2],
+    ['windows_desktop', 1],
+    ['windows_mcp_doctor', 1],
+    ["ctx.inject(['tools'], (scoped) =>", 1],
+    ['scoped.tools.guard((execution) => windowsGuardDecision(execution))', 1],
+    ['tools.restrict({ deny })', 1],
+    ['registrations: new Map()', 1],
+    // the cheap state read, and the removal path that takes the names away
+    ['vmWindowsMcpState', 1],
+    ['vm-removed', 1],
+    ['DSH_CUA_MCP_STATE_POLL_MS', 1],
+    // the Computer Use grant, in memory, per session
+    ["action !== 'cua-grant'", 1],
+    ['function teardown(reason)', 1],
+    // J20-4: THE IN-FLIGHT ATTACH TICKET. `WIN_MCP.name` is '' for an attach
+    // still in its 45 s handshake, so a delete that landed mid-handshake skipped
+    // teardown and 19 schemas of a deleted computer reappeared until the next
+    // beat. The ticket carries the target name and is killed by teardown, and
+    // every write re-checks the generation.
+    ['inflightTicket: null', 1],
+    ['WIN_MCP.generation += 1', 1],
+    ['const isDead = () => ticket.dead === true || WIN_MCP.generation !== generation', 1],
+    ['if (isDead()) { abort(', 3],
+    ['function forgetSessionTarget(name)', 1],
+    ['const inflightName = WIN_MCP_AUX.inflightTicket === null', 1],
+    // J20-5: CROSS-SESSION TARGETING. One process, one attached computer, many
+    // sessions: the tools may only be used by the session that bound THAT
+    // computer, and the refusal is structured.
+    ["code: 'not-the-target'", 2],
+    ['this session is bound to ${row.name}; the Windows bridge is attached to ${attached}; bind this session first', 1],
+    ['via: \'implicit-single-target\'', 1],
+    ['function knownWindowsComputers()', 1],
+    ['function targetMatchFor(agent)', 1],
+    // J20-3: THE STATE BUS IS CONSUMED, NOT ONLY POLLED. One long-lived
+    // subscription on the same unix socket; a supervisor without the op answers
+    // `unknown op` (or closes without `ready`) and the 10 s poll does the job.
+    ["socket.write(`${JSON.stringify({ op: 'subscribe', events: ['vm-state', 'vm-removed'] })}\\n`)", 1],
+    ['function startWindowsStateStream(socketPath)', 1],
+    ['function handleVmEvent(event)', 1],
+    ['const WIN_MCP_STREAM = {', 1],
+    // the doctor answers the new questions too
+    ["reason: 'implicit-single-target'", 1],
+    ['pendingName: WIN_MCP_AUX.inflightTicket === null ? null : String(WIN_MCP_AUX.inflightTicket.name ?? \'\')', 1]
   ],
   proxy: [
     ['export function prefixRootPaths(text, prefix)', 1],
@@ -1157,7 +1576,14 @@ const NEEDLES = {
     // next to the OEM payload path they belong to.
     ['DSH_CUA_WINDOWS_CDBOOT_KEYS_MS=1500,3500,5500', 1],
     ['DSH_CUA_WINDOWS_CDBOOT_KEYS=0', 1],
-    ['startup.nsh', 1]
+    ['startup.nsh', 1],
+    // WP-2/WP-7/WP-9: the switches the new paths read.
+    ['DSH_CUA_VNC_CLIP=1', 1],
+    ['DSH_CUA_VNC_CLIP_POLL_MS=1200', 1],
+    ['DSH_CUA_CLIP_AGENT=1', 1],
+    ['DSH_CUA_WIN_LEGACY_BIOS=1', 1],
+    ['DSH_CUA_MCP_STATE_POLL_MS=10000', 1],
+    ['DSH_CUA_WIN_ISO_SHA256=1', 1]
   ]
 }
 
@@ -1632,7 +2058,7 @@ function sourceOf(label, name) {
   // is out of scope and says so out loud — it is never silently dropped.
   // F1/F2/F3/F4: the boot path has its own suite now (stub QEMU: a dead init, an
   // EGL failure that must degrade once, the watchdog and the sentence).
-  const suite = ['supervisor-smoke.mjs', 'modules-unit.mjs', 'qmp-shutdown.mjs', 'windows-boot.mjs']
+  const suite = ['supervisor-smoke.mjs', 'modules-unit.mjs', 'qmp-shutdown.mjs', 'windows-boot.mjs', 'windows-mcp-gate.mjs']
   if (!REPO_LAYOUT) {
     if (!quietMode) console.log('  n/a  L5 the runtime suite lives in the checkout, not in the flat image check tree')
   } else {
@@ -1641,7 +2067,7 @@ function sourceOf(label, name) {
       if (!quietMode) console.log('  ok   L5 the runtime suite is committed under tests/')
     } else {
       failures += 1
-      missing.push('tests/: supervisor-smoke.mjs, modules-unit.mjs, qmp-shutdown.mjs and windows-boot.mjs must be committed')
+      missing.push('tests/: supervisor-smoke.mjs, modules-unit.mjs, qmp-shutdown.mjs, windows-boot.mjs and windows-mcp-gate.mjs must be committed')
       console.log('  FAIL L5 runtime suite')
     }
   }
@@ -1692,6 +2118,184 @@ function sourceOf(label, name) {
       failures += 1
       missing.push('docker/cua-vm-supervisor.mjs: ISO_DIR must be in ACCOUNTED_PATHS (the ISO cache is the largest thing in a Windows store)')
       console.log('  FAIL M1 ISO accounting')
+    }
+  }
+}
+
+/**
+ * WP-2/WP-3/WP-5/WP-7: THE TABLE, THE FIRMWARE SPLIT AND THE WIRE FORMAT ARE
+ * EXERCISED, NOT SPELLED.
+ *
+ * A needle can prove a code is NAMED; only the module can prove the sixteen
+ * codes are the set, that every installable one has a chain, that `xp` REFUSES,
+ * that Windows 7 boots on pc/SeaBIOS with no pflash, and that an RFB
+ * ServerCutText has the header noVNC reads. The module is imported from the
+ * tree being gated (checkout OR the flat image tree), so this cannot pass
+ * against another copy.
+ */
+{
+  const winFile = pick('cua-vm-windows-qemu.mjs')
+  const clipFile = pick('cua-vnc-clip.mjs')
+  const supervisorFile = pick('cua-vm-supervisor.mjs')
+  total += 1
+  if (winFile === null || clipFile === null || supervisorFile === null) {
+    failures += 1
+    missing.push('WP-2: cua-vm-windows-qemu.mjs, cua-vnc-clip.mjs and cua-vm-supervisor.mjs are all needed for the semantic catalog/firmware/clipboard assertions')
+    console.log('  FAIL WP-2 semantic catalog / firmware / clipboard / bridge')
+  } else {
+    let ok = false
+    let detail = ''
+    const supervisorText = readFileSync(supervisorFile, 'utf8')
+    // WP-4.1: THE FIRST-READY FALLBACK MUST NOT COME BACK. A needle cannot say
+    // "this expression is absent"; the regex can.
+    const noFirstReady = !/entries\.find\(\(\[, row\]\) => row\?\.kind === 'windows' && row\.state === 'ready'\)/u.test(supervisorText)
+    try {
+      const win = await import(pathToFileURL(winFile).href)
+      const clip = await import(pathToFileURL(clipFile).href)
+      const EXPECTED = '11,11l,11e,10,10l,10e,7u,xp,2025,2022,2019,2016,2012,core11,tiny11,tiny10'
+      const sixteen = [...win.WINDOWS_VERSIONS].join(',') === EXPECTED
+      // every code except xp must have at least one source to walk
+      const chained = win.WINDOWS_VERSIONS.filter((code) => code !== 'xp')
+        .every((code) => Array.isArray(win.WINDOWS_ISO_SOURCES[code]?.sources) && win.WINDOWS_ISO_SOURCES[code].sources.length > 0)
+      let refused = null
+      try { win.resolveWindowsIsoSources('xp') } catch (error) { refused = error?.code ?? String(error) }
+      let modernText = ''
+      let legacyText = ''
+      let legacyMachine = ''
+      const store = mkdtempSync(path.join(os.tmpdir(), 'cua-gate-vm-'))
+      try {
+        const paths = win.windowsPaths(store, 'gate-check')
+        const base = { name: 'gate-check', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: false }
+        const modern = win.buildQemuArgs({ ...base, windowsVersion: '11' })
+        const legacy = win.buildQemuArgs({ ...base, windowsVersion: '7u' })
+        modernText = modern.join(' ')
+        legacyText = legacy.join(' ')
+        legacyMachine = String(legacy[legacy.indexOf('-machine') + 1] ?? '')
+      } finally {
+        rmSync(store, { recursive: true, force: true })
+      }
+      // THE UEFI PROFILE: q35 + smm=off + the OVMF pflash pair + a TPM.
+      // THE BIOS PROFILE: pc/accel=kvm, NO pflash, NO TPM, an IDE disk.
+      const firmwareOk = modernText.includes('q35,accel=kvm,smm=off')
+        && modernText.includes('if=pflash,format=raw,readonly=on,file=')
+        && modernText.includes('tpm-crb,tpmdev=tpm0')
+        && /^pc,accel=kvm$/u.test(legacyMachine)
+        && !legacyText.includes('if=pflash')
+        && !legacyText.includes('tpm-crb')
+        && legacyText.includes('ide-hd,drive=disk0')
+      const alias = win.canonicalWindowsVersion('ltsc11') === '11l' && win.canonicalWindowsVersion('ltsc10') === '10l'
+      // THE RFB FRAME noVNC reads: type 3, three pad bytes, BE length, bytes.
+      const frame = clip.serverCutTextFrame('hi')
+      const expectedFrame = Buffer.from([3, 0, 0, 0, 0, 0, 0, 2, 104, 105])
+      const clipOk = frame.equals(expectedFrame)
+        && clip.isClientCutText(Buffer.from([6, 0, 0, 0, 0, 0, 0, 3, 65, 66, 67])) === true
+        && clip.wsAccept('dGhlIHNhbXBsZSBub25jZQ==') === 's3pPLMBiTxaQ9kYGzzhZRbK+xOo='
+      ok = sixteen && chained && refused === 'legacy-installer-unsupported' && firmwareOk && alias && clipOk && noFirstReady
+      if (ok !== true) detail = JSON.stringify({ sixteen, chained, refused, firmwareOk, alias, clipOk, noFirstReady })
+    } catch (error) {
+      detail = String(error?.stack ?? error)
+    }
+    if (ok === true) {
+      if (!process.argv.includes('--quiet')) console.log('  ok   WP-2/WP-3/WP-4/WP-7 sixteen codes, xp refused, 7u on pc/SeaBIOS without pflash, 11 on q35+OVMF+TPM, no first-ready fallback, RFB frame + handshake')
+    } else {
+      failures += 1
+      missing.push(`WP-2/WP-3: the catalog, the firmware profiles, the xp refusal, the RFB frame or the first-ready-fallback invariant no longer holds — ${detail}`)
+      console.log('  FAIL WP-2 semantic catalog / firmware / clipboard / bridge')
+    }
+  }
+}
+
+/**
+ * J1-6: THE ISO DOCUMENT IS ENFORCED, NOT "KEPT HONEST" BY HOPE.
+ *
+ * `docs/windows-iso-sources.md` is the page an operator reads before spending
+ * 5–8 GB of store on an install medium. It is generated from the module, and the
+ * README used to claim it was "kept honest" by the tests — but no test compared
+ * the two, so a hand-edit of a SHA-256 (or a URL that moved) would sail through
+ * every gate and only surface as a digest refusal after the download.
+ *
+ * The module is IMPORTED (not grepped) and `ISO_SOURCE_CHAINS` is reached the
+ * public way — `WINDOWS_ISO_SOURCES[code].sources`, which IS that table — so the
+ * comparison is against the data the downloader walks, not against its source
+ * text. Each of the five columns is compared: strategy, url, bytes, sha256 and
+ * selection. The first divergent code is named in the failure, because "the
+ * docs drifted" is not actionable and `11l row 2 sha256` is.
+ *
+ * Deliberate non-comparisons: the prose (`label`, `probed`), and the `(live
+ * handshake: …)` placeholder the writer emits for a strategy whose URL does not
+ * exist until the network answers. Those are documentation, not pins.
+ */
+{
+  const winFile = pick('cua-vm-windows-qemu.mjs')
+  const docFile = path.join(ROOT, 'docs', 'windows-iso-sources.md')
+  total += 1
+  if (winFile === null || !existsSync(docFile)) {
+    failures += 1
+    missing.push('J1-6: cua-vm-windows-qemu.mjs and docs/windows-iso-sources.md are both required — the ISO doc is enforced against the module, so a missing side is a missing contract')
+    console.log('  FAIL J1-6 ISO doc honesty')
+  } else {
+    let firstDrift = null
+    let compared = 0
+    try {
+      const win = await import(pathToFileURL(winFile).href)
+      const md = readFileSync(docFile, 'utf8').split(/\r?\n/u)
+      // The doc's per-code sections: `### \`11\` — Windows 11 Pro`.
+      const sections = new Map()
+      let current = null
+      for (const line of md) {
+        const heading = /^### `([^`]+)`/u.exec(line)
+        if (heading !== null) { current = heading[1]; sections.set(current, []); continue }
+        if (/^## /u.test(line)) current = null
+        if (current === null) continue
+        if (!line.startsWith('|')) continue
+        if (/\|\s*strategy\s*\|/u.test(line)) continue
+        if (/^\|[-: |]+\|$/u.test(line)) continue
+        sections.get(current).push(line)
+      }
+      const cellsOf = (line) => line.split('|').slice(1, -1).map((cell) => cell.trim())
+      const expectedSelection = (source) => source?.selection === undefined
+        ? 'catalog default'
+        : `${source.selection.key} \`${source.selection.value}\``
+      for (const code of win.WINDOWS_VERSIONS) {
+        const rows = (sections.get(code) ?? []).map(cellsOf)
+        const sources = win.WINDOWS_ISO_SOURCES?.[code]?.sources ?? []
+        if (rows.length !== sources.length) {
+          firstDrift = `code ${code}: the doc has ${rows.length} row(s), the module's chain has ${sources.length}`
+          break
+        }
+        for (let index = 0; index < sources.length; index += 1) {
+          const source = sources[index]
+          const [strategy, url, bytes, sha256, selection] = rows[index]
+          const urlOk = typeof source.url === 'string' && source.url !== ''
+            ? url === source.url
+            // A strategy with no static URL (mido/esd) says so in prose; the
+            // placeholder is allowed, a fabricated URL is not.
+            : url === '—' || url.startsWith('(')
+          const checks = [
+            ['strategy', strategy, String(source.strategy)],
+            ['url', url, urlOk ? url : (source.url ?? '(a live handshake)')],
+            ['bytes', bytes, source.bytes > 0 ? String(source.bytes) : '—'],
+            ['sha256', sha256, source.sha256 !== '' ? `\`${source.sha256}\`` : '—'],
+            ['selection', selection, expectedSelection(source)]
+          ]
+          compared += 1
+          const wrong = checks.find(([, got, want]) => got !== want)
+          if (wrong !== undefined) {
+            firstDrift = `code ${code} row ${index + 1} (${source.strategy}) ${wrong[0]}: the doc says ${JSON.stringify(wrong[1])}, the module says ${JSON.stringify(wrong[2])}`
+            break
+          }
+        }
+        if (firstDrift !== null) break
+      }
+    } catch (error) {
+      firstDrift = String(error?.stack ?? error)
+    }
+    if (firstDrift === null) {
+      if (!process.argv.includes('--quiet')) console.log(`  ok   J1-6 docs/windows-iso-sources.md matches ISO_SOURCE_CHAINS on all five columns (${compared} chain row(s))`)
+    } else {
+      failures += 1
+      missing.push(`J1-6: docs/windows-iso-sources.md drifted from ISO_SOURCE_CHAINS — ${firstDrift}`)
+      console.log('  FAIL J1-6 ISO doc honesty')
     }
   }
 }

@@ -73,3 +73,29 @@ services:
       DSH_CUA_VM_WIN_MCP: "${DSH_CUA_VM_WIN_MCP:-1}"
 
 volumes: {}
+
+# ---------------------------------------------------------------------
+# HARDENING NOTES — comments only, deliberately not keys.
+#
+# * read_only: the harness rootfs stays read-only (compose.yaml). Everything a
+#   Windows computer writes lands in the /cua-vm volume — disk.qcow2,
+#   efi-vars.qcow2, tpm/, oem/, serial.log, credentials.json — or in /tmp
+#   (tmpfs). Do NOT mount the store read-only to "harden" it: QEMU writes the
+#   disk image and swtpm writes its state, so a read-only store is a boot
+#   failure, not a hardening.
+#
+# * Suggested ceilings for a full Windows install plus a running guest, as
+#   COMMENTS on purpose — a real key here would OOM-kill the install halfway
+#   through on a host that would otherwise have finished it:
+#       mem_limit: 12g
+#       pids_limit: 512
+#   QEMU reserves the guest's RAM eagerly (chunks of 1 GB), so mem_limit has to
+#   cover guest memory + OVMF + swtpm + the supervisor. Lower the guest's RAM
+#   before lowering this.
+#
+# * tap/bridge networking is NOT supported by this file. It needs CAP_NET_ADMIN
+#   (the harness runs cap_drop ALL) and a host bridge; SLIRP user-mode
+#   networking is the only wired path, and the guest still reaches host
+#   services at 10.0.2.2. See the README's "Bridge networking" note for what
+#   enabling it would require.
+# ---------------------------------------------------------------------

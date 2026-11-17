@@ -1,7 +1,17 @@
 import net, { createConnection } from 'node:net'
 import path from 'node:path'
 import z from '@deepseek-ai/schemastery'
-import { createDshCuaClient, windowsMcpEnabled } from './win-mcp.js'
+import {
+  createDshCuaClient,
+  windowsMcpEnabled,
+  TOOL_PREFIX,
+  REVEAL_TOOL_NAME,
+  DOCTOR_TOOL_NAME,
+  windowsToolName,
+  windowsGuestToolName,
+  sshArgv,
+  mcpError
+} from './win-mcp.js'
 
 export const name = 'cua-vm'
 export const inject = ['tools', 'systemPrompt', 'webServer']
@@ -81,6 +91,1241 @@ const textOutput = (description) => ({
   render: (_args, value) => [{ type: 'text', text: value.text }]
 })
 
+/* ==================================================================== *
+ * WP-5 — THE WINDOWS dsh-cua BRIDGE IS PROCESS STATE, NOT PLUGIN STATE
+ * ==================================================================== *
+ *
+ * THE BUG THIS REPLACES
+ * ---------------------
+ * The bridge used to be `const WIN_MCP = {...}` INSIDE apply(), i.e. one copy
+ * per mounted plugin, while the tools it registered live on the HOST-GLOBAL
+ * `ctx.tools.register`. Its only teardown was a 5 s heartbeat inside the same
+ * apply(). Two consequences, both visible to the model:
+ *
+ *   1. a VM deleted from the panel still left ~19 `mcp__windows__*` schemas in
+ *      EVERY session's tool list until the next beat — dead names that cost
+ *      context and answer "connection refused";
+ *   2. the heartbeat is per-apply, so a session created from a different ctx
+ *      (or a reloaded plugin) could not take the names down at all, and a
+ *      second attach raced itself into two SSH sessions.
+ *
+ * The fix is four layers, and every one of them is in THIS file's process, not
+ * in the plugin instance:
+ *
+ *   (1) WIN_MCP, module level, so every apply() and every session shares one
+ *       view of "is the bridge up, and which names does it own".
+ *   (2) Registration/disposal by HAND (`registrations: Map<name, dispose>`),
+ *       not by `ctx.effect`'s return value: an effect unwinds with ITS ctx, and
+ *       the names are global. teardown() can therefore be called from the state
+ *       poll, from the client's own exit, from a plugin dispose, or from a
+ *       per-agent pre-step self-heal, and always removes exactly the names it
+ *       registered.
+ *   (3) A PER-AGENT DUAL GATE: `restrict({deny})` hides the names from an agent
+ *       that has not passed the grant+reveal gate, and `tools.guard` vetoes the
+ *       call at dispatch time with a structured refusal — so a name that is
+ *       still visible (a race, a cached step admission) is REFUSED, never run.
+ *   (4) A reveal (`windows_desktop`) and a doctor (`windows_mcp_doctor`) that
+ *       can PROVE the leak surface: `windows_mcp_doctor` reports every global
+ *       schema under TOOL_PREFIX, and offline that list MUST be empty.
+ *
+ * COST CONTROL still applies: the guest's schema is ~3-8k tokens, so nothing is
+ * attached unless a Windows computer is bound to a session AND online, and the
+ * revealed tools stay hidden (restricted) until the model asks for the desktop.
+ */
+const WIN_MCP = {
+  /** The computer whose guest MCP server is attached ('' when none). */
+  name: '',
+  /** The live SSH+MCP client (null when none). */
+  client: null,
+  /** True only while a handshake has completed AND the poll agrees. */
+  online: false,
+  /** The in-flight attach promise, so two beats never open two SSH sessions. */
+  inflight: null,
+  /**
+   * THE ATTACH GENERATION (J20-4). Bumped by every `teardown()`, and read by
+   * the attach that is currently in flight: an attach that crosses a teardown
+   * (`await client.connect()` is 45 s wide) MUST NOT register a single name
+   * afterwards. The bump is name-independent, so a delete that arrives while
+   * the target is still unnamed (WIN_MCP.name === '') is covered too.
+   */
+  generation: 0,
+  /** publicName -> the exact disposer ctx.tools.register() handed back. */
+  registrations: new Map(),
+  /** agent -> whether that agent has revealed the desktop. Memory only. */
+  reveals: new WeakMap(),
+  /** Every live agent whose tool view this registry gates. */
+  agents: new Set(),
+  /** The last structured failure, as `code: message`. */
+  lastError: '',
+  /** Why the bridge is in its current state, in words a human can read. */
+  reason: 'not attempted'
+}
+
+/**
+ * The bookkeeping the literal above cannot express, kept separate so the
+ * contract object stays readable. Everything here is memory-only as well: no
+ * grant, no reveal and no binding is ever written to disk or to the profile.
+ */
+const WIN_MCP_AUX = {
+  /** The plugin ctx that owns the global tool registry (set by apply()). */
+  ctx: undefined,
+  /** The supervisor socket call (set by apply()). */
+  supervisorCall: undefined,
+  /** agent -> { handle, key } — the ONE active restriction per agent. */
+  gates: new Map(),
+  /** agent -> the inject fiber that installed that agent's guard. */
+  fibers: new Map(),
+  /** sessionId -> grant boolean. */
+  grants: new Map(),
+  /** The grant a NEW session starts with: OFF unless the user flips it. */
+  grantDefault: false,
+  /** sessionIds that have revealed the desktop (for the doctor). */
+  revealedSessions: new Set(),
+  /** sessionId -> { name, at }: the computer a session asked for. */
+  targets: new Map(),
+  /** The target record the attached client was opened against. */
+  target: null,
+  /** [{ name, description, parameters }] of the attached guest tools. */
+  tools: [],
+  /** When the isOnline() answer was last refreshed. */
+  onlineCheckedAt: 0,
+  /**
+   * What the SUPERVISOR said about the bound computer on the last probe.
+   *
+   * `isOnline` cannot mean "we are already attached": the initial handshake
+   * happens exactly once, BEFORE WIN_MCP.online is set, so answering from
+   * `WIN_MCP.online` made the first connect fail with its own vm-offline. The
+   * bridge asks "is the computer reachable", and the state probe is who knows.
+   */
+  targetOnline: false,
+  /** Do not re-dial SSH before this instant (a failed attach is not a loop). */
+  retryAt: 0,
+  /** When a bind last triggered a probe, so a Linux exec cannot become a poll. */
+  lastBindSyncAt: 0,
+  /** A coalescing handle for the tools/change reapply. */
+  gateTimer: null,
+  /** The last gate installation failure (restrict/guard), for the doctor. */
+  gateError: '',
+  /**
+   * THE IN-FLIGHT ATTACH TICKET (J20-4): `{ generation, name, dead, at }`.
+   * Held by name-independent module state so `teardown()` can kill an attach
+   * whose target has not been adopted yet (`WIN_MCP.name` is still '').
+   */
+  inflightTicket: null,
+  /**
+   * Every Windows computer the supervisor's registry has shown us, refreshed by
+   * the same 30 s `vmList` that keeps the REA cache warm. It exists for ONE
+   * honest relaxation: "exactly one Windows computer exists and this session
+   * never bound anything" may use the bridge, and says so in the doctor.
+   */
+  windowsRegistryNames: [],
+  /** sessionIds that were let through by the 'implicit-single-target' rule. */
+  implicitTargets: new Set()
+}
+
+/**
+ * THE STATE STREAM (J20-3). One long-lived unix-socket subscription, the same
+ * socket and framing the ops channel uses:
+ *
+ *   → {"op":"subscribe","events":["vm-state","vm-removed"]}
+ *   ← {"event":"ready","events":[…]}
+ *   ← {"event":"vm-state","name":"…","state":"…"}
+ *   ← {"event":"vm-removed","name":"…"}
+ *
+ * A supervisor without the op answers `unknown op` (or closes without a
+ * `ready`), and this client then stops asking and leaves the 10 s poll to do
+ * the job — exactly the behaviour before this change. The poll keeps running
+ * either way.
+ */
+const WIN_MCP_STREAM = {
+  /** The live subscription socket, or null. */
+  socket: null,
+  /** The partially received line. */
+  buffer: '',
+  /** The pending reconnect timer (unref'd), or null. */
+  retryTimer: null,
+  /** Current backoff; 0 while the stream is live. */
+  retryMs: 0,
+  /** Consecutive attempts that never reached `ready`. */
+  attempts: 0,
+  /** True between `ready` and the socket closing. */
+  live: false,
+  /** null = unknown, true = the supervisor speaks subscribe, false = it does not. */
+  supported: null,
+  /** Set by the plugin dispose, so the retry chain stops for good. */
+  closed: false,
+  /** The coalescing timer for a state-event burst, or null. */
+  syncTimer: null,
+  /** The socket path, remembered for the reconnect. */
+  socketPath: '',
+  /** When `ready` last arrived / when an event last arrived. */
+  readyAt: 0,
+  lastEventAt: 0,
+  /** The last event, as `event:name:state` — the doctor prints it. */
+  lastEvent: '',
+  /** How many state events this plugin consumed (proves the stream works). */
+  events: 0,
+  /** Why the stream is not live, in words the doctor can print. */
+  error: ''
+}
+
+/** The state poll: 10 s, so a delete/shutdown cannot outlive a turn boundary. */
+const WIN_MCP_DEFAULT_POLL_MS = 10_000
+/** The isOnline() cache `callTool` re-checks against (win-mcp asks per call). */
+const WIN_MCP_ONLINE_TTL_MS = 10_000
+/** The guest handshake budget — kept at 45 s, as the design requires. */
+const WIN_MCP_ATTACH_TIMEOUT_MS = 45_000
+/** After a failed attach, wait this long before dialling again. */
+const WIN_MCP_RETRY_MS = 30_000
+/** What the SSH channel is configured with, reported by the doctor. */
+const WIN_MCP_KEEPALIVE = Object.freeze({ interval: 10, countMax: 2 })
+
+/** `DSH_CUA_MCP_STATE_POLL_MS`, read at call time so a test can shrink it. */
+function windowsMcpPollMs() {
+  const raw = Number(process.env.DSH_CUA_MCP_STATE_POLL_MS ?? '')
+  return Number.isFinite(raw) && raw >= 1000 ? Math.floor(raw) : WIN_MCP_DEFAULT_POLL_MS
+}
+
+/** Hand the module-level registry its host ctx and its socket call. */
+function bindWindowsMcpHost(ctx, supervisorCall) {
+  WIN_MCP_AUX.ctx = ctx
+  WIN_MCP_AUX.supervisorCall = supervisorCall
+}
+
+/** The session id an agent belongs to; '' when the agent is not addressable. */
+function sessionKeyOf(agent) {
+  const id = agent?.id ?? agent?.session?.id ?? agent?.sessionId
+  return id === undefined || id === null ? '' : String(id)
+}
+
+/** The Computer Use grant of one agent's session (default OFF). */
+function grantFor(agent) {
+  const key = sessionKeyOf(agent)
+  if (WIN_MCP_AUX.grants.has(key)) return WIN_MCP_AUX.grants.get(key) === true
+  return WIN_MCP_AUX.grantDefault === true
+}
+
+/** Whether this agent has asked for the desktop (the reveal gate). */
+function revealedFor(agent) {
+  if (agent === undefined || agent === null) return false
+  return WIN_MCP.reveals.get(agent) === true
+}
+
+/**
+ * CROSS-SESSION TARGETING (J20-5).
+ *
+ * One process, one attached Windows computer, MANY sessions. The attach itself
+ * is a global resource (one SSH session, one set of guest tools), so it is
+ * resolved from the most recent binding — but the TOOLS may only be used by the
+ * session that bound THAT computer. Without this, session B (which never named
+ * a computer) clicked on session A's Windows desktop, because the guard only
+ * asked "is the grant on for you" and never "is that machine yours".
+ *
+ * The rule, in order:
+ *   1. the executing agent's session has a binding → it must be the attached
+ *      name, else `not-the-target`;
+ *   2. the session has NO binding → denied, with the same code (the honest
+ *      behaviour the README claims), EXCEPT the one explicit relaxation below;
+ *   3. `implicit-single-target`: when exactly ONE Windows computer is known to
+ *      the bridge and this session never bound anything, it may use it, and the
+ *      doctor says so. A second computer withdraws the allowance.
+ */
+function boundTargetOf(agent) {
+  const key = sessionKeyOf(agent)
+  if (key === '') return null
+  const row = WIN_MCP_AUX.targets.get(key)
+  return row === undefined || row === null ? null : row
+}
+
+/**
+ * How many Windows computers EXIST — the supervisor's registry is the truth,
+ * and the attached one always counts (a row that answered a state probe exists,
+ * whatever a 30 s-old snapshot says). Only when the registry has never been
+ * read (or an older supervisor answers no registry at all) do the session
+ * bindings stand in for it, because then they are the only evidence there is.
+ */
+function knownWindowsComputers() {
+  const names = new Set(WIN_MCP_AUX.windowsRegistryNames)
+  if (WIN_MCP.name !== '') names.add(WIN_MCP.name)
+  if (names.size === 0) {
+    for (const row of WIN_MCP_AUX.targets.values()) if (row?.name) names.add(String(row.name))
+  }
+  return [...names]
+}
+
+/**
+ * Does the executing agent's session own the attached computer?
+ * Answers `{ ok: true, via }` or `{ ok: false, code, text }` — never throws, so
+ * both the restrict() gate and the dispatch guard can call it.
+ */
+function targetMatchFor(agent) {
+  const attached = WIN_MCP.name
+  if (attached === '') {
+    return { ok: false, code: 'not-the-target', bound: null, attached: '', text: 'no Windows computer is attached to this bridge right now' }
+  }
+  const row = boundTargetOf(agent)
+  if (row !== null) {
+    if (row.name === attached) return { ok: true, via: 'binding', bound: row.name, attached }
+    return {
+      ok: false,
+      code: 'not-the-target',
+      bound: row.name,
+      attached,
+      text: `this session is bound to ${row.name}; the Windows bridge is attached to ${attached}; bind this session first`
+    }
+  }
+  const key = sessionKeyOf(agent)
+  const known = knownWindowsComputers()
+  if (known.length === 1 && known[0] === attached) {
+    // The declared relaxation, recorded rather than silent: one computer, and
+    // this session never said otherwise, so there is nothing to get wrong.
+    if (key !== '') WIN_MCP_AUX.implicitTargets.add(key)
+    return { ok: true, via: 'implicit-single-target', bound: null, attached }
+  }
+  return {
+    ok: false,
+    code: 'not-the-target',
+    bound: null,
+    attached,
+    text: `this session is bound to nothing; the Windows bridge is attached to ${attached}; bind this session first (cua_vm_exec, cua_vm_gui or cua_vm_ensure on ${attached} binds it)`
+  }
+}
+
+/**
+ * Flip the grant, in memory, for one session or (no session id) for the whole
+ * process and every session that has not overridden it.
+ */
+function setWindowsGrant(sessionId, granted) {
+  const value = granted === true
+  if (sessionId === undefined || sessionId === null || sessionId === '') {
+    WIN_MCP_AUX.grantDefault = value
+    WIN_MCP_AUX.grants.clear()
+  } else {
+    WIN_MCP_AUX.grants.set(String(sessionId), value)
+  }
+  reapplyWindowsGates('grant')
+  return windowsGrantSnapshot()
+}
+
+/** What the grant route answers, so a UI and the model read the same facts. */
+function windowsGrantSnapshot() {
+  return {
+    default: WIN_MCP_AUX.grantDefault === true ? 'on' : 'off',
+    on: [...WIN_MCP_AUX.grants.entries()].filter(([, value]) => value === true).map(([key]) => key),
+    off: [...WIN_MCP_AUX.grants.entries()].filter(([, value]) => value !== true).map(([key]) => key),
+    sessions: WIN_MCP.agents.size,
+    online: WIN_MCP.online === true,
+    revealed: [...WIN_MCP_AUX.revealedSessions]
+  }
+}
+
+/**
+ * The names an agent must NOT see: every name this bridge owns, unless the
+ * bridge is online AND that agent has the grant, the reveal AND owns the
+ * attached computer. The target check is what makes a second session's tool
+ * list honest: its names are hidden exactly like they were offline.
+ */
+function gateDenyList(agent) {
+  const names = [...WIN_MCP.registrations.keys()]
+  if (names.length === 0) return []
+  const open = WIN_MCP.online === true
+    && grantFor(agent) === true
+    && revealedFor(agent) === true
+    && targetMatchFor(agent).ok === true
+  return open ? [] : names
+}
+
+/**
+ * Apply (or lift) ONE agent's restriction, reusing the handle when the deny set
+ * did not change. `restrict()` itself emits `tools/change`, so an unchanged key
+ * MUST short-circuit or the listener re-enters for ever.
+ */
+function applyAgentGate(agent, reason = '') {
+  if (agent === undefined || agent === null) return
+  let tools
+  try {
+    tools = agent.ctx?.get?.('tools')
+  } catch {
+    tools = undefined
+  }
+  if (tools === undefined || tools === null) return
+  const deny = gateDenyList(agent)
+  const key = deny.join(',')
+  const record = WIN_MCP_AUX.gates.get(agent) ?? { handle: null, key: null }
+  if (record.key === key) {
+    WIN_MCP_AUX.gates.set(agent, record)
+    return
+  }
+  if (record.handle !== null) {
+    try { record.handle() } catch { /* the layer may already be gone */ }
+    record.handle = null
+  }
+  record.key = key
+  if (deny.length > 0) {
+    try {
+      const handle = tools.restrict({ deny })
+      record.handle = typeof handle === 'function' ? handle : null
+    } catch (error) {
+      // A name that was disposed between the snapshot and the call is not an
+      // unknown tool any more: forget the key so the next beat retries cleanly.
+      record.key = null
+      WIN_MCP_AUX.gateError = `${reason || 'gate'}: ${error?.message ?? error}`
+    }
+  }
+  WIN_MCP_AUX.gates.set(agent, record)
+}
+
+/** Re-gate every agent this registry knows (state transition, reveal, attach). */
+function reapplyWindowsGates(reason = '') {
+  for (const agent of [...WIN_MCP.agents]) {
+    try { applyAgentGate(agent, reason) } catch (error) {
+      WIN_MCP_AUX.gateError = `${reason || 'gate'}: ${error?.message ?? error}`
+    }
+  }
+}
+
+/** Coalesce a storm of tools/change emissions (19 registers) into one pass. */
+function scheduleWindowsGates(reason = '') {
+  if (WIN_MCP_AUX.gateTimer !== null) return
+  WIN_MCP_AUX.gateTimer = setImmediate(() => {
+    WIN_MCP_AUX.gateTimer = null
+    reapplyWindowsGates(reason)
+  })
+  WIN_MCP_AUX.gateTimer.unref?.()
+}
+
+/** Install the per-agent guard once; the restriction is applied by the gate. */
+function installWindowsAgent(agent) {
+  if (agent === undefined || agent === null) return
+  if (WIN_MCP.agents.has(agent)) return
+  WIN_MCP.agents.add(agent)
+  try {
+    const fiber = agent.ctx.inject(['tools'], (scoped) => {
+      // The guard reads LIVE module state at dispatch time, so an agent whose
+      // gate was applied before the attach still vetoes the call afterwards.
+      scoped.tools.guard((execution) => windowsGuardDecision(execution))
+    })
+    WIN_MCP_AUX.fibers.set(agent, fiber)
+  } catch (error) {
+    WIN_MCP_AUX.gateError = `guard install: ${error?.message ?? error}`
+  }
+  applyAgentGate(agent, 'agent-created')
+}
+
+/** Drop every trace of one agent: the guard fiber, the restriction, the reveal. */
+function disposeWindowsAgent(agent) {
+  if (agent === undefined || agent === null) return
+  WIN_MCP.agents.delete(agent)
+  const key = sessionKeyOf(agent)
+  if (key !== '') {
+    WIN_MCP_AUX.grants.delete(key)
+    WIN_MCP_AUX.targets.delete(key)
+    WIN_MCP_AUX.revealedSessions.delete(key)
+  }
+  const record = WIN_MCP_AUX.gates.get(agent)
+  WIN_MCP_AUX.gates.delete(agent)
+  if (record?.handle) {
+    try { record.handle() } catch { /* already lifted */ }
+  }
+  const fiber = WIN_MCP_AUX.fibers.get(agent)
+  WIN_MCP_AUX.fibers.delete(agent)
+  if (fiber !== undefined) {
+    try { void Promise.resolve(fiber.dispose()).catch(() => {}) } catch { /* already disposed */ }
+  }
+}
+
+/**
+ * THE DISPATCH VETO.
+ *
+ * A hidden tool that is still called (a step admission captured before the
+ * attach, a name that survived a race) must be REFUSED with a reason the model
+ * can branch on, and never run. The structured identity (`info.code`) is what
+ * the D-plugin part reads back; the same code is also written into the reason
+ * as a `code:` line so it survives into the tool output text the model sees.
+ */
+function windowsGuardDecision(execution) {
+  const toolName = typeof execution?.name === 'string' ? execution.name : ''
+  if (toolName.startsWith(TOOL_PREFIX) === false) return undefined
+  if (WIN_MCP.online !== true) {
+    return {
+      reason: [
+        `refused: the Windows computer is not online, so ${toolName} cannot run`,
+        'code: vm-offline',
+        `why: ${WIN_MCP.reason || 'the bridge is down'}${WIN_MCP.lastError ? ` (${WIN_MCP.lastError})` : ''}`,
+        'next: start the computer (cua_vm_start) and call windows_desktop again, or use cua_vm_gui for a screenshot loop'
+      ].join('\n'),
+      info: { name: toolName, code: 'vm-offline', reason: WIN_MCP.reason }
+    }
+  }
+  const agent = execution?.agent
+  // THE TARGET CHECK RUNS EVEN WHEN `execution.agent` IS MISSING. An execution
+  // whose session cannot be named has no binding, so it has no right to the
+  // attached computer's desktop: the refusal is the same `not-the-target` the
+  // mismatch produces, with the reason spelled out.
+  const match = targetMatchFor(agent)
+  if (match.ok !== true) {
+    return {
+      reason: [
+        `refused: ${toolName} drives the Windows computer ${match.attached || 'attached to this bridge'}, and this session may not use it`,
+        `code: ${match.code}`,
+        `why: ${match.text}`,
+        'next: run cua_vm_exec, cua_vm_gui or cua_vm_ensure on the computer this session means (that binds it), then call windows_desktop again'
+      ].join('\n'),
+      info: { name: toolName, code: match.code, bound: match.bound ?? null, attached: match.attached ?? '' }
+    }
+  }
+  if (agent !== undefined && agent !== null) {
+    if (grantFor(agent) !== true) {
+      return {
+        reason: [
+          `refused: the Computer Use grant is off for this session, so ${toolName} did not run`,
+          'code: grant-off',
+          'next: the user turns it on (Personal VM panel → Computer Use, or POST /dsh-cua-vm/cua-grant { "grant": true }); the grant is memory-only and per session'
+        ].join('\n'),
+        info: { name: toolName, code: 'grant-off' }
+      }
+    }
+    if (revealedFor(agent) !== true) {
+      return {
+        reason: [
+          `refused: ${toolName} is hidden until this session reveals the desktop`,
+          'code: reveal-required',
+          'next: call windows_desktop (no arguments) first; it lists the tools it just unhid'
+        ].join('\n'),
+        info: { name: toolName, code: 'reveal-required' }
+      }
+    }
+  }
+  return undefined
+}
+
+/** Every global tool name on the host registry — the leak surface the doctor checks. */
+function globalSchemaNames() {
+  const ctx = WIN_MCP_AUX.ctx
+  if (ctx === undefined) return []
+  try {
+    const schemas = ctx.tools.schemas()
+    return (Array.isArray(schemas) ? schemas : []).map((schema) => String(schema?.name ?? '')).filter((name) => name !== '')
+  } catch {
+    return []
+  }
+}
+
+/**
+ * TAKE THE BRIDGE DOWN. Every entry point funnels through here, and it is
+ * idempotent: the map is emptied BEFORE the disposers run, so a disposer that
+ * re-enters cannot see a half-torn registry.
+ *
+ * J20-4: it also BUMPs the attach generation and kills the ticket of an attach
+ * that is currently in flight. `WIN_MCP.name` is '' for that attach (it is set
+ * only after `connect()` answers), so a name comparison alone could not catch
+ * it — the generation is name-independent on purpose.
+ */
+function teardown(reason) {
+  const why = String(reason ?? 'unspecified')
+  const hadState = WIN_MCP.name !== '' || WIN_MCP.client !== null || WIN_MCP.online === true || WIN_MCP.registrations.size > 0
+  // Invalidate any attach that is between `connect()` and registration FIRST,
+  // so nothing it does after this line can put a name back on the registry.
+  WIN_MCP.generation += 1
+  if (WIN_MCP_AUX.inflightTicket !== null) WIN_MCP_AUX.inflightTicket.dead = true
+  const client = WIN_MCP.client
+  WIN_MCP.client = null
+  WIN_MCP.online = false
+  WIN_MCP.name = ''
+  WIN_MCP_AUX.target = null
+  WIN_MCP_AUX.tools = []
+  const disposers = [...WIN_MCP.registrations.values()]
+  WIN_MCP.registrations.clear()
+  for (const dispose of disposers) {
+    try { dispose() } catch { /* the tool registry may already be gone */ }
+  }
+  try { client?.close() } catch { /* the child may already be dead */ }
+  WIN_MCP_AUX.targetOnline = false
+  WIN_MCP.reason = why
+  if (hadState) console.log(`[cua-vm] windows MCP torn down (${why})`)
+  reapplyWindowsGates(`teardown:${why}`)
+}
+
+/** One supervisor probe of a bound computer; tolerates a pre-WP5 supervisor. */
+async function resolveOneWindowsTarget(name) {
+  const call = WIN_MCP_AUX.supervisorCall
+  if (typeof call !== 'function') return { ok: false, reason: 'no supervisor call is bound' }
+  let state
+  try {
+    state = await call({ op: 'vmWindowsMcpState', name })
+  } catch (error) {
+    const text = String(error?.message ?? error)
+    if (/unknown op/iu.test(text) === false) return { ok: false, reason: `supervisor-unavailable: ${text}` }
+    // LEGACY FALLBACK: a supervisor older than this plugin has no state op. The
+    // old attach op still honors an explicit name, so the SAME target rule holds
+    // — and a row that answers with a different computer is refused, never
+    // adopted ("never the first ready row").
+    try {
+      const answer = await call({ op: 'vmWindowsMcp', name })
+      if (answer?.available !== true) return { ok: false, reason: `not-online: ${answer?.reason ?? 'the supervisor offered no endpoint'}` }
+      const actual = String(answer.name ?? name)
+      if (actual !== name) return { ok: false, reason: `not-the-target (the supervisor offered ${actual} instead of ${name})` }
+      return {
+        ok: true,
+        target: { name, host: '127.0.0.1', sshPort: Number(answer.sshPort ?? 0), keyPath: answer.keyPath, user: answer.user ?? 'cua', state: String(answer.state ?? 'ready') }
+      }
+    } catch (fallbackError) {
+      return { ok: false, reason: `not-online: ${fallbackError?.message ?? fallbackError}` }
+    }
+  }
+  const answer = state ?? {}
+  const actual = String(answer.name ?? name)
+  if (actual !== name) return { ok: false, reason: `not-the-target (the supervisor reported ${actual} instead of ${name})` }
+  const kind = String(answer.kind ?? 'windows')
+  if (kind !== 'windows') return { ok: false, reason: `not-the-target (${name} is a ${kind} computer, and only a Windows one speaks dsh-cua)` }
+  const rowState = String(answer.state ?? 'unknown')
+  // An explicit refusal keeps its own words: "no ready Windows computer" is a
+  // better reason than "state unknown".
+  if (answer.available === false && answer.reason !== undefined) {
+    return { ok: false, reason: `not-online: ${answer.reason}` }
+  }
+  // `available` and `online` are both accepted: the op is new supervisor-side,
+  // and a state answer that only carries `state: "ready"` still means online.
+  const online = answer.online === true || answer.available === true || rowState === 'ready'
+  if (online !== true) return { ok: false, reason: `vm-state:${rowState} (not online)` }
+  let sshPort = Number(answer.sshPort ?? 0)
+  let keyPath = answer.keyPath
+  let user = answer.user ?? 'cua'
+  if (!(sshPort > 0)) {
+    // The state op may answer facts only; the endpoint details still come from
+    // the attach op, for the SAME name.
+    try {
+      const detail = await call({ op: 'vmWindowsMcp', name })
+      if (detail?.available === true && String(detail.name ?? name) === name) {
+        sshPort = Number(detail.sshPort ?? 0)
+        keyPath = detail.keyPath ?? keyPath
+        user = detail.user ?? user
+      }
+    } catch { /* the host is online but the details op failed: not attachable */ }
+  }
+  if (!(sshPort > 0)) return { ok: false, reason: `not-online (no SSH port for ${name})` }
+  return { ok: true, target: { name, host: String(answer.host ?? '127.0.0.1'), sshPort, keyPath, user: String(user), state: rowState } }
+}
+
+/**
+ * WHICH COMPUTER. Not the first ready row: the name a SESSION recorded when it
+ * created, ensured, started, executed on or drove that computer. The most
+ * recent binding wins, and a binding that no longer resolves is skipped rather
+ * than adopted — a mismatch is `not-the-target`, never an attach.
+ */
+async function resolveWindowsTarget() {
+  const rows = [...WIN_MCP_AUX.targets.entries()].sort((left, right) => right[1].at - left[1].at)
+  const names = []
+  for (const [, row] of rows) {
+    if (row.name === '' || names.includes(row.name)) continue
+    names.push(row.name)
+    if (names.length >= 4) break
+  }
+  if (names.length === 0) {
+    WIN_MCP.reason = 'not-the-target (no computer is bound to a session yet: cua_vm_create/cua_vm_ensure, or cua_vm_exec/cua_vm_gui on a Windows computer, binds it)'
+    return null
+  }
+  let first = ''
+  for (const name of names) {
+    const resolved = await resolveOneWindowsTarget(name)
+    if (resolved.ok === true) {
+      WIN_MCP_AUX.targetOnline = true
+      return resolved.target
+    }
+    if (first === '') first = resolved.reason
+  }
+  WIN_MCP_AUX.targetOnline = false
+  WIN_MCP.reason = first === '' ? 'not-the-target' : first
+  return null
+}
+
+/**
+ * ATTACH — one SSH handshake, then register every guest tool under its public
+ * `mcp__windows__*` name. Registration is by hand (NOT `ctx.effect`) so the
+ * disposer is ours to call from any teardown entry point.
+ */
+async function attachWindowsMcp(target) {
+  if (WIN_MCP.inflight !== null) return WIN_MCP.inflight
+  const ctx = WIN_MCP_AUX.ctx
+  if (ctx === undefined) return undefined
+  let ownTicket = null
+  WIN_MCP.inflight = (async () => {
+    if (WIN_MCP_AUX.retryAt > Date.now()) return
+    teardown('switching computers')
+    // THE TICKET (J20-4). `teardown()` above has just bumped the generation, so
+    // this attach owns exactly the generation it was born in. Anything that
+    // tears the bridge down while `connect()` is waiting kills the ticket, and
+    // every write below re-checks it — no name is registered after that point.
+    const generation = WIN_MCP.generation
+    const ticket = { generation, name: String(target.name ?? ''), dead: false, at: Date.now() }
+    WIN_MCP_AUX.inflightTicket = ticket
+    ownTicket = ticket
+    const isDead = () => ticket.dead === true || WIN_MCP.generation !== generation
+    // Abandon ship without leaving a name, a client or an `online` behind.
+    const abort = (why) => {
+      ticket.dead = true
+      try { client?.close() } catch { /* never opened */ }
+      if (WIN_MCP.client === client) WIN_MCP.client = null
+      if (WIN_MCP.name === target.name) WIN_MCP.name = ''
+      WIN_MCP.online = false
+      WIN_MCP.reason = `${why} (attach aborted)`
+      console.log(`[cua-vm] windows MCP attach to ${target.name} aborted: ${why}`)
+    }
+    // The resolution that got us here IS the online verdict the client asks for.
+    WIN_MCP_AUX.targetOnline = true
+    let client = null
+    try {
+      if (!(Number(target.sshPort) > 0)) throw mcpError('no-ssh-port', `the supervisor offered no SSH port for ${target.name}`)
+      client = createDshCuaClient({
+        name: target.name,
+        host: target.host ?? '127.0.0.1',
+        sshPort: target.sshPort,
+        keyPath: target.keyPath,
+        user: target.user ?? 'cua',
+        timeoutMs: WIN_MCP_ATTACH_TIMEOUT_MS,
+        // The client re-checks this before EVERY call; a stale session must fail
+        // with vm-offline instead of hanging on a half-open socket.
+        isOnline: () => windowsMcpIsOnline(),
+        // A dead child is an immediate teardown, not a 5 s wait for the beat.
+        onClosed: (code) => {
+          if (WIN_MCP.client !== client) return
+          WIN_MCP.lastError = `the guest MCP session ended (exit ${code})`
+          teardown(`client-closed:${code}`)
+        }
+      })
+      if (isDead()) { abort('the bridge was torn down while the handshake was in flight'); return }
+      const session = await client.connect()
+      // THE RACE J20-4 NAMES: a row deleted, or a shutdown observed, during the
+      // 45 s handshake has already called teardown(); registering now would put
+      // 19 dead schemas back on every session's tool list until the next beat.
+      if (isDead()) { abort('the bridge was torn down during the handshake'); return }
+      WIN_MCP.client = client
+      WIN_MCP.name = target.name
+      WIN_MCP.online = true
+      WIN_MCP.lastError = ''
+      WIN_MCP_AUX.onlineCheckedAt = Date.now()
+      WIN_MCP_AUX.target = { ...target }
+      const failed = []
+      WIN_MCP_AUX.tools = session.tools.map((tool) => ({
+        name: windowsToolName(tool.name),
+        description: String(tool.description ?? tool.name),
+        parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} }
+      }))
+      for (const tool of session.tools) {
+        // Re-checked BEFORE EACH register: `ctx.tools.register` may grow an
+        // await later, and a teardown that lands between two registrations must
+        // cost zero names, not "the rest of them".
+        if (isDead()) { abort('the bridge was torn down during registration'); return }
+        const publicName = windowsToolName(tool.name)
+        const definition = {
+          name: publicName,
+          description: `${tool.description ?? tool.name} (dsh-cua, Windows computer ${target.name})`,
+          parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} },
+          // The design's budget: a pywinauto round trip is fast, and the SSH
+          // keepalive (10s × 2) decides a dead link long before this.
+          timeoutMs: WIN_MCP_ATTACH_TIMEOUT_MS,
+          output: textOutput('The guest tool result as JSON, or a `code:` line when it failed.'),
+          async execute(args = {}) {
+            try {
+              const result = await client.callTool(windowsGuestToolName(tool.name), args ?? {})
+              return { text: JSON.stringify(result) }
+            } catch (error) {
+              // D PLUGIN PART: the structured code reaches the MODEL as text, so
+              // it can branch instead of guessing at an SSH message.
+              const code = error?.code ?? 'tool-failed'
+              return { text: `${error?.message ?? error}\ncode: ${code}` }
+            }
+          }
+        }
+        try {
+          const dispose = ctx.tools.register(definition)
+          WIN_MCP.registrations.set(publicName, dispose)
+        } catch (error) {
+          // ONE bad guest tool must not cost the other eighteen: the name is
+          // recorded as a registration failure, and the bridge stays up.
+          failed.push(`${publicName}: ${error?.message ?? error}`)
+        }
+      }
+      if (failed.length > 0) WIN_MCP.lastError = `registration failed for ${failed.length} tool(s): ${failed[0]}`
+      WIN_MCP.reason = `attached (${WIN_MCP.registrations.size} tool(s))`
+      WIN_MCP_AUX.retryAt = 0
+      console.log(`[cua-vm] windows MCP attached to ${target.name} (${session.tools.length} tool(s))`)
+      reapplyWindowsGates('attach')
+    } catch (error) {
+      try { client?.close() } catch { /* never opened */ }
+      WIN_MCP.online = false
+      WIN_MCP.lastError = `${error?.code ?? 'attach-failed'}: ${error?.message ?? error}`
+      WIN_MCP.reason = `attach failed: ${WIN_MCP.lastError}`
+      WIN_MCP_AUX.retryAt = Date.now() + WIN_MCP_RETRY_MS
+      console.log(`[cua-vm] windows MCP NOT attached: ${WIN_MCP.lastError}`)
+      teardown(WIN_MCP.reason)
+    }
+  })().finally(() => {
+    WIN_MCP.inflight = null
+    // Only clear OUR ticket: a newer attach (or a teardown that already killed
+    // it) must keep whatever it put there.
+    if (WIN_MCP_AUX.inflightTicket === ownTicket) WIN_MCP_AUX.inflightTicket = null
+  })
+  return WIN_MCP.inflight
+}
+
+/**
+ * THE STATE PATH. Since J20-3 this is the BELT, not the only brace: the
+ * supervisor's `subscribe` stream (see `handleVmEvent`) delivers a transition
+ * inside a turn, and this poll still runs behind it — a slower cadence on a
+ * supervisor that speaks the stream, the old 10 s answer on one that does not.
+ *
+ * Every tick resolves the bound computer and either confirms the attach, tears
+ * it down (the row is gone: `vm-removed`; the row is not ready: `vm-state:*`)
+ * or dials SSH on the transition into online. Nothing here guesses a target.
+ */
+async function syncWindowsMcp(reason = 'poll') {
+  if (windowsMcpEnabled() !== true) {
+    teardown(`disabled (DSH_CUA_VM_WIN_MCP=0) via ${reason}`)
+    return
+  }
+  if (typeof WIN_MCP_AUX.supervisorCall !== 'function') return
+  const target = await resolveWindowsTarget()
+  if (target === null) {
+    teardown(WIN_MCP.reason || 'not-the-target')
+    return
+  }
+  if (WIN_MCP.online === true && WIN_MCP.name === target.name && WIN_MCP.client?.state?.connected === true) {
+    WIN_MCP.reason = `attached (${WIN_MCP.registrations.size} tool(s))`
+    return
+  }
+  await attachWindowsMcp(target)
+}
+
+/**
+ * The `isOnline` the guest client asks before every call (10 s cache).
+ *
+ * It answers "is the bound computer reachable", which is TRUE during the very
+ * first handshake — the supervisor's state probe said so one moment ago. The
+ * 10 s cache means a dead link costs at most one refresh before the call is
+ * refused with vm-offline instead of hanging on a half-open socket.
+ */
+function windowsMcpIsOnline() {
+  if (WIN_MCP.online !== true && WIN_MCP_AUX.targetOnline !== true) return false
+  const now = Date.now()
+  if (now - WIN_MCP_AUX.onlineCheckedAt > WIN_MCP_ONLINE_TTL_MS) {
+    WIN_MCP_AUX.onlineCheckedAt = now
+    void syncWindowsMcp('online check').catch(() => {})
+  }
+  return true
+}
+
+/* ------------------------------------------------------------------ *
+ * J20-3 — CONSUMING THE SUPERVISOR'S STATE BUS
+ *
+ * The supervisor has answered `{"op":"subscribe"}` with a newline-delimited
+ * event stream since WP-4 (one line per REAL transition, a `ready` line first,
+ * a 25 s ping to reap dead clients). This plugin never consumed it, so a
+ * shutdown took up to one 10 s poll interval to reach `teardown()` — the README
+ * claims a single idempotent teardown behind that bus, and this is the client
+ * half of the claim.
+ *
+ * The stream is a plain unix-socket connection on the SAME socket as the ops
+ * channel, and every event rides the SAME two functions the poll uses
+ * (`forgetSessionTarget` / `teardown` + `syncWindowsMcp`). Nothing here can
+ * invent a target: an event only ever acts on the attached name, an in-flight
+ * attach ticket, or a name some session already bound.
+ *
+ * A supervisor that does not speak `subscribe` answers `unknown op` (or closes
+ * without `ready`); the client then backs off and leaves the 10 s poll alone,
+ * which is exactly the pre-J20-3 behaviour. The poll keeps running either way.
+ * ------------------------------------------------------------------ */
+const WIN_MCP_STREAM_BACKOFF_MS = Object.freeze([1000, 2000, 5000, 10_000, 30_000, 60_000])
+/** Coalesce a boot's burst of transitions into one state probe. */
+const WIN_MCP_STREAM_SYNC_MS = 50
+
+/** Open (or re-open) the one subscription. Safe to call twice. */
+function streamOpen(socketPath) {
+  if (WIN_MCP_STREAM.closed === true) return
+  if (WIN_MCP_STREAM.socket !== null) return
+  WIN_MCP_STREAM.socketPath = socketPath
+  let socket
+  try {
+    socket = net.connect(socketPath)
+  } catch (error) {
+    streamScheduleRetry(`state stream: ${error?.message ?? error}`)
+    return
+  }
+  WIN_MCP_STREAM.socket = socket
+  let settled = false
+  const finish = (why) => {
+    if (settled === true) return
+    settled = true
+    if (WIN_MCP_STREAM.socket === socket) WIN_MCP_STREAM.socket = null
+    WIN_MCP_STREAM.live = false
+    try { socket.destroy() } catch { /* already gone */ }
+    if (WIN_MCP_STREAM.closed !== true) streamScheduleRetry(why)
+  }
+  socket.setEncoding('utf8')
+  socket.on('connect', () => {
+    try {
+      // `vm-removed` rides the state stream supervisor-side, but asking for it
+      // by name is the contract the supervisor documents.
+      socket.write(`${JSON.stringify({ op: 'subscribe', events: ['vm-state', 'vm-removed'] })}\n`)
+    } catch (error) {
+      finish(`state stream: ${error?.message ?? error}`)
+    }
+  })
+  socket.on('data', (chunk) => {
+    WIN_MCP_STREAM.buffer += chunk
+    if (WIN_MCP_STREAM.buffer.length > 1024 * 1024) {
+      WIN_MCP_STREAM.buffer = ''
+      finish('state stream: 1 MiB without a newline')
+      return
+    }
+    let at = WIN_MCP_STREAM.buffer.indexOf('\n')
+    while (at >= 0) {
+      const line = WIN_MCP_STREAM.buffer.slice(0, at)
+      WIN_MCP_STREAM.buffer = WIN_MCP_STREAM.buffer.slice(at + 1)
+      if (line.trim() !== '') {
+        let event = null
+        try { event = JSON.parse(line) } catch { event = null }
+        if (event !== null) handleStreamLine(event, finish)
+      }
+      at = WIN_MCP_STREAM.buffer.indexOf('\n')
+    }
+  })
+  socket.on('error', (error) => finish(`state stream: ${error?.message ?? error}`))
+  socket.on('close', () => finish(WIN_MCP_STREAM.live === true
+    ? 'state stream: the supervisor closed the subscription'
+    : 'state stream: no ready line (the supervisor may be older than the subscribe op)'))
+}
+
+/** One backoff step; unref'd, so a dead supervisor cannot hold the process. */
+function streamScheduleRetry(why) {
+  WIN_MCP_STREAM.live = false
+  if (why !== '') WIN_MCP_STREAM.error = String(why)
+  if (WIN_MCP_STREAM.closed === true || WIN_MCP_STREAM.retryTimer !== null) return
+  const index = Math.min(WIN_MCP_STREAM.attempts, WIN_MCP_STREAM_BACKOFF_MS.length - 1)
+  const wait = WIN_MCP_STREAM_BACKOFF_MS[index]
+  WIN_MCP_STREAM.attempts += 1
+  WIN_MCP_STREAM.retryMs = wait
+  const timer = setTimeout(() => {
+    WIN_MCP_STREAM.retryTimer = null
+    streamOpen(WIN_MCP_STREAM.socketPath)
+  }, wait)
+  timer.unref?.()
+  WIN_MCP_STREAM.retryTimer = timer
+}
+
+/** Start consuming the bus (idempotent), and stop for good on plugin dispose. */
+function startWindowsStateStream(socketPath) {
+  WIN_MCP_STREAM.closed = false
+  streamOpen(socketPath)
+}
+
+function stopWindowsStateStream() {
+  WIN_MCP_STREAM.closed = true
+  if (WIN_MCP_STREAM.retryTimer !== null) {
+    clearTimeout(WIN_MCP_STREAM.retryTimer)
+    WIN_MCP_STREAM.retryTimer = null
+  }
+  if (WIN_MCP_STREAM.syncTimer !== null) {
+    clearTimeout(WIN_MCP_STREAM.syncTimer)
+    WIN_MCP_STREAM.syncTimer = null
+  }
+  const socket = WIN_MCP_STREAM.socket
+  WIN_MCP_STREAM.socket = null
+  WIN_MCP_STREAM.live = false
+  if (socket !== null) {
+    try { socket.destroy() } catch { /* already gone */ }
+  }
+}
+
+/** A state transition this bridge cares about → ONE coalesced state probe. */
+function scheduleStreamSync() {
+  if (WIN_MCP_STREAM.syncTimer !== null) return
+  const timer = setTimeout(() => {
+    WIN_MCP_STREAM.syncTimer = null
+    void syncWindowsMcp('stream').catch(() => {})
+  }, WIN_MCP_STREAM_SYNC_MS)
+  timer.unref?.()
+  WIN_MCP_STREAM.syncTimer = timer
+}
+
+/** One parsed line from the subscription. */
+function handleStreamLine(event, finish) {
+  if (event?.event === 'ready') {
+    WIN_MCP_STREAM.live = true
+    WIN_MCP_STREAM.supported = true
+    WIN_MCP_STREAM.attempts = 0
+    WIN_MCP_STREAM.retryMs = 0
+    WIN_MCP_STREAM.readyAt = Date.now()
+    WIN_MCP_STREAM.error = ''
+    return
+  }
+  if (typeof event?.event !== 'string') {
+    // An ANSWER, not an event: a supervisor without the op answers `ok: false`.
+    if (event?.ok === false) {
+      WIN_MCP_STREAM.supported = false
+      finish(`state stream unsupported: ${String(event.error ?? 'refused')} (the 10 s poll carries the state)`)
+    }
+    return
+  }
+  if (event.event === 'ping') return
+  WIN_MCP_STREAM.events += 1
+  WIN_MCP_STREAM.lastEventAt = Date.now()
+  WIN_MCP_STREAM.lastEvent = `${event.event}:${String(event.name ?? '')}:${String(event.state ?? '')}`
+  handleVmEvent(event)
+}
+
+/**
+ * THE BUS → THE SAME TWO PATHS THE POLL USES.
+ *
+ * `vm-removed`  : the row is gone → forget the bindings and tear down (the
+ *                 in-flight ticket dies too; see `forgetSessionTarget`);
+ * `vm-state`    : not online → tear down NOW; online → let the poll's one state
+ *                 probe attach, so the "which computer" rule is never duplicated.
+ */
+function handleVmEvent(event) {
+  const what = String(event?.event ?? '')
+  const name = String(event?.name ?? '')
+  if (name === '') return
+  if (what === 'vm-removed') {
+    forgetSessionTarget(name)
+    return
+  }
+  if (what !== 'vm-state') return
+  const state = String(event?.state ?? '')
+  const online = state === 'ready'
+  const attached = WIN_MCP.name === name
+  const inflight = WIN_MCP_AUX.inflightTicket !== null && String(WIN_MCP_AUX.inflightTicket.name ?? '') === name
+  if (online !== true && (attached === true || inflight === true)) {
+    teardown(`vm-state:${state} (stream:${name})`)
+    return
+  }
+  const relevant = attached === true
+    || inflight === true
+    || [...WIN_MCP_AUX.targets.values()].some((row) => row?.name === name)
+  if (relevant !== true) return
+  scheduleStreamSync()
+}
+
+/**
+ * PER-AGENT SELF-HEAL at the step boundary: if the SSH session died between
+ * beats, take the names away NOW instead of letting the model discover it. The
+ * step itself is never swallowed — next() runs on every path.
+ */
+function selfHealWindowsMcp(agent) {
+  try {
+    if (WIN_MCP.online !== true) {
+      applyAgentGate(agent, 'pre-step offline')
+      // ONE probe per poll interval, not one per step: a Linux-only workspace
+      // must not pay a supervisor round trip for every step it takes.
+      if (WIN_MCP_AUX.targets.size > 0 && Date.now() - WIN_MCP_AUX.onlineCheckedAt > windowsMcpPollMs()) {
+        WIN_MCP_AUX.onlineCheckedAt = Date.now()
+        void syncWindowsMcp('pre-step').catch(() => {})
+      }
+      return
+    }
+    if (WIN_MCP.client?.state?.connected !== true) {
+      teardown(`pre-step: the SSH session is gone${WIN_MCP.lastError ? ` (${WIN_MCP.lastError})` : ''}`)
+      return
+    }
+    applyAgentGate(agent, 'pre-step')
+    if (WIN_MCP_AUX.onlineCheckedAt === 0 || Date.now() - WIN_MCP_AUX.onlineCheckedAt > windowsMcpPollMs()) {
+      WIN_MCP_AUX.onlineCheckedAt = Date.now()
+      void syncWindowsMcp('pre-step').catch(() => {})
+    }
+  } catch (error) {
+    WIN_MCP_AUX.gateError = `pre-step: ${error?.message ?? error}`
+  }
+}
+
+/**
+ * BIND THE COMPUTER A SESSION ASKED FOR. Called by cua_vm_create/ensure and by
+ * cua_vm_exec/cua_vm_gui/cua_vm_start, i.e. only on the model's own explicit
+ * statement of which computer it means.
+ */
+function rememberSessionTarget(exec, name) {
+  const agent = exec?.agent
+  if (agent === undefined || agent === null) return
+  const key = sessionKeyOf(agent)
+  if (key === '') return
+  if (name === undefined || name === null || String(name) === '') return
+  const bound = String(name)
+  WIN_MCP_AUX.targets.set(key, { name: bound, at: Date.now() })
+  applyAgentGate(agent, 'bound target')
+  // Bound, but do not turn every exec into a probe: one bind-triggered sync per
+  // 5 s is enough to pick a new computer up, and the 10 s poll covers the rest.
+  const now = Date.now()
+  if ((WIN_MCP.name !== bound || WIN_MCP.online !== true) && now - WIN_MCP_AUX.lastBindSyncAt > 5000) {
+    WIN_MCP_AUX.lastBindSyncAt = now
+    void syncWindowsMcp('bound target').catch(() => {})
+  }
+}
+
+/**
+ * Forget a computer that was deleted, and take its tools away at once.
+ *
+ * J20-4: `WIN_MCP.name` is '' for an attach that is still in flight, so testing
+ * the name alone MISSED the delete that lands mid-handshake. The delete route
+ * skipped teardown, the attach finished 20 s later, and 19 schemas of a computer
+ * that no longer exists reappeared until the next poll beat. The in-flight
+ * ticket carries the name for exactly that window.
+ */
+function forgetSessionTarget(name) {
+  const gone = String(name ?? '')
+  if (gone === '') return
+  for (const [key, row] of [...WIN_MCP_AUX.targets.entries()]) {
+    if (row.name !== gone) continue
+    WIN_MCP_AUX.targets.delete(key)
+    WIN_MCP_AUX.revealedSessions.delete(key)
+  }
+  const inflightName = WIN_MCP_AUX.inflightTicket === null ? '' : String(WIN_MCP_AUX.inflightTicket.name ?? '')
+  if (WIN_MCP.name === gone || inflightName === gone) teardown(`vm-removed:${gone}`)
+}
+
+/** The reveal: unhide the bridged tools for one agent, then re-gate. */
+function revealWindowsTools(agent) {
+  const tools = Array.isArray(WIN_MCP_AUX.tools) ? WIN_MCP_AUX.tools : []
+  if (agent !== undefined && agent !== null) {
+    WIN_MCP.reveals.set(agent, true)
+    const key = sessionKeyOf(agent)
+    if (key !== '') WIN_MCP_AUX.revealedSessions.add(key)
+  }
+  const online = WIN_MCP.online === true
+  const granted = agent === undefined || agent === null ? WIN_MCP_AUX.grantDefault === true : grantFor(agent)
+  // J20-5: revealing is not a way around the target rule. A session that bound
+  // ANOTHER computer gets a structured `not-the-target` here, at the first call
+  // it makes, instead of 19 visible names that refuse one by one.
+  const match = targetMatchFor(agent)
+  const revealed = online && granted && match.ok === true
+  reapplyWindowsGates('reveal')
+  const code = revealed
+    ? ''
+    : online !== true
+      ? 'vm-offline'
+      : granted !== true
+        ? 'grant-off'
+        : (match.code ?? 'not-the-target')
+  return {
+    revealed,
+    tools: tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
+    online,
+    granted,
+    target: WIN_MCP.name === '' ? null : WIN_MCP.name,
+    bound: boundTargetOf(agent)?.name ?? null,
+    code,
+    note: revealed
+      ? `${tools.length} dsh-cua tool(s) are now visible for this session.`
+      : online !== true
+        ? `The Windows computer is not online yet (${WIN_MCP.reason}); start it and call windows_desktop again.`
+        : granted !== true
+          ? 'The Computer Use grant is off for this session, so the tools stay hidden: the user turns it on in the Personal VM panel (or POST /dsh-cua-vm/cua-grant with {"grant":true}).'
+          : `${match.text}. The tools went back to hidden for this session.`
+  }
+}
+
+/**
+ * THE DOCTOR. It answers the one question the bug was about: are any
+ * `mcp__windows__*` schemas still on the global registry while the bridge is
+ * down? Offline, `leaks` MUST be empty — anything else is `status: "leaking"`,
+ * which is exactly the state that used to persist for minutes after a delete.
+ */
+async function windowsMcpDoctor(execAgent) {
+  try {
+    if (windowsMcpEnabled() === true && typeof WIN_MCP_AUX.supervisorCall === 'function') {
+      // A fast probe, not a handshake: the doctor must answer in one socket
+      // round trip, and only the transition into online dials SSH.
+      const target = await resolveWindowsTarget()
+      if (target === null) {
+        if (WIN_MCP.online === true) teardown(WIN_MCP.reason || 'not-the-target')
+      } else if (WIN_MCP.online !== true || WIN_MCP.name !== target.name) {
+        void syncWindowsMcp('doctor').catch(() => {})
+      }
+    }
+  } catch (error) {
+    WIN_MCP.lastError = `doctor probe failed: ${error?.message ?? error}`
+  }
+  const names = globalSchemaNames()
+  const leaks = names.filter((name) => name.startsWith(TOOL_PREFIX))
+  const guestTools = Array.isArray(WIN_MCP_AUX.tools) ? WIN_MCP_AUX.tools : []
+  const registered = [...WIN_MCP.registrations.keys()]
+  // The names the GUEST offered, in their public `mcp__windows__*` form (the
+  // map is stored at attach; nothing is re-derived from a live client here).
+  const expected = guestTools.map((tool) => tool.name)
+  const target = WIN_MCP_AUX.target
+  // J20-5: WHY THIS SESSION CAN (OR CANNOT) USE THE DESKTOP. `viewer` is the
+  // executing session's binding, not a global fact, and the mismatch codes are
+  // the same strings the dispatch guard returns.
+  const viewer = (() => {
+    const key = sessionKeyOf(execAgent)
+    const match = targetMatchFor(execAgent)
+    return {
+      session: key === '' ? null : key,
+      bound: boundTargetOf(execAgent)?.name ?? null,
+      attached: WIN_MCP.name === '' ? null : WIN_MCP.name,
+      match: match.ok === true,
+      via: match.via ?? null,
+      code: match.ok === true ? null : match.code,
+      reason: match.ok === true ? '' : match.text
+    }
+  })()
+  return {
+    status: WIN_MCP.online !== true && leaks.length > 0 ? 'leaking' : 'ok',
+    enabled: windowsMcpEnabled() === true,
+    target: WIN_MCP.name === '' ? null : WIN_MCP.name,
+    online: WIN_MCP.online === true,
+    state: target?.state ?? 'unknown',
+    registered,
+    expected,
+    // The leak surface as the HOST registry sees it (the global view), which is
+    // what another session's tool list is built from.
+    schemas: names,
+    leaks,
+    grants: {
+      default: WIN_MCP_AUX.grantDefault === true ? 'on' : 'off',
+      on: [...WIN_MCP_AUX.grants.entries()].filter(([, value]) => value === true).map(([key]) => key)
+    },
+    revealed: [...WIN_MCP_AUX.revealedSessions],
+    lastError: WIN_MCP.lastError,
+    reason: WIN_MCP.reason,
+    keepalive: { interval: WIN_MCP_KEEPALIVE.interval, countMax: WIN_MCP_KEEPALIVE.countMax },
+    gate: 'restrict+guard',
+    keepaliveMs: windowsMcpPollMs(),
+    bound: [...WIN_MCP_AUX.targets.entries()].map(([session, row]) => ({ session, name: row.name, at: row.at })),
+    agents: WIN_MCP.agents.size,
+    pending: WIN_MCP.inflight !== null,
+    // J20-4: what an in-flight attach is currently aiming at, and the generation
+    // it was born in — `pending` plus `attach.pendingName` is the window in which
+    // a delete must kill the ticket instead of the (still '') name.
+    attach: {
+      generation: WIN_MCP.generation,
+      pendingName: WIN_MCP_AUX.inflightTicket === null ? null : String(WIN_MCP_AUX.inflightTicket.name ?? ''),
+      pendingDead: WIN_MCP_AUX.inflightTicket === null ? null : WIN_MCP_AUX.inflightTicket.dead === true
+    },
+    // J20-5: the executing session's view, and the ONE declared relaxation.
+    viewer,
+    implicitTarget: {
+      active: WIN_MCP_AUX.implicitTargets.size > 0,
+      reason: 'implicit-single-target',
+      computers: knownWindowsComputers(),
+      sessions: [...WIN_MCP_AUX.implicitTargets]
+    },
+    // J20-3: the supervisor's state bus, as this plugin consumes it.
+    stream: {
+      live: WIN_MCP_STREAM.live === true,
+      supported: WIN_MCP_STREAM.supported,
+      events: WIN_MCP_STREAM.events,
+      lastEvent: WIN_MCP_STREAM.lastEvent,
+      lastEventAt: WIN_MCP_STREAM.lastEventAt,
+      readyAt: WIN_MCP_STREAM.readyAt,
+      retryMs: WIN_MCP_STREAM.retryMs,
+      error: WIN_MCP_STREAM.error
+    },
+    ssh: WIN_MCP.client?.sshArgv?.() ?? (target !== null && Number(target.sshPort) > 0
+      ? sshArgv({ host: target.host ?? '127.0.0.1', port: target.sshPort, user: target.user, keyPath: target.keyPath })
+      : null),
+    gateError: WIN_MCP_AUX.gateError
+  }
+}
+
 /**
  * The prompt the model always reads. Kept as lines so the REA paragraph can be
  * appended as one more sentence-pair, not rewrapped by hand.
@@ -148,10 +1393,18 @@ export function apply(ctx, config = {}) {
   const REA_CACHE_TTL_MS = 30_000
   const reaCache = { at: 0, vms: [] }
 
-  /** The registry is `{ name: meta }`; a computer opts in with `rea: true`. */
+  /**
+   * The registry is `{ name: meta }`; a computer opts in with `rea: true`.
+   *
+   * J20-5: the same 30 s snapshot is also the ONLY cheap answer to "how many
+   * Windows computers exist at all", which the implicit-single-target rule
+   * needs. It is memory-only and refreshed off the prompt path, like the rest.
+   */
   function rememberRea(registry) {
-    reaCache.vms = Object.entries(registry ?? {})
-      .filter(([, vm]) => vm?.rea === true)
+    const rows = Object.entries(registry ?? {})
+    reaCache.vms = rows.filter(([, vm]) => vm?.rea === true).map(([name]) => name).sort()
+    WIN_MCP_AUX.windowsRegistryNames = rows
+      .filter(([, vm]) => String(vm?.kind ?? '') === 'windows')
       .map(([name]) => name)
       .sort()
     reaCache.at = Date.now()
@@ -168,96 +1421,21 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * THE dsh-cua TOOLS OF A WINDOWS COMPUTER, ATTACHED ONLY WHILE IT IS THE ONE.
+   * WP-5: THE BRIDGE IS MODULE STATE (see the block above `apply`).
    *
-   * A Windows guest is reachable over SSH, and inside it `dsh-cua` drives the
-   * desktop from the INTERACTIVE session (pywinauto cannot see windows from
-   * Session 0). Its MCP tool list is what makes element-level work cheap:
-   * `find_elements` + `type_text` return a receipt ("action_sent",
-   * "effect_verified") in a few hundred bytes, where the screenshot loop costs a
-   * PNG per attempt.
+   * This call only BINDS the host to that registry — it no longer owns a copy of
+   * the bridge. The old code did, and that is why a delete left dead
+   * `cua_win__*` names in every session: the disposers belonged to ONE ctx and
+   * nothing outside that apply() could reach them.
    *
-   * The registration is DYNAMIC and EPHEMERAL:
-   *   * nothing is written to the profile, ever;
-   *   * tools exist only while a `kind: "windows"` computer is `ready`;
-   *   * switching or deleting the computer disposes them;
-   *   * DSH_CUA_VM_WIN_MCP=0 disables the whole path.
-   *
-   * COST: the guest's schema is ~3-8k tokens while it is attached, which is why
-   * it is not attached to a Linux-only workspace at all.
+   * The state has TWO sources now, and neither owns a copy of the rules:
+   * the supervisor's `subscribe` stream (a transition arrives in milliseconds,
+   * see `WIN_MCP_STREAM`) and the 10 s `vmWindowsMcpState` poll behind it for a
+   * supervisor that does not speak the op. Both end in the same
+   * `resolveWindowsTarget` / `teardown` paths, so a tick never guesses a target
+   * and never opens SSH twice (WIN_MCP.inflight).
    */
-  // `inflight` is the guard, not `at`: a connect can take up to 45 s while the
-  // beat is 5 s, so without it two ticks race into two SSH sessions and register
-  // every tool twice (the second registration throws, the first leaks).
-  const WIN_MCP = { name: '', client: null, disposers: [], inflight: null, reason: 'not attempted' }
-
-  function detachWindowsMcp(reason) {
-    for (const dispose of WIN_MCP.disposers.splice(0)) {
-      try { dispose() } catch { /* the tool registry may already be gone */ }
-    }
-    WIN_MCP.client?.close()
-    WIN_MCP.client = null
-    if (WIN_MCP.name !== '') console.log(`[cua-vm] windows MCP detached (${reason})`)
-    WIN_MCP.name = ''
-    WIN_MCP.reason = reason
-  }
-
-  async function attachWindowsMcp() {
-    if (WIN_MCP.inflight !== null) return WIN_MCP.inflight
-    WIN_MCP.inflight = (async () => {
-      if (!windowsMcpEnabled()) {
-        detachWindowsMcp('disabled (DSH_CUA_VM_WIN_MCP=0)')
-        return
-      }
-    let target = null
-    try {
-      const answer = await call({ op: 'vmWindowsMcp', name: '' })
-      target = answer?.available === true ? answer : null
-    } catch (error) {
-      detachWindowsMcp(`no ready Windows computer (${error?.message ?? error})`)
-      return
-    }
-    if (target === null) {
-      detachWindowsMcp('no ready Windows computer')
-      return
-    }
-    if (WIN_MCP.name === target.name && WIN_MCP.client?.state.connected === true) return
-    detachWindowsMcp('switching computers')
-    const client = createDshCuaClient({
-      name: target.name,
-      sshPort: target.sshPort,
-      keyPath: target.keyPath,
-      user: target.user ?? 'cua',
-      timeoutMs: 45000
-    })
-    try {
-      const session = await client.connect()
-      WIN_MCP.client = client
-      WIN_MCP.name = target.name
-      for (const tool of session.tools) {
-        const publicName = `cua_win__${String(tool.name).replace(/[^A-Za-z0-9_]/gu, '_')}`
-        const dispose = ctx.effect(() => ctx.tools.register({
-          name: publicName,
-          description: `${tool.description ?? tool.name} (dsh-cua, Windows computer ${target.name})`,
-          parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} },
-          output: textOutput('The guest tool result as JSON.'),
-          async execute(args = {}) {
-            const result = await client.callTool(tool.name, args)
-            return { text: JSON.stringify(result) }
-          }
-        }), `cua-vm: windows mcp ${publicName}`)
-        if (typeof dispose === 'function') WIN_MCP.disposers.push(dispose)
-      }
-      WIN_MCP.reason = `attached (${session.tools.length} tool(s))`
-      console.log(`[cua-vm] windows MCP attached to ${target.name} (${session.tools.length} tool(s))`)
-    } catch (error) {
-      client.close()
-      WIN_MCP.reason = `attach failed: ${error?.message ?? error}`
-      console.log(`[cua-vm] windows MCP NOT attached: ${error?.message ?? error}`)
-    }
-    })().finally(() => { WIN_MCP.inflight = null })
-    return WIN_MCP.inflight
-  }
+  bindWindowsMcpHost(ctx, call)
 
   /**
    * The Personal VM page's own API. It speaks the same socket as the tools, so
@@ -345,9 +1523,14 @@ export function apply(ctx, config = {}) {
           case 'windowsFreeSpace': return send(200, { ok: true, ...(await call({ op: 'vmWindowsFreeSpace', ...(await body()) })) })
           case 'stop': return send(200, { ok: true, ...(await call({ op: 'stop', ...(await body()) })) })
           case 'delete': {
-            const answer = await call({ op: 'vmDelete', ...(await body()) })
+            const request = await body()
+            const answer = await call({ op: 'vmDelete', ...request })
             // Deleting the last REA computer has to take the paragraph with it.
             void refreshReaCache()
+            // WP-5: A DELETE FROM THE PANEL IS THE REPORTED LEAK. The guest MCP
+            // tools must go NOW, not on the next 10 s tick — and the binding of
+            // the session that created the computer goes with it.
+            forgetSessionTarget(request.name)
             return send(200, { ok: true, ...answer })
           }
           case 'exec': return send(200, { ok: true, ...(await call({ op: 'exec', ...(await body()) })) })
@@ -364,6 +1547,57 @@ export function apply(ctx, config = {}) {
       }
     }
   }), 'cua-vm: page api')
+
+  /**
+   * THE COMPUTER USE GRANT — the switch the per-agent gate reads.
+   *
+   * It lives in MEMORY, per session, and it starts OFF: an agent that can click
+   * a Windows desktop without the user saying so is the thing the grant exists
+   * to prevent. The panel (or a curl from the user's own shell) flips it here;
+   * a mutating route is same-origin only, so no other page can turn it on.
+   *
+   *   GET  /dsh-cua-vm/cua-grant            -> { ok, default, on, off, ... }
+   *   POST /dsh-cua-vm/cua-grant {"grant":true,"sessionId":"…"}
+   *
+   * `sessionId` is optional: without it the DEFAULT flips (every session that
+   * has not overridden it). Nothing here is persisted, and a restart forgets it.
+   */
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'prefix',
+    path: '/dsh-cua-vm',
+    handler: async (req, res) => {
+      const send = (status, payload) => {
+        res.statusCode = status
+        res.setHeader('content-type', 'application/json; charset=utf-8')
+        res.setHeader('cache-control', 'no-store')
+        res.end(JSON.stringify(payload))
+      }
+      const action = new URL(req.url ?? '/dsh-cua-vm', 'http://localhost').pathname.replace(/^\/dsh-cua-vm\/?/u, '')
+      if (action !== 'cua-grant') return send(404, { ok: false, error: `unknown action: ${action}` })
+      if (req.method !== 'POST') return send(200, { ok: true, ...windowsGrantSnapshot() })
+      // CSRF: a mutating route must be same-origin. A request without an Origin
+      // (curl, the user's own shell) is allowed; a cross-origin page is not.
+      const origin = String(req.headers.origin ?? '')
+      const host = String(req.headers.host ?? '')
+      if (origin !== '' && host !== '') {
+        let originHost = ''
+        try { originHost = new URL(origin).host } catch { originHost = '' }
+        if (originHost !== '' && originHost !== host) return send(403, { ok: false, error: 'cross-origin grant change refused' })
+      }
+      let body = {}
+      try {
+        const chunks = []
+        for await (const chunk of req) chunks.push(chunk)
+        const raw = Buffer.concat(chunks).toString('utf8')
+        body = raw === '' ? {} : JSON.parse(raw)
+      } catch {
+        return send(400, { ok: false, error: 'the grant body is not JSON' })
+      }
+      const sessionId = body.sessionId === undefined || body.sessionId === null ? '' : String(body.sessionId).slice(0, 128)
+      return send(200, { ok: true, granted: body.grant === true, ...setWindowsGrant(sessionId, body.grant === true) })
+    }
+  }), 'cua-vm: computer use grant')
+
 
   ctx.systemPrompt.section({
     name: 'tool:cua_vm',
@@ -387,22 +1621,75 @@ export function apply(ctx, config = {}) {
     return () => clearInterval(timer)
   }, 'cua-vm: rea awareness cache')
 
-  // The Windows MCP tools are attached by the same 30 s beat: one socket call
-  // when there is nothing to attach, one SSH handshake when a Windows computer
-  // becomes ready, and a disposal the moment it stops being ready.
+  /**
+   * THE STATE POLL (10 s, `DSH_CUA_MCP_STATE_POLL_MS`).
+   *
+   * It is deliberately NOT the REA beat: a shutdown/delete must take the guest's
+   * tools away inside a turn, not after 30 s, and the poll is one small socket
+   * request per bound computer while it is idle. SSH is dialled only on the
+   * transition into online (attachWindowsMcp checks inflight and retryAt).
+   */
   ctx.effect(() => {
-    void attachWindowsMcp()
-    // FIVE SECONDS, not the 30 s cache beat: a shutdown or a delete must take the
-    // guest's tools away promptly — a model that calls `cua_win__*` against a
-    // stopped computer gets a confusing SSH failure, and 30 s of that is long
-    // enough to blame the wrong thing.
-    const timer = setInterval(() => { void attachWindowsMcp() }, 5000)
+    void syncWindowsMcp('startup').catch(() => {})
+    // J20-3: the push half. One long-lived subscription; if the supervisor does
+    // not speak `subscribe` this silently degrades to the poll below.
+    startWindowsStateStream(socketPath)
+    const timer = setInterval(() => { void syncWindowsMcp('poll').catch(() => {}) }, windowsMcpPollMs())
     if (typeof timer.unref === 'function') timer.unref()
     return () => {
       clearInterval(timer)
-      detachWindowsMcp('plugin disposed')
+      stopWindowsStateStream()
+      // Teardown entry point #3: the plugin going away must not leave the
+      // host-global names behind — the next mount would collide on them.
+      teardown('plugin disposed')
+      for (const agent of [...WIN_MCP.agents]) disposeWindowsAgent(agent)
     }
-  }, 'cua-vm: windows mcp (lazy)')
+  }, 'cua-vm: windows mcp (state poll + state stream)')
+
+  /**
+   * THE PER-AGENT GATE (layer 3). `agent/created` installs the guard fiber and
+   * the first restriction; `agent/pre-step` self-heals an offline bridge and
+   * MUST always continue the step; `tools/change` re-applies after an attach or
+   * a disposal; `agent/disposed` drops the grant, the reveal and the binding.
+   */
+  ctx.on('agent/created', ({ agent }) => { installWindowsAgent(agent) })
+  ctx.on('agent/disposed', ({ agent }) => { disposeWindowsAgent(agent) })
+  ctx.on('agent/pre-step', async ({ agent }, next) => {
+    try {
+      selfHealWindowsMcp(agent)
+    } catch (error) {
+      WIN_MCP_AUX.gateError = `pre-step: ${error?.message ?? error}`
+    }
+    // NEVER swallow the step: the bridge failing is not a reason to stall a turn.
+    return next()
+  })
+  ctx.on('tools/change', () => { scheduleWindowsGates('tools/change') })
+
+  /**
+   * The two tools that are NEVER gated (they do not start with TOOL_PREFIX):
+   *   * `windows_desktop` reveals the bridged tools for the calling session;
+   *   * `windows_mcp_doctor` reports the leak surface and the keepalive.
+   */
+  ctx.effect(() => ctx.tools.register({
+    name: REVEAL_TOOL_NAME,
+    description: 'Reveal the Windows desktop: unhides this session\u2019s dsh-cua tools (element-level click/type/find over SSH) and returns their names, descriptions and parameters. No arguments.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: textOutput('Whether the tools are now visible, and their schemas.'),
+    async execute(_args = {}, exec) {
+      return { text: JSON.stringify(revealWindowsTools(exec?.agent)) }
+    }
+  }), 'cua-vm: windows desktop reveal')
+
+  ctx.effect(() => ctx.tools.register({
+    name: DOCTOR_TOOL_NAME,
+    description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation, the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: textOutput('One JSON object: status, target, online, registered, schemas, leaks, grants, keepalive, gate.'),
+    async execute(_args = {}, exec) {
+      return { text: JSON.stringify(await windowsMcpDoctor(exec?.agent)) }
+    }
+  }), 'cua-vm: windows mcp doctor')
+
 
   ctx.tools.register({
     name: 'cua_vm_status',
@@ -475,7 +1762,7 @@ export function apply(ctx, config = {}) {
       }
     },
     output: textOutput('Creation result and the VM name to use in later calls.'),
-    async execute(args = {}) {
+    async execute(args = {}, exec) {
       const result = await call({
         op: 'ensure',
         workspace: args.workspace ?? workspaceRoot,
@@ -489,6 +1776,9 @@ export function apply(ctx, config = {}) {
         android: args.android === true,
         rea: args.rea === true
       })
+      // WP-5: the computer this SESSION asked for. The bridge only ever attaches
+      // to a name a session recorded, never to "the first ready row".
+      rememberSessionTarget(exec, result.name)
       const gpuNote = result.gpu === true ? ' with a GPU (virgl)' : ''
       return { text: `${result.created ? 'Created' : 'Resumed'} ${result.name} (tier=${result.tier}, state=${result.state}${gpuNote}). Use this name with cua_vm_exec.` }
     }
@@ -518,7 +1808,7 @@ export function apply(ctx, config = {}) {
       }
     },
     output: textOutput('The computer, its renderer, disk, Android and REA status.'),
-    async execute(input) {
+    async execute(input, exec) {
       if (input.kind === 'windows') {
         // Refused HERE as well as in the supervisor: a tool that sends a
         // combination the backend will reject costs a round trip and reads like
@@ -526,6 +1816,7 @@ export function apply(ctx, config = {}) {
         if (input.rea === true) throw new Error('REA is not available for Windows computers: the kit is a Linux guest layer. Create the Windows computer without it, or use a Linux computer.')
         if (input.android === true) throw new Error('Android is not available for Windows computers: the SDK and the AVD run in a Linux guest.')
         const answer = await call({ op: 'vmWindowsCreate', ...input })
+        rememberSessionTarget(exec, answer.name)
         const parts = [`${answer.name} is ${answer.state} (Windows).`]
         if (answer.console) parts.push(`Live view: ${answer.console} (noVNC over QEMU VNC, never published raw).`)
         parts.push(answer.passwordHint)
@@ -538,6 +1829,7 @@ export function apply(ctx, config = {}) {
         return { text: parts.join(' ') }
       }
       const answer = await call({ op: 'vmCreate', ...input })
+      rememberSessionTarget(exec, answer.name)
       const parts = [`${answer.name} is ${answer.state}${input.gpu === true ? ' with a GPU (virgl)' : ''}.`]
       // A SPARSE DISK BIGGER THAN THE QUOTA IS CREATED, NOT REFUSED: the
       // supervisor sends `disk-over-policy` here (Linux and Windows alike), so
@@ -603,9 +1895,11 @@ export function apply(ctx, config = {}) {
       }
     },
     output: textOutput('What happened, or the screenshot path.'),
-    async execute(input) {
+    async execute(input, exec) {
       const target = input.name
       const answer = await call({ op: 'gui', ...input, name: target })
+      // Driving the desktop is an explicit statement of the target, so it binds.
+      rememberSessionTarget(exec, target)
       return { text: answer.output || `${input.action} done` }
     }
   })
@@ -684,8 +1978,12 @@ export function apply(ctx, config = {}) {
         text: `exit=${value.exit} (${value.ms} ms)\n${value.stdout}${value.stderr ? `\n[stderr]\n${value.stderr}` : ''}`
       }]
     },
-    async execute(args = {}) {
+    async execute(args = {}, exec) {
       const result = await call({ op: 'exec', name: args.name, cmd: args.cmd, cwd: args.cwd, timeout: args.timeout ?? 300 })
+      // An exec names its computer explicitly, so it binds the bridge to it:
+      // this is how a session that did not create the Windows computer still
+      // gets its dsh-cua tools, WITHOUT falling back to "first ready row".
+      if (result.available !== false) rememberSessionTarget(exec, args.name)
       if (result.available === false) {
         // A Windows computer has no guest agent. The schema still has to answer,
         // so the refusal travels in stderr with exit 126 — the shape a shell
@@ -789,8 +2087,12 @@ export function apply(ctx, config = {}) {
       }
     },
     output: textOutput('Start result, the boot source, and the provisioning outcome.'),
-    async execute(args = {}) {
+    async execute(args = {}, exec) {
       const answer = await call({ op: 'vmStart', name: args.name })
+      // A start is the transition into online: bind now and poll once, instead
+      // of waiting up to a full interval for the tools to appear.
+      rememberSessionTarget(exec, args.name)
+      void syncWindowsMcp('started').catch(() => {})
       const parts = [`${answer.name} is ${answer.state}.`]
       if (answer.coldBoot === true) parts.push(answer.detail || 'cold-booted from its checkpoint.')
       if (answer.bootedFrom === 'image') parts.push('No checkpoint was available, so it booted the base image: the previous disk is gone.')
@@ -937,6 +2239,9 @@ export function apply(ctx, config = {}) {
     output: textOutput('Destroy result, the items that survived, and the kill log when force was used.'),
     async execute(args = {}) {
       const result = await call({ op: 'destroy', name: args.name, force: args.force === true })
+      // Teardown entry point: a deleted computer must lose its names HERE, not
+      // on the next poll — this is the delete that used to leak for minutes.
+      forgetSessionTarget(args.name)
       const killed = (result.force?.killed ?? []).map((item) => `- ${item.status === 'removed' ? 'KILLED' : 'STILL RUNNING'} ${item.target}: ${item.detail}`).join('\n')
       if (result.complete === false) {
         // A PARTIAL manifest is not a deletion, and a KEPT item is the usual

@@ -1115,3 +1115,562 @@ copied under `/tmp` and both env vars unset: `BOOT OK pid=4780 in 177 ms`,
 (checkout) / **473** (flat, L5 + N3 `n/a`), `check-cua-rea` **67**, `ci-gates` 9/1/1
 (`check-office` is pre-existing), and all four suites PASS. No Windows *install*
 (OOBE) was attempted: the replay proves QEMU accepts the argv and initializes.
+
+## 17. Branch `cua-vm-improve` — 2026-11-17: sixteen versions, two firmwares, a gated bridge, a real clipboard
+
+Six packages landed together because they share one seam: the Windows computer is
+a **catalog row** (what it installs, how it boots, which media) and everything the
+model touches on it is **gated state** (which tools exist, for which session, for
+how long). Each package below is problem → change → the command that proves it.
+
+### A. The sixteen-code catalog, and an ISO chain instead of a URL
+
+**Problem.** `windowsVersion` knew six spellings and only two of them could
+actually download anything: the five-version list was an artefact of the
+Evaluation Center, and on 2026-11-15 four of its five pinned URLs answered
+**HTTP 400** (the media moved behind a session-token page). "Windows 11
+Enterprise" and "Server 2019" had no spelling at all, so every caller had to hand
+in a `windowsIso`. A refusal for a spelling that exists reads as a make-believe
+catalog; a 400 halfway through 5.5 GB is worse than no pin.
+
+**Change.**
+* `WINDOWS_VERSIONS` is the dockur/windows vocabulary — `11, 11l, 11e, 10, 10l,
+  10e, 7u, xp, 2025, 2022, 2019, 2016, 2012, core11, tiny11, tiny10` — one
+  `WINDOWS_CATALOG` row each, carrying `sizeGb` (the store reservation), `bios`
+  (the firmware profile) and `selection` (the `<InstallFrom>` Setup installs).
+* `WINDOWS_VERSION_ALIASES` is frozen and maps the old spellings into it
+  (`ltsc11`/`11ltsc` → `11l`, `ltsc10` → `10l`, …); an unknown one throws with the
+  full list instead of defaulting to Windows 11.
+* `xp` is **listed and refused** with `code: legacy-installer-unsupported` — its
+  Setup waits for `winnt.sif` from a floppy/ISO root, which this payload does not
+  build. The refusal fires before a download or a spawn.
+* A version is an ORDERED chain (`mido` → `esd` → `link1/link2/link6` →
+  `midoDirect`), each entry pinned by byte count and SHA-256. The download is
+  checked against `Content-Length` and hashed while it streams; a mismatch throws
+  `iso-digest-mismatch`, and a verified file gets a `.sha256` sidecar so the next
+  create does not re-hash it. `isoFileName` is a function of the URL again (it
+  used to append random bytes, so the reservation and the write named different
+  paths and every restart re-downloaded).
+
+**Verify.**
+```bash
+node tools/check-cua-vm.mjs --root .        # catalog + sources sections, and the
+                                            # semantic "sixteen codes / xp refuses" block
+node tests/modules-unit.mjs                 # per-code chains, tiny10 = archive.org only,
+                                            # verifyIsoDigest (right/wrong hash), isoFileName
+node tests/windows-boot.mjs                 # xp refuses BEFORE spawn (no argv line)
+```
+Data, per code, with URLs and digests: `docs/windows-iso-sources.md`.
+
+### B. Firmware is a profile, not a boolean
+
+**Problem.** The backend was written for Windows 11 and hard-coded its firmware:
+q35 + OVMF + swtpm + virtio-blk + virtio-net. Windows 7 x64 Setup boots under
+**BIOS only** — handed OVMF it reaches "Press any key", finds no bootable device
+and drops into the EFI Shell — and the swtpm is a device its installer has never
+heard of. Five separate decisions had to move together; leaving any one at its
+UEFI value produces a QEMU that starts and a guest that never boots, which reads
+as "the ISO is corrupt".
+
+**Change.** `WINDOWS_FIRMWARE_PROFILES` names the two computers: `ovmf` (q35, UEFI,
+TPM2, virtio) and `seabios` (`pc`/i440FX, no pflash, no TPM, IDE, e1000e).
+`buildQemuArgs()` branches on `firmware.bios` for the machine spec, the pflash
+pair, the TPM trio, the disk model and the NIC. The profile is resolved once per
+boot (`spec.firmware` → declared version → the `firmware.json` marker the create
+wrote → the MEDIA FILE NAME → OVMF), so a Windows 7 computer that restarts without
+a `windowsVersion` on its row still comes back on `pc`. `DSH_CUA_WIN_LEGACY_BIOS=0`
+refuses the BIOS path instead of quietly changing firmware.
+
+**Verify.**
+```bash
+node tests/modules-unit.mjs   # 7u profile = seabios/pc/no-tpm/ide-hd/e1000e;
+                              # 7u argv has no pflash and no TPM; 11 argv keeps both
+node tests/windows-boot.mjs   # a real boot on the stub: -machine pc,accel=kvm,
+                              # no if=pflash, no swtpm socket created, IDE disk,
+                              # and the staged answer file still has <InstallFrom>
+```
+
+### C. The Windows MCP bridge: a namespace, three gates, and a teardown that cannot leak
+
+**Problem.** The bridge registered ~19 tools on the HOST-GLOBAL registry and its
+only teardown was a 5 s heartbeat inside one `apply()`. A computer deleted or
+stopped still left 19 dead `mcp__windows__*` schemas in **every** session's tool
+list, costing context and answering "connection refused"; a second ctx or a
+reloaded plugin could not take them down at all. It also attached whatever row
+happened to be `ready`, so a session could drive the wrong computer, and the names
+it invented (`cua_win__*`) were not MCP names.
+
+**Change.**
+* `WIN_MCP` is module-level process state, with `registrations: Map<name,
+  dispose>` filled by hand — so `teardown()` can run from the state poll, the
+  guest client's `onClosed`, a plugin dispose or a per-agent pre-step, and always
+  removes exactly what it registered (the map is emptied BEFORE the disposers run).
+* `vmWindowsMcp({ name })` REQUIRES a name (no "first ready row"), and
+  `vmWindowsMcpState({ name })` is the cheap read the poll uses (registry + ports,
+  never SSH). The supervisor also grew a real push stream (`subscribe` →
+  `vm-state` / `vm-removed` / `ping`).
+* Three gates, all in the plugin: the **grant** (Computer Use, in memory, per
+  session, OFF by default, `/dsh-cua-vm/cua-grant`), the **reveal**
+  (`windows_desktop`), and the **guard** (`tools.guard`, which refuses a name that
+  is still visible with `code: vm-offline | grant-off | reveal-required`).
+* Naming: `TOOL_PREFIX = 'mcp__windows__'` through `windowsToolName()`, plus
+  `windows_mcp_doctor` reporting the raw prefix surface so a leak is visible.
+  Keepalive `ServerAliveInterval=10` × `CountMax=2`.
+
+**Verify.**
+```bash
+node tools/check-cua-vm.mjs --root .   # index/winMcp/supervisor sections + the
+                                       # FORBIDDEN "no first-ready fallback" regex
+node tests/windows-mcp-gate.mjs        # 19 registrations; powered-off and removed
+                                       # both call EVERY disposer and leave zero
+                                       # prefixed schemas; every agent's deny set is
+                                       # all 19; guard returns vm-offline; the
+                                       # pre-step self-heal clears a leaked session
+                                       # and calls next() once
+```
+
+### D. The clipboard: an agent in the user's session, and a bridge in front of noVNC
+
+**Problem.** Two obvious routes are dead and both were tried live: an RFB
+`ClientCutText` is accepted by QEMU and dropped (no clipboard agent in the guest,
+so the paste "succeeds" and pastes the PREVIOUS clipboard), and `Set-Clipboard`
+over SSH lands in Session 0's empty clipboard. The panel's two on-demand tasks
+worked but could not prove anything: `schtasks /run` only QUEUES, so the body's
+exit had to be polled, and the content was never verified.
+
+**Change.**
+* `docker/cua-clip-agent.ps1` — an in-session loop registered by firstboot as
+  `cua-clip-agent` (`/sc onlogon /it /rl LIMITED`): watches the clipboard, writes
+  `clip-current.txt`, polls `outbox\clip-<seq>.json`, sets the clipboard and
+  writes `clip-ack.json` with `seq`, `sha256` and `equal`.
+* The backend tries the agent first (`~250 ms`, verified by seq + digest + `equal`
+  + a read-back hash) and falls back to `cua-clip-set`/`cua-clip-get`, reporting
+  `fastPathReason` — "pasted, slowly" and "pasted, verified" are different facts
+  and both are named.
+* `docker/cua-vnc-clip.mjs` — the image's own noVNC front door: static files, the
+  WebSocket handshake (`258EAFA5-…`), an RFB-aware TCP client and the clipboard in
+  both directions over the supervisor's own control socket. Loopback only, no new
+  dependency, no Python. The supervisor prefers it and falls back to websockify if
+  it is missing, `DSH_CUA_VNC_CLIP=0`, or it never listens.
+* Encoding is reversible: latin1 when every code point fits a byte, UTF-8
+  otherwise, with the RFB length header counting BYTES.
+
+**Verify.**
+```bash
+node tests/modules-unit.mjs        # ServerCutText frame bytes [3,0,0,0,0,0,0,2,104,105],
+                                   # ClientCutText parse, wsAccept, encoding label,
+                                   # clipAckMatches, and the task-path ORDER
+node tests/supervisor-smoke.mjs    # agent path verified:true on an equal ack;
+                                   # ack-mismatch never reports verified; no agent
+                                   # → cua-clip-set with fastPathReason 'no-agent'
+node tools/check-cua-vm.mjs --root .  # vncClip section + the Dockerfile COPYs
+```
+
+### E. Effects and captures: a read-back, or an honest "unverifiable"
+
+**Problem.** "The click worked" was a claim with no evidence. The old answer could
+not distinguish "the pointer moved", "the window changed" and "nobody looked", and
+a click computed from an older screenshot landed on whatever had moved into that
+pixel.
+
+**Change.** Every action may carry an `effect` (`before`/`after` for the pointer,
+the active window, an element read-back, or a frame change) and a `verified` of
+`confirmed | unverifiable` — never `changed: false` for a side nobody read.
+`captureIdFor()` names each frame (`<name>:<epochMs>:<sha1(png)[:8]>`),
+`latestCapture()` expires it after 15 minutes, and a click citing anything else is
+refused with `code: stale-capture`. `DSH_CUA_VM_EFFECTS=0` turns the read-back off
+and says so in the answer.
+
+**Verify.**
+```bash
+node tools/check-cua-vm.mjs --root .   # captureIdFor/latestCapture/stale-capture
+                                       # and the verified: confirmed|unverifiable form
+grep -n "stale-capture" docker/cua-vm-supervisor.mjs   # the refusal has a code
+```
+
+### F. Linux fixes, and the hardening that keeps the seam honest
+
+**Problem.** Three Linux answers were guesses. `cua_vm_disk` ended both guest
+commands with `|| true` and reported the REQUESTED size, so a failed `resize2fs`
+still said "grew to 40 GB" and the next ENOSPC had no explanation. A checkpoint
+was "path or null", which collapsed "no disk", "no room" and "qemu-img refused"
+into one silent `no disk to checkpoint`. And the doctor answered questions nobody
+could check: which QEMU is this, did this boot get the 9p share, is a `gpu: true`
+row actually software-rendered.
+
+**Change.**
+* `growGuestDisk` resizes the qcow2 (`block_resize`), grows the partition and the
+  filesystem in the guest, then READS `df -B1 --output=size,avail /` and answers
+  with the measured number. `NOCHANGE` is success; a refused `resize2fs` is
+  `guest-resize-failed`, a refused `growpart` is `guest-growpart-failed`, and a
+  filesystem below 95 % of the request is `short-grow` — with the command output.
+  The registry only records a grow that changed something.
+* `checkpointDiskFile` returns `{ ok, path, bytes }` or `{ ok: false, reason }`
+  (`policy`, `quota`, `no-disk`, `unknown`), the row keeps `checkpointSkipped`, an
+  interrupted convert is PROMOTED (not deleted), and shutdown/start respect it.
+* The doctor reports `provenance` (the `cua` version, the real QEMU path **and its
+  SHA-256**, and the honest `baseImage: "cua-managed (no digest pin)"`), a
+  `linux-checkpoint-layout` check, a `gpu-degraded` check for a `gpu: true` row
+  whose renderer is software, and a `9p-share-not-attached` check read from the
+  cmdline QEMU actually ran.
+* Hardening unchanged and re-proved: `cap_drop ALL`, read-only rootfs,
+  `no-new-privileges`, no Docker socket on the Windows path, QMP/VNC/SSH bound to
+  loopback, the credentials file 0600 and never in the registry, and the new
+  clipboard bridge loopback-only (its `--http-port`/`--vnc-port` refuse anything
+  else).
+
+**Verify.**
+```bash
+node tests/supervisor-smoke.mjs   # grow success = measured GB; resize2fs failure
+                                  # = guest-resize-failed (no || true); growpart
+                                  # failure = guest-growpart-failed; short grow
+                                  # = short-grow and the row keeps the old size
+node tests/modules-unit.mjs       # parseGuestDf (the supervisor's own parser)
+node tests/qmp-shutdown.mjs       # the shutdown/suspend split is unchanged
+```
+
+### What is NOT claimed
+
+Windows XP does not install (refused by name). There is no per-window capture, no
+background invoke, no image clipboard and no OCR on a frame — the design drafts,
+prerequisites and acceptance criteria for those live in
+`docs/cua-capability-roadmap.md`. The guest's base disk image has no digest pin
+(the doctor says so); the Microsoft media do, per source.
+
+## 18. Branch `cua-vm-improve` — 2026-11-17 (jury fix round)
+
+The jury round found **21 consolidated defects** across the three juries
+(J20-1…5, J21-1…6, J22-1…13; where two juries filed the same behaviour under
+different numbers it is listed once and both numbers are named). Each entry is
+problem → fix → the command that proves it. Nothing in `docker/*` is touched by
+the test writer except where the fix itself was the source; the proof lives in
+`tests/*`, `tools/check-cua-vm.mjs` and `docs/`.
+
+### 1. J20-1 (a/b/c) — three documented knobs were dead
+
+**Problem.** `DSH_CUA_WIN_ISO_SHA256=0` was documented as the way to accept a
+mirror that serves byte-identical media, but nothing read it; `verified` was
+always `true` or the download always threw. `DSH_CUA_VNC_CLIP_POLL_MS` was
+documented and **never passed** to the bridge, so the written interval and the
+real one (the bridge's own 1200 ms) could disagree silently. And the opt-out, when
+added, had to be decided once per download or the size check, the streaming digest
+and the answer's `note` could disagree with each other.
+**Fix.** `isoDigestCheckDisabled()` accepts exactly the string `'0'`; the decision
+is made once at the top of `ensureIso()` and once in `inspectCachedIso()`; every
+skipped result returns `verified: false` plus `ISO_DIGEST_DISABLED_NOTE`. The
+supervisor reads `DSH_CUA_VNC_CLIP_POLL_MS` in `vncClipPollMs()`, clamps it to
+200–60000 ms, rounds it, and passes `--poll-ms` to the bridge.
+**Verify.** `node tests/modules-unit.mjs` (J1-5 unpinned-cache block);
+`node tests/supervisor-smoke.mjs` (J20-1c clamp: 99999→60000, `abc`→1200,
+and the real bridge argv `fix-bridge:60000`); `node tools/check-cua-vm.mjs --root .`
+(needles `isoDigestCheckDisabled`, `DSH_CUA_VNC_CLIP_POLL_MS`).
+
+### 2. J20-2 / J1-1, J1-3 — a redirect that loses the socket, a comma that splits an option
+
+**Problem.** A `Location` header the URL parser rejects threw out of a socket
+callback (leaving a `.part` behind and no attempt accounting); and every path
+interpolated into a QEMU option string (`file=`, `path=`) was raw, so an operator
+medium named `win11,beta.iso` — or a store path containing a comma — became
+`file=win11` plus a mystery option that QEMU parsed as something else.
+**Fix.** Redirects go through the same `fail()` as any other hop error
+(`code: bad-redirect`, `.part` unlinked, the next strategy tried).
+`qemuEscapeOptionValue()` is the single export every interpolation calls, and it
+is applied to OVMF code, EFI vars, the system disk, setup.img, the ISO, the
+driver ISO and the TPM socket path — **and to swtpm's own argv** (`--ctrl
+path=`, `--tpmstate dir=`, `--pid file=`, `--log file=`), which uses the same
+comma-splitting grammar: an unescaped store path there produced a truncated
+socket/state path, a log written somewhere else and "could not open pid file".
+Both option grammars only understand `,,`.
+**Verify.** `node tests/modules-unit.mjs` (`qemuEscapeOptionValue('a,b') ===
+'a,,b'`); `node tools/check-cua-vm.mjs --root .` (the escaped `file=`/`path=` needles for
+QEMU AND for swtpm's `--ctrl/--tpmstate/--pid/--log`, `bad-redirect`).
+
+### 3. J20-2 (second half) / J1-4, J1-5, J1-6 — a cache that verified nothing, a preflight that demanded the wrong firmware, a doc nobody checked
+
+**Problem.** Three separate lies on the create path. (a) A cached ISO with no
+pin returned `ok: true` having verified nothing, and a matching `.sha256` sidecar
+was trusted without hashing the file — so a half-written or substituted ISO was
+"cached". (b) The create preflight demanded qemu + OVMF (both files) + swtpm from
+EVERY Windows create, while a `7u` row boots pc/SeaBIOS with no pflash and no TPM:
+a host that could run Windows 7 was refused for two files the boot spec never
+opens. (c) `docs/windows-iso-sources.md` claimed to be "kept honest" by the tests,
+but no assertion compared it to the module.
+**Fix.** (a) The sidecar is hashed against the file; no pin and no valid sidecar
+is `unpinned-cache` and a re-download. (b) `requiredCaps` comes from the same
+`windowsFirmwareProfile()` the boot spec uses: `seabios` needs only `qemu`, UEFI
+needs `qemu, ovmfCode, ovmfVars, swtpm`, and the refusal names the missing set.
+(c) The gate's `J1-6` block imports `WINDOWS_ISO_SOURCES` and diffs every chain row
+against the markdown table on all five columns, failing with the first divergent
+code and field.
+**Verify.** `node tests/modules-unit.mjs` (J1-5 refuses the unpinned cache and
+re-downloads); `node tests/supervisor-smoke.mjs` (J1-4: a 7u create without
+OVMF/swtpm gets past the caps check; an 11 create names `ovmfCode`);
+`node tools/check-cua-vm.mjs --root .` (`J1-6 … matches ISO_SOURCE_CHAINS on all
+five columns (45 chain row(s))`).
+
+### 4. J20-3 — the state bus was polled, never consumed
+
+**Problem.** The supervisor had a `subscribe` op that pushed `vm-state` /
+`vm-removed` lines, but the plugin never opened it: a delete or a shutdown was
+discovered on the next 10 s poll, so dead `mcp__windows__*` schemas survived for
+up to a turn. The README even described the poll as the push.
+**Fix.** `startWindowsStateStream()` holds ONE long-lived subscription
+(`{"op":"subscribe","events":["vm-state","vm-removed"]}`), parses the `ready` line,
+reconnects with backoff, and turns a transition into the same idempotent
+`teardown()` the poll uses. A supervisor that answers `unknown op` (or closes
+without `ready`) marks the stream unsupported and the poll remains the belt. The
+doctor reports `stream.live/supported/events/lastEvent`.
+**Verify.** `node tests/windows-mcp-gate.mjs` (the fake supervisor answers the
+subscription op; the state/removal checks complete in ms) and
+`node tests/supervisor-smoke.mjs` (`WP-4: subscribe announces the stream …`).
+
+### 5. J20-4 — a delete that landed mid-handshake resurrected 19 schemas
+
+**Problem.** `WIN_MCP.name` is `''` until the 45 s SSH handshake finishes, so a
+delete (or a shutdown) during that window compared `'' !== name`, skipped
+teardown, and the attach then registered 19 schemas of a computer that no longer
+existed — until the next beat.
+**Fix.** Every attach mints a ticket `{ generation, name, dead, at }` and bumps
+`WIN_MCP.generation` in teardown. `forgetSessionTarget()` kills a ticket whose
+NAME matches even while the attach is in flight, and every write (`connect`
+return, before each `register`) re-checks `isDead()` and aborts without leaving a
+name, client or `online` behind. The doctor shows `attach.pendingName` /
+`attach.pendingDead`.
+**Verify.** `node tests/windows-mcp-gate.mjs` (J20-4 block: held handshake, delete
+mid-flight, ticket dead, generation bumped, 0 registrations afterwards).
+
+### 6. J20-5 — session B clicked on session A's desktop
+
+**Problem.** The guard asked "is the grant on for you", never "is that machine
+yours". With one process, one attached computer and many sessions, a session that
+had bound nothing (or another computer) could drive someone else's guest.
+**Fix.** `targetMatchFor()` implements the ordered rule: a session's binding must
+be the attached name, else `not-the-target` with both names in the text; no
+binding is refused too — except `implicit-single-target`, when exactly ONE Windows
+computer is known and the session never bound anything. The relaxation is recorded
+in the doctor (`viewer.via`, `implicitTarget.sessions`) and withdrawn by a second
+computer. The reveal and the deny list both consult the same rule.
+**Verify.** `node tests/windows-mcp-gate.mjs` (two-computer refusal text, the
+implicit allowance, its withdrawal with two computers).
+
+### 7. J21-1a — the agent's clock had three spellings
+
+**Problem.** `readClipState()` read only `ts`. The shipped `cua-clip-agent.ps1`
+writes `at`; an earlier build and the test stubs write `ts`; JSON convention says
+`updatedAt`. A live agent was therefore evaluated as age 0 → `Infinity` → "stale",
+the fast path never ran, and every paste silently took the slow schtasks path.
+**Fix.** The stamp is the first of `at`, `ts`, `updatedAt` that is a positive
+finite number; a MISSING stamp stays `0` and is reported as `stampMissing` +
+`agent-stale` — freshness is never invented from `undefined`.
+**Verify.** `node tests/modules-unit.mjs` (three accepted spellings + missing =
+agent-stale).
+
+### 8. J21-2 — an agent's own failure was reported as a digest mismatch
+
+**Problem.** The verdict looked only at `equal`/`seq`/`sha256`, so
+`{ ok: false, error: 'clipboard is locked by another process' }` fell through to
+the generic `ack-mismatch` — sending the reader to hashing and encoding instead of
+the agent's complaint.
+**Fix.** `clipAckVerdict()` is the new exported verdict. An explicit `ok: false`,
+or a non-empty `error`, answers `agent-error:<code>` (code first, else a one-line
+truncated message); `undefined` is NOT `false`, so agents that predate the field
+still pass. `clipAckMatches()` remains the boolean half.
+**Verify.** `node tests/modules-unit.mjs` (E_LOCK, message-only, legacy `ok`
+missing, whitespace-only error).
+
+### 9. J21-3 (also filed as J22-1) — the paste passed one object, not the text
+
+**Problem.** `windowsBackend.clipboardSet({ ...meta, name })` passed ONE argument.
+The backend's signature is `clipboardSet(rawSpec, text)`, so EVERY host→guest
+paste — the panel route and the noVNC bridge's control-socket write — failed with
+"clipboardSet needs the text to paste" after the whole SSH task had been prepared.
+**Fix.** The supervisor passes `clipboardSet({ ...meta, name }, text)` (the spec
+stays an object the backend normalises). The test seam starts the REAL supervisor
+with a resolve hook that wraps only `createWindowsBackend`, recording the raw
+positional arguments.
+**Verify.** `node tests/supervisor-smoke.mjs` (`J21-3 … the backend received the
+text as the SECOND POSITIONAL argument`, `argCount === 2`).
+
+### 10. J21-4 — the ack is written before the copy, so one read could see the old payload
+
+**Problem.** The agent writes `clip-ack.json` before it rewrites
+`clip-current.txt`. A single immediate read of the copy could therefore describe
+the PREVIOUS payload while the ack (and the clipboard) already held ours: a false
+`readBackEqual: false` on a paste that worked.
+**Fix.** The read-back and the ack are re-read up to `CLIP_ACK_READ_ATTEMPTS = 3`
+times, 250 ms apart; the LAST ack whose `seq` matches is the final word, and a
+newer matching ack that reports a failure wins over the older success.
+**Verify.** `node tests/modules-unit.mjs` (the agent-path checks exercise the
+three-round read); `node tests/supervisor-smoke.mjs` (`readBackEqual === true`
+end-to-end).
+
+### 11. J21-5c — a too-large text cost a round trip to be refused
+
+**Problem.** The agent refuses a JOB FILE, not a text. A text legal for the task
+path (up to 1 MiB) could exceed the JSON job's limit after wrapper + escaping, so
+the backend uploaded a job the agent then dropped as `too-large` — one wasted SSH
+round trip, reported as an agent bug.
+**Fix.** `CLIP_OUTBOX_WRAPPER_BUDGET = 2048` is subtracted from the agent's limit
+and checked BEFORE the first round trip; the exact serialized size is re-checked
+after the JSON is built (escaping is not linear). The fast path declines with
+`reason: 'too-large'`; the schtasks fallback (1 MiB text) still delivers and names
+the decline.
+**Verify.** `node tests/modules-unit.mjs` (J21-5: `via: task`,
+`fastPathReason: too-large`, **0** clip-state/clip-ack calls and **0** outbox
+uploads).
+
+### 12. J21-6 — a NUL in the text was reported as a clean paste
+
+**Problem.** The Windows clipboard (and every C-string reader of it) stops at the
+first U+0000, so `ok: true` claimed bytes that never landed.
+**Fix.** A NUL keeps `ok: true` (the prefix DID land) but sets `verified: false`
+and returns `nulTruncated: { landed, total }`, counted in code points, with a
+detail sentence naming both numbers.
+**Verify.** `node tests/modules-unit.mjs` (J21-6: `landed === 1`, `total === 4`).
+
+### 13. J22-2 / J22-3 — the seq is a Date.now() stamp, and both scripts held it in an Int32
+
+**Problem.** The supervisor's `seq` is `Date.now()` (~1.79e12). Both
+`cua-clip-agent.ps1` and `cua-firstboot.ps1` declared it as an `[int]`, so the
+value overflowed on assignment and every ack was compared against a truncated
+number — an ack that could never match.
+**Fix.** `[long]$seq` is the first assignment in both scripts, and the value is
+carried as `[long]` on every path that reads it back.
+**Verify.** `node tools/check-cua-vm.mjs --root .` (`[long]$seq` in BOTH ps1
+sections); `node tests/windows-boot.mjs` (the answer-file contract is unchanged).
+
+### 14. J22-4 — read-back before the ack (the paste order)
+
+**Problem.** A failed `clip-current.txt` write (permissions, a full disk) was
+ignored and the ack still claimed `equal: true`. An ack could name a copy that
+did not hold the text.
+**Fix.** The contract is SET → READ BACK → write `clip-current.txt` → ack →
+delete, and the read-back is written BEFORE the ack. A failed copy write refuses
+with a named reason instead of acknowledging.
+**Verify.** `node tools/check-cua-vm.mjs --root .` (`# TEXT FIRST, THEN THE STATE
+THAT VOUCHES FOR IT`); `node tests/supervisor-smoke.mjs` (agent path
+`readBackEqual`).
+
+### 15. J22-5 — the size test was on the escaped JSON file, and refusals had no sha
+
+**Problem.** The agent tested the length of the JSON FILE, so a legal text whose
+escaping inflated it was refused while the backend believed it was fine; and a
+too-large refusal acked without a digest, so it could not be told from an empty
+reply.
+**Fix.** The test is on the TEXT in chars; the SHA-256 is computed BEFORE any
+refusal, and every refusal carries its code.
+**Verify.** `node tools/check-cua-vm.mjs --root .` (`THE SIZE TEST IS ON THE
+TEXT, IN CHARS`, `$error = 'too-large'`); `node tests/modules-unit.mjs` (the
+too-large answer is a named reason, not a bare failure).
+
+### 16. J22-6 — the privacy off-switch read as "registered"
+
+**Problem.** `C:\ProgramData\cua\clip-agent-disabled` was honoured by the agent
+(`exit 0`) but the firstboot step recorded `ok: true`, so the state file said the
+task had been registered when it never was.
+**Fix.** The switch is now materialized in three hops, because the guest cannot
+read the host environment. (1) The BACKEND is the writer:
+`CLIP_AGENT_SENTINEL_FILE` is staged beside the OEM payload when
+`DSH_CUA_CLIP_AGENT=0`, copied into `$OEM$/$$/Setup/Scripts`, and carried into
+`setup.img`'s root through `SETUP_IMAGE_OPTIONAL` (so an unset knob is not
+"incomplete payload"); an unset knob unlinks a stale root sentinel, and the writer
+logs `clip agent disabled by DSH_CUA_CLIP_AGENT=0 (sentinel staged)`. (2)
+`cua-firstboot.ps1` SEARCHES the same locations, COPIES a staged sentinel to
+`C:\ProgramData\cua\` before its check, then refuses to register the task and
+records `skipped: true, reason: 'clip-agent-disabled'`. (3) The agent (and its
+embedded fallback copy) runs the same search-then-stage hop and exits on the
+path.
+**Verify.** `node tests/modules-unit.mjs` (J22-6: `=0` stages root + Scripts, the
+real setup.img carries it, unset stages nothing and still builds/verifies, the
+stale root sentinel is unlinked); `node tools/check-cua-vm.mjs --root .`
+(`CLIP_AGENT_SENTINEL_FILE`, `SETUP_IMAGE_OPTIONAL`, the log line, the firstboot
+search-then-stage block, the embedded hop).
+
+### 17. J22-7 — SIGTERM left the live-view children holding their ports
+
+**Problem.** `server.close()` closes the unix socket and nothing else. The
+websockify / `cua-vnc-clip.mjs` children in `LIVE_VIEWS` survived the container
+stop, keeping their loopback ports and (worse) relaying to a bridge whose
+supervisor socket was gone — every clipboard write then failed with a
+control-socket error the user reads as "paste does nothing". A killed boot also
+left its swtpm behind.
+**Fix.** `sweepLiveViews()` SIGTERMs every child on SIGTERM/SIGINT and the process
+exits only after they are reaped (or after the unref'd
+`SHUTDOWN_LIVE_VIEW_DEADLINE_MS = 2000`). `stopBootResidue()` sweeps swtpm for a
+boot that was killed.
+**Verify.** `node tests/supervisor-smoke.mjs` (J22-7: exit 0, both stub bridges
+recorded a `stop`, 0 late stops); `node tools/check-cua-vm.mjs --root .`
+(`sweepLiveViews`, `stopBootResidue`).
+
+### 18. J22-8 — the front-door kind was assumed, not read
+
+**Problem.** The supervisor reported `kind: 'novnc-clip'` the moment the port
+answered. An image without a noVNC tree served a WS-only bridge that the panel
+rendered as a page which 404s, and the clipboard triple claimed a channel the page
+did not have.
+**Fix.** The bridge prints `[cua-vnc-clip] <kind> on http://…` to stderr; the
+supervisor captures that line across write chunks, requires
+`novnc-clip`/`novnc-clip-bare`, re-probes the listener after the wait, and falls
+back to websockify/raw when the line never arrives or the child dies.
+**Verify.** `node tests/supervisor-smoke.mjs` (J22-8: `novnc-clip`,
+`novnc-clip-bare` honoured, a silent listener is NOT the view and its child is
+killed).
+
+### 19. J22-9 / J22-13 — `schtasks /run` was taken as proof the agent is alive
+
+**Problem.** `/run` only QUEUES a task; its exit code says the queue accepted the
+request. firstboot declared the clipboard agent live without ever seeing a fresh
+`clip-state.json`.
+**Fix.** `/run` is followed by a freshness proof on `clip-state.json` (≤10 s); a
+task that started but never wrote state fails with `task-started-but-no-state`,
+and the waiter is a `[long]` window, not a bare loop.
+**Verify.** `node tests/supervisor-smoke.mjs` (the clipboard contract checks
+treat a task with no state as a failure);
+`node tools/check-cua-vm.mjs --root .` (`task-started-but-no-state`,
+`[long]$seq`).
+
+### 20. J22-10 / J22-11 — two logon sessions shared one outbox
+
+**Problem.** Every clipboard file was a single global path. A second logon (RDP,
+a reconnect, autologon plus a human) wrote the same `outbox`, served each other's
+payload, and one session's restart re-announced a clipboard the backend had
+already accepted.
+**Fix.** Session-derived paths (`clip-state-<id>.json`, `clip-ack-<id>.json`,
+`clip-current-<id>.txt`, `outbox-<id>\`) plus the canonical un-suffixed copies
+written by the SAME owner (`Write-JsonPair` / `Write-TextPair` — identical bytes,
+so a reader on either path sees one truth). A single-owner lock (60 s freshness
+window) means only the freshest session drives the clipboard; the backend keeps
+reading the canonical paths, unchanged.
+**Verify.** `node tools/check-cua-vm.mjs --root .` (both per-session path needles,
+`Write-*-Pair`, the ownership window).
+
+### 21. J22-12 — a reopened preview came back without its clipboard
+
+**Problem.** `restorePorts()` reopened the TCP relay after an aborted shutdown but
+told `openRelay` neither `view` nor `clipboard`. The live view came back and the
+paste controls did not — exactly the moment the user is still looking at the
+console.
+**Fix.** `relayCapabilities(snapshot, rawVncPort)` recomputes the triple from the
+recorded front door with the same rules a fresh `ensureWindowsConsoleRelay` uses
+(bridge → clipboard up; noVNC/websockify → page without clipboard; raw VNC →
+neither; no recorded view → infer raw from the target port), and `restorePorts`
+passes both to `openRelay`.
+**Verify.** `node tests/supervisor-smoke.mjs` (J22-12: `relayCapabilities` cases
+plus the live relay row's `view`/`clipboard`);
+`node tools/check-cua-vm.mjs --root .` (`view: capabilities.view, clipboard:
+capabilities.clipboard`).
+
+### What the round does NOT claim
+
+The `too-large` pre-check protects the JOB path only: a text over the outbox
+budget but under 1 MiB still pastes through the documented schtasks fallback, and
+the answer says so (`fastPathReason: "too-large"`). `implicit-single-target` is a
+deliberate relaxation, not a guarantee: two computers, or one binding, withdraw
+it. And `relayCapabilities` is exercised as a function (it is module-scope in the
+supervisor, not exported); the call site is pinned by the gate needle rather than
+by a second process. The sentinel's stale guard unlinks the payload-ROOT copy; a
+sentinel already written into an existing `$OEM$/$$/Setup/Scripts` tree is only
+replaced while the knob is `0` (the normal create/delete paths build that tree
+from scratch, and the medium root is rebuilt on every install boot).
+`DSH_CUA_CLIP_AGENT` is read at staging time only, so flipping it on a running
+computer takes effect on the next re-stage, not on the fly.

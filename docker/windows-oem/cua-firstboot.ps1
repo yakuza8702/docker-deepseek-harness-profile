@@ -1,5 +1,5 @@
 <#
-  cua-firstboot.ps1 — everything a fresh Windows computer needs to be usable by
+  cua-firstboot.ps1 - everything a fresh Windows computer needs to be usable by
   the harness, in one idempotent script.
 
   WHAT IT INSTALLS (all of it needed, none of it optional):
@@ -19,7 +19,7 @@
   It writes C:\cua-provision.json as an AUDIT marker: it records which steps
   succeeded and when, so a human (or a later `cua_vm_exec 'type
   C:\cua-provision.json'`) can see what the install actually did. Readiness is
-  NOT derived from it — `vmWindowsStatus` waits for the SSH banner, which only
+  NOT derived from it - `vmWindowsStatus` waits for the SSH banner, which only
   exists once the `openssh` step has run.
 #>
 param([switch]$Force)
@@ -47,15 +47,33 @@ if (Test-Path $marker) {
   } catch { Say "marker unreadable, starting fresh: $($_.Exception.Message)" }
 }
 $done = @{}
-foreach ($step in $state.steps) { if ($step.ok -eq $true) { $done[$step.step] = $true } }
+# A `skipped` entry is ok:true but NOT done: the privacy off-switch (J20-1b) is
+# re-checked on every run, so removing the sentinel registers and starts the
+# task without needing -Force (and while it is there, nothing is registered).
+foreach ($step in $state.steps) { if ($step.ok -eq $true -and $step.skipped -ne $true) { $done[$step.step] = $true } }
 if ($Force) { $done = @{}; $state.steps = @() }
 
 function Step([string]$name, [scriptblock]$body) {
   if ($done.ContainsKey($name)) { Say "== $name (already done, skipped)"; return }
   Say "== $name"
   try {
-    & $body
-    $state.steps += @{ step = $name; ok = $true }
+    $result = & $body
+    $entry = @{ step = $name; ok = $true }
+    # A BODY MAY ANNOTATE ITS OWN MARKER ENTRY by returning a hashtable. The
+    # clip-agent step uses it to record `skipped = $true; reason =
+    # 'clip-agent-disabled'` when the privacy off-switch sentinel exists: a bare
+    # ok:true there would read as "the task was registered", which is the exact
+    # lie the switch exists to prevent.
+    #
+    # SEARCHED, NOT TESTED ON $result: a body that logged with Say before
+    # returning its hashtable hands back an ARRAY of strings and hashtables, and
+    # `$result -is [hashtable]` would be false - the skip annotation would vanish
+    # into a plain ok:true, which is the defect all over again.
+    $annotation = @($result | Where-Object { $_ -is [hashtable] } | Select-Object -First 1)
+    if ($annotation.Count -gt 0) {
+      foreach ($key in $annotation[0].Keys) { $entry[$key] = $annotation[0][$key] }
+    }
+    $state.steps += $entry
   } catch {
     Say "FAILED $name : $($_.Exception.Message)"
     $state.steps += @{ step = $name; ok = $false; error = $_.Exception.Message }
@@ -64,7 +82,7 @@ function Step([string]$name, [scriptblock]$body) {
 }
 
 # M2: `Get-Command python` on Windows 11 happily returns the WindowsApps
-# App Execution Alias — a 0-byte stub that opens the Store instead of running
+# App Execution Alias - a 0-byte stub that opens the Store instead of running
 # Python. Installing "succeeded", pip then failed, and the whole dsh-cua step
 # died. Only a real interpreter (outside \WindowsApps) counts.
 function Get-RealPython {
@@ -72,6 +90,19 @@ function Get-RealPython {
     if ($candidate.Source -and $candidate.Source -notmatch '\\WindowsApps\\') { return $candidate.Source }
   }
   return $null
+}
+
+# J22-13: THE ONLY LOCAL PROOF THAT cua-clip-agent IS RUNNING. `schtasks /run`
+# exits 0 when Task Scheduler ACCEPTS the request, not when the loop executes -
+# and a task whose -File points at nothing "starts" too. The loop publishes
+# clip-state*.json as soon as it owns the session and heartbeats it every 30 s,
+# so a file stamp taken before the run and re-read afterwards is evidence.
+function Get-ClipStateStamps([string]$dir) {
+  $map = @{}
+  foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter 'clip-state*.json' -File -ErrorAction SilentlyContinue)) {
+    $map[$file.FullName] = $file.LastWriteTimeUtc.Ticks
+  }
+  return $map
 }
 
 Step 'openssh' {
@@ -134,14 +165,14 @@ Step 'clipboard-tasks' {
   #
   # The RFB route (ClientCutText) is dead here: the Windows guest runs a bare
   # QEMU VNC server with NO clipboard agent, so a ClientCutText is accepted by
-  # QEMU and dropped by the desktop — a human who pasted got the guest's OLD
+  # QEMU and dropped by the desktop - a human who pasted got the guest's OLD
   # clipboard, not the text that was sent. `Set-Clipboard` over SSH is dead for
   # the same reason the desktop is unreachable from SSH: sshd runs in Session 0,
   # which owns a different (empty) clipboard than the interactive session the
   # user sees.
   #
   # So the clipboard is moved by TWO on-demand tasks, each of which runs
-  # `/it` — IN THE INTERACTIVE USER SESSION — which is the only place
+  # `/it` - IN THE INTERACTIVE USER SESSION - which is the only place
   # `Set-Clipboard` / `Get-Clipboard` mean anything:
   #
   #   cua-clip-set   C:\ProgramData\cua\clip.txt      -> clipboard
@@ -193,8 +224,414 @@ Set-Clipboard -Value ([IO.File]::ReadAllText('C:\ProgramData\cua\clip.txt'))
   Say 'clipboard tasks registered (cua-clip-set, cua-clip-get: ondemand, interactive, hidden)'
 }
 
+# cua-clip-agent: the in-session clipboard loop (bidirectional). Marker key is
+# new so a machine already marked "clipboard-tasks: ok" still gets it.
+#
+# WHY THIS IS A SECOND STEP AND NOT PART OF `clipboard-tasks`: the two on-demand
+# tasks above are the DIRECTED path (the supervisor says "paste this now"). This
+# one is the AMBIENT path: it watches the session's clipboard so a human who
+# copies in Notepad is visible to the harness without anyone asking, and it
+# applies requests the supervisor leaves in outbox\clip-*.json. It must run
+# continuously, so it is a separate `onlogon` task in the same interactive
+# session - a machine that already finished `clipboard-tasks` still needs it,
+# which is exactly what a new marker key buys.
+Step 'clip-agent-task' {
+  # THE PRIVACY OFF-SWITCH (J20-1b), AND ITS CONTRACT WITH docker/cua-clip-agent.ps1
+  # ---------------------------------------------------------------------------
+  # DSH_CUA_CLIP_AGENT=0 means "do not run the ambient clipboard loop". This
+  # script CANNOT read the host environment - the flag is an image-build variable
+  # and the guest has no way back to it - so the switch is materialized as a FILE
+  # named `clip-agent-disabled`, and that single file travels in TWO STAGES:
+  #
+  #   STAGE 1 - THE BACKEND, AT INSTALL TIME (another lane's code, named here so
+  #   the contract is one paragraph instead of an assumption). When
+  #   DSH_CUA_CLIP_AGENT=0 it stages the file named `clip-agent-disabled` in
+  #   BOTH places the guest can still read during and after Setup:
+  #
+  #         <setup.img root>\clip-agent-disabled      the answer medium, beside
+  #                                                   Autounattend.xml
+  #         $OEM$\$$\Setup\Scripts\clip-agent-disabled   what Setup copies into
+  #                                                   C:\Windows\Setup\Scripts
+  #
+  #   STAGE 2 - THIS SCRIPT, AT FIRSTBOOT (the block right below). It searches
+  #   the known staging locations for that file name and COPIES it to the one
+  #   canonical path every consumer reads:
+  #
+  #         C:\ProgramData\cua\clip-agent-disabled    (sentinel; exists = disabled)
+  #
+  #   WITHOUT STAGE 2 THE SWITCH IS SILENTLY OFF: the backend's file sits on the
+  #   medium and in Setup\Scripts, the check below tests ProgramData, finds
+  #   nothing, and the ambient loop is registered anyway. That gap is the defect
+  #   this pair of blocks closes.
+  #
+  # BOTH CONSUMERS READ THE CANONICAL PATH: the check below (before the task is
+  # registered) and docker/cua-clip-agent.ps1 at startup (it exits quietly
+  # there, so a machine whose task was registered before the switch was flipped
+  # also stops); the embedded fallback copy below repeats the same
+  # search-then-stage hop, so a guest that runs the agent out of ProgramData
+  # honours the switch too. Sentinel present -> this step registers NOTHING and
+  # starts NOTHING, and records the skip in the audit marker: `skipped = $true`,
+  # never a plain ok:true that would read as "registered".
+
+  # STAGE 2 (the half that was missing). SEARCH-THEN-STAGE, additive by
+  # construction: when no staged copy exists anywhere, nothing is written, no
+  # directory is created, and the check below runs against exactly the state it
+  # always ran against. The directory list is the SAME one the OEM payload
+  # search uses further down ($PSScriptRoot, Setup\Scripts, and the removable
+  # roots Setup hands the answer medium), so both the setup.img ROOT copy and
+  # the $OEM$ copy are reached, plus a copy already put in place by hand.
+  #
+  # -ErrorAction SilentlyContinue on the probes IS NOT DECORATION: a bare
+  # Test-Path against a drive letter this guest does not have (a machine with no
+  # G:) is an error, and the same block in the embedded copy below runs under
+  # $ErrorActionPreference = 'Stop'. A missing drive must read as "not there",
+  # never as "the step failed".
+  $sentinelName = 'clip-agent-disabled'
+  $sentinelPath = 'C:\ProgramData\cua\clip-agent-disabled'
+  if (-not (Test-Path -LiteralPath $sentinelPath -ErrorAction SilentlyContinue)) {
+    $sentinelDirs = @($PSScriptRoot, 'C:\Windows\Setup\Scripts', 'C:\ProgramData\cua', 'C:\', 'D:\', 'E:\', 'F:\', 'G:\', 'H:\')
+    foreach ($sentinelDir in $sentinelDirs) {
+      if (-not $sentinelDir) { continue }
+      $sentinelStaged = Join-Path $sentinelDir $sentinelName
+      if (-not (Test-Path -LiteralPath $sentinelStaged -ErrorAction SilentlyContinue)) { continue }
+      # The clipboard step creates ProgramData\cua, but a -Force run against a
+      # partly wiped install must not fail on a missing directory: create it.
+      New-Item -ItemType Directory -Force -Path 'C:\ProgramData\cua' | Out-Null
+      Copy-Item -LiteralPath $sentinelStaged -Destination $sentinelPath -Force
+      Say "clip agent: staged sentinel $sentinelStaged -> $sentinelPath"
+      break
+    }
+  }
+
+  if (Test-Path -LiteralPath 'C:\ProgramData\cua\clip-agent-disabled') {
+    Say 'clip agent: DISABLED by the privacy off-switch (clip-agent-disabled present); task NOT registered'
+    return @{ skipped = $true; reason = 'clip-agent-disabled' }
+  }
+
+  $agentScript = 'C:\ProgramData\cua\clip-agent.ps1'
+  New-Item -ItemType Directory -Force -Path 'C:\ProgramData\cua\outbox' | Out-Null
+
+  # THE BODY COMES FROM THE OEM PAYLOAD, and the payload is searched where Setup
+  # actually put it: next to this script ($PSScriptRoot), in Setup\Scripts (where
+  # setupcomplete.cmd and this file land), and on the roots of the removable
+  # media the fallback boot path uses (FIRSTBOOT_FALLBACK_COMMAND in
+  # cua-vm-windows-qemu.mjs walks C:..H: the same way).
+  #
+  # THE EMBEDDED COPY IS THE FLOOR, NOT THE PREFERRED PATH. An image whose OEM
+  # payload predates this file (no cua-clip-agent.ps1 staged) would otherwise
+  # register a task whose -File points at nothing: a task that exists, reports
+  # success and does nothing - the exact failure this repository keeps naming.
+  # docker/cua-clip-agent.ps1 is the source of truth; the inline text below is
+  # THAT FILE VERBATIM except for comment-only and blank lines (generated, not
+  # hand-copied), so the loop logic - [long] seq, the clip-current-before-ack
+  # order, the text-length size test, the per-session paths and the owner lock -
+  # is identical on both paths. Only the files are absent-or-present, not the code.
+  $agentSource = $null
+  $searchDirs = @($PSScriptRoot, 'C:\Windows\Setup\Scripts', 'C:\', 'D:\', 'E:\', 'F:\', 'G:\', 'H:\')
+  foreach ($dir in $searchDirs) {
+    if (-not $dir) { continue }
+    $candidate = Join-Path $dir 'cua-clip-agent.ps1'
+    if (Test-Path -LiteralPath $candidate) { $agentSource = $candidate; break }
+  }
+  if ($agentSource) {
+    Copy-Item -LiteralPath $agentSource -Destination $agentScript -Force
+    Say "clip agent: $agentSource -> $agentScript"
+  } else {
+    Set-Content -Path $agentScript -Encoding ASCII -Value @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+$Dir = 'C:\ProgramData\cua'
+# SEARCH-THEN-STAGE, THE SAME HOP AS cua-firstboot.ps1: the backend stages a file
+# named clip-agent-disabled on the answer medium and into Setup\Scripts, while the
+# sentinel this loop honours lives in $Dir. Copy a staged one into place first, so
+# a guest that is only reachable through the medium still stops. Additive: no
+# staged copy anywhere means no write, no directory change, no behaviour change.
+# -ErrorAction SilentlyContinue: a drive letter this guest does not have must read
+# as "not there" (this file runs under $ErrorActionPreference = 'Stop').
+if (-not (Test-Path -LiteralPath (Join-Path $Dir 'clip-agent-disabled') -ErrorAction SilentlyContinue)) {
+  foreach ($stagedDir in @($PSScriptRoot, 'C:\Windows\Setup\Scripts', 'C:\ProgramData\cua', 'C:\', 'D:\', 'E:\', 'F:\', 'G:\', 'H:\')) {
+    if (-not $stagedDir) { continue }
+    $stagedSentinel = Join-Path $stagedDir 'clip-agent-disabled'
+    if (-not (Test-Path -LiteralPath $stagedSentinel -ErrorAction SilentlyContinue)) { continue }
+    try {
+      New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+      Copy-Item -LiteralPath $stagedSentinel -Destination (Join-Path $Dir 'clip-agent-disabled') -Force
+    } catch { }
+    break
+  }
+}
+if (Test-Path -LiteralPath (Join-Path $Dir 'clip-agent-disabled')) { exit 0 }
+$sessionId = 0
+try { $sessionId = [int](Get-Process -Id $PID).SessionId } catch { $sessionId = 0 }
+$SessionTag = '-' + [string]$sessionId
+$Outbox = Join-Path $Dir 'outbox'
+$OutboxSession = Join-Path $Dir ('outbox' + $SessionTag)
+$CurrentPath = Join-Path $Dir 'clip-current.txt'
+$CurrentPathSession = Join-Path $Dir ('clip-current' + $SessionTag + '.txt')
+$StatePath = Join-Path $Dir 'clip-state.json'
+$StatePathSession = Join-Path $Dir ('clip-state' + $SessionTag + '.json')
+$AckPath = Join-Path $Dir 'clip-ack.json'
+$AckPathSession = Join-Path $Dir ('clip-ack' + $SessionTag + '.json')
+$PollMs = 400
+$MaxChars = 1048576
+$MaxOutboxPerCycle = 4
+$OwnerWindowSeconds = 60
+$HeartbeatSeconds = 30
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+New-Item -ItemType Directory -Force -Path $Outbox | Out-Null
+New-Item -ItemType Directory -Force -Path $OutboxSession | Out-Null
+function Get-Sha256([string]$Text) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = $Utf8NoBom.GetBytes($Text)
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+}
+function Get-NowIso {
+  return (Get-Date).ToString('o', $Invariant)
+}
+function Write-JsonPair([string]$Canonical, [string]$Scoped, $Object) {
+  $json = $Object | ConvertTo-Json -Depth 4 -Compress
+  [System.IO.File]::WriteAllText($Scoped, $json, $Utf8NoBom)
+  [System.IO.File]::WriteAllText($Canonical, $json, $Utf8NoBom)
+}
+function Write-TextPair([string]$Canonical, [string]$Scoped, [string]$Text) {
+  [System.IO.File]::WriteAllText($Scoped, $Text, $Utf8NoBom)
+  [System.IO.File]::WriteAllText($Canonical, $Text, $Utf8NoBom)
+}
+function Test-SessionAlive([int]$Session) {
+  try {
+    return (@(Get-Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.SessionId -eq $Session } |
+      Select-Object -First 1).Count -gt 0)
+  } catch { return $true }
+}
+function Test-OtherOwner {
+  $cutoff = [DateTime]::UtcNow.AddSeconds(-$OwnerWindowSeconds)
+  foreach ($item in @(Get-ChildItem -LiteralPath $Dir -Filter 'clip-state-*.json' -File -ErrorAction SilentlyContinue)) {
+    $idText = $item.BaseName.Substring('clip-state'.Length).TrimStart('-')
+    $id = -1
+    if (-not [int]::TryParse($idText, [ref]$id)) { continue }
+    if ($id -eq $sessionId) { continue }
+    if ($item.LastWriteTimeUtc -gt $cutoff -and (Test-SessionAlive $id)) { return $true }
+  }
+  if (Test-Path -LiteralPath $StatePath) {
+    try {
+      $legacy = Get-Item -LiteralPath $StatePath
+      if ($legacy.LastWriteTimeUtc -gt $cutoff) {
+        $owner = -1
+        try {
+          $declared = ([System.IO.File]::ReadAllText($StatePath, $Utf8NoBom) | ConvertFrom-Json).session
+          if ($null -ne $declared) { $owner = [int]$declared }
+        } catch { $owner = -1 }
+        if ($owner -ge 0 -and $owner -ne $sessionId -and (Test-SessionAlive $owner)) { return $true }
+      }
+    } catch { }
+  }
+  return $false
+}
+function Update-Heartbeat {
+  $now = [DateTime]::UtcNow
+  foreach ($path in @($StatePathSession, $StatePath)) {
+    try {
+      if (Test-Path -LiteralPath $path) { [System.IO.File]::SetLastWriteTimeUtc($path, $now) }
+    } catch { }
+  }
+}
+function Read-ClipboardText {
+  for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    try {
+      $value = [System.Windows.Forms.Clipboard]::GetText()
+      if ($null -eq $value) { return '' }
+      return [string]$value
+    } catch {
+      Start-Sleep -Milliseconds (40 * ($attempt + 1))
+    }
+  }
+  return $null
+}
+function Write-ClipboardState([string]$Text, [long]$Seq, [int]$Session) {
+  $state = @{
+    seq = $Seq
+    sha256 = Get-Sha256 $Text
+    chars = $Text.Length
+    at = Get-NowIso
+    session = $Session
+  }
+  Write-TextPair $CurrentPath $CurrentPathSession $Text
+  Write-JsonPair $StatePath $StatePathSession $state
+}
+function Invoke-OutboxItem($File, [int]$Session) {
+  [long]$seq = 0
+  $wantAck = $true
+  $ok = $false
+  $equal = $false
+  $error = $null
+  $readBack = ''
+  $expected = ''
+  $pasted = $false
+  try {
+    $raw = [System.IO.File]::ReadAllText($File.FullName, $Utf8NoBom)
+    $request = $raw | ConvertFrom-Json
+    $seq = [long]$request.seq
+    $text = [string]$request.text
+    if ($null -ne $request.wantAck) { $wantAck = [bool]$request.wantAck }
+    $expected = Get-Sha256 $text
+    if ($text.Length -gt $MaxChars) {
+      $error = 'too-large'
+    } else {
+      Set-Clipboard -Value $text
+      $pasted = $true
+      Start-Sleep -Milliseconds 60
+      $readBack = [string](Get-Clipboard -Raw)
+      $equal = ($readBack -ceq $text)
+      $ok = $equal
+      if (-not $ok) { $error = 'readback-mismatch' }
+    }
+  } catch {
+    $error = $_.Exception.Message
+  }
+  if ($pasted) {
+    try { Write-TextPair $CurrentPath $CurrentPathSession $readBack } catch { }
+  }
+  if ($wantAck) {
+    if ((-not $error) -and (-not $ok)) { $error = 'paste-not-applied' }
+    $ack = @{
+      seq = $seq
+      ok = $ok
+      sha256 = $expected
+      readBack = $readBack
+      equal = $equal
+      at = Get-NowIso
+      error = $error
+    }
+    try { Write-JsonPair $AckPath $AckPathSession $ack } catch { }
+  }
+  try { Remove-Item -LiteralPath $File.FullName -Force } catch { }
+}
+function Invoke-Outbox([int]$Session) {
+  $pending = @()
+  foreach ($dir in @($OutboxSession, $Outbox)) {
+    $pending += @(Get-ChildItem -LiteralPath $dir -Filter 'clip-*.json' -File -ErrorAction SilentlyContinue)
+  }
+  $pending = @($pending | Sort-Object LastWriteTime | Select-Object -First $MaxOutboxPerCycle)
+  foreach ($file in $pending) {
+    Invoke-OutboxItem $file $Session
+  }
+}
+$seq = [long]0
+$lastSha = ''
+foreach ($candidate in @($StatePathSession, $StatePath)) {
+  if (-not (Test-Path -LiteralPath $candidate)) { continue }
+  try {
+    $previous = [System.IO.File]::ReadAllText($candidate, $Utf8NoBom) | ConvertFrom-Json
+    if ($null -ne $previous.seq) { $seq = [long]$previous.seq }
+    if ($null -ne $previous.sha256) { $lastSha = [string]$previous.sha256 }
+    break
+  } catch { }
+}
+$published = $false
+$lastBeat = [DateTime]::UtcNow
+while ($true) {
+  if (Test-OtherOwner) {
+    Start-Sleep -Seconds 60
+    continue
+  }
+  try { Invoke-Outbox $sessionId } catch { }
+  $text = Read-ClipboardText
+  if ($null -ne $text) {
+    $sha = Get-Sha256 $text
+    if (($sha -ne $lastSha) -or (-not $published)) {
+      $advanced = $false
+      if ($sha -ne $lastSha) { $seq += 1; $advanced = $true }
+      try {
+        Write-ClipboardState $text $seq $sessionId
+        $lastSha = $sha
+        $published = $true
+        $lastBeat = [DateTime]::UtcNow
+      } catch {
+        if ($advanced) { $seq -= 1 }
+      }
+    }
+  }
+  if ($published -and ((([DateTime]::UtcNow) - $lastBeat).TotalSeconds -ge $HeartbeatSeconds)) {
+    Update-Heartbeat
+    $lastBeat = [DateTime]::UtcNow
+  }
+  Start-Sleep -Milliseconds $PollMs
+}
+'@
+    Say 'clip agent: the OEM payload had no cua-clip-agent.ps1; wrote the embedded copy'
+  }
+
+  # /sc onlogon + /it = the loop starts with the interactive session, which is
+  # the only session whose clipboard the user can see and touch. /rl LIMITED =
+  # the user's own token (elevation would move it to another desktop).
+  #
+  # THROUGH A .cmd FILE FOR THE SAME REASON AS THE TASKS ABOVE: Windows
+  # PowerShell 5.1 hands a variable containing spaces to a native program
+  # unquoted, so `& schtasks /tr $tr` arrives as `/tr powershell.exe -NoProfile
+  # ...` and schtasks takes only `powershell.exe` as the action. cmd parses the
+  # quoted argument the documented way.
+  $agentTr = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File $agentScript"
+  $agentCmd = Join-Path $env:TEMP 'cua-clip-agent.cmd'
+  @("schtasks /create /tn `"cua-clip-agent`" /sc onlogon /it /rl LIMITED /f /tr `"$agentTr`"") |
+    Set-Content -Path $agentCmd -Encoding ASCII
+  & cmd /c $agentCmd
+  $agentExit = $LASTEXITCODE
+  Remove-Item -Force $agentCmd -ErrorAction SilentlyContinue
+  if ($agentExit -ne 0) { throw "schtasks could not register cua-clip-agent (exit $agentExit)" }
+  # Run it now instead of waiting for the next logon: a machine that is already
+  # logged in is the common case when firstboot is re-run.
+  #
+  # 'started' IS NOT WHAT schtasks /run PROVES (J22-13). Its exit code says Task
+  # Scheduler ACCEPTED the request; a task whose -File points at nothing also
+  # "starts" and exits immediately, and the old code recorded ok:true for it. The
+  # proof is the loop's own writes: it publishes clip-state*.json as soon as it
+  # owns the session and heartbeats the stamp every 30 s, so the stamp is local
+  # evidence that the loop is alive.
+  #
+  # A LOOP THAT IS ALREADY ALIVE GETS NO SECOND INSTANCE: at logon the task is
+  # already running, and a -Force firstboot would otherwise start one more loop in
+  # the same session, where the two would race for the same outbox request. A
+  # state stamp fresher than the loop's own 60 s lock window is that check.
+  $stateDir = 'C:\ProgramData\cua'
+  $before = Get-ClipStateStamps $stateDir
+  $freshCutoff = ([DateTime]::UtcNow.AddSeconds(-60)).Ticks
+  $proven = (@($before.Values | Where-Object { $_ -gt $freshCutoff }).Count -gt 0)
+  if ($proven) {
+    Say 'clip agent: an instance is already running (state file fresher than 60 s); not started again'
+  } else {
+    & schtasks /run /tn 'cua-clip-agent' | Out-Null
+    $runExit = $LASTEXITCODE
+    if ($runExit -ne 0) { throw "schtasks could not start cua-clip-agent (exit $runExit)" }
+    for ($probe = 0; $probe -lt 20; $probe++) {
+      # 20 x 500 ms = 10 s. A cold powershell.exe plus Add-Type of WinForms is the
+      # slow part, not the loop itself, so a couple of seconds of patience is owed
+      # to the first start of a session.
+      Start-Sleep -Milliseconds 500
+      $after = Get-ClipStateStamps $stateDir
+      foreach ($path in $after.Keys) {
+        if ((-not $before.ContainsKey($path)) -or ($after[$path] -gt $before[$path])) { $proven = $true; break }
+      }
+      if ($proven) { break }
+    }
+    if (-not $proven) {
+      # FAILED, not success: "a task that exists and does nothing" is the failure
+      # mode this repository keeps naming, and a marker that says ok lets the next
+      # run skip the step forever.
+      throw 'task-started-but-no-state'
+    }
+  }
+  Say 'clip agent registered (cua-clip-agent: onlogon, interactive, hidden) and running (state file confirmed)'
+}
+
 # THE STEP IS RENAMED ON PURPOSE. It used to be `autostart-task`, and a computer
-# whose marker already says `autostart-task: ok` would SKIP its body — i.e. every
+# whose marker already says `autostart-task: ok` would SKIP its body - i.e. every
 # machine that has the visible console window would keep it. A new key re-runs
 # exactly the one step whose old result is the bug, and leaves the expensive
 # steps (OpenSSH, python, pip) skipped as before.
@@ -209,20 +646,20 @@ Step 'autostart-windowless' {
   #
   #   1. It ran `python.exe`, which ALWAYS allocates a console. The task was
   #      registered with Hidden=False, so every logon left a permanently blank,
-  #      visible console window on the desktop — the reported defect. The fix is
+  #      visible console window on the desktop - the reported defect. The fix is
   #      `pythonw.exe` (the windowless interpreter that ships beside python.exe)
   #      plus `-Hidden` on the task itself; if an unusual install has no
   #      pythonw.exe, a `powershell -WindowStyle Hidden` wrapper gets the same
   #      result.
   #   2. It passed `--pipe \\.\pipe\dsh-cua`, an argument that does not exist:
   #      upstream `dsh_cua.server main()` takes no pipe option. The named pipe
-  #      in win-mcp.js's diagram was therefore never created — the SSH side
+  #      in win-mcp.js's diagram was therefore never created - the SSH side
   #      starts its OWN stdio server per session, and the two never met. The
   #      argument is gone rather than documented as broken.
   #
   # WHAT THIS MEANS, HONESTLY: with a stdio-only upstream, ONE shared session-2
   # server cannot be reached over SSH yet. The MCP attach keeps working as it
-  # really does — an independent stdio server per SSH session (19 tools) — and
+  # really does - an independent stdio server per SSH session (19 tools) - and
   # the clipboard/session-2 features need either these on-demand tasks (which
   # they now have) or an upstream pipe server (which does not exist). See
   # plugins/dsh-cua-vm/README.md and REPORT.md.
