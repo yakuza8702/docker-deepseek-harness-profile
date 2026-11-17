@@ -60,7 +60,7 @@ import path from 'node:path'
 import { createSpace, formatSpace, formatSpaceWarning, pngSize, relativeToPixels, resolutionProblem, spaceLine, toDisplayPixels, SPACE_CACHE_MS } from './cua-vm-space.mjs'
 import {
   createWindowsBackend, windowsEnabled, windowsHostCaps, windowsQmpAdapter,
-  WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
+  WINDOWS_ISO_SOURCES, WINDOWS_VERSIONS, WINDOWS_CATALOG, WINDOWS_MIN_MEMORY_GB, WINDOWS_MIN_DISK_GB,
   WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
   WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
@@ -6171,6 +6171,23 @@ const handlers = {
         qemu: WINDOWS_QEMU,
         hostCaps: windowsBackend.hostCaps(),
         liveView: 'noVNC over websockify at /vm/port/<name>/',
+        // THE PANEL'S VERSION PICKER COMES FROM THE CATALOG, NOT FROM A COPY.
+        //
+        // The picker used to be a list of codes in the plugin and a table of
+        // labels/sizes in the backend — two sources that drift. The catalog is
+        // already the single source of truth for `sizeGb` (the store
+        // reservation), `bios` (which firmware profile the guest needs) and
+        // `refusal` (`xp` is LISTED and not installable, and saying so is
+        // better than hiding the code), so it travels here in COMPACT rows:
+        // label + sizeGb + bios + refusal only — no ISO URL, no product key,
+        // no image id, because this answer goes to a page and to a model.
+        versions: WINDOWS_VERSIONS,
+        catalog: Object.fromEntries(WINDOWS_VERSIONS.map((code) => [code, {
+          label: WINDOWS_CATALOG[code].label,
+          sizeGb: WINDOWS_CATALOG[code].sizeGb,
+          bios: WINDOWS_CATALOG[code].bios,
+          refused: WINDOWS_CATALOG[code].refusal ?? null
+        }])),
         ...(windowsEnabled() ? {} : { reason: 'the Windows backend is disabled (DSH_CUA_VM_WINDOWS=0)' })
       }
     })

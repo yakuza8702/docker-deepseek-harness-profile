@@ -88,6 +88,138 @@ window.__ModuleLoader__.load({
       return `${name}: password hidden and removed from this page.`
     }
 
+    /**
+     * THE VERSION LIST IS DATA, NOT MARKUP.
+     *
+     * `vmList`'s `windows` payload carries the backend catalog (`versions`: the
+     * 16 codes; `catalog`: one row per code with label/sizeGb/bios/refused), and
+     * the panel renders exactly that, in the backend's own order. When the field
+     * is absent (a supervisor older than this page) the select falls back to the
+     * same 16 rows instead of going empty — the codes below ARE the catalog, so
+     * a fallback row can never invent a version the backend refuses to answer.
+     * The markers are read off the row too: `xp` is LISTED and refused (its
+     * refusal is data — no Autounattend path), `7u` boots SeaBIOS and is
+     * experimental, and the tiny/core codes keep their own Tiny labels.
+     */
+    const WINDOWS_CATALOG_FALLBACK = [
+      { code: '11', label: 'Windows 11 Pro', sizeGb: 7.9, bios: 'ovmf' },
+      { code: '11l', label: 'Windows 11 LTSC', sizeGb: 4.7, bios: 'ovmf' },
+      { code: '11e', label: 'Windows 11 Enterprise', sizeGb: 6.6, bios: 'ovmf' },
+      { code: '10', label: 'Windows 10 Pro', sizeGb: 5.7, bios: 'ovmf' },
+      { code: '10l', label: 'Windows 10 LTSC', sizeGb: 4.6, bios: 'ovmf' },
+      { code: '10e', label: 'Windows 10 Enterprise', sizeGb: 5.2, bios: 'ovmf' },
+      { code: '7u', label: 'Windows 7 Ultimate', sizeGb: 3.1, bios: 'seabios' },
+      { code: 'xp', label: 'Windows XP Professional', sizeGb: 0.6, bios: 'seabios', refused: true },
+      { code: '2025', label: 'Windows Server 2025', sizeGb: 7.6, bios: 'ovmf' },
+      { code: '2022', label: 'Windows Server 2022', sizeGb: 6.0, bios: 'ovmf' },
+      { code: '2019', label: 'Windows Server 2019', sizeGb: 5.3, bios: 'ovmf' },
+      { code: '2016', label: 'Windows Server 2016', sizeGb: 6.5, bios: 'ovmf' },
+      { code: '2012', label: 'Windows Server 2012', sizeGb: 4.3, bios: 'ovmf' },
+      { code: 'core11', label: 'Tiny11 Core', sizeGb: 3.0, bios: 'ovmf' },
+      { code: 'tiny11', label: 'Tiny11', sizeGb: 5.3, bios: 'ovmf' },
+      { code: 'tiny10', label: 'Tiny10', sizeGb: 3.6, bios: 'ovmf' }
+    ]
+
+    // The spellings the backend canonicalises. Mirrored here so a stored draft
+    // that says `11ltsc` renders as "Windows 11 LTSC (4.7 GB) — alias" instead
+    // of a blank select; the payload's own `aliases` wins when it carries one.
+    const WINDOWS_VERSION_ALIASES_FALLBACK = {
+      '11p': '11', pro11: '11', win11: '11', windows11: '11', '11ltsc': '11l', ltsc11: '11l', win11l: '11l', 'win11-ltsc': '11l', '11iot': '11l', iot11: '11l', '11i': '11l',
+      '10p': '10', pro10: '10', win10: '10', windows10: '10', '10ltsc': '10l', ltsc10: '10l', win10l: '10l', 'win10-ltsc': '10l', '10iot': '10l', iot10: '10l',
+      '7': '7u', win7: '7u', win7u: '7u', windows7: '7u', '7e': '7u',
+      xp32: 'xp', winxp: 'xp', winxp86: 'xp', windowsxp: 'xp',
+      '25': '2025', win25: '2025', win2025: '2025', windows2025: '2025',
+      '22': '2022', win22: '2022', win2022: '2022', windows2022: '2022',
+      '19': '2019', win19: '2019', win2019: '2019', windows2019: '2019',
+      '16': '2016', win16: '2016', win2016: '2016', windows2016: '2016',
+      '2012r2': '2012', win2012: '2012', win2012r2: '2012', windows2012: '2012',
+      'core 11': 'core11', tiny11core: 'core11', tiny11_core: 'core11',
+      'tiny 11': 'tiny11', tiny_11: 'tiny11', 'tiny 10': 'tiny10', tiny_10: 'tiny10'
+    }
+
+    /** `null` for "no size", not 0 — `Number(null)` is 0 and would print "(0.0 GB)". */
+    function toSizeGb(value) {
+      if (value === null || value === undefined || value === '') return null
+      const size = Number(value)
+      return Number.isFinite(size) ? size : null
+    }
+
+    function windowsAliasMap(windows) {
+      const aliases = windows?.aliases
+      if (aliases !== null && typeof aliases === 'object' && !Array.isArray(aliases)) return aliases
+      return WINDOWS_VERSION_ALIASES_FALLBACK
+    }
+
+    /**
+     * One row per code, whatever shape the payload uses: an array of rows that
+     * carry `code`, a `code → row` map, or a bare `versions` array (zipped by
+     * index, with the fallback row filling the facts). `versions` order wins, so
+     * the dropdown cannot reorder itself between two polls.
+     */
+    function windowsCatalogRows(windows) {
+      const versions = Array.isArray(windows?.versions) ? windows.versions.map((code) => String(code)) : []
+      const catalog = windows?.catalog
+      const rows = new Map()
+      const add = (code, row) => {
+        const value = String(code ?? row?.code ?? row?.id ?? '')
+        if (value === '' || rows.has(value)) return
+        rows.set(value, {
+          code: value,
+          label: typeof row?.label === 'string' && row.label !== '' ? row.label : value,
+          sizeGb: toSizeGb(row?.sizeGb),
+          bios: typeof row?.bios === 'string' ? row.bios : null,
+          refused: row?.refused === true || (typeof row?.refused === 'string' && row.refused !== '')
+        })
+      }
+      if (Array.isArray(catalog)) {
+        catalog.forEach((row, index) => add(row?.code ?? versions[index], row))
+      } else if (catalog !== null && typeof catalog === 'object') {
+        for (const [code, row] of Object.entries(catalog)) add(code, row)
+      }
+      if (rows.size === 0 && versions.length > 0) {
+        for (const code of versions) {
+          add(code, WINDOWS_CATALOG_FALLBACK.find((row) => row.code === code) ?? { label: code })
+        }
+      }
+      if (rows.size === 0) return WINDOWS_CATALOG_FALLBACK
+      const order = versions.length > 0
+        ? versions.concat([...rows.keys()].filter((code) => !versions.includes(code)))
+        : [...rows.keys()]
+      return order.filter((code) => rows.has(code)).map((code) => rows.get(code))
+    }
+
+    /** `Windows 7 Ultimate (3.1 GB — SeaBIOS, experimental)`; markers are data. */
+    function windowsVersionLabel(row) {
+      const size = toSizeGb(row?.sizeGb)?.toFixed(1) ?? null
+      const marker = row?.refused === true ? 'refused: no Autounattend path'
+        : row?.bios === 'seabios' ? 'SeaBIOS, experimental' : ''
+      if (size === null) return marker === '' ? String(row?.label ?? '') : `${row?.label ?? ''} (${marker})`
+      return marker === '' ? `${row.label} (${size} GB)` : `${row.label} (${size} GB — ${marker})`
+    }
+
+    /**
+     * THE STORED DRAFT WINS OVER THE CATALOG, NOT THE OTHER WAY ROUND.
+     * A draft holding `11ltsc` (a spelling the old six-option list used) must
+     * stay selectable: a `value` that no `<option>` carries makes the browser
+     * silently show the first entry, so the user would create `11` believing it
+     * was their LTSC choice. The extra option is labelled with the canonical
+     * form. The disabled state belongs to the kind select above and is untouched.
+     */
+    function windowsVersionOptions(windows, current) {
+      const options = windowsCatalogRows(windows).map((row) => ({ value: row.code, label: windowsVersionLabel(row) }))
+      const value = String(current ?? '')
+      if (value === '' || options.some((option) => option.value === value)) return options
+      const canonical = windowsAliasMap(windows)[value.toLowerCase()] ?? null
+      const row = canonical === null ? null : windowsCatalogRows(windows).find((entry) => entry.code === canonical) ?? null
+      options.push({
+        value,
+        label: row === null
+          ? `${value} (not in this catalog — kept from your draft)`
+          : `${windowsVersionLabel(row)} — alias "${value}"`
+      })
+      return options
+    }
+
     async function api(path, body) {
       const response = await fetch(`/cua/${path}`, body === undefined
         ? { headers: { accept: 'application/json' } }
@@ -744,15 +876,9 @@ window.__ModuleLoader__.load({
                       value: draft.windowsVersion, style: S.input,
                       onChange: (event) => setDraft({ ...draft, windowsVersion: event.target.value })
                     },
-                      h('option', { value: '11' }, 'Windows 11'),
-                      // Pinned, probed public ISO (Microsoft's own Evaluation Center
-                      // link resolves to it) — the only 11-family image that installs
-                      // without an operator-supplied ISO.
-                      h('option', { value: '11ltsc' }, 'Windows 11 IoT Enterprise LTSC 2024 (pinned ISO)'),
-                      h('option', { value: '10' }, 'Windows 10'),
-                      h('option', { value: 'ltsc10' }, 'Windows 10 LTSC'),
-                      h('option', { value: '2022' }, 'Server 2022'),
-                      h('option', { value: '2025' }, 'Server 2025 (pinned ISO)')
+                      // every code has an ordered ISO source chain with sha256+size verification; aliases (11ltsc, ltsc10, ltsc11, win11, …) still work
+                      windowsVersionOptions(state?.windows, draft.windowsVersion).map((option) =>
+                        h('option', { key: option.value, value: option.value }, option.label))
                     ))
             ),
             // The recommendation, stated where the number is typed — the create
@@ -809,7 +935,7 @@ window.__ModuleLoader__.load({
             ),
             draft.kind === 'linux'
               ? h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Enable REA adds Node 22, rea-agents, a JDK 21, Ghidra 12.1.4 and JADX to the computer, roughly 3.5 GB installed, and lifts the disk to at least a 40 GB one. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field. Leaving Enable GPU unticked uses the host default (virgl when this host can do it).')
-              : h('div', { style: S.muted }, 'Windows is a DIRECT QEMU computer (OVMF firmware, a swtpm TPM2, a qcow2 disk under the VM store) — there is no container runtime. It needs /dev/kvm and compose.windows.yaml for the devices (DSH_CUA_VM_WINDOWS=1). The recommended floor is 64 GB disk and 6 GB RAM: create below it anyway, and the computer carries a warning that Windows Update will run out of space. The install takes tens of minutes and lists as installing until SSH answers AND QMP says running. Once ready: exec/put/get work over SSH, the desktop is cua_vm_gui over QMP, and the live view at /vm/port/<name>/ is a noVNC stream a human can drive. It cannot take REA or Android, and the disk does not grow. Its password is generated and shown with Reveal — stored 0600 in the VM store, never in the registry.'),
+              : h('div', { style: S.muted }, 'Windows is a DIRECT QEMU computer (OVMF firmware for the UEFI editions, SeaBIOS for 7u, a swtpm TPM2, a qcow2 disk under the VM store) — there is no container runtime. It needs /dev/kvm and compose.windows.yaml for the devices (DSH_CUA_VM_WINDOWS=1). The recommended floor is 64 GB disk and 6 GB RAM: create below it anyway, and the computer carries a warning that Windows Update will run out of space. The install takes tens of minutes and lists as installing until SSH answers AND QMP says running. Once ready: exec/put/get work over SSH, the desktop is cua_vm_gui over QMP, and the live view at /vm/port/<name>/ is a noVNC stream a human can drive. It cannot take REA or Android, and the disk does not grow. Its password is generated and shown with Reveal — stored 0600 in the VM store, never in the registry.'),
             // A SPARSE DISK OVER THE POLICY IS CREATED, NOT REFUSED: this is advice,
             // not a block (the supervisor sends warnings[code: disk-over-policy]).
             draft.rea === true && form.diskQuotaGb < Math.max(40, draft.diskGb) && h('div', { style: { ...S.muted, color: T.error } },
@@ -1147,7 +1273,13 @@ window.__ModuleLoader__.load({
     // U1: the two state transitions the hide button depends on, and the secret
     // helpers around them, are pure functions so a test can prove "hide clears
     // the value" without mounting the page.
-    module.exports.__test = { hideSecretEntry, noteAfterHide, clean }
+    // V6: the version picker is pure data → label, exported for the same reason:
+    // a unit test can prove the 16-code fallback, the xp refusal marker and the
+    // stored-alias option without mounting the page.
+    module.exports.__test = {
+      hideSecretEntry, noteAfterHide, clean,
+      windowsCatalogRows, windowsVersionLabel, windowsVersionOptions, WINDOWS_CATALOG_FALLBACK
+    }
     return module.exports
   }
 })

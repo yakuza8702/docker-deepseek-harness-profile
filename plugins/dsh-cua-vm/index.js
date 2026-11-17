@@ -1801,9 +1801,9 @@ export function apply(ctx, config = {}) {
         diskGb: { type: 'number', description: 'Disk size in GB. Omitted: 20 for Linux, 64 for Windows. Below a Windows floor (64 GB disk / 6 GB RAM / 2 vCPU) the computer is still created and the result carries a warning.' },
         android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating (Linux only).' },
         rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true. Linux only.' },
-        windowsVersion: { type: 'string', enum: ['11', '11ltsc', '10', 'ltsc10', '2022', '2025'], description: 'Windows version. "2025" and "11ltsc" (Windows 11 IoT Enterprise LTSC 2024, alias "ltsc11") have pinned, probed public ISOs; 11/10/ltsc10/2022 require windowsIso (their evaluation media is behind a session-token page). Windows only.' },
+        windowsVersion: { type: 'string', enum: ['11', '11l', '11e', '10', '10l', '10e', '7u', 'xp', '2025', '2022', '2019', '2016', '2012', 'core11', 'tiny11', 'tiny10'], description: 'Windows version code (dockur/windows vocabulary): 11=Win 11 Pro, 11l=Win 11 LTSC, 11e=Win 11 Enterprise, 10=Win 10 Pro, 10l=Win 10 LTSC, 10e=Win 10 Enterprise, 7u=Win 7 Ultimate (SeaBIOS, experimental), xp=listed but refused (legacy-installer-unsupported: no Autounattend path), 2025/2022/2019/2016/2012=Server, core11/tiny11/tiny10=Tiny11/Tiny10 community media. Every code has an ordered ISO source chain (mido/ESD/mirrors) with sha256+size verification; aliases (11ltsc, ltsc11, ltsc10, win11, …) still work and canonicalise. Windows only.' },
         windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL (downloaded once into $STORE/iso/) or a file path inside the VM store or the workspace (attached directly as a QEMU drive). Windows only; mutually exclusive with windowsVersion.' },
-        windowsImageIndex: { type: 'integer', description: 'Windows only, optional: the /IMAGE/INDEX the answer file installs (1-based, as listed in the ISO sources/install.wim). Omit to use the version default: the pinned 11ltsc media names its edition explicitly (/IMAGE/NAME), Server 2025 installs image 2 (Standard Evaluation, Desktop Experience), any windowsIso installs image 1. Needed only for an unusual ISO where those are wrong.' },
+        windowsImageIndex: { type: 'integer', description: 'Windows only, optional: the /IMAGE/INDEX the answer file installs (1-based, as listed in the ISO sources/install.wim). Omit to use the version default: the pinned 11l media names its edition explicitly (/IMAGE/NAME), Server 2025 installs image 2 (Standard Evaluation, Desktop Experience), any windowsIso installs image 1. Needed only for an unusual ISO where those are wrong.' },
         windowsImageName: { type: 'string', description: 'Windows only, optional: the exact /IMAGE/NAME to install, e.g. "Windows 11 IoT Enterprise LTSC 2024 Evaluation". Wins over windowsImageIndex. Use it when the ISO carries several editions and the name is known exactly — a name that does not match the media fails the install.' }
       }
     },
@@ -2183,12 +2183,18 @@ export function apply(ctx, config = {}) {
     name: 'cua_vm_doctor',
     description: 'Diagnose the host: /dev/kvm, render node, QEMU virgl support, Docker engine reachability, store accounting, policy.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
-    output: textOutput('Host capabilities and the store policy, one line per fact.'),
+    output: textOutput('Host capabilities, the Windows version codes this host can install, and the store policy, one line per fact.'),
     async execute() {
       const answer = await call({ op: 'vmDoctor' })
       const caps = answer.hostCaps ?? {}
       const windows = answer.windows ?? {}
       const store = answer.store ?? {}
+      // THE VERSION LIST IS THE SUPERVISOR'S, NOT A GUESS. `vmDoctor` already
+      // carries `windows.versions` (16 canonical codes), so the doctor prints it
+      // and returns it structured: the model used to choose from a stale
+      // 6-code `enum` in the tool schema and could not tell an alias from an
+      // unsupported version.
+      const versions = Array.isArray(windows.versions) ? windows.versions.map((code) => String(code)) : []
       return {
         text: [
           // The device and its ACCESS are two facts: "present but DENIED" is
@@ -2205,9 +2211,17 @@ export function apply(ctx, config = {}) {
           `windows: ${windows.enabled
             ? `enabled (direct qemu: ${windows.hostCaps?.qemu ? 'present' : 'MISSING'}, OVMF ${windows.hostCaps?.ovmfCode ? 'present' : 'MISSING'}, swtpm ${windows.hostCaps?.swtpm ? 'present' : 'MISSING'}, KVM ${windows.hostCaps?.kvm ? (windows.hostCaps?.kvmUsable ? 'present' : 'present but NOT openable by this uid (gid/group_add)') : 'MISSING'})`
             : `disabled (${windows.reason})`}`,
+          `windows versions: ${versions.length > 0 ? `${versions.length} code(s): ${versions.join(', ')}` : 'unknown (the supervisor is older than this plugin)'}`,
           `store: ${(store.usedBytes / 1024 ** 3).toFixed(1)} GB of ${(store.quotaBytes / 1024 ** 3).toFixed(0)} GB`,
           `policy: shutdownTimeoutSec=${answer.shutdownTimeoutSec} checkpointPolicy=${answer.checkpointPolicy} computers=${answer.vms}`
-        ].join('\n')
+        ].join('\n'),
+        // The structured half: `text` is what the model reads, this is what a
+        // caller (or a test) can branch on without parsing prose.
+        windows: {
+          enabled: windows.enabled === true,
+          versions,
+          isoSources: windows.isoSources ?? null
+        }
       }
     }
   })
