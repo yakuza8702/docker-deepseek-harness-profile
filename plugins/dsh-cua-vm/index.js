@@ -99,7 +99,7 @@ const CUA_PROMPT_LINES = [
   'On a GPU computer Xorg runs on virgl and reports OpenGL 4.3 (Mesa under-reports 4.2; the session lifts it); if an app refuses, check `cua_vm_gui geometry` or `glxinfo -B`, and use `LIBGL_ALWAYS_SOFTWARE=1` (llvmpipe, slower) only as a genuine, stated fallback.',
   'SPACE: the screenshot and the click share ONE space, and the tool measures it — every desktop result prints `screenshot WxH · display WxH · scale N`. When scale is 1 (a 1200x750 desktop) image pixels are display pixels; when it is not, the result says `image px = 0.9375 × display px; cua maps it — do not rescale`, and that is literal: click the pixel you see, never multiply it.',
   'SHUTDOWN vs SUSPEND: `cua_vm_shutdown` is a real ACPI powerdown, then a checkpoint, then the sandbox is removed (`state: powered-off`); `cua_vm_start` cold-boots from that checkpoint — do NOT expect `sb resume` to work on a powered-off computer, that is the trap the split exists for. `cua_vm_suspend` keeps the sandbox and resumes instantly. Neither happens on its own: the computer runs until the user asks.',
-  'WINDOWS (`kind: "windows"`, direct QEMU + OVMF/TPM2): exec/put/get work over the guest OpenSSH server like the Linux computer (Session 0, cmd.exe, `C:\\` paths); the desktop is `cua_vm_gui` over QMP and the LIVE VIEW at /vm/port/<name>/ (noVNC), where a human can drive the same screen. Its GPU is a virtio-gpu with NO Windows 3D driver: Direct3D falls back to WARP (CPU), so do not promise hardware acceleration; there is no mouse-cursor overlay on this path (the real pointer is in the frame). QMP typing is ASCII-only and there is no clipboard, no accessibility tree and no window list — for element-level work use the dsh-cua tools when the guest advertises them. It cannot take `rea: true` or `android: true`; the generated password is per computer (Reveal), and SSH keys are per computer too.',
+  'WINDOWS (`kind: "windows"`, direct QEMU + OVMF/TPM2): exec/put/get work over the guest OpenSSH server like the Linux computer (Session 0, cmd.exe, `C:\\` paths); the desktop is `cua_vm_gui` over QMP and the LIVE VIEW at /vm/port/<name>/ (noVNC), where a human can drive the same screen. Its GPU is a virtio-gpu with NO Windows 3D driver: Direct3D falls back to WARP (CPU), so do not promise hardware acceleration; there is no mouse-cursor overlay on this path (the real pointer is in the frame). QMP typing is ASCII-only, there is no RFB clipboard (the guest runs no clipboard agent, so `cua_vm_gui` has no `clipboard` action on Windows — use the panel Clipboard section, which drives a task in the user session), no accessibility tree and no window list — for element-level work use the dsh-cua tools when the guest advertises them. It cannot take `rea: true` or `android: true`; the generated password is per computer (Reveal), and SSH keys are per computer too.',
   'If a tool reports no VM, call `cua_vm_ensure` once, then `cua_vm_exec`.',
   'For reverse-engineering work — a feature to reimplement, a suspicious binary, an APK, an Electron app, a model file — create the computer with `rea: true` (and let the disk be at least 40 GB); REA is not installed on a computer created without it, and installing it by hand inside a 20 GB disk is the wrong fix.'
 ]
@@ -333,6 +333,16 @@ export function apply(ctx, config = {}) {
           // The generated Windows password, on demand only: the row carries a
           // `credentials: true` flag, the secret stays in the 0600 file.
           case 'windowsPassword': return send(200, { ok: true, ...(await call({ op: 'vmWindowsPassword', ...(await body()) })) })
+          // U2: THE CLIPBOARD, THROUGH THE GUEST'S INTERACTIVE SESSION. The
+          // supervisor drives the two on-demand tasks (cua-clip-set /
+          // cua-clip-get) over the SSH channel it already has; the /cua switch
+          // only forwards, so the panel and the model cannot drift. A computer
+          // that is not ready answers `available: false` with the reason, which
+          // is what the panel renders as the DISABLED section.
+          case 'windowsClipboardSet': return send(200, { ok: true, ...(await call({ op: 'vmWindowsClipboardSet', ...(await body()) })) })
+          case 'windowsClipboardGet': return send(200, { ok: true, ...(await call({ op: 'vmWindowsClipboardGet', ...(await body()) })) })
+          // U4: the measured C: free space (throttled 60 s at the supervisor).
+          case 'windowsFreeSpace': return send(200, { ok: true, ...(await call({ op: 'vmWindowsFreeSpace', ...(await body()) })) })
           case 'stop': return send(200, { ok: true, ...(await call({ op: 'stop', ...(await body()) })) })
           case 'delete': {
             const answer = await call({ op: 'vmDelete', ...(await body()) })

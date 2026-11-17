@@ -92,8 +92,18 @@ and image, and offers:
   `running` and a resumed one as `ready`; both count as running. The list polls
   while a machine starts and the transient note clears when it is up.
 * **Show VM**, left of Delete — the shared desktop (section 7).
-* **Terminal** (one command, inline output), **Metrics** (guest load / memory /
-  disk / vCPU), **Delete** (confirmed).
+* **Run command** (one command, inline output — NOT a pty: no prompt, no job
+  control, no working directory that survives the call; the button used to say
+  "Terminal", which promised a shell the panel does not have), **Metrics** (guest
+  load / memory / disk / vCPU), **Delete** (confirmed).
+* **Reveal / Hide password** (Windows only) — the label and the click now agree:
+  hiding DELETES the value from the page state and clears the note that used to
+  quote it.
+* **Clipboard** (Windows only) — a textarea + **Paste to guest** +
+  **Read guest clipboard**, driving the guest's interactive-session tasks. The
+  noVNC paste box does not work on Windows (no clipboard agent in the guest).
+* **Free space** on the spec line (Windows, ready) — `Get-PSDrive C` over SSH,
+  throttled 60 s, with a warning below 10 GB.
 * **New computer** — name, vCPU, RAM, image. Debian and Arch are not Cua disks:
   they need `cua images build` and a pinned reference, and the panel says so
   instead of substituting Ubuntu. The model is told to ask for name/spec/image

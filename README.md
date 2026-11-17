@@ -831,9 +831,15 @@ row. Neither branch gives Windows accelerated 3D — see the ceilings below.
 **Honest ceilings:** the GPU option is a virtio-gpu backed by the host render
 node, but Windows has **no accelerated 3D driver** here — Direct3D falls back to
 WARP (CPU), and an EGL handle in `nvidia-smi` is the host-side QEMU context, not
-guest acceleration. QMP typing is ASCII-only, there is no clipboard, no
-accessibility tree, no window list and **no cursor overlay** (the pointer in the
-frame is the real one). `cua_vm_suspend` is QMP `stop`; `cua_vm_shutdown` is the
+guest acceleration. QMP typing is ASCII-only, no accessibility tree, no window
+list and **no cursor overlay** (the pointer in the frame is the real one). The
+**clipboard has no RFB path** on a Windows computer (no guest clipboard agent, so
+a ClientCutText is accepted and dropped; `Set-Clipboard` over SSH lands in
+Session 0): use the panel's **Clipboard** section, which drives two on-demand
+interactive tasks in the guest. The live view's own paste box cannot be patched
+from this plugin — it ships in the image's noVNC. The disk free space of a ready
+Windows computer is read over SSH (`Get-PSDrive C`, 60 s) and shown on its row,
+with a warning below 10 GB. `cua_vm_suspend` is QMP `stop`; `cua_vm_shutdown` is the
 same ACPI → checkpoint → `powered-off` path as Linux. The dsh-cua element tools
 attach lazily over SSH only while a Windows computer is ready (~3-8k tokens), and
 `DSH_CUA_VM_WIN_MCP=0` removes them.

@@ -1065,6 +1065,90 @@ say so), and the key schedule is anchored on the firmware's actual serial
 timeline instead of on the spawn clock. Whether Setup then reads it is the one
 step only a live install can show — and it is now the only remaining unknown.
 
+### 9.6.15 Live-verified Windows-panel UX defects (U1–U4)
+
+Four defects reported from a **live, fully installed Windows computer** (SSH up,
+GUI control proven end to end). All four were reproducible on that machine and
+none of them is a Windows problem — they are this plugin's.
+
+| # | defect | root cause | fix |
+|---|---|---|---|
+| U1 | "Hide password" left the password visible | the label followed `secret[name]`, the click always called `revealPassword`; `setSecret` had no clear path; the reveal ALSO interpolated the password into the persistent note banner | `hidePassword()` deletes the key from a copied state and clears the note if it carried the value; the button toggles on `secret[name]`; the reveal note says where the password is, not what it is |
+| U2 | clipboard into the guest did nothing | RFB `ClientCutText` is dropped (no guest clipboard agent — a paste delivered the OLD clipboard); `Set-Clipboard` over SSH writes **Session 0**'s clipboard | two on-demand `/it` tasks (`cua-clip-set`, `cua-clip-get`) that run in the interactive session, driven over SSH/scp; panel Clipboard section; noVNC paste box documented as unusable |
+| U3 | a blank console window at every logon | the autostart task ran `python.exe` (always allocates a console) with `Hidden=False`, and passed a fictional `--pipe \\.\pipe\dsh-cua` | `pythonw.exe` + `-Hidden` (a hidden PowerShell wrapper when no pythonw exists); the pipe argument is gone, and the limitation is documented |
+| U4 | "6.8 GB free on C:" — the warning was real | the panel showed the VIRTUAL disk size only; nothing ever read the guest's free space | `freeSpace` on the status payload (`Get-PSDrive C` over SSH, throttled 60 s), printed on the spec line with the below-floor warning (10 GB) |
+
+**The clipboard is the interesting one**, because two "obvious" paths both
+*succeed* and do nothing, which is worse than failing:
+
+* RFB `ClientCutText` — QEMU accepts the message and the guest drops it; the
+  paste then delivers whatever the guest already had. Proven on the live VM.
+* `Set-Clipboard` over SSH — sshd is in Session 0; the command exits 0 and the
+  user's session clipboard never changes.
+
+The only context that owns the visible clipboard is the logged-on session, so the
+bridge is two **on-demand, interactive** (`/sc ondemand /it /rl LIMITED`) tasks
+running `Set-Clipboard` / `Get-Clipboard` there. Three invariants make it honest:
+
+1. the text file is written **before** the task is run (the file's `schtasks /run`
+   only QUEUES the task — ordering is the whole protocol);
+2. the task's **`Last Result`** is polled with `/query /fo LIST /v`, so a non-zero
+   exit is reported as *"the clipboard was NOT set"* with the code, never as a
+   success;
+3. the read direction **deletes `clip-read.txt` first**, so a task that did not
+   run cannot be answered with yesterday's clipboard.
+
+Text never travels on a command line (`&`, `|`, `;`, quotes would be re-parsed by
+`cmd.exe`): it is scp'd as a file, capped at 1 MiB. The `ssh`/`scp` transport is
+**injected** into the backend, so the protocol is driven by a stub in
+`tests/modules-unit.mjs` and the ORDER is asserted, not commented.
+
+**U3's honest limitation, recorded here as a follow-up.** Upstream
+`dsh_cua.server main()` takes **no** `--pipe` argument, so the named pipe the
+firstboot task referenced was never created. The consequence is documented
+instead of papered over:
+
+* the MCP attach keeps working as it really does — an independent stdio server
+  per SSH session, 19 tools;
+* **one shared session-2 server cannot be reached from Session 0 yet**, which is
+  why the clipboard does not ride that channel (the `/it` tasks above exist);
+* if upstream grows a pipe server, the firstboot task registers it and
+  `win-mcp.js` proxies to it. Until then this is a **documented limitation**, and
+  the visible console window — the user-visible half — is gone.
+
+Also relabelled: the panel's **"Terminal"** button is a one-shot exec form (one
+command, captured output) with no pty. It is now **"Run command"**, with a title
+that says exactly that. A real pty needs a bidirectional stream plus a resize
+path on both backends — not a rename, so it is not attempted.
+
+**Verification actually run** (this round):
+
+* `node tools/check-cua-vm.mjs` → **PASS**, **663** assertions over 18 files
+  (was 604), and the same gate replayed from `cwd=/` against a flat tree
+  assembled exactly as the image assembles `/opt/seek-harness/cua-check` → **PASS,
+  661/18** (the flat layout has no `Dockerfile`, by design).
+* `node tools/check-cua-rea.mjs` → **67** needles, PASS.
+* `node tools/ci-gates.mjs` → 9 passed, 1 skipped (image artifact), **1 failed:
+  `check-office.mjs`** — pre-existing and unrelated (the office bundle/CLI are not
+  installed in this sandbox; it failed identically before this round).
+* `node tests/modules-unit.mjs` → **PASS**, **31** new assertions: the hide-password
+  state transition (and that the reveal note never interpolates the value), the
+  clipboard protocol against a stub transport (order, `Last Result`, stale-file
+  clearing, missing-file failure, no-transport, >1 MiB refusal), the two
+  firstboot task registrations (on-demand/`/it`/LIMITED/hidden), `pythonw.exe` +
+  `-Hidden` and the absent `--pipe`, and the free-space parser/formatter.
+* `node tests/supervisor-smoke.mjs` → **PASS**, **8** new assertions: the three new ops
+  refuse an unknown computer, a not-ready row answers `available:false` **with
+  the reason** (the panel's disabled state), and a status poll carries
+  `freeSpace` without failing on it.
+* `node tests/windows-boot.mjs` → PASS; `node tests/qmp-shutdown.mjs` → PASS.
+* `node --check` clean on every changed file.
+
+**Note on `module.exports.__test`**: the client now exports two pure helpers
+(`hideSecretEntry`, `noteAfterHide`) plus `clean`, used only by the unit test.
+The defect was a state transition ("hide" cleared nothing), and a renderer test
+would not have named it.
+
 ### 9.7 What is still open (TBC)
 
 1. **A real guest round trip** on a built image: boot, provision v7 (`space_helper=1`),
@@ -1093,3 +1177,15 @@ step only a live install can show — and it is now the only remaining unknown.
    display), and the noVNC page's exact URL depends on the shipped noVNC build.
    The display-number conversion itself is pinned by a unit test (`-vnc :31` for
    port 5931), which is the part that was wrong.
+10. **FOLLOW-UP (U3): a shared session-2 dsh-cua server over a named pipe.** With
+    a stdio-only upstream (`main()` takes no `--pipe`), each SSH attach starts its
+    own server and nothing can reach a listener in the user's session. The
+    clipboard works around it with two `/it` tasks; a general fix needs upstream
+    to accept a pipe (or a socket) so ONE long-lived session-2 server exists.
+    Recorded as a documented limitation in `plugins/dsh-cua-vm/README.md`, not as
+    a pending bug, and no fake flag is registered for it.
+11. **The clipboard bridge is verified against a stub transport, not a live
+    guest.** The order (`clip.txt` before `schtasks /run`), the `Last Result`
+    check, the stale-file delete and the missing-file failure are all asserted;
+    what a live run would add is the Windows-side task plumbing itself
+    (`/it` session routing, `Last Result` semantics on that build).

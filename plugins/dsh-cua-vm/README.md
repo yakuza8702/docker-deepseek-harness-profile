@@ -264,8 +264,11 @@ runs `cua-firstboot.ps1` at first logon. That script installs:
   `administrators_authorized_keys` (password auth stays on as the human fallback);
 * **Python** from python.org (silent install);
 * **dsh-cua** via pip;
-* a **scheduled task in the interactive session** running `dsh-cua-server` on a
-  named pipe.
+* a **scheduled task in the interactive session** running `dsh-cua-server` —
+  with `pythonw.exe` (no console window) and `-Hidden`, and **without** a pipe
+  argument (see the honest limitation below);
+* **two on-demand, interactive clipboard tasks** (`cua-clip-set`,
+  `cua-clip-get`) — the only clipboard path that works on Windows.
 
 It writes `C:\cua-provision.json` as its marker.
 
@@ -396,9 +399,12 @@ host bridge, so it is **not** the default and is not wired here; the harness kee
 ### dsh-cua tools (element actions, lazily attached)
 
 While a Windows computer is `ready`, the plugin attaches the guest's MCP tool
-list through
-`ssh … python -m dsh_cua.server --stdio --pipe \\.\pipe\dsh-cua`
-(`plugins/dsh-cua-vm/win-mcp.js`). The tools appear as `cua_win__<name>` and are
+list through `ssh … python -m dsh_cua.server --stdio`
+(`plugins/dsh-cua-vm/win-mcp.js`) — **one stdio server per SSH session, 19
+tools**. There is no shared pipe server: upstream `dsh_cua.server main()` takes no
+`--pipe` argument, so one long-lived session-2 server cannot be reached from
+Session 0 yet (see [The interactive session, and what does not exist yet](#the-interactive-session-and-what-does-not-exist-yet)).
+The tools appear as `cua_win__<name>` and are
 **disposed** within ~5 s of the computer stopping, being switched away from, or
 being deleted (the attach check runs on a 5 s beat, not the 30 s cache beat —
 a stale `cua_win__*` call against a stopped computer is a confusing SSH error).
@@ -419,6 +425,89 @@ Kill switch: `DSH_CUA_VM_WIN_MCP=0` disables the whole path (no SSH bridge, no
 tools, no tokens). The same bridge can also be used as a plain MCP stdio server
 (`node plugins/dsh-cua-vm/win-mcp.js --stdio --port <sshPort> --key <path>`) if
 you prefer a `dsh-mcp-client` row.
+
+### The clipboard (and why the noVNC paste box does nothing)
+
+**Use the panel's Clipboard section.** It is the only path that works.
+
+A human's instinct is the noVNC paste box in the live view. On a Windows
+computer that box delivers **nothing**: it sends an RFB `ClientCutText`, QEMU
+accepts it, and the guest drops it because a bare Windows desktop has no
+clipboard agent to receive it. The live symptom is worse than a failure — the
+paste "succeeds" and pastes the guest's **previous** clipboard. That box lives in
+the image's own `/usr/share/novnc`, not in this plugin, so it cannot be patched
+from here; the fix is the Clipboard section, and this paragraph.
+
+`Set-Clipboard` over SSH does not work either: `sshd` runs in **Session 0**,
+which owns a different (empty) clipboard than the interactive session the user
+sees. The command exits 0 and nothing changes.
+
+So the clipboard is moved by **two on-demand scheduled tasks that run in the
+interactive session** (`/sc ondemand /it /rl LIMITED`), registered by
+`cua-firstboot.ps1`:
+
+| task | direction | body |
+|---|---|---|
+| `cua-clip-set` | panel → guest | `Set-Clipboard -Value ([IO.File]::ReadAllText('C:\ProgramData\cua\clip.txt'))` |
+| `cua-clip-get` | guest → panel | `[IO.File]::WriteAllText('C:\ProgramData\cua\clip-read.txt', (Get-Clipboard -Raw))` |
+
+The supervisor writes/reads those files over the SSH/scp channel it already has
+and runs the task with `schtasks /run`. Three details make it honest rather than
+apparently-working:
+
+1. **the file is written BEFORE the task runs** — otherwise the task reads the
+   previous paste, which is the same "old clipboard" symptom one layer up;
+2. **the task's own `Last Result` is read** (`/query /fo LIST /v`) — `schtasks
+   /run` only QUEUES the task, so a non-zero exit is reported as "the clipboard
+   was NOT set" with the code, never as a success;
+3. **the read direction deletes `clip-read.txt` first**, so a task that did not
+   run cannot be answered with yesterday's clipboard.
+
+Text is never placed on a command line (a `&`, `|`, `;` or quote would be
+re-parsed by `cmd.exe`); it travels as a file, and the payload is capped at 1 MiB
+— a bigger paste is a file transfer, so use `cua_vm_put`.
+
+The panel section renders **disabled with the reason** whenever the computer is
+not `ready` or SSH is down. It is the same answer the model gets: not an error,
+a state.
+
+### Disk free space, on the spec line
+
+`diskGb` is the **virtual** size the user asked for; it cannot say that a 64 GB
+disk has 6.8 GB left, which is the state Windows Update fails in and Setup gets
+blamed for. A ready Windows row therefore carries `freeSpace` — read inside the
+guest with `Get-PSDrive C`, throttled to **60 s** — and the panel prints it on
+the spec line with the below-floor warning (**10 GB**) in the error colour. A
+probe that cannot answer says `available: false` and why; it never prints 0 GB
+and never fails the status call.
+
+### The interactive session, and what does not exist yet
+
+Honest state of the agent surface, because two parts of it used to be described
+as working when they were not:
+
+* **What works.** `dsh-cua` (pywinauto) inside the guest, started PER SSH
+  SESSION as `python -m dsh_cua.server --stdio`; the plugin attaches its 19
+  tools while a Windows computer is ready. Session-2-only features (the
+  clipboard) go through the two `/it` tasks above.
+* **What does not exist.** A single long-lived server in the user's session that
+  SSH could attach to. Upstream `dsh_cua.server main()` has no `--pipe` option,
+  so the named pipe this plugin's firstboot task used to reference
+  (`\\.\pipe\dsh-cua`) was **never created** — the argument is gone, because
+  a flag that does not exist is a lie in two places at once.
+* **What that costs.** Each SSH attach starts its own server (it works, and it is
+  what the tools use), but there is no shared state between attaches and no way
+  to reach a session-2 listener. If upstream grows a pipe server, the firstboot
+  task can register it and `win-mcp.js` can proxy to it; until then this is a
+  documented limitation, not a pending bug.
+
+**Run command, not Terminal.** The panel's button opens a ONE-SHOT command form:
+one line, Run, and the captured output. It has no pty, no prompt, no job control
+and no working directory that survives the call (Windows runs it through `sshd`
+in Session 0; Linux through `sb exec`). It used to be labelled "Terminal", which
+promised a shell the panel does not have. A real pty would need a bidirectional
+stream and a resize path on both backends — not a rename, so the label is the
+honest fix.
 
 ### Lifecycle states
 

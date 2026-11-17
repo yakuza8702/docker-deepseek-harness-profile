@@ -95,6 +95,30 @@ const FILES = {
  */
 const NEEDLES = {
   supervisor: [
+    // U2/U4: THE CLIPBOARD (session 2 only) AND THE MEASURED FREE SPACE.
+    // The backend owns the protocol (file, then task, then the task's own Last
+    // Result); this file owns the channel (the per-computer key, scp). The
+    // transport is INJECTED so a test can drive the real protocol with a stub.
+    ['async vmWindowsClipboardSet({ name, text } = {})', 1],
+    ['async vmWindowsClipboardGet({ name } = {})', 1],
+    ['async vmWindowsFreeSpace({ name, force = false } = {})', 1],
+    ['windowsBackend.clipboardSet({ ...meta, name })', 1],
+    ['windowsBackend.clipboardGet({ ...meta, name })', 1],
+    ['transport: windowsClipboardTransport()', 1],
+    ['function windowsClipboardTransport()', 1],
+    ['cua-clip-set', 2],
+    ['cua-clip-get', 1],
+    ['Last Result', 2],
+    ['clip-read.txt', 1],
+    ['U2: WHAT TO SAY WHEN THE CLIPBOARD SECTION IS UNAVAILABLE', 1],
+    // U4: the measured C: free space, throttled, never fatal.
+    ["freeSpace: state === 'ready' ? await windowsFreeSpace(meta)", 1],
+    ['const WINDOWS_FREE_TTL_MS = 60000', 1],
+    // One probe per computer at a time: the panel's 5 s status beat and the 60 s
+    // free-space beat must not open two SSH sessions on a guest that is busy.
+    ['const WINDOWS_FREE_INFLIGHT = new Map()', 1],
+    ['if (WINDOWS_FREE_INFLIGHT.get(name) === probe) WINDOWS_FREE_INFLIGHT.delete(name)', 1],
+    ['\'powershell -NoProfile -NonInteractive -Command "(Get-PSDrive -Name C).Free"\'', 1],
     // registry v2 + read-migration
     ['const REGISTRY_VERSION = 2', 1],
     ['function migrateRegistryRow(row, mapKey = \'\')', 1],
@@ -633,6 +657,10 @@ const NEEDLES = {
     ['export function canonicalWindowsVersion(version)', 1],
     // FLOORS ARE WARNINGS. The create must produce advice, never a clamp.
     ['export function windowsCapacityWarnings({ diskGb, memory, cpu })', 1],
+    // U4: the free-space formatters live in THIS module (pure, unit-tested).
+    ['export function parseFreeSpaceProbe(stdout)', 1],
+    ['export function formatWindowsFreeSpace(bytes)', 1],
+    ['export const WINDOWS_FREE_FLOOR_GB = 10', 1],
     ['disk-below-floor', 1],
     ['memory-below-floor', 1],
     ['Created anyway on request', 3],
@@ -792,7 +820,13 @@ const NEEDLES = {
     ["request('tools/list'", 1],
     ["request('tools/call'", 1],
     ['dsh_cua.server', 1],
-    ['--stdio', 1]
+    ['--stdio', 1],
+    // U3: THE PIPE FLAG IS GONE FROM THE COMMAND. It named a listener upstream
+    // does not implement; the documented consequence (one stdio server PER SSH
+    // session, no shareable session-2 server yet) is what replaced it.
+    ["'python -m dsh_cua.server --stdio'", 1],
+    ['U3: THERE IS NO NAMED PIPE', 1],
+    ['ONE shared session-2 server cannot be reached', 1]
   ],
   oemAnswer: [
     ['<unattend xmlns="urn:schemas-microsoft-com:unattend">', 1],
@@ -855,7 +889,34 @@ const NEEDLES = {
     ['Register-ScheduledTask', 1],
     ['-LogonType Interactive', 1],
     // D10: the marker is an audit trail, not a readiness signal.
-    ['an AUDIT marker', 1]
+    ['an AUDIT marker', 1],
+    // U2: THE CLIPBOARD BRIDGE. Two on-demand tasks that run IN THE USER'S
+    // SESSION, because that is the only clipboard a human can see (RFB
+    // ClientCutText has no guest agent; Set-Clipboard over SSH writes Session
+    // 0's clipboard). The flags are the contract: /sc ondemand (only when the
+    // supervisor asks), /it (interactive = the user's session), /rl LIMITED
+    // (the same token the user's own PowerShell gets).
+    // The task lines go through a generated .cmd because Windows PowerShell 5.1
+    // passes a variable containing spaces to a native program UNQUOTED, so
+    // `& schtasks /tr $var` arrived as `/tr powershell.exe ...` and only the
+    // executable was registered. The batch file is the documented quoting path.
+    ['cua-clip-set`" /sc ondemand /it /rl LIMITED /f /tr', 1],
+    ['cua-clip-get`" /sc ondemand /it /rl LIMITED /f /tr', 1],
+    ['cmd /c $cmdFile', 1],
+    ['Set-Clipboard -Value ([IO.File]::ReadAllText(', 1],
+    ["[IO.File]::WriteAllText('C:\\ProgramData\\cua\\clip-read.txt', [string](Get-Clipboard -Raw))", 1],
+    ['clip-set.ps1', 1],
+    ['clip-get.ps1', 1],
+    // U3: THE CONSOLE IS GONE. python.exe always allocates one; pythonw.exe does
+    // not, and the task carries -Hidden as well. The `--pipe` argument is gone
+    // because upstream `dsh_cua.server main()` has no such option — it named a
+    // listener nothing ever created.
+    ['pythonw.exe', 2],
+    ['New-ScheduledTaskAction -Execute $pyw -Argument', 1],
+    ['-Settings $settings -Hidden -Force', 1],
+    ['-WindowStyle Hidden', 1],
+    ['U3: WHAT USED TO BE WRONG, TWICE', 1],
+    ['upstream `dsh_cua.server main()` takes no pipe option', 1]
   ],
   provision: [
     ['MARKER=/var/lib/cua-provision', 1],
@@ -975,7 +1036,34 @@ const NEEDLES = {
     ['Waiting for ${name} to power off', 1],
     // * The result is SURFACED: a mayBeTorn answer and the supervisor's own
     //   detail sentence reach the note instead of a silent success.
-    ['payload?.mayBeTorn === true', 1]
+    ['payload?.mayBeTorn === true', 1],
+    // U1: HIDE IS A CLEAR. The button toggles (the label already followed the
+    // state, the click did not), the secret state is deletable, and the reveal
+    // note no longer carries the password.
+    ["onClick: () => (secret[name] ? hidePassword(name) : void revealPassword(name))", 1],
+    ['const hidePassword = (name) => {', 1],
+    ['setSecret((current) => hideSecretEntry(current, name))', 1],
+    ['function hideSecretEntry(current, name) {', 1],
+    ['delete next[name]', 1],
+    ['function noteAfterHide(note, name, value) {', 1],
+    ['password revealed below', 1],
+    ['module.exports.__test', 1],
+    // U3: THE BUTTON IS NOT A TERMINAL. A one-shot exec form labelled
+    // "Terminal" promised a shell; there is no pty on either backend.
+    ["}, 'Run command'),", 1],
+    ['Not an interactive terminal: there is no pty', 1],
+    ['ONE command (sh -c on Linux, cmd.exe on Windows)', 1],
+    // U2: THE CLIPBOARD SECTION (the only clipboard path that works here).
+    ["h('div', { style: { ...S.muted, fontWeight: 600 } }, 'Clipboard')", 1],
+    ["'Paste to guest'", 1],
+    ["'Read guest clipboard'", 1],
+    ["api('windowsClipboardSet'", 1],
+    ["api('windowsClipboardGet'", 1],
+    ['there is no clipboard agent in the guest', 1],
+    // U4: the MEASURED free space joins the spec line, with the warning visible.
+    ["api('windowsFreeSpace'", 1],
+    ['${space.line}', 1],
+    ['space.belowFloor === true', 1]
   ],
   index: [
     ["name: 'cua_vm_start'", 1],
@@ -1017,6 +1105,11 @@ const NEEDLES = {
     // sentence as a human (elapsed, serial tail, readiness).
     ["op: 'vmWindowsStatus', name, tail: 5", 1],
     ['serial (last ${info.serialTail.length})', 1],
+    // U2/U4: the /cua switch forwards the three new calls, and the op names are
+    // the supervisor's (so the panel and the model cannot drift).
+    ["case 'windowsClipboardSet': return send(200, { ok: true, ...(await call({ op: 'vmWindowsClipboardSet'", 1],
+    ["case 'windowsClipboardGet': return send(200, { ok: true, ...(await call({ op: 'vmWindowsClipboardGet'", 1],
+    ["case 'windowsFreeSpace': return send(200, { ok: true, ...(await call({ op: 'vmWindowsFreeSpace'", 1],
     // the prompt carries the invariants
     ['SPACE:', 1],
     ['SHUTDOWN vs SUSPEND:', 1],

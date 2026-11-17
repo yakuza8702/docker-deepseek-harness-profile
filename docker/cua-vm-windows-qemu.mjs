@@ -866,6 +866,53 @@ export function windowsCapacityWarnings({ diskGb, memory, cpu }) {
   return warnings
 }
 
+/* ------------------------------------------------------------------ *
+ * U4: THE FREE SPACE THAT IS ACTUALLY LEFT
+ * ------------------------------------------------------------------ */
+
+/**
+ * Below this many free bytes on C:, Windows Update and Setup's own working set
+ * are the next thing to fail — the live computer was reported at 6.8 GB free on
+ * a 64 GB disk, and "the install failed" then reads like a Windows bug.
+ */
+export const WINDOWS_FREE_FLOOR_GB = 10
+
+/**
+ * `(Get-PSDrive -Name C).Free` answers a bare integer, but the remote shell is
+ * cmd.exe and PowerShell's formatting can add a header, a blank line or (on a
+ * localized image) a warning. Taking the FIRST run of digits is deliberately
+ * conservative: a "0" on a broken probe would read as "the disk is full", which
+ * is a louder lie than "unknown". A probe that answers no digits is unknown.
+ */
+export function parseFreeSpaceProbe(stdout) {
+  const text = String(stdout ?? '')
+  const match = /(\d+)/u.exec(text)
+  if (match === null) return null
+  const bytes = Number(match[1])
+  return Number.isFinite(bytes) && bytes > 0 ? bytes : null
+}
+
+/**
+ * The measured free space, its one-line form and the below-floor warning.
+ * Returns null when the probe produced no number, so the caller reports
+ * "unavailable" instead of printing 0 GB.
+ */
+export function formatWindowsFreeSpace(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return null
+  const gb = bytes / 1024 ** 3
+  const text = gb >= 10 ? `${gb.toFixed(1)} GB` : `${gb.toFixed(2)} GB`
+  const below = gb < WINDOWS_FREE_FLOOR_GB
+  return {
+    bytes,
+    freeGb: Number(gb.toFixed(2)),
+    line: `${text} free on C:`,
+    belowFloor: below,
+    warning: below
+      ? `only ${text} free on C: (the recommended minimum is ${WINDOWS_FREE_FLOOR_GB} GB): Windows Update, Setup and a pip install all need room, and the install fails with an unrelated-looking error once the disk is full`
+      : undefined
+  }
+}
+
 /**
  * Is this host able to boot a Windows computer at all?
  *
@@ -2368,8 +2415,14 @@ export function windowsQmpAdapter(primitive) {
  * @param {string} options.store            the VM store
  * @param {(host: string, port: number, commands: object[], opts?: object) => Promise<object[]>} options.qmp
  * @param {(...parts: any[]) => void} options.log
+ * @param {object|null} [options.transport] U2: the clipboard channel —
+ *        `{ sshRun(spec, command, opts), putText(spec, guestPath, text),
+ *        getText(spec, guestPath) }`. INJECTED so a unit test drives the real
+ *        clipboard code with a stub and asserts the ORDER (file before task);
+ *        the supervisor passes its ssh/scp helpers. `null` means "no SSH",
+ *        which the CLIENTS report as a disabled state rather than as an error.
  */
-export function createWindowsBackend({ store, qmp, log = () => {} }) {
+export function createWindowsBackend({ store, qmp, log = () => {}, transport = null }) {
   /** Monotonic counter so two frames never share a serial name. */
   let FRAME_SEQUENCE = 0
 
@@ -2951,6 +3004,184 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     return { method: 'quit', exited: false, forced: true, installInProgress }
   }
 
+  /* ------------------------------------------------------------------ *
+   * U2: THE CLIPBOARD, THROUGH THE GUEST'S INTERACTIVE SESSION
+   * ------------------------------------------------------------------ */
+
+  /**
+   * THE ONLY WORKING CLIPBOARD PATH OF A WINDOWS GUEST — and why it is built
+   * this way.
+   *
+   * Two routes look obvious and BOTH ARE DEAD (each was tried on the live VM):
+   *
+   *   RFB ClientCutText  QEMU's VNC server accepts the message and drops it:
+   *                      the guest runs no clipboard agent, so the desktop
+   *                      never sees the text. A human who pasted got the
+   *                      guest's OLD clipboard — the send "worked" and did
+   *                      nothing, which is the worst possible failure.
+   *   Set-Clipboard      sshd runs in SESSION 0. Session 0 has its own window
+   *   over SSH           station and its own (empty) clipboard, so the command
+   *                      exits 0 and the user sees nothing change.
+   *
+   * What DOES work is the only context that owns the visible clipboard: the
+   * logged-on user's own session. `cua-firstboot.ps1` registers two on-demand
+   * tasks with `/it` (interactive) whose bodies run `Set-Clipboard` /
+   * `Get-Clipboard` THERE, and the pair below drives them over the SSH channel
+   * the supervisor already has:
+   *
+   *   set  text -> C:\\ProgramData\\cua\\clip.txt  -> schtasks /run /tn cua-clip-set
+   *   get  schtasks /run /tn cua-clip-get -> C:\\ProgramData\\cua\\clip-read.txt
+   *
+   * THREE THINGS THAT MAKE THE DIFFERENCE BETWEEN WORKING AND LOOKING LIKE IT:
+   *
+   *   1. THE ORDER. clip.txt is written BEFORE the task runs, always: a task
+   *      that fires first reads the PREVIOUS paste, which is the same
+   *      "old clipboard" symptom one layer up.
+   *   2. THE COMPLETION. `schtasks /run` answers "SUCCESS: Attempted to run"
+   *      as soon as the task is QUEUED; it says nothing about the body. The
+   *      task's own `Last Result` from `/query /fo LIST /v` is the exit code,
+   *      and a non-zero one is reported as a failure — never as a paste.
+   *   3. THE STALE RESULT. The get direction deletes clip-read.txt first, so a
+   *      task that did not run cannot be answered with yesterday's clipboard.
+   *
+   * The transport is INJECTED (this.options.sshRun / scpRun), so a test drives
+   * this exact code against a stub and asserts the order instead of trusting a
+   * comment.
+   */
+  const CLIP_DIR = 'C:\\ProgramData\\cua'
+  const CLIP_TEXT_PATH = `${CLIP_DIR}\\clip.txt`
+  const CLIP_READ_PATH = `${CLIP_DIR}\\clip-read.txt`
+  const CLIP_SET_TASK = 'cua-clip-set'
+  const CLIP_GET_TASK = 'cua-clip-get'
+  /** A clipboard is small; anything larger is a caller mistake, not a paste. */
+  const CLIP_MAX_BYTES = 1024 * 1024
+  /** How long the get direction waits for the interactive task to write. */
+  const clipSettleMs = () => Math.max(0, Number(process.env.DSH_CUA_WIN_CLIP_SETTLE_MS ?? 1500))
+  const CLIP_POLL_MS = 250
+  const CLIP_POLLS = 12
+
+  /** The injected channel, or null: `null` is the DISABLED state, not a throw. */
+  const clipTransport = () => transport
+
+  function clipText(text) {
+    // The text NEVER travels on a command line: batch-mode SSH runs cmd.exe as
+    // the remote shell and a `;` `&` `|` or a quote in the payload would be
+    // re-parsed there. It goes in a file, and the file is what the task reads.
+    if (typeof text !== 'string') throw new Error('clipboardSet needs the text to paste')
+    if (Buffer.byteLength(text, 'utf8') > CLIP_MAX_BYTES) {
+      throw new Error(`the clipboard text is larger than ${CLIP_MAX_BYTES} bytes, which is a file transfer, not a paste (use cua_vm_put)`)
+    }
+    return text
+  }
+
+  /**
+   * Run one on-demand task and wait until it reports a Last Result.
+   *
+   * `/query /fo LIST /v` carries `Status` (Running while the body executes) and
+   * `Last Result` (the program's exit code). While an instance is still running
+   * Last Result is the PREVIOUS run's code, so both are read: only "not running
+   * AND has a code" is an answer.
+   */
+  async function runClipTask(spec, task, { timeoutMs = 20000 } = {}) {
+    const t = clipTransport()
+    if (t === null) return { ok: false, code: -1, detail: 'no SSH transport is wired into the Windows backend' }
+    const started = await t.sshRun(spec, `schtasks /run /tn ${task}`, { timeoutMs: 15000 })
+    // A non-zero /run means it never even queued: that is a real failure and it
+    // must not be reported as a clipboard operation.
+    if (started.code !== 0) {
+      return {
+        ok: false,
+        code: started.code,
+        detail: `schtasks /run /tn ${task} exited ${started.code}: ${(started.stderr || started.stdout || '').trim() || 'no output'}`
+      }
+    }
+    const deadline = Date.now() + Math.max(1000, timeoutMs)
+    let last = ''
+    while (Date.now() < deadline) {
+      const query = await t.sshRun(spec, `schtasks /query /tn ${task} /fo LIST /v`, { timeoutMs: 15000 })
+      last = `${query.stdout || ''}\n${query.stderr || ''}`
+      const result = /Last Result:\s*(-?\d+)/iu.exec(last)?.[1]
+      const status = /Status:\s*([^\r\n]+)/iu.exec(last)?.[1]?.trim() ?? ''
+      const running = /running/iu.test(status)
+      if (!running && result !== undefined) {
+        const code = Number(result)
+        return { ok: code === 0, code, detail: code === 0 ? '' : `task ${task} exited ${code} (Last Result)` }
+      }
+      await new Promise((resolve) => setTimeout(resolve, CLIP_POLL_MS))
+    }
+    return { ok: false, code: -1, detail: `task ${task} did not report a Last Result within ${timeoutMs} ms (last status line: ${last.trim().split('\n').slice(-1)[0] || 'none'})` }
+  }
+
+  /**
+   * PASTE `text` INTO THE GUEST'S CLIPBOARD (session 2).
+   *
+   * The order is the contract: the file exists before the task runs.
+   */
+  async function clipboardSet(rawSpec, text) {
+    const spec = namedSpec(rawSpec)
+    const t = clipTransport()
+    if (t === null) {
+      return { ok: false, reason: 'no-ssh', detail: 'clipboardSet needs the guest SSH transport, which is not wired into this backend' }
+    }
+    const payload = clipText(text)
+    const made = await t.sshRun(spec, `if not exist "${CLIP_DIR}" mkdir "${CLIP_DIR}"`, { timeoutMs: 15000 })
+    if (made.code !== 0) {
+      return { ok: false, reason: 'ssh', detail: `could not create ${CLIP_DIR} over SSH: exit ${made.code} ${(made.stderr || '').trim()}`, code: made.code }
+    }
+    const uploaded = await t.putText(spec, CLIP_TEXT_PATH, payload)
+    if (uploaded?.code !== 0) {
+      return { ok: false, reason: 'upload', path: CLIP_TEXT_PATH, detail: `the text did not reach ${CLIP_TEXT_PATH}: ${(uploaded?.stderr || '').trim() || `exit ${uploaded?.code}`}`, code: uploaded?.code }
+    }
+    const ran = await runClipTask(spec, CLIP_SET_TASK)
+    if (!ran.ok) {
+      return { ok: false, reason: 'task', path: CLIP_TEXT_PATH, task: CLIP_SET_TASK, detail: ran.detail, code: ran.code }
+    }
+    return {
+      ok: true,
+      task: CLIP_SET_TASK,
+      path: CLIP_TEXT_PATH,
+      bytes: Buffer.byteLength(payload, 'utf8'),
+      detail: `${Buffer.byteLength(payload, 'utf8')} byte(s) are on the guest clipboard (${CLIP_SET_TASK} ran in the interactive session)`
+    }
+  }
+
+  /**
+   * READ THE GUEST'S CLIPBOARD (session 2).
+   *
+   * `Get-Clipboard -Raw` runs inside the task, so this is the VISIBLE clipboard,
+   * not Session 0's. The result file is polled because the task is queued
+   * asynchronously and there is no other completion channel over SSH.
+   */
+  async function clipboardGet(rawSpec) {
+    const spec = namedSpec(rawSpec)
+    const t = clipTransport()
+    if (t === null) {
+      return { ok: false, reason: 'no-ssh', detail: 'clipboardGet needs the guest SSH transport, which is not wired into this backend' }
+    }
+    // THE STALE RESULT GOES FIRST (see the header): without this a task that
+    // fails to run answers with the PREVIOUS read and a success.
+    const cleared = await t.sshRun(spec, `if exist "${CLIP_READ_PATH}" del /f /q "${CLIP_READ_PATH}"`, { timeoutMs: 15000 })
+    if (cleared.code !== 0) {
+      return { ok: false, reason: 'ssh', detail: `could not clear ${CLIP_READ_PATH}: exit ${cleared.code} ${(cleared.stderr || '').trim()}`, code: cleared.code }
+    }
+    const ran = await runClipTask(spec, CLIP_GET_TASK)
+    if (!ran.ok) return { ok: false, reason: 'task', task: CLIP_GET_TASK, detail: ran.detail, code: ran.code }
+    const settle = clipSettleMs()
+    if (settle > 0) await new Promise((resolve) => setTimeout(resolve, settle))
+    let fetched = null
+    for (let attempt = 0; attempt < CLIP_POLLS; attempt += 1) {
+      fetched = await t.getText(spec, CLIP_READ_PATH)
+      if (fetched?.code === 0) break
+      await new Promise((resolve) => setTimeout(resolve, CLIP_POLL_MS))
+    }
+    if (fetched?.code !== 0) {
+      // A task that reported 0 but produced no file is a REAL failure: saying
+      // "empty clipboard" here would be the same lie as the RFB path.
+      return { ok: false, reason: 'missing', task: CLIP_GET_TASK, detail: `task ${CLIP_GET_TASK} reported success but ${CLIP_READ_PATH} is not readable: ${(fetched?.stderr || '').trim() || `exit ${fetched?.code}`}`, code: fetched?.code }
+    }
+    return { ok: true, task: CLIP_GET_TASK, path: CLIP_READ_PATH, text: String(fetched.text ?? ''), detail: 'read from the guest clipboard (the interactive session)' }
+  }
+
   /** Kill the process (last resort, after `shutdown` refused to exit). */
   function kill(target) {
     const name = windowsRowName(target)
@@ -3114,7 +3345,9 @@ export function createWindowsBackend({ store, qmp, log = () => {} }) {
     detachInstallMedia,
     kill,
     forceKill,
-    stopSwtpm
+    stopSwtpm,
+    clipboardSet,
+    clipboardGet
   }
 }
 

@@ -1306,6 +1306,71 @@ try {
     writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify({ version: 2, vms: {} }, null, 2)}\n`)
   }
 
+  // ---- U2/U4 (smoke): THE CLIPBOARD OPS AND THE FREE-SPACE BEAT ----
+  //
+  // The clipboard protocol is unit-tested with a stub transport; what this
+  // proves is the SUPERVISOR's half — that `vmWindowsClipboardSet/Get` refuse an
+  // unavailable computer with `available:false` + a reason (the panel renders
+  // that as DISABLED, not as an error), and that they refuse an unknown name
+  // outright. A row that is not `ready` cannot paste, because the tasks run in a
+  // session that does not exist yet.
+  {
+    // A row of our own: win-legacy may have been consumed by an earlier case
+    // (the suite mutates the registry deliberately), and this block is about the
+    // SHAPE of the answers, not about that row.
+    const parkedName = 'win-parked'
+    const parkedRegistry = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    parkedRegistry.vms[parkedName] = {
+      workspace: '/w-parked', kind: 'windows', backend: 'qemu', state: 'powered-off',
+      cpu: 2, memory: 6, diskGb: 64, windowsVersion: '11ltsc',
+      createdAt: new Date().toISOString(), ports: { qmp: 46950, ssh: 47950, vnc: 5950 }
+    }
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(parkedRegistry, null, 2)}\n`)
+    const ghost = await call({ op: 'vmWindowsClipboardSet', name: 'no-such-computer', text: 'x' })
+    check('U2: the clipboard SET op refuses an unknown computer', ghost.ok === false && /no Windows computer named/u.test(ghost.error ?? ''), String(ghost.error ?? '').slice(0, 120))
+    const ghostGet = await call({ op: 'vmWindowsClipboardGet', name: 'no-such-computer' })
+    check('U2: the clipboard GET op refuses an unknown computer', ghostGet.ok === false && /no Windows computer named/u.test(ghostGet.error ?? ''))
+    const notReady = await call({ op: 'vmWindowsClipboardSet', name: parkedName, text: 'hello' })
+    check('U2: a powered-off Windows row answers available:false with the reason (a DISABLED panel section)',
+      notReady.ok === true && notReady.available === false && /not ready/u.test(notReady.reason ?? '')
+        && /interactive session/u.test(notReady.reason ?? '') && typeof notReady.hint === 'string',
+      JSON.stringify(notReady).slice(0, 200))
+    const notReadyGet = await call({ op: 'vmWindowsClipboardGet', name: parkedName })
+    check('U2: ...the same for the READ direction', notReadyGet.ok === true && notReadyGet.available === false && /not ready/u.test(notReadyGet.reason ?? ''))
+    // U4: the same three answers for the free-space probe.
+    const freeGhost = await call({ op: 'vmWindowsFreeSpace', name: 'no-such-computer' })
+    check('U4: the free-space op refuses an unknown computer', freeGhost.ok === false)
+    // A row whose SSH is switched off has no clipboard transport at all: that is
+    // a DISABLED state with its own sentence, not an SSH error.
+    const noSshName = 'win-nossh'
+    const noSshRegistry = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    noSshRegistry.vms[noSshName] = {
+      workspace: '/w-nossh', kind: 'windows', backend: 'qemu', state: 'ready', ssh: false,
+      cpu: 2, memory: 6, diskGb: 64, windowsVersion: '11ltsc',
+      createdAt: new Date().toISOString(), ports: { qmp: 46951, ssh: 47951, vnc: 5951 }
+    }
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(noSshRegistry, null, 2)}\n`)
+    const noSsh = await call({ op: 'vmWindowsClipboardSet', name: noSshName, text: 'x' })
+    check('U2: a row with SSH disabled answers available:false naming the transport, not an SSH error',
+      noSsh.ok === true && noSsh.available === false && /SSH is disabled/u.test(noSsh.reason ?? '')
+        && /no other transport/u.test(noSsh.reason ?? ''), JSON.stringify(noSsh).slice(0, 200))
+    // U4: THE STATUS BEAT CARRIES IT TOO. The panel reads `freeSpace` off the
+    // same payload it already polls, and an installing/half-installed row must
+    // answer "unavailable + why" instead of failing the whole status call (a
+    // status poll that can die on an optional extra is how a row goes blank).
+    // WIN_SETUP has been consumed by the earlier cases (the suite mutates the
+    // registry on purpose), so the parked row is the one that is still there.
+    const statusFree = await call({ op: 'vmWindowsStatus', name: parkedName, tail: 2 })
+    check('U4: a status poll carries `freeSpace` and never fails because of it',
+      statusFree.ok === true && statusFree.freeSpace !== undefined
+        && statusFree.freeSpace.available === false && /not running|not ready/u.test(statusFree.freeSpace.reason ?? ''),
+      JSON.stringify(statusFree.freeSpace ?? null).slice(0, 200))
+    const freeOff = await call({ op: 'vmWindowsFreeSpace', name: parkedName })
+    check('U4: a powered-off row answers available:false with the reason (never 0 GB)',
+      freeOff.ok === true && freeOff.available === false && /not ready/u.test(freeOff.reason ?? '') && freeOff.bytes === undefined,
+      JSON.stringify(freeOff).slice(0, 160))
+  }
+
   // ---- F1 (smoke): every action the PANEL sends has a case in the plugin ----
   //
   // The `/cua` switch is the one hop the supervisor tests cannot reach: it lives

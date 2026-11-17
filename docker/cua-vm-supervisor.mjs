@@ -49,8 +49,9 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync
+  chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync
 } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { createSpace, formatSpace, formatSpaceWarning, pngSize, relativeToPixels, resolutionProblem, toDisplayPixels, SPACE_CACHE_MS } from './cua-vm-space.mjs'
 import {
@@ -70,7 +71,10 @@ import {
   // lines threw `qmpStateLabel is not defined` — a latent bug that stayed hidden
   // only because the QMP signature mismatch made `probe()` fail earlier.
   qmpStateLabel, endpointLabel,
-  qemuStderrExcerpt, qemuStderrReason
+  qemuStderrExcerpt, qemuStderrReason,
+  // U4: the free-space sentence and its below-floor warning are the module's
+  // (pure, tested) formatters; the supervisor only supplies the measurement.
+  parseFreeSpaceProbe, formatWindowsFreeSpace
 } from './cua-vm-windows-qemu.mjs'
 import { kvmDoctorFacts, kvmPreflightError, kvmStatus } from './cua-vm-kvm.mjs'
 
@@ -1255,7 +1259,12 @@ const windowsBackend = createWindowsBackend({
   // and forwards this one's, so neither contract moves and a unit test can
   // prove the join with a faithful stub.
   qmp: windowsQmpAdapter(qmpCommands),
-  log
+  log,
+  // U2: THE CLIPBOARD CHANNEL. The backend owns the protocol (write the file,
+  // run the /it task, read its Last Result); this module owns the transport
+  // (the per-computer key, the port forward, scp). Separating them is what makes
+  // the protocol testable against a stub.
+  transport: windowsClipboardTransport()
 })
 
 /**
@@ -3739,6 +3748,139 @@ function scpRun(meta, localPath, guestPath, { direction }) {
   })
 }
 
+/* ------------------------------------------------------------------ *
+ * U2: THE CLIPBOARD TRANSPORT (and U4: the C: free-space probe)
+ * ------------------------------------------------------------------ */
+
+/** A scratch directory per call, so two pastes cannot share a file. */
+function clipboardTempDir() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'cua-clip-'))
+  chmodSync(dir, 0o700)
+  return dir
+}
+
+/**
+ * U2: THE TRANSPORT the Windows backend's clipboard code is injected with.
+ *
+ * The backend owns the PROTOCOL (write the file, run the task, read the task's
+ * Last Result); this module owns the CHANNEL (the per-computer SSH key, the port
+ * forward, scp). Keeping them apart is what lets a unit test drive the real
+ * protocol with a stub: if the order "file first, task second" ever regresses,
+ * a test fails instead of a user pasting the previous clipboard again.
+ *
+ * TEXT IS NEVER PUT ON A COMMAND LINE. `set` writes it to a 0600 local file and
+ * scp's it; `get` scp's the guest's file back and reads it. A passage with a
+ * quote, `&`, `|` or `;` therefore cannot be re-parsed by cmd.exe — the same
+ * class of defect as a path that breaks scp.
+ */
+function windowsClipboardTransport() {
+  return {
+    sshRun: (meta, command, opts) => sshRun(meta, command, opts),
+    /** text -> guestPath, over scp. Returns { code, stderr }. */
+    async putText(meta, guestPath, text) {
+      const dir = clipboardTempDir()
+      const local = path.join(dir, 'clip.txt')
+      try {
+        writeFileSync(local, String(text ?? ''), { encoding: 'utf8', mode: 0o600 })
+        return await scpRun(meta, local, assertWindowsGuestPath(guestPath), { direction: 'to-guest' })
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+    /** guestPath -> text, over scp. Returns { code, stderr, text }. */
+    async getText(meta, guestPath) {
+      const dir = clipboardTempDir()
+      const local = path.join(dir, 'clip-read.txt')
+      try {
+        const copied = await scpRun(meta, local, assertWindowsGuestPath(guestPath), { direction: 'from-guest' })
+        if (copied.code !== 0) return { ...copied, text: '' }
+        // Get-Clipboard -Raw keeps CRLF; the panel prints it as-is, so no
+        // normalisation is done here (a paste that silently "tidies" the text is
+        // a second clipboard nobody asked for).
+        return { ...copied, text: readFileSync(local, 'utf8') }
+      } catch (error) {
+        return { code: -1, stderr: `${error?.message ?? error}`, text: '' }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  }
+}
+
+/**
+ * U4: THE FREE SPACE ON C:, AS THE GUEST SEES IT.
+ *
+ * `diskGb` in the row is the VIRTUAL SIZE of the disk — the number the user
+ * asked for — and it says nothing about what is LEFT. The reported computer had
+ * 6.8 GB free on a 64 GB disk, which is exactly the state where Windows Update
+ * fails and the install is blamed instead. The panel shows the measured value
+ * next to the spec, with the below-floor warning attached.
+ *
+ * THROTTLED TO 60 s per computer: this runs on the status beat (every 5 s while
+ * a row is installing, every 4 s while an action is pending), and an SSH round
+ * trip per poll would be both wasteful and a load on a guest that is busy.
+ * The probe NEVER throws: a failure is `available: false` with the reason, so a
+ * status call cannot fail because an optional extra could not be read.
+ */
+const WINDOWS_FREE_TTL_MS = 60000
+const WINDOWS_FREE_CACHE = new Map()
+/**
+ * ONE PROBE PER COMPUTER AT A TIME. The panel polls the status at 5 s while a
+ * row installs and the free-space call has its own 60 s beat; without this an
+ * SSH round trip that takes longer than its TTL would let a second probe start
+ * behind the first, on a guest that is busy installing. A second caller waits on
+ * the SAME promise instead of opening a second connection.
+ */
+const WINDOWS_FREE_INFLIGHT = new Map()
+
+async function windowsFreeSpace(meta, { force = false } = {}) {
+  const name = meta?.name ?? ''
+  if (name === '') return { available: false, reason: 'no computer name' }
+  const cached = WINDOWS_FREE_CACHE.get(name)
+  if (!force && cached !== undefined && Date.now() - cached.at < WINDOWS_FREE_TTL_MS) {
+    return { available: true, ...cached.value, cached: true, at: new Date(cached.at).toISOString() }
+  }
+  const running = WINDOWS_FREE_INFLIGHT.get(name)
+  if (running !== undefined) return running
+  const probe = (async () => {
+    // Get-PSDrive is the cheapest correct answer and needs no elevation. The
+    // remote shell is cmd.exe, so the PowerShell expression travels as ONE
+    // quoted argument with no cmd metacharacter in it.
+    const result = await sshRun(meta, 'powershell -NoProfile -NonInteractive -Command "(Get-PSDrive -Name C).Free"', { timeoutMs: 20000 })
+    if (result.code !== 0) {
+      return {
+        available: false,
+        reason: `the guest did not answer the free-space probe (ssh exit ${result.code}${(result.stderr || '').trim() ? `: ${(result.stderr || '').trim().split('\n')[0]}` : ''})`
+      }
+    }
+    const measured = formatWindowsFreeSpace(parseFreeSpaceProbe(result.stdout))
+    if (measured === null) {
+      return { available: false, reason: `the free-space probe answered something that is not a number: ${(result.stdout || '').trim().slice(0, 120) || '(empty)'}` }
+    }
+    WINDOWS_FREE_CACHE.set(name, { at: Date.now(), value: measured })
+    return { available: true, ...measured, cached: false, at: new Date().toISOString() }
+  })()
+  WINDOWS_FREE_INFLIGHT.set(name, probe)
+  try {
+    return await probe
+  } finally {
+    if (WINDOWS_FREE_INFLIGHT.get(name) === probe) WINDOWS_FREE_INFLIGHT.delete(name)
+  }
+}
+
+/**
+ * U2: WHAT TO SAY WHEN THE CLIPBOARD SECTION IS UNAVAILABLE.
+ *
+ * The one thing a user did wrong on the live VM was reach for the noVNC paste
+ * box. That box is part of the IMAGE's /usr/share/novnc, not this plugin, so it
+ * cannot be patched from here — and it feeds the RFB ClientCutText path, which
+ * is dead (see the backend's clipboardSet). The README says the same; this
+ * string is what the panel AND the model see, so the instruction cannot drift.
+ */
+const WINDOWS_CLIPBOARD_HINT = {
+  hint: 'the panel Clipboard section pastes through cua-clip-set, which runs in the interactive session — use it instead of the noVNC paste box (that box rides the RFB ClientCutText path, and a Windows guest has no clipboard agent to receive it)'
+}
+
 /** The one sentence every Windows refusal uses, so they cannot drift apart. */
 const WINDOWS_NO_AGENT = (tool) => `cua_vm_${tool} needs the guest SSH server, which this Windows computer does not answer yet (still installing, or sshd is down). `
   + 'Once it is ready, exec/put/get work over SSH like the Linux computer; for the desktop use cua_vm_gui (QMP) or the live view at /vm/port/<name>/.'
@@ -3797,7 +3939,10 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
         output: `${formatSpace(measured)} (QMP screendump: the PNG IS the display, no capture budget)\n`
           + mapping
           + `the frame is in the workspace at ${artifact} — image px = display px, and clicks take the same pixels.\n`
-          + 'Windows limits: no clipboard, no accessibility tree, no window list, no cursor overlay (the real pointer is in the frame). For element-level actions use the dsh-cua tools once the guest is ready.'
+          // U2: THE CLIPBOARD IS NOT A GUI ACTION HERE. It has no RFB path on a
+          // Windows guest; it goes through the interactive-session tasks, so the
+          // sentence points at those instead of claiming there is none.
+          + 'Windows limits: no accessibility tree, no window list, no cursor overlay (the real pointer is in the frame) and no RFB clipboard (the guest has no clipboard agent). For text on the clipboard use the panel Clipboard section or the cua-clip-set/cua-clip-get tasks, and for element-level actions use the dsh-cua tools once the guest is ready.'
       })
     }
   } catch (error) {
@@ -3811,7 +3956,7 @@ async function windowsGui({ name, action, x, y, x2, y2, text, key, save, relativ
     if (!Number.isFinite(parsed) || parsed < 0) throw new Error('coordinates must be positive numbers')
     return parsed
   }
-  const limits = 'Windows limits: no clipboard, no accessibility tree, no window list, no driver cursor overlay. Use screenshot + click, or the dsh-cua element tools.'
+  const limits = 'Windows limits: no accessibility tree, no window list, no driver cursor overlay, and no RFB clipboard (use the panel Clipboard section or the cua-clip-set / cua-clip-get tasks). Use screenshot + click, or the dsh-cua element tools.'
   switch (action) {
     case 'click':
     case 'dclick':
@@ -4860,10 +5005,104 @@ const handlers = {
           : 'poll this call until state is "ready" (or call cua_vm_status): readiness answers when the SSH banner answers AND QMP says running; a timeout past installTimeoutMinutes marks the row error with the serial tail')
         : state === 'ready' ? `exec/put/get work over SSH; the desktop is cua_vm_gui over QMP, or the live view at /vm/port/${name}/` : undefined,
       installTimeoutMinutes: timeoutMinutes,
+      // U4: THE SPACE THAT IS ACTUALLY LEFT. `diskGb` is the VIRTUAL size the
+      // user asked for; the reported computer had 6.8 GB free on a 64 GB disk,
+      // which is the state Windows Update fails in and the install gets blamed
+      // for. Read over SSH (Get-PSDrive), throttled to 60 s by the helper, and
+      // never fatal: a probe that cannot answer says `available: false` and why.
+      freeSpace: state === 'ready' ? await windowsFreeSpace(meta) : { available: false, reason: `not running (${state}): the disk free space is measured inside the guest, so it needs the guest up` },
       console: state === 'ready' ? `/vm/port/${name}/` : undefined,
       ports: meta.ports,
       logTail: windowsLogTail(name, Math.max(1, Math.min(200, Number(tail) || 20))).slice(-4000)
     })
+  },
+
+  /**
+   * U2: PASTE TEXT INTO THE GUEST'S CLIPBOARD (session 2, via cua-clip-set).
+   *
+   * HONEST REFUSALS, in the order a caller can act on them:
+   *   * no such row / not a Windows computer            -> fail
+   *   * the row is not ready, or sshd does not answer    -> `available: false`
+   *     with the reason (the PANEL renders the section disabled; a model gets a
+   *     sentence it can retry after Start, not a fake success)
+   *   * a schtasks or scp failure                        -> fail, with the exit
+   *     code and the guest's own first line of stderr
+   */
+  async vmWindowsClipboardSet({ name, text } = {}) {
+    if (!name) throw new Error('name is required')
+    if (typeof text !== 'string') throw new Error('text is required (the clipboard text to paste)')
+    const meta = readRegistry().vms[name]
+    if (!meta || meta.kind !== 'windows') return fail(`no Windows computer named "${name}"`)
+    if (meta.state !== 'ready') {
+      return ok({
+        available: false,
+        reason: `the computer is ${meta.state}, not ready: the clipboard tasks run in its interactive session, which does not exist until Windows has booted and logged in`,
+        ...WINDOWS_CLIPBOARD_HINT
+      })
+    }
+    // SSH IS THE ONLY TRANSPORT (the text is written over it, the task is run
+    // over it). A row with `ssh: false` is a DISABLED state, not an error.
+    if (meta.ssh === false) {
+      return ok({
+        available: false,
+        reason: 'SSH is disabled for this computer, and the clipboard bridge has no other transport (RFB ClientCutText is dropped by a Windows guest)',
+        ...WINDOWS_CLIPBOARD_HINT
+      })
+    }
+    const result = await windowsBackend.clipboardSet({ ...meta, name })
+    // A no-ssh answer is a DISABLED state, not a failure: the panel says why.
+    if (result.ok !== true && result.reason === 'no-ssh') {
+      return ok({ available: false, reason: result.detail, ...WINDOWS_CLIPBOARD_HINT })
+    }
+    if (result.ok !== true) return fail(`the clipboard was NOT set: ${result.detail ?? result.reason ?? 'unknown'}`, { name, ...result })
+    return ok({ name, ...result, note: result.detail })
+  },
+
+  /**
+   * U4: THE C: FREE SPACE, ON ITS OWN CALL.
+   *
+   * The panel's spec line shows it for a ready row. It is a separate op (rather
+   * than a field on vmList) because vmList is the registry and this is a
+   * MEASUREMENT: keeping them apart is why the number is throttled to 60 s here
+   * and cannot slow down the list.
+   */
+  async vmWindowsFreeSpace({ name, force = false } = {}) {
+    if (!name) throw new Error('name is required')
+    const meta = readRegistry().vms[name]
+    if (!meta || meta.kind !== 'windows') return fail(`no Windows computer named "${name}"`)
+    if (meta.state !== 'ready') {
+      return ok({ name, available: false, reason: `the computer is ${meta.state}, not ready: free space is measured inside the guest over SSH` })
+    }
+    return ok({ name, ...(await windowsFreeSpace({ ...meta, name }, { force: force === true })) })
+  },
+
+  /** U2: READ THE GUEST'S CLIPBOARD (session 2, via cua-clip-get). */
+  async vmWindowsClipboardGet({ name } = {}) {
+    if (!name) throw new Error('name is required')
+    const meta = readRegistry().vms[name]
+    if (!meta || meta.kind !== 'windows') return fail(`no Windows computer named "${name}"`)
+    if (meta.state !== 'ready') {
+      return ok({
+        available: false,
+        reason: `the computer is ${meta.state}, not ready: the clipboard tasks run in its interactive session, which does not exist until Windows has booted and logged in`,
+        ...WINDOWS_CLIPBOARD_HINT
+      })
+    }
+    // SSH IS THE ONLY TRANSPORT (the text is written over it, the task is run
+    // over it). A row with `ssh: false` is a DISABLED state, not an error.
+    if (meta.ssh === false) {
+      return ok({
+        available: false,
+        reason: 'SSH is disabled for this computer, and the clipboard bridge has no other transport (RFB ClientCutText is dropped by a Windows guest)',
+        ...WINDOWS_CLIPBOARD_HINT
+      })
+    }
+    const result = await windowsBackend.clipboardGet({ ...meta, name })
+    if (result.ok !== true && result.reason === 'no-ssh') {
+      return ok({ available: false, reason: result.detail, ...WINDOWS_CLIPBOARD_HINT })
+    }
+    if (result.ok !== true) return fail(`the clipboard was NOT read: ${result.detail ?? result.reason ?? 'unknown'}`, { name, ...result })
+    return ok({ name, ...result, chars: [...String(result.text ?? '')].length })
   },
 
   async vmWindowsLogs({ name, tail = 40 } = {}) {

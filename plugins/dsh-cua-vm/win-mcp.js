@@ -9,17 +9,28 @@
  * round trip is a PNG the model has to look at, while `find_elements` and
  * `type_text` return a few hundred bytes of structured JSON with a receipt.
  *
- * Layout:
+ * Layout (WHAT ACTUALLY RUNS TODAY):
  *
- *   harness (this process) ──ssh──▶ guest: cua@:22 (sshd)
- *                                     └─▶ \\.\pipe\dsh-cua (interactive session)
- *                                           └─▶ dsh-cua-server (pywinauto)
+ *   harness (this process) ──ssh──▶ guest: cua@:22 (sshd, Session 0)
+ *                                     └─▶ `python -m dsh_cua.server --stdio`
+ *                                           one server per SSH session (pywinauto)
  *
- * SSH lands in Session 0, where there IS no desktop, so the SSH side does not
- * drive the UI itself: the OEM first-boot script starts `dsh-cua-server` as an
- * INTERACTIVE logon task and the SSH shell proxies stdio to that named pipe.
- * (See docker/windows-oem/cua-firstboot.ps1 — the task is the reason pywinauto
- * can see windows at all.)
+ * U3: THERE IS NO NAMED PIPE. The earlier diagram showed
+ * `\\.\pipe\dsh-cua (interactive session)` with an interactive
+ * `dsh-cua-server` behind it, but upstream `dsh_cua.server main()` takes no
+ * `--pipe` argument: the firstboot task was registering a listener that no
+ * program ever created. The command below no longer passes it, because a flag
+ * that does not exist is a lie in two places at once.
+ *
+ * The consequence is documented instead of papered over: with a stdio-only
+ * upstream, ONE shared session-2 server cannot be reached from Session 0, so
+ * each SSH attach starts its OWN stdio server inside the guest (19 tools, and
+ * it works). Session-2-only features — the clipboard — therefore do NOT ride
+ * this channel: `cua-firstboot.ps1` registers two on-demand `/it` tasks for
+ * them (see docker/cua-vm-windows-qemu.mjs → clipboardSet/clipboardGet), which
+ * is the only way to reach the interactive session. A pipe server upstream
+ * would let one long-lived server be shared; it does not exist yet, and this
+ * file will use it when it does.
  *
  * TWO USES, ONE IMPLEMENTATION
  * ----------------------------
@@ -48,9 +59,16 @@ export function windowsMcpEnabled() {
   return String(process.env.DSH_CUA_VM_WIN_MCP ?? '1') !== '0'
 }
 
-/** The guest command that speaks MCP: the pipe proxy the OEM script installs. */
+/**
+ * The guest command that speaks MCP over the SSH channel: a plain stdio server.
+ *
+ * U3: NO `--pipe`. `dsh_cua.server main()` has no such option (the flag was
+ * accepted only as a stray argv token and ignored), so naming a pipe here
+ * promised a shared listener that nothing ever created. The server is started
+ * PER SSH SESSION and speaks JSON-RPC on that session's stdio.
+ */
 export function guestMcpCommand() {
-  return String(process.env.DSH_CUA_WIN_MCP_COMMAND || 'python -m dsh_cua.server --stdio --pipe \\\\.\\pipe\\dsh-cua')
+  return String(process.env.DSH_CUA_WIN_MCP_COMMAND || 'python -m dsh_cua.server --stdio')
 }
 
 /**

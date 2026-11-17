@@ -55,6 +55,39 @@ window.__ModuleLoader__.load({
       return String(text).replaceAll(';', ',')
     }
 
+    /**
+     * U1: THE SECRET STATE IS CLEARABLE.
+     *
+     * `setSecret` only ever ADDED a key (`{ ...current, [name]: password }`), so
+     * a revealed password could not leave the component: "Hide password" flipped
+     * the label and the value lived on. Returning a NEW object without the key
+     * (never mutating the old one) is what makes the next render actually hide
+     * it — React only re-renders on a new reference, which is why the delete has
+     * to be part of the copy.
+     *
+     * Pure and exported (`module.exports.__test`) so a unit test can assert the
+     * transition without a renderer.
+     */
+    function hideSecretEntry(current, name) {
+      const next = { ...(current ?? {}) }
+      delete next[name]
+      return next
+    }
+
+    /**
+     * U1: ...AND THE NOTE IS NOT A PASSWORD DISPLAY.
+     *
+     * The reveal note used to interpolate the password, so "hiding" left it in
+     * the persistent banner. The reveal note no longer carries the value; this
+     * helper is the belt for a note that DOES (one written by an older build, or
+     * by a future regression): hide clears it instead of leaving it on screen.
+     */
+    function noteAfterHide(note, name, value) {
+      if (typeof note !== 'string') return note
+      if (typeof value !== 'string' || value === '' || !note.includes(value)) return note
+      return `${name}: password hidden and removed from this page.`
+    }
+
     async function api(path, body) {
       const response = await fetch(`/cua/${path}`, body === undefined
         ? { headers: { accept: 'application/json' } }
@@ -242,6 +275,12 @@ window.__ModuleLoader__.load({
       // "Force delete" instead of leaving the user with a stuck name.
       const [installInfo, setInstallInfo] = useState({})
       const [partial, setPartial] = useState(null)
+      // U2: the per-computer clipboard form (the text to paste, the readout of
+      // what the guest holds, and which direction is in flight).
+      const [clip, setClip] = useState({})
+      // U4: the measured C: free space per computer, refreshed at most once a
+      // minute — the number Windows Update fails on, not the virtual disk size.
+      const [freeSpace, setFreeSpace] = useState({})
 
       const load = useCallback(async () => {
         try {
@@ -308,6 +347,83 @@ window.__ModuleLoader__.load({
         const timer = setInterval(() => { void refresh() }, 5000)
         return () => { cancelled = true; clearInterval(timer) }
       }, [installingKey])
+
+      /**
+       * U4: THE FREE SPACE THAT IS ACTUALLY LEFT.
+       *
+       * `diskGb` is the virtual size the user asked for; it cannot say that the
+       * reported computer had 6.8 GB left on a 64 GB disk. This asks the
+       * supervisor (which reads `Get-PSDrive C` over the guest's SSH) ONCE A
+       * MINUTE for each ready Windows computer: a 60 s beat is enough for a
+       * number that moves in gigabytes, and it keeps an SSH round trip off the
+       * 4 s action poll. A failure leaves the previous number in place rather
+       * than blanking a row that is still ready.
+       */
+      const readyWindows = Object.entries(state?.vms ?? {})
+        .filter(([, vm]) => vm?.kind === 'windows' && (vm?.state === 'ready' || vm?.state === 'running'))
+        .map(([name]) => name)
+      const freeKey = readyWindows.join(',')
+      useEffect(() => {
+        if (freeKey === '') return undefined
+        let cancelled = false
+        const refresh = async () => {
+          for (const name of freeKey.split(',')) {
+            try {
+              const payload = await api('windowsFreeSpace', { name })
+              if (cancelled) return
+              setFreeSpace((current) => ({ ...current, [name]: payload }))
+            } catch {
+              // A probe that cannot answer must not wipe the last good number.
+            }
+          }
+        }
+        void refresh()
+        const timer = setInterval(() => { void refresh() }, 60000)
+        return () => { cancelled = true; clearInterval(timer) }
+      }, [freeKey])
+
+      /**
+       * U2: PASTE TO THE GUEST.
+       *
+       * The text goes to the supervisor, which writes it to
+       * C:\ProgramData\cua\clip.txt, runs the `cua-clip-set` task IN THE
+       * INTERACTIVE SESSION (that is the only clipboard the user can see) and
+       * reports the task's own Last Result. A refusal is printed as it came:
+       * "the clipboard was NOT set" with the schtasks or scp reason, never a
+       * cheerful "done" over a queue that never ran.
+       */
+      const pasteToGuest = async (name) => {
+        const entry = clip[name] ?? {}
+        setClip((current) => ({ ...current, [name]: { ...entry, busy: 'set', out: '' } }))
+        try {
+          const payload = await api('windowsClipboardSet', { name, text: entry.text ?? '' })
+          setClip((current) => ({
+            ...current,
+            [name]: { ...(current[name] ?? {}), busy: null, out: payload.available === false
+              ? `paste unavailable: ${payload.reason}`
+              : clean(payload.detail ?? 'pasted') }
+          }))
+        } catch (error) {
+          setClip((current) => ({ ...current, [name]: { ...(current[name] ?? {}), busy: null, out: clean(error?.message ?? error) } }))
+        }
+      }
+
+      /** U2: READ THE GUEST'S CLIPBOARD into the readout (session 2). */
+      const readGuestClipboard = async (name) => {
+        const entry = clip[name] ?? {}
+        setClip((current) => ({ ...current, [name]: { ...entry, busy: 'get', out: '' } }))
+        try {
+          const payload = await api('windowsClipboardGet', { name })
+          setClip((current) => ({
+            ...current,
+            [name]: { ...(current[name] ?? {}), busy: null, out: payload.available === false
+              ? `read unavailable: ${payload.reason}`
+              : clean(`guest clipboard (${payload.chars} char(s)):\n${payload.text ?? ''}`) }
+          }))
+        } catch (error) {
+          setClip((current) => ({ ...current, [name]: { ...(current[name] ?? {}), busy: null, out: clean(error?.message ?? error) } }))
+        }
+      }
 
       /**
        * FORCE DELETE: the escape hatch for a row the normal manifest could not
@@ -418,15 +534,42 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** The generated Windows password, on demand. It never lands in a log. */
+      /**
+       * The generated Windows password, on demand. It never lands in a log.
+       *
+       * U1: THE NOTE IS NOT A PASSWORD DISPLAY. It used to interpolate the
+       * password into the persistent note banner AND into the reveal row, and
+       * "Hide password" only flipped the row's label: the secret stayed in
+       * state and the password STAYED IN THE BANNER for as long as the note was
+       * up. Now the note says only that the password was revealed (where it
+       * lives, what it costs), and `hidePassword` is a real clear.
+       */
       const revealPassword = async (name) => {
         try {
           const payload = await api('windowsPassword', { name })
-          setNote(`${name}: user "${payload.username}", password "${payload.password}" — stored 0600 in the VM store, never in the registry.`)
+          setNote(clean(`${name}: password revealed below (user "${payload.username}"). It is stored 0600 in the VM store, never in the registry — Hide password removes it from this page.`))
           setSecret((current) => ({ ...current, [name]: payload.password }))
         } catch (error) {
           setNote(clean(error?.message ?? error))
         }
+      }
+
+      /**
+       * U1: HIDE IS A CLEAR, NOT A LABEL.
+       *
+       * `setSecret` had only one direction (reveal), so the secret stayed in the
+       * component state for the rest of the session: the label said "Reveal
+       * password" while the value lived on in memory, and any re-render that
+       * consulted `secret[name]` printed it again. The two pure helpers below
+       * are exported for the unit test (`module.exports.__test`), because the
+       * defect was exactly that "hide" did not clear anything — a React test
+       * would test the renderer, while a unit test of the STATE TRANSITION is
+       * what names the bug.
+       */
+      const hidePassword = (name) => {
+        const value = secret[name]
+        setSecret((current) => hideSecretEntry(current, name))
+        setNote((current) => noteAfterHide(current, name, value))
       }
 
       /** The measured space, so the shown line is the tool's own line. */
@@ -697,8 +840,14 @@ window.__ModuleLoader__.load({
               // B1: THE REQUESTED SPEC. The row stores what the user asked for,
               // so a Windows computer shows its own 20 GB / 4 GB instead of the
               // recommendation. `?` means the row predates the field.
+              // U4: THE MEASURED FREE SPACE IS PART OF THE SPEC LINE. `diskGb`
+              // is the VIRTUAL size; the reported computer had 6.8 GB free on a
+              // 64 GB disk, which is the state Windows Update fails in. The
+              // number comes from the guest (Get-PSDrive, throttled 60 s) and
+              // the below-floor warning is shown next to it, not tooltip'd away.
+              const space = windows ? freeSpace[name] ?? null : null
               const specLine = windows
-                ? `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · Windows ${vm.windowsVersion || 'ISO'}`
+                ? `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · Windows ${vm.windowsVersion || 'ISO'}${space?.available === true && typeof space.line === 'string' ? ` · ${space.line}` : ''}`
                 : `${vm.cpu ?? '?'} vCPU · ${vm.memory ?? '?'} GB · ${vm.image ?? 'linux'}`
               // A stuck install (installing with no live QEMU) cannot be deleted
               // by the normal path — the panel says so and offers the force.
@@ -774,17 +923,28 @@ window.__ModuleLoader__.load({
                     }
                   }, busy && busyLabel !== null ? busyLabel : 'Suspend'),
                   h('button', { type: 'button', style: S.button, onClick: () => void showVm(name) }, 'Show VM'),
+                  // U1: ONE BUTTON, TWO DIRECTIONS. The label follows the
+                  // state, so the click has to follow it too: it used to say
+                  // "Hide password" and still call revealPassword.
                   windows && h('button', {
                     type: 'button', style: S.button,
-                    onClick: () => void revealPassword(name)
+                    onClick: () => (secret[name] ? hidePassword(name) : void revealPassword(name))
                   }, secret[name] ? 'Hide password' : 'Reveal password'),
-                  // A Windows computer runs the same terminal: the command goes
-                  // over SSH (cmd.exe), not through a cua agent.
+                  // U3: NOT A TERMINAL — SAY SO. This button opens a ONE-SHOT
+                  // command form: a command line, Run, and the captured output.
+                  // There is no pty, no job control, no `cd` that survives the
+                  // call, and no interactive prompt (the Windows side runs it
+                  // through sshd in Session 0, the Linux side through `sb exec`).
+                  // Labelling it "Terminal" promised a shell the panel does not
+                  // have; adding a real pty is not trivial (it needs a
+                  // bidirectional stream and a resize path on both backends), so
+                  // the honest fix is the label.
                   h('button', {
                     type: 'button',
+                    title: 'Runs ONE command and shows its output. Not an interactive terminal: there is no pty, no prompt and no persistent working directory.',
                     style: { ...S.button, background: exec !== null && exec.name === name ? T.hover : 'transparent' },
                     onClick: () => setExec((current) => (current !== null && current.name === name ? null : { name, cmd: '', out: '', busy: false }))
-                  }, 'Terminal'),
+                  }, 'Run command'),
                   windows === false && h('button', {
                     type: 'button',
                     style: { ...S.button, background: metricFor === name ? T.hover : 'transparent' },
@@ -836,6 +996,58 @@ window.__ModuleLoader__.load({
                 ),
                 secret[name] && h('div', { style: { ...S.muted, fontFamily: 'ui-monospace, monospace' } },
                   `user "cua" password "${secret[name]}" (also in $STORE/windows/${name}/credentials.json, mode 0600)`),
+                // U4: THE DISK IS NOT THE FREE SPACE. A below-floor number is
+                // printed in the error colour with the remedy, because "the
+                // install failed" with 6.8 GB left is a different problem from
+                // "the install failed" with 40 GB left.
+                space?.available === true && space.belowFloor === true && h('div', { style: { ...S.muted, color: T.error } },
+                  clean(space.warning ?? `only ${space.line}`)),
+                space?.available === false && h('div', { style: S.muted },
+                  clean(`free space unavailable: ${space.reason ?? 'the guest did not answer'}`)),
+                // U2: THE CLIPBOARD, WHERE IT ACTUALLY WORKS.
+                //
+                // A Windows guest has no clipboard agent, so the noVNC paste box
+                // (which rides RFB ClientCutText) delivers nothing, and
+                // Set-Clipboard over SSH writes Session 0's clipboard, which the
+                // user never sees. These two buttons drive on-demand tasks that
+                // run IN THE INTERACTIVE SESSION instead. When the computer is
+                // not ready the section is disabled WITH the reason: a button
+                // that explains itself beats a button that fails.
+                windows && (() => {
+                  const entry = clip[name] ?? {}
+                  // TWO reasons to be disabled, both stated: the row is not
+                  // running (no interactive session exists), or the row says
+                  // SSH is off — the bridge has no other transport, and a button
+                  // that fails with an SSH error is worse than a disabled one
+                  // that says why.
+                  const usable = ready === true && vm.ssh !== false
+                  const reason = vm.ssh === false
+                    ? 'SSH is disabled for this computer, and the clipboard bridge has no other transport (it writes the text over SSH and runs the task with schtasks)'
+                    : usable ? null : `the clipboard runs in the computer's interactive session, which exists once it is ready (state: ${vm.state ?? 'unknown'})`
+                  return h('div', { style: { display: 'grid', gap: 6, padding: '8px 0 0', borderTop: `1px solid ${T.line}` } },
+                    h('div', { style: { ...S.muted, fontWeight: 600 } }, 'Clipboard'),
+                    h('div', { style: S.muted },
+                      'Pastes through a task in the Windows session (the only clipboard a user can see). The noVNC paste box does not work on this kind of computer: there is no clipboard agent in the guest.'),
+                    h('textarea', {
+                      value: entry.text ?? '', rows: 3, disabled: !usable,
+                      placeholder: usable ? 'text to paste into the guest' : (reason ?? ''),
+                      style: { ...S.input, width: '100%', boxSizing: 'border-box', resize: 'vertical', opacity: usable ? 1 : 0.6 },
+                      onChange: (event) => setClip((current) => ({ ...current, [name]: { ...(current[name] ?? {}), text: event.target.value } }))
+                    }),
+                    h('div', { style: S.row },
+                      h('button', {
+                        type: 'button', style: S.button, disabled: !usable || entry.busy === 'set',
+                        onClick: () => void pasteToGuest(name)
+                      }, entry.busy === 'set' ? 'Pasting…' : 'Paste to guest'),
+                      h('button', {
+                        type: 'button', style: S.button, disabled: !usable || entry.busy === 'get',
+                        onClick: () => void readGuestClipboard(name)
+                      }, entry.busy === 'get' ? 'Reading…' : 'Read guest clipboard')
+                    ),
+                    reason !== null && h('div', { style: S.muted }, clean(reason)),
+                    typeof entry.out === 'string' && entry.out !== '' && h('pre', { style: S.pre }, entry.out)
+                  )
+                })(),
                 // F4: THE WAITING ROW SAYS WHAT IT IS WAITING FOR. The poll above
                 // already refreshes `vm.state`; printing it here is what turns a
                 // silent 120 s label into "ACPI was asked, the guest has not
@@ -862,7 +1074,7 @@ window.__ModuleLoader__.load({
                 exec !== null && exec.name === name && h('div', { style: { display: 'grid', gap: 6 } },
                   h('div', { style: { display: 'flex', gap: 6 } },
                     h('input', {
-                      value: exec.cmd, placeholder: 'command inside the VM (sh -c)', style: { ...S.input, flex: 1 },
+                      value: exec.cmd, placeholder: 'ONE command (sh -c on Linux, cmd.exe on Windows) — no prompt, output is captured once', style: { ...S.input, flex: 1 },
                       onChange: (event) => setExec({ ...exec, cmd: event.target.value }),
                       onKeyDown: (event) => { if (event.key === 'Enter') void run() }
                     }),
@@ -932,6 +1144,10 @@ window.__ModuleLoader__.load({
 
     module.exports.apply = apply
     module.exports.inject = inject
+    // U1: the two state transitions the hide button depends on, and the secret
+    // helpers around them, are pure functions so a test can prove "hide clears
+    // the value" without mounting the page.
+    module.exports.__test = { hideSecretEntry, noteAfterHide, clean }
     return module.exports
   }
 })
