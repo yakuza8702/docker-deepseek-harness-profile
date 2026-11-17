@@ -1012,7 +1012,7 @@ RUN set -eux; \
 # needs (and root, which runs the gate below, is unaffected either way).
 # ---------------------------------------------------------------------
 RUN install -d -m 0755 /opt/seek-harness/cua-check
-COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-guest-android.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-kvm.mjs docker/cua-vm-windows-qemu.mjs docker/cua-guest-provision.sh docker/cua-vnc-clip.mjs Dockerfile /opt/seek-harness/cua-check/
+COPY --chmod=0644 docker/cua-guest-rea.sh docker/cua-guest-android.sh docker/cua-vm-supervisor.mjs docker/cua-vm-space.mjs docker/cua-vm-kvm.mjs docker/cua-vm-windows-qemu.mjs docker/cua-guest-provision.sh docs/windows-iso-sources.md docker/cua-vnc-clip.mjs Dockerfile /opt/seek-harness/cua-check/
 COPY --chmod=0644 docker/windows-oem/Autounattend.xml docker/windows-oem/setupcomplete.cmd docker/windows-oem/cua-firstboot.ps1 docker/windows-oem/Unattend.vbs docker/cua-clip-agent.ps1 /opt/seek-harness/cua-check/
 COPY --chmod=0644 plugins/dsh-cua-vm/client.js plugins/dsh-cua-vm/index.js plugins/dsh-cua-vm/win-mcp.js /opt/seek-harness/cua-check/
 COPY --chmod=0644 docker/proxy.mjs compose.yaml compose.windows.yaml .env.example /opt/seek-harness/cua-check/
@@ -1033,6 +1033,10 @@ RUN set -eux; \
       setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/usr/local/share/cua-vm/windows-oem/$f' && test -s '/usr/local/share/cua-vm/windows-oem/$f'" \
         || { echo "EACCES: /usr/local/share/cua-vm/windows-oem/$f is unreadable by uid 1000"; exit 1; }; \
       setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/opt/seek-harness/cua-check/$f'" \
+        || { echo "EACCES: the fallback copy /opt/seek-harness/cua-check/$f is unreadable by uid 1000"; exit 1; }; \
+    done; \
+    for f in windows-iso-sources.md; do \
+      setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/opt/seek-harness/cua-check/$f' && test -s '/opt/seek-harness/cua-check/$f'" \
         || { echo "EACCES: the fallback copy /opt/seek-harness/cua-check/$f is unreadable by uid 1000"; exit 1; }; \
     done; \
     stat -c '%a %U:%G %n' /usr/local/share/cua-vm /usr/local/share/cua-vm/windows-oem /opt/seek-harness/cua-check

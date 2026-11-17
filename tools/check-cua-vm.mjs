@@ -1347,7 +1347,12 @@ const NEEDLES = {
     // gate tree the build re-runs this very script against.
     ['COPY --chmod=0755 docker/cua-vnc-clip.mjs /usr/local/bin/cua-vnc-clip.mjs', 1],
     ['COPY --chown=1000:1000 --chmod=0644 docker/cua-clip-agent.ps1 /usr/local/share/cua-vm/windows-oem/cua-clip-agent.ps1', 1],
-    ['docker/cua-vnc-clip.mjs Dockerfile /opt/seek-harness/cua-check/', 1],
+    // The flat-tree COPY line is asserted SEMANTICALLY below (J1-6b): an
+    // adjacency needle (`cua-vnc-clip.mjs Dockerfile …`) broke the moment
+    // `docs/windows-iso-sources.md` was inserted between the two entries, even
+    // though the tree was still correct. The loose needles here only say the
+    // files are mentioned and the agent reaches BOTH destinations.
+    ['docker/cua-vnc-clip.mjs', 1],
     ['docker/cua-clip-agent.ps1 /opt/seek-harness/cua-check/', 1]
   ],
   client: [
@@ -2206,6 +2211,60 @@ function sourceOf(label, name) {
 }
 
 /**
+ * J1-6b: THE FLAT GATE TREE CARRIES WHAT THE GATE READS.
+ *
+ * CI run 44092830634 failed here, not in the doc comparison: the image assembles
+ * `/opt/seek-harness/cua-check/` as a FLAT directory (a list of COPY lines, every
+ * file at the root) and re-runs THIS script against it. When the ISO doc was
+ * added to the enforcement but `docs/` was never copied, the gate correctly
+ * refused a "missing side" — in the image only, because the checkout has `docs/`.
+ *
+ * The check is SEMANTIC rather than an adjacency needle: it parses every COPY
+ * whose destination is the flat tree, basenames each source tokren (so
+ * `docs/windows-iso-sources.md` must land as `windows-iso-sources.md`), and
+ * requires the same set of names `pick()` resolves in the flat layout. Reordering
+ * or inserting entries cannot break it; DROPPING one fails it with the name.
+ */
+{
+  const dockerfile = pick('Dockerfile')
+  total += 1
+  // Every file the gate resolves by name when ROOT is the flat image tree, plus
+  // the doc J1-6 enforces. `windows-iso-sources.md` is the entry CI was missing.
+  const flatRequired = [
+    'cua-vm-supervisor.mjs', 'cua-vm-space.mjs', 'cua-vm-kvm.mjs', 'cua-vm-windows-qemu.mjs',
+    'cua-vnc-clip.mjs', 'win-mcp.js', 'client.js', 'index.js',
+    'Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', 'cua-clip-agent.ps1',
+    'cua-guest-provision.sh', 'cua-guest-android.sh', 'proxy.mjs',
+    'compose.yaml', 'compose.windows.yaml', '.env.example', 'Dockerfile',
+    'windows-iso-sources.md'
+  ]
+  let flatOk = false
+  let flatDetail = 'Dockerfile not found'
+  if (dockerfile !== null) {
+    const flat = new Set()
+    for (const line of readFileSync(dockerfile, 'utf8').split(/\r?\n/u)) {
+      if (!/^\s*COPY\b/u.test(line)) continue
+      const tokens = line.trim().split(/\s+/u).filter((token) => !token.startsWith('--')).slice(1)
+      const destination = tokens.pop()
+      if (destination !== '/opt/seek-harness/cua-check/') continue
+      for (const source of tokens) flat.add(path.posix.basename(source))
+    }
+    const absent = flatRequired.filter((name) => !flat.has(name))
+    flatOk = absent.length === 0
+    flatDetail = absent.length === 0
+      ? `${flatRequired.length} file(s), including windows-iso-sources.md`
+      : `the in-image gate would fail: missing ${absent.join(', ')} from the flat COPY set`
+  }
+  if (flatOk) {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   J1-6b the flat /opt/seek-harness/cua-check tree carries every file the gate reads (${flatDetail})`)
+  } else {
+    failures += 1
+    missing.push(`J1-6b: /opt/seek-harness/cua-check is FLAT, so the COPY set must carry the doc and every file the gate reads — ${flatDetail}`)
+    console.log('  FAIL J1-6b flat gate tree')
+  }
+}
+
+/**
  * J1-6: THE ISO DOCUMENT IS ENFORCED, NOT "KEPT HONEST" BY HOPE.
  *
  * `docs/windows-iso-sources.md` is the page an operator reads before spending
@@ -2224,14 +2283,26 @@ function sourceOf(label, name) {
  * Deliberate non-comparisons: the prose (`label`, `probed`), and the `(live
  * handshake: …)` placeholder the writer emits for a strategy whose URL does not
  * exist until the network answers. Those are documentation, not pins.
+ *
+ * THE DOC IS FOUND WHEREVER THE TREE PUTS IT. The repository keeps it at
+ * `docs/windows-iso-sources.md`, while the image's `/opt/seek-harness/cua-check`
+ * is a FLAT tree (every file at the root, `docs/` never copied) — so a single
+ * `path.join(ROOT, 'docs', …)` made the in-image gate fail on a file that ships
+ * correctly. The two layouts are both real: resolve FLAT FIRST (the image), then
+ * the checkout path, and fail only when NEITHER exists. The success line names
+ * which one was used, so a reader can tell which tree the gate saw.
  */
 {
   const winFile = pick('cua-vm-windows-qemu.mjs')
-  const docFile = path.join(ROOT, 'docs', 'windows-iso-sources.md')
+  const docCandidates = [
+    path.join(ROOT, 'windows-iso-sources.md'),
+    path.join(ROOT, 'docs', 'windows-iso-sources.md')
+  ]
+  const docFile = docCandidates.find((candidate) => existsSync(candidate)) ?? null
   total += 1
-  if (winFile === null || !existsSync(docFile)) {
+  if (winFile === null || docFile === null) {
     failures += 1
-    missing.push('J1-6: cua-vm-windows-qemu.mjs and docs/windows-iso-sources.md are both required — the ISO doc is enforced against the module, so a missing side is a missing contract')
+    missing.push(`J1-6: cua-vm-windows-qemu.mjs and windows-iso-sources.md are both required — the ISO doc is enforced against the module, so a missing side is a missing contract (looked for ${docCandidates.map((candidate) => path.relative(ROOT, candidate) || '.').join(', ')})`)
     console.log('  FAIL J1-6 ISO doc honesty')
   } else {
     let firstDrift = null
@@ -2291,10 +2362,10 @@ function sourceOf(label, name) {
       firstDrift = String(error?.stack ?? error)
     }
     if (firstDrift === null) {
-      if (!process.argv.includes('--quiet')) console.log(`  ok   J1-6 docs/windows-iso-sources.md matches ISO_SOURCE_CHAINS on all five columns (${compared} chain row(s))`)
+      if (!process.argv.includes('--quiet')) console.log(`  ok   J1-6 ${path.relative(ROOT, docFile) || path.basename(docFile)} matches ISO_SOURCE_CHAINS on all five columns (${compared} chain row(s))`)
     } else {
       failures += 1
-      missing.push(`J1-6: docs/windows-iso-sources.md drifted from ISO_SOURCE_CHAINS — ${firstDrift}`)
+      missing.push(`J1-6: ${path.relative(ROOT, docFile) || path.basename(docFile)} drifted from ISO_SOURCE_CHAINS — ${firstDrift}`)
       console.log('  FAIL J1-6 ISO doc honesty')
     }
   }
