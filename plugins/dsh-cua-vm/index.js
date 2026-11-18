@@ -348,8 +348,27 @@ const WIN_MCP_AUX = {
   fibers: new Map(),
   /** sessionId -> grant boolean. */
   grants: new Map(),
-  /** The grant a NEW session starts with: OFF unless the user flips it. */
-  grantDefault: false,
+  /**
+   * THE GRANT A NEW SESSION STARTS WITH: ON (and the off switch is unchanged).
+   *
+   * RATIONALE. This grant is a per-session, IN-MEMORY SAFETY DEFAULT, not a
+   * security boundary: what actually guards the desktop is everything behind it
+   * — the same-origin page API, the SSH-only guest bridge, the per-agent
+   * `restrict` + `guard` veto, and the target binding that says a session may
+   * only drive the computer it bound. The grant only decides whether a fresh
+   * session must make one extra manual round trip before it may click.
+   *
+   * Shipping it OFF meant EVERY first-boot test failed on a step nobody had
+   * taken yet: the bridge attached, the tools stayed hidden, and the session
+   * looked broken until a human found the panel switch. Auto-on removes that
+   * manual step and nothing else.
+   *
+   * Denying is still explicit and still works exactly as it did: the panel
+   * toggle or `POST /dsh-cua-vm/cua-grant {"grant":false}` (optionally with a
+   * `sessionId`) flips this off, `grant-off` stays a real refusal code, and a
+   * restart forgets all of it because nothing here is persisted.
+   */
+  grantDefault: true,
   /** sessionIds that have revealed the desktop (for the doctor). */
   revealedSessions: new Set(),
   /** sessionId -> { name, at }: the computer a session asked for. */
@@ -505,7 +524,7 @@ function sessionKeyOf(agent) {
   return id === undefined || id === null ? '' : String(id)
 }
 
-/** The Computer Use grant of one agent's session (default OFF). */
+/** The Computer Use grant of one agent's session (default ON, see WIN_MCP_AUX). */
 function grantFor(agent) {
   const key = sessionKeyOf(agent)
   if (WIN_MCP_AUX.grants.has(key)) return WIN_MCP_AUX.grants.get(key) === true
@@ -785,9 +804,9 @@ function windowsGuardDecision(execution) {
     if (grantFor(agent) !== true) {
       return {
         reason: [
-          `refused: the Computer Use grant is off for this session, so ${toolName} did not run`,
+          `refused: the Computer Use grant is OFF for this session (turned off explicitly), so ${toolName} did not run`,
           'code: grant-off',
-          'next: the user turns it on (Personal VM panel → Computer Use, or POST /dsh-cua-vm/cua-grant { "grant": true }); the grant is memory-only and per session'
+          'next: the user turns it back on (Personal VM panel → Computer Use, or POST /dsh-cua-vm/cua-grant { "grant": true }); the grant is ON by default, memory-only and per session'
         ].join('\n'),
         info: { name: toolName, code: 'grant-off' }
       }
@@ -1109,6 +1128,52 @@ async function attachWindowsMcp(target) {
 }
 
 /**
+ * LET A LATE RELAY IN — THE POLL IS THE WATCH THAT NEVER GIVES UP.
+ *
+ * The lane is decided on every attach (`resolveGuestMcpTransport`), and the
+ * Windows logon task that starts the interactive relay can come up MINUTES
+ * after the boot that made sshd reachable. The client covers the common case
+ * with its own 15 s watch (`startUpgradeWatch` in win-mcp.js), which is the
+ * FAST path — but a relay that starts at attach+16 s is missed by it forever,
+ * and that is exactly the observed defect: relay listening on 47999 while the
+ * session sat on `session-0-direct` with RELAY_DOWN, blind for its whole life.
+ *
+ * So the bridge owns the SLOW path too: every poll tick that still sees the
+ * blind lane asks the client to reconsider. Nothing here re-implements the
+ * decision or opens a second SSH session — `maybeUpgradeTransport()` is the
+ * client's own method, and its verified contract is:
+ *
+ *   • it throttles itself to one probe per RELAY_UPGRADE_INTERVAL_MS (60 s)
+ *     and returns `{ upgraded, reason }` without throwing;
+ *   • it never acts during a `tools/call` (in-flight check, re-checked after
+ *     the await), so a poll nudge cannot cut a call the model is waiting on;
+ *   • on success it tears its own child down, `onClosed` tells this plugin,
+ *     and the next poll re-attaches THROUGH the relay — the registrations stay
+ *     owned by `attachWindowsMcp`, never by the client.
+ *
+ * Net effect: a relay that starts later is picked up within one poll interval
+ * plus one throttle window (≤60 s of it listening), instead of a single 15 s
+ * window that has already closed. `DSH_CUA_VM_WIN_MCP_UPGRADE=0` is honoured
+ * here too, so the escape hatch that silences the client's watch silences this
+ * as well. Returns whether a nudge was issued (for the call sites' readability),
+ * and never throws: this runs from the health timer.
+ */
+function nudgeRelayUpgrade(reason = 'poll') {
+  if (WIN_MCP.client?.state?.transport !== 'session-0-direct') return false
+  if (String(process.env.DSH_CUA_VM_WIN_MCP_UPGRADE ?? '1') === '0') return false
+  try {
+    // The contract above says it never rejects; the extra `.catch` is
+    // belt-and-braces so a health timer can never take the harness down over a
+    // transport it was only trying to improve.
+    void Promise.resolve(WIN_MCP.client?.maybeUpgradeTransport?.()).catch(() => {})
+  } catch (error) {
+    WIN_MCP.lastError = `relay upgrade nudge (${reason}): ${error?.message ?? error}`
+    return false
+  }
+  return true
+}
+
+/**
  * THE STATE PATH. Since J20-3 this is the BELT, not the only brace: the
  * supervisor's `subscribe` stream (see `handleVmEvent`) delivers a transition
  * inside a turn, and this poll still runs behind it — a slower cadence on a
@@ -1117,6 +1182,11 @@ async function attachWindowsMcp(target) {
  * Every tick resolves the bound computer and either confirms the attach, tears
  * it down (the row is gone: `vm-removed`; the row is not ready: `vm-state:*`)
  * or dials SSH on the transition into online. Nothing here guesses a target.
+ *
+ * Every tick that leaves the bridge CONNECTED on the blind lane also nudges the
+ * client's relay upgrade (`nudgeRelayUpgrade` above): the attach is re-validated
+ * here for the life of the session, so this is the one loop that can heal a
+ * relay which started after the client's 15 s watch closed.
  */
 async function syncWindowsMcp(reason = 'poll') {
   if (windowsMcpEnabled() !== true) {
@@ -1131,9 +1201,15 @@ async function syncWindowsMcp(reason = 'poll') {
   }
   if (WIN_MCP.online === true && WIN_MCP.name === target.name && WIN_MCP.client?.state?.connected === true) {
     WIN_MCP.reason = `attached (${WIN_MCP.registrations.size} tool(s))`
+    // THE HEAL. The assign is already live and valid; the only outstanding
+    // question is whether it is blind and no longer has to be.
+    nudgeRelayUpgrade(reason)
     return
   }
   await attachWindowsMcp(target)
+  // A fresh attach can land blind too (the probe said RELAY_DOWN and the relay
+  // answered a moment later). The same nudge covers it until the next tick.
+  nudgeRelayUpgrade(reason)
 }
 
 /**
@@ -1481,7 +1557,7 @@ function revealWindowsTools(agent) {
       : online !== true
         ? `The Windows computer is not online yet (${WIN_MCP.reason}); start it and call windows_desktop again.`
         : granted !== true
-          ? 'The Computer Use grant is off for this session, so the tools stay hidden: the user turns it on in the Personal VM panel (or POST /dsh-cua-vm/cua-grant with {"grant":true}).'
+          ? 'The Computer Use grant is OFF for this session (turned off explicitly), so the tools stay hidden: the user turns it back on in the Personal VM panel (or POST /dsh-cua-vm/cua-grant with {"grant":true}); it is ON by default.'
           : `${match.text}. The tools went back to hidden for this session.`
   }
 }
@@ -1934,13 +2010,17 @@ export function apply(ctx, config = {}) {
   /**
    * THE COMPUTER USE GRANT — the switch the per-agent gate reads.
    *
-   * It lives in MEMORY, per session, and it starts OFF: an agent that can click
-   * a Windows desktop without the user saying so is the thing the grant exists
-   * to prevent. The panel (or a curl from the user's own shell) flips it here;
-   * a mutating route is same-origin only, so no other page can turn it on.
+   * It lives in MEMORY, per session, and it starts ON (see
+   * `WIN_MCP_AUX.grantDefault` for why: it is a per-session in-memory safety
+   * default, not a security boundary, and the off default cost every first-boot
+   * test a manual step). ON is the default, not the only answer — the panel (or
+   * a curl from the user's own shell) turns it OFF here, and `grant-off` stays a
+   * real refusal. A mutating route is same-origin only, so no other page can
+   * flip it either way.
    *
-   *   GET  /dsh-cua-vm/cua-grant            -> { ok, default, on, off, ... }
+   *   GET  /dsh-cua-vm/cua-grant            -> { ok, default:'on'|'off', on, off, … }
    *   POST /dsh-cua-vm/cua-grant {"grant":true,"sessionId":"…"}
+   *   POST /dsh-cua-vm/cua-grant {"grant":false,"sessionId":"…"}   (deny)
    *
    * `sessionId` is optional: without it the DEFAULT flips (every session that
    * has not overridden it). Nothing here is persisted, and a restart forgets it.

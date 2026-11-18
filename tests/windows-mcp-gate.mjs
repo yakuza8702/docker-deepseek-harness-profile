@@ -45,7 +45,14 @@
  *       disposer;
  *   (c) every live agent's `restrict({deny})` hides all 19 while the gate is
  *       closed;
- *   (d) `tools.guard` refuses a bridged name offline with `code: vm-offline`;
+ *   (d) `tools.guard` refuses a bridged name offline with `code: vm-offline`,
+ *       and ONLINE the refusal proves the grant's default: a new session starts
+ *       GRANTED (`GET /dsh-cua-vm/cua-grant` answers `default: "on"`), so the
+ *       first veto is `reveal-required`; an explicit
+ *       `POST {"grant":false,"sessionId":"session-A"}` is what turns the code
+ *       into `grant-off`, and the suite restores it because the checks after
+ *       (d) need session A granted. Nothing persists — the whole grant map is
+ *       in-memory and dies with the plugin;
  *   (e) the pre-step self-heal clears a leaked session (names alive, client
  *       dead) and still calls `next()` exactly once.
  */
@@ -280,6 +287,25 @@ const post = async (routePath, body, headers = { origin: 'http://127.0.0.1:3079'
   return { status: res.statusCode, body: JSON.parse(res.text) }
 }
 
+/**
+ * The Computer Use grant route. It is a SECOND prefix registration
+ * (`/dsh-cua-vm`), so `post()` above (which resolves `/cua`) cannot reach it and
+ * a GET is a read with no body. Same-origin headers, because the route refuses a
+ * cross-origin mutation by design.
+ */
+const grant = async (method, body = undefined) => {
+  const route = routes.get('/dsh-cua-vm')
+  const req = {
+    method,
+    url: '/dsh-cua-vm/cua-grant',
+    headers: { origin: 'http://127.0.0.1:3079', host: '127.0.0.1:3079' },
+    async *[Symbol.asyncIterator]() { if (body !== undefined) yield Buffer.from(JSON.stringify(body)) }
+  }
+  const res = { statusCode: 0, headers: {}, setHeader(k, v) { this.headers[k] = v }, end(text) { this.text = text } }
+  await route.handler(req, res)
+  return { status: res.statusCode, body: JSON.parse(res.text) }
+}
+
 /** Deliver one supervisor event the way the plugin really learns it. */
 const deliver = {
   /** The row's state changed; the poll (and the shared teardown) observes it. */
@@ -332,12 +358,47 @@ try {
   check('(c) ...and the non-bridged tools are never in a deny list',
     [agentA, agentB].every((agent) => !agent.denied().some((name) => !name.startsWith('mcp__windows__'))))
 
-  // ---- the guard, online: the grant and the reveal are both closed ----
+  // ---- (d) the guard, online: THE GRANT STARTS ON, AND A DENY IS EXPLICIT ----
+  //
+  // The grant default flipped to ON (see `WIN_MCP_AUX.grantDefault`): a fresh
+  // session no longer has to find the panel switch before its first click, so
+  // "the guard refuses with grant-off" is no longer the state of a NEW session —
+  // it is the state of an EXPLICITLY DENIED one. The honest assertion is the
+  // three-step one below: read the default from the route, watch the refusal
+  // move from `reveal-required` to `grant-off` only after a deny is posted, and
+  // put the grant back because every later check needs session A granted.
+  //
+  // The default is read with GET (never POST `{}`: without a `sessionId` the
+  // route flips the PROCESS default and clears the per-session overrides).
+  const grantDefaultView = await grant('GET')
+  check('(d) a new session starts with the Computer Use grant ON (the route says default on)',
+    grantDefaultView.status === 200 && grantDefaultView.body.ok === true
+    && grantDefaultView.body.default === 'on'
+    && grantDefaultView.body.off.includes('session-A') === false,
+    `default=${grantDefaultView.body.default} on=${JSON.stringify(grantDefaultView.body.on)} off=${JSON.stringify(grantDefaultView.body.off)}`)
+  // Granted but not revealed: the guard still vetoes, with the OTHER code, which
+  // is what proves the grant was the thing missing before and not the reveal.
+  check('(d) ...granted and unrevealed, the guard refuses with code reveal-required (not grant-off)',
+    agentA.guards[0]({ name: 'mcp__windows__tool_click_at', agent: agentA.agent })?.info?.code === 'reveal-required',
+    String(agentA.guards[0]({ name: 'mcp__windows__tool_click_at', agent: agentA.agent })?.reason ?? '').split('\n')[1])
+  const denyAnswer = await grant('POST', { grant: false, sessionId: 'session-A' })
+  check('(d) POST /dsh-cua-vm/cua-grant {"grant":false,"sessionId":"session-A"} denies exactly that session',
+    denyAnswer.status === 200 && denyAnswer.body.ok === true && denyAnswer.body.granted === false
+    && denyAnswer.body.off.includes('session-A') && denyAnswer.body.off.includes('session-B') === false,
+    `granted=${denyAnswer.body.granted} off=${JSON.stringify(denyAnswer.body.off)} on=${JSON.stringify(denyAnswer.body.on)}`)
   const grantOff = agentA.guards[0]({ name: 'mcp__windows__tool_click_at', agent: agentA.agent })
-  check('(d) online with the grant off, the guard refuses with code grant-off',
-    grantOff?.info?.code === 'grant-off', String(grantOff?.reason ?? '').split('\n')[1])
+  check('(d) denied, the guard refuses with code grant-off',
+    grantOff?.info?.code === 'grant-off' && /code: grant-off/u.test(grantOff?.reason ?? ''),
+    String(grantOff?.reason ?? '').split('\n')[1])
   check('the guard ignores a non-bridged name entirely',
     agentA.guards[0]({ name: 'cua_vm_exec', agent: agentA.agent }) === undefined)
+  const restoreAnswer = await grant('POST', { grant: true, sessionId: 'session-A' })
+  check('(d) ...and granting session A back restores it (the later checks need it granted)',
+    restoreAnswer.status === 200 && restoreAnswer.body.granted === true
+    && restoreAnswer.body.on.includes('session-A') && restoreAnswer.body.default === 'on',
+    `granted=${restoreAnswer.body.granted} on=${JSON.stringify(restoreAnswer.body.on)} default=${restoreAnswer.body.default}`)
+  check('(d) ...so the guard is back at reveal-required, never grant-off, for the rest of the suite',
+    agentA.guards[0]({ name: 'mcp__windows__tool_click_at', agent: agentA.agent })?.info?.code === 'reveal-required')
 
   // ---- (b) event 1: vm-state powered-off ----
   const before = disposed.length

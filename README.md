@@ -1210,11 +1210,17 @@ the TOOLS are still per session, and the rule is enforced on every call:
 
 **Three gates, and they are all in the plugin's process:**
 
-1. **the grant** — Computer Use is **off** until the user turns it on, in memory,
-   per session: Personal VM panel → **Computer Use**, or
-   `POST /dsh-cua-vm/cua-grant {"grant": true, "sessionId": "…"}` (same-origin
-   only; `GET` reports the state). A restart forgets it. An agent that can click a
-   Windows desktop without the user saying so is the thing the grant prevents.
+1. **the grant** — Computer Use is **ON by default**, in memory, per session. It
+   is a per-session safety default, not a boundary (the page API is same-origin,
+   the guest bridge is SSH-only, and the guard plus the target binding decide every
+   call), and shipping it off cost every first-boot test a manual panel step
+   before its first click. Denying is still explicit and still works: Personal VM
+   panel → **Computer Use**, or
+   `POST /dsh-cua-vm/cua-grant {"grant": false, "sessionId": "…"}` (same-origin
+   only; `GET` reports `default`/`on`/`off`, and `grant-off` stays a real refusal
+   code). A restart forgets all of it. What the grant can never do is make a
+   stopped computer's tools visible: **offline hides the 19 names regardless of the
+   grant**, because the gate is `online && granted && revealed && target`.
 2. **the reveal** — even with the grant on, the names stay hidden until
    `windows_desktop` is called for that session. This is cost control: the guest's
    schema is ~3-8k tokens.
@@ -1381,6 +1387,17 @@ become a reconnect storm), never while a `tools/call` is in flight — closing t
 child under a call the model is waiting on would fail that call — and
 `DSH_CUA_VM_WIN_MCP_UPGRADE=0` turns the watch off.
 
+**The upgrade also rides the 10 s poll, so a late relay is not missed.** One 15 s
+window at connect time cannot cover a logon task that fires a minute later, and
+that was the whole failure: the computer had a working relay and the session stayed
+blind. So every state-poll beat (`DSH_CUA_MCP_STATE_POLL_MS`, 10 s) that still sees
+a CONNECTED `session-0-direct` attach calls the client's own
+`maybeUpgradeTransport()` again (`nudgeRelayUpgrade`) — nothing is re-implemented,
+and the throttling, in-flight and teardown rules above are the ones that apply. A
+relay that starts late therefore heals the session within **≤60 s** (one throttle
+window) instead of never, on top of the 15 s fast path, and
+`DSH_CUA_VM_WIN_MCP_UPGRADE=0` disables this path as well as the watch.
+
 `windows_mcp_doctor` reports the facts from the client's own **synchronous,
 zero-SSH** `doctorFacts()` — the doctor has its own probe budget and never opens a
 second SSH session to answer a question: `transport`, `relayPort`, `relayOk`, plus
@@ -1394,13 +1411,14 @@ bridge as healthy in exactly the case the doctor exists for.
 |---|---|---|
 | `DSH_CUA_MCP_RELAY_PORT` | `47999` | the loopback port `--serve` binds and `--connect` dials. Unparseable or out-of-range values fall back to `47999` on **both** sides of the wire instead of building a broken command |
 | `DSH_CUA_MCP_RELAY_LOG` | `C:\ProgramData\cua\mcp-relay.log` | where the relay appends its one-line-per-event log |
-| `DSH_CUA_VM_WIN_MCP_UPGRADE` | `1` | `0` disables the upgrade watch, so a `session-0-direct` attach stays on that lane even if the relay comes up later |
+| `DSH_CUA_VM_WIN_MCP_UPGRADE` | `1` | `0` disables the relay upgrade on BOTH paths (the 15 s watch and the 10 s poll nudge), so a `session-0-direct` attach stays on that lane even if the relay comes up later |
 
 The chain is gated, not assumed: `tools/check-cua-vm.mjs` asserts the relay's modes,
 the `--ping` mode and its `PING_BUDGET`/`read_probe_answer` reader, the probe pair
 (including the **8-byte** answer), the client's `py -3 … --ping <port>` command and
 its 12 s wall, the upgrade watch (`shouldUpgradeToRelay`, `maybeUpgradeTransport`,
-`startUpgradeWatch`, the one log line and the env escape hatch), both task names
+`startUpgradeWatch`, the one log line, the env escape hatch) and the poll-side nudge
+that heals a late relay (`nudgeRelayUpgrade`), both task names
 (`mcp-relay-task` and the `cua-mcp-host` logon task), the `py -3 … --connect`
 default, the fallback reason, the doctor's `transport`/`transportText` lines, the
 Dockerfile COPYs and the uid-1000 readability proof; `tests/modules-unit.mjs` pins

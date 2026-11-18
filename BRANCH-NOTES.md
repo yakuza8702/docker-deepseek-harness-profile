@@ -2583,3 +2583,129 @@ source (2) — `WIN_MCP.online` — is the only source, and the poll beat
 (`DSH_CUA_MCP_STATE_POLL_MS`, 10 s) is what bounds the window. That is the pre-fix
 behaviour, deliberately, and the doctor says `stream.supported: false` when it
 happens.
+
+---
+
+## 26. Branch `cua-vm-improve` — 2026-11-18: a first boot that had to be unblocked by a human, and a relay nobody asked twice
+
+Both defects come from the same clean-session test: a fresh Windows computer, a
+fresh session, no prior state, no human in the loop. Everything the harness needs
+was running, and the run still failed — once because a safety default asked a
+question nobody was there to answer, once because a heal got exactly one chance to
+notice something that arrived late.
+
+### The evidence, from the clean session
+
+**1. The transport stayed `session-0-direct` although the relay was listening.**
+
+```
+$ ssh -p <port> cua@127.0.0.1 'py -3 C:\ProgramData\cua\mcp-relay.py --ping 47999'
+RELAY_OK
+
+windows_mcp_doctor → transport: "session-0-direct"
+                     transportText: "windows mcp transport: session-0 fallback: …desktop automation will be blind"
+                     relayOk: false
+```
+
+The attach happened while the `cua-mcp-host` logon task was still coming up, the
+probe answered `RELAY_DOWN`, and the session fell back — correctly. What was wrong
+is that it *stayed* there. The client's upgrade watch is one 15 s window that
+starts at connect and closes for good; the relay answered a few seconds after that
+window, so the one mechanism that could have upgraded the attach was already gone.
+The computer was healthy, the desktop was unreachable, and nothing in the process
+was ever going to ask again.
+
+**2. The Computer Use grant was off, so the flow blocked on a human.**
+
+A fresh session had to find Personal VM → **Computer Use** before its first
+`mcp__windows__*` call. In a scripted clean-session test that is a dead end: the
+bridge attached, the 19 tools stayed hidden, and the run looked broken rather than
+gated. The default was the problem, not the gate — the grant is a per-session,
+in-memory safety default, and everything that actually guards the desktop sits
+behind it (same-origin page API, SSH-only guest bridge, `restrict` + `guard` veto
+on every call, per-session target binding).
+
+### The fixes
+
+**A. The grant now starts ON (`grantDefault: true`).** Nothing else about denying
+changed: the panel switch and `POST /dsh-cua-vm/cua-grant {"grant": false,
+"sessionId": "…"}` still turn it off, `grant-off` is still a real refusal code, the
+grant is still per session and still forgotten by a restart, and the offline layer
+still hides all 19 names regardless of it — the deny set is rebuilt from `online &&
+granted && revealed && target`, so a stopped computer's tools cannot be revealed by
+a grant. What a first boot no longer needs is a human to click a switch before the
+first click.
+
+**B. The relay upgrade rides the 10 s state poll (`nudgeRelayUpgrade`).** Every
+poll beat that still sees a CONNECTED `session-0-direct` attach asks the client's
+own `maybeUpgradeTransport()` to reconsider — the same probe, the same 60 s
+throttle, the same in-flight guard, the same teardown of the client's SSH child,
+because the plugin calls the client's method instead of re-implementing the
+decision. A relay that starts late is now healed within **≤60 s** (one throttle
+window) on top of the 15 s fast path, instead of never. `DSH_CUA_VM_WIN_MCP_UPGRADE=0`
+disables this path as well as the watch, and the nudge never throws: it runs from
+the health timer.
+
+**C. The suite asserted the old default.** `tests/windows-mcp-gate.mjs` check (d)
+expected `grant-off` from a *fresh* session. A refusal is now evidence of an
+explicit deny, so the check became the honest sequence: read the default from
+`GET /dsh-cua-vm/cua-grant` (`default: "on"`), see the first veto come back as
+`reveal-required` (granted, unrevealed), POST `{"grant":false,"sessionId":"session-A"}`,
+get `grant-off`, then restore session A because every later check needs it granted.
+The default is read with GET on purpose: a POST `{}` with no `sessionId` flips the
+*process* default and clears the per-session overrides.
+
+| defect | measured | fix | where it is asserted |
+|---|---|---|---|
+| the relay answered after the 15 s watch closed | `RELAY_OK` from `--ping`, `transport: "session-0-direct"`, blind for the rest of the session | `nudgeRelayUpgrade(reason)` on every poll beat of a connected blind attach (plus the two call sites in `syncWindowsMcp`), env escape hatch honoured there too | `check-cua-vm` (index.js: the function, its blind-lane guard, the env line, the client call, both call sites); `windows-mcp-gate` (the attach/teardown behaviour it rides on) |
+| a fresh session had to be granted by hand | 19 names hidden, guard `grant-off`, no human in a clean-session run | `grantDefault: true` — ON per session, in memory, with deny unchanged | `windows-mcp-gate` (d): route default `on`, `reveal-required` before the deny, `grant-off` after it, restored afterwards; `check-cua-vm` (index.js: `grantDefault: true`, the two `default: … ? 'on' : 'off'` snapshots) |
+
+### The files
+
+| file | change |
+|---|---|
+| `plugins/dsh-cua-vm/index.js` | `WIN_MCP_AUX.grantDefault: true` (+ the rationale block: a per-session safety default, not a boundary), `nudgeRelayUpgrade(reason = 'poll')` and its two call sites in `syncWindowsMcp` |
+| `tests/windows-mcp-gate.mjs` | a `grant(method, body)` helper for the second prefix route (`/dsh-cua-vm`), check (d) rewritten as default → reveal-required → explicit deny → `grant-off` → restore → `reveal-required`, header updated; the other 44 checks untouched |
+| `tools/check-cua-vm.mjs` | 7 index.js needles: `grantDefault: true`, the two grant snapshots, `function nudgeRelayUpgrade(`, its blind-lane guard, the `DSH_CUA_VM_WIN_MCP_UPGRADE` line inside it, the client call, and the pair of call sites |
+| `README.md` | the grant is ON by default per session (in memory; panel switch or `POST {"grant":false}` denies; offline hides the 19 names regardless); the relay upgrade now rides the 10 s poll (≤60 s heal, plus the 15 s fast path, `DSH_CUA_VM_WIN_MCP_UPGRADE=0` disables both); the env row and the gate paragraph updated |
+| `plugins/dsh-cua-vm/README.md` | the same two changes in the plugin's own words, in “The gate: grant → reveal → guard” and “A late relay heals the live session”, plus the env table row |
+| `BRANCH-NOTES.md` | this section |
+
+### Verify
+
+All of these, all exit 0, from the repo root:
+
+```bash
+node tools/check-cua-vm.mjs --root .      # 1094 assertions / 23 files (index.js: 90)
+node tools/check-cua-rea.mjs --root .     # 67 needles / 5 files
+node tests/modules-unit.mjs               # 361 assertions
+node tests/windows-boot.mjs               # 63 assertions
+node tests/windows-mcp-gate.mjs           # 50 assertions (45 before; (d) grew from 1 to 6)
+node tests/supervisor-smoke.mjs           # 254 assertions
+node tests/qmp-shutdown.mjs               # 7 assertions
+```
+
+Anchors, for a reviewer who wants to read the code instead of the tests:
+
+* `plugins/dsh-cua-vm/index.js` — `grantDefault: true,` (the rationale block above
+  it is the argument), `function grantFor(agent)`, `function setWindowsGrant(`,
+  `function windowsGrantSnapshot(` (the two `default: WIN_MCP_AUX.grantDefault ===
+  true ? 'on' : 'off'`), the `/dsh-cua-vm/cua-grant` route comment, `function
+  nudgeRelayUpgrade(reason = 'poll')`, `if (WIN_MCP.client?.state?.transport !==
+  'session-0-direct') return false`, the two `nudgeRelayUpgrade(reason)` call sites
+  in `syncWindowsMcp`.
+* `tests/windows-mcp-gate.mjs` — `const grant = async (method, body)`, check `(d) a
+  new session starts with the Computer Use grant ON`, `(d) denied, the guard
+  refuses with code grant-off`, `(d) ...and granting session A back restores it`.
+* `tools/check-cua-vm.mjs` — the `J22-15` needle groups (grant default under
+  “the Computer Use grant, in memory, per session”; the poll nudge under “THE
+  RELAY HEAL RIDES THE 10 s POLL”).
+
+**Residual risk, named honestly.** The poll nudge heals a late relay only while
+the process is up and the attach stays CONNECTED on the blind lane; a relay that
+starts *and* dies between two beats is still only noticed by the next attach, and
+a session that never attached has no blind lane to heal. And "ON by default" is a
+product decision about ergonomics, not about security: the guard, the reveal, the
+target binding and the offline teardown are what refuse a call, and a reviewer who
+disagrees with the default can flip one constant — `grantDefault` — without
+touching any of them.

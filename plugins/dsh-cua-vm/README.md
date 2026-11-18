@@ -551,8 +551,9 @@ session**, which is the only session whose desktop UIA can see; see
 [The interactive session](#the-interactive-session--the-mcp-server-lives-there-now-the-relay).
 When the probe says the relay is not listening, the attach falls back to starting
 its own Session 0 server (MCP works, the desktop is blind) and records why — and
-keeps watching, so a relay that comes up later upgrades that attach instead of
-leaving it blind (see [the relay](#the-interactive-session--the-mcp-server-lives-there-now-the-relay)).
+keeps watching (a 15 s fast path at connect, plus a nudge from every 10 s state
+poll), so a relay that comes up later upgrades that attach instead of leaving it
+blind (see [the relay](#the-interactive-session--the-mcp-server-lives-there-now-the-relay)).
 **Nothing is written to the profile.**
 
 #### The namespace is the harness's
@@ -573,11 +574,19 @@ while attached**, zero when no Windows computer is active.
 Cost and consent are two different problems, so there are three layers and every
 one of them lives in the plugin's process (module-level state, not per-mount):
 
-1. **the grant** — Computer Use is **off** by default, in memory, per session.
-   The user turns it on in Personal VM → **Computer Use**, or with
-   `POST /dsh-cua-vm/cua-grant {"grant": true, "sessionId": "…"}`;
-   `GET /dsh-cua-vm/cua-grant` reports the state. Mutating the grant is
-   same-origin only, and a restart forgets it.
+1. **the grant** — Computer Use is **ON by default**, in memory, per session. It
+   is a per-session safety default, not a boundary (`WIN_MCP_AUX.grantDefault`):
+   the same-origin page API, the SSH-only guest bridge, the guard below and the
+   per-session target binding are what actually stand between a session and the
+   desktop, and the grant only decides whether a fresh session needs one manual
+   round trip before it may click. **Denying is explicit and unchanged**: Personal
+   VM → **Computer Use**, or
+   `POST /dsh-cua-vm/cua-grant {"grant": false, "sessionId": "…"}` (same-origin
+   only); `GET /dsh-cua-vm/cua-grant` reports `default`/`on`/`off`, and `grant-off`
+   is still the refusal code that deny produces. A restart forgets all of it. The
+   offline layer hides the 19 names **regardless of the grant**: the deny set is
+   rebuilt from `online && granted && revealed && target`, so no grant makes a
+   stopped computer's tools visible.
 2. **the reveal** — with the grant on, the names are still hidden until
    `windows_desktop` is called for that session. `restrict({ deny })` is what
    hides them, and the deny set is every name this bridge registered.
@@ -878,11 +887,22 @@ the whole session. Bounded: one attempt per `RELAY_UPGRADE_INTERVAL_MS` (60 s),
 never while a `tools/call` is in flight, and `DSH_CUA_VM_WIN_MCP_UPGRADE=0` disables
 the watch entirely.
 
+**The heal also rides the 10 s state poll.** The 15 s watch covers a relay that
+starts seconds late, not one that starts a minute late (the logon task can fire
+long after the attach), and that was the reported residue: the computer was fine and
+the session stayed blind. So every poll beat that still sees a CONNECTED
+`session-0-direct` attach nudges the client's own `maybeUpgradeTransport()` again
+(`nudgeRelayUpgrade`) — the same probe, the same 60 s throttle, the same in-flight
+guard and the same teardown of the client's child, because the plugin calls the
+client's method instead of re-implementing the decision. A late relay is therefore
+healed within **≤60 s** (one throttle window) on top of the 15 s fast path, and
+`DSH_CUA_VM_WIN_MCP_UPGRADE=0` silences this path too.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `DSH_CUA_MCP_RELAY_PORT` | `47999` | relay port on both sides of the wire; garbage falls back to the default rather than building a broken command |
 | `DSH_CUA_MCP_RELAY_LOG` | `C:\ProgramData\cua\mcp-relay.log` | the relay's event log |
-| `DSH_CUA_VM_WIN_MCP_UPGRADE` | `1` | `0` keeps a blind `session-0-direct` attach on that lane instead of chasing a relay that starts later |
+| `DSH_CUA_VM_WIN_MCP_UPGRADE` | `1` | `0` disables the relay upgrade on both paths (the 15 s watch and the 10 s poll nudge), keeping a blind `session-0-direct` attach on that lane |
 
 `DSH_CUA_WIN_MCP_COMMAND` still overrides the command verbatim (the doctor records
 that the relay was bypassed on purpose). The relay's limits are honest ones: it

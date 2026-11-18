@@ -1835,6 +1835,14 @@ const NEEDLES = {
     ['DSH_CUA_MCP_STATE_POLL_MS', 1],
     // the Computer Use grant, in memory, per session
     ["action !== 'cua-grant'", 1],
+    // J22-15: THE GRANT STARTS ON. The off default cost every first-boot test a
+    // manual panel step; the grant is a per-session in-memory safety default, not
+    // a boundary (the page API, the SSH-only guest bridge, the guard and the
+    // target binding are). `grant-off` stays a real refusal code — it is now the
+    // answer to an EXPLICIT deny, which is what `tests/windows-mcp-gate.mjs`
+    // drives (default read from the route, deny posted, refusal asserted).
+    ['grantDefault: true,', 1],
+    ['default: WIN_MCP_AUX.grantDefault === true ? \'on\' : \'off\'', 2],
     ['function teardown(reason)', 1],
     // J20-4: THE IN-FLIGHT ATTACH TICKET. `WIN_MCP.name` is '' for an attach
     // still in its 45 s handshake, so a delete that landed mid-handshake skipped
@@ -1879,6 +1887,22 @@ const NEEDLES = {
     ["if (facts.transport === 'session-0-direct')", 1],
     ['windows mcp transport: session-0 fallback: ${detail}', 1],
     ['not attached yet (no lane decided in this process)', 1],
+    // J22-15: THE RELAY HEAL RIDES THE 10 s POLL. The client's own upgrade watch
+    // is one 15 s window at connect time; a relay whose logon task starts AFTER
+    // that window was never seen, and the session stayed blind for its whole
+    // life on a computer that had a working relay. Every poll beat that leaves
+    // the bridge CONNECTED on the blind lane now nudges the client's own
+    // `maybeUpgradeTransport()`: no second SSH session, no second decision, and
+    // its 60 s throttle + in-flight guard are what bound the cost. The env
+    // escape hatch is honoured HERE TOO, so `DSH_CUA_VM_WIN_MCP_UPGRADE=0`
+    // silences the slow path as well as the 15 s watch.
+    ['function nudgeRelayUpgrade(reason = \'poll\')', 1],
+    ["if (WIN_MCP.client?.state?.transport !== 'session-0-direct') return false", 1],
+    ["if (String(process.env.DSH_CUA_VM_WIN_MCP_UPGRADE ?? '1') === '0') return false", 1],
+    ['void Promise.resolve(WIN_MCP.client?.maybeUpgradeTransport?.()).catch(() => {})', 1],
+    // ...from the two places a poll can land: the already-attached tick and the
+    // fresh attach, because a fresh attach can come up blind too.
+    ['nudgeRelayUpgrade(reason)', 2],
     // WP-10: THE DOCTOR'S STALE PROBE (`online: true / state: ready` seconds
     // after a power-off). The verdict is built FIRST from the stream's newest
     // vm-state and the plugin's own state; a live probe is DETAIL, aged by
