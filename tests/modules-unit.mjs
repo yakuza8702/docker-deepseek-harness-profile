@@ -19,7 +19,7 @@ import {
   isoFileName, clipAckMatches, clipAckVerdict, clipSha256, ensureIso, qemuEscapeOptionValue,
   charToKey, parseKeySpec, generatePassword, windowsEnabled,
   buildQemuArgs, vncDisplayFor, vncPortFor, windowsPaths, frameSpace,
-  OEM_PAYLOAD_FILES, OEM_PAYLOAD_REQUIRED, OEM_CLIP_AGENT_FILE, CLIP_AGENT_SENTINEL_FILE, SETUP_IMAGE_OPTIONAL, oemPayloadDir, oemPayloadDirStatus, oemPayloadDeniedDir, resolveOemSourceDir, writeOemPayload,
+  OEM_PAYLOAD_FILES, OEM_PAYLOAD_REQUIRED, OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE, CLIP_AGENT_SENTINEL_FILE, SETUP_IMAGE_OPTIONAL, oemPayloadDir, oemPayloadDirStatus, oemPayloadDeniedDir, resolveOemSourceDir, writeOemPayload,
   oemPayloadMissingError, oemPayloadDeniedError, windowsKvmPreflight,
   SETUP_IMAGE_ENTRIES, SETUP_IMAGE_LABEL, buildSetupImage, verifySetupImage, answerFileDiskIds,
   assertAnswerFileTargetsSystemDisk, normaliseProductKey,
@@ -45,7 +45,10 @@ import {
 } from '../docker/cua-vnc-clip.mjs'
 import {
   DEFAULT_SERVER_NAME, TOOL_PREFIX, REVEAL_TOOL_NAME, DOCTOR_TOOL_NAME,
-  windowsToolName, windowsGuestToolName, sshArgv, SSH_KEEPALIVE
+  windowsToolName, windowsGuestToolName, sshArgv, SSH_KEEPALIVE,
+  // J22-14: the interactive MCP relay's lane, probe and zero-SSH doctor facts.
+  RELAY_COMMAND, RELAY_PORT_DEFAULT, RELAY_OK, RELAY_BAD, RELAY_DOWN, RELAY_PROBE_TTL_MS,
+  SESSION0_FALLBACK_REASON, relayPort, relayProbeCommand, createDshCuaClient
 } from '../plugins/dsh-cua-vm/win-mcp.js'
 
 /** The checkout root — the source of `docker/windows-oem/` in these tests. */
@@ -670,6 +673,83 @@ check('exactly two versions carry a live mido strategy (11 and 10, the two pages
 }
 
 // ------------------------------------------------------------------ *
+// J22-14: THE INTERACTIVE MCP RELAY — one python file, two modes
+// ------------------------------------------------------------------ *
+// The Windows MCP server used to be started BY the SSH command, i.e. in
+// Session 0, where UIA enumerates zero windows (`list_windows` answered 0 while
+// notepad sat in "Services"). The relay keeps the stdio transport exactly as it
+// is and moves only the SERVER into the logged-on user's session.
+//
+// What is asserted here is the part that is PURE: the probe pair and its LENGTH
+// (the firstboot bug was a nine-byte read of an eight-byte answer), the lane
+// constants on both sides of the wire, the port rule, and the doctor's zero-SSH
+// facts. The guest-side wiring is gated by tools/check-cua-vm.mjs; the
+// behavioural half (a real attach, a real doctor payload) is tests/windows-mcp-gate.mjs,
+// which is why `transportText` — built inside index.js from those same facts —
+// is not re-tested here.
+{
+  const relaySource = readFileSync(path.join(REPO, 'docker', 'cua-mcp-relay.py'), 'utf8')
+  const ping = /PROBE_PING = b'([^']+)'/u.exec(relaySource)?.[1] ?? ''
+  const ok = /PROBE_OK = b'([^']+)'/u.exec(relaySource)?.[1] ?? ''
+  const pyPort = Number(/^DEFAULT_PORT = (\d+)$/mu.exec(relaySource)?.[1] ?? 0)
+  check('J22-14: the relay answers RELAY_PING with RELAY_OK — and RELAY_OK is EIGHT bytes',
+    ping === 'RELAY_PING' && ok === 'RELAY_OK'
+    && Buffer.byteLength(ping, 'ascii') === 10 && Buffer.byteLength(ok, 'ascii') === 8,
+    `${ping || 'missing'}(${Buffer.byteLength(ping, 'ascii')}) -> ${ok || 'missing'}(${Buffer.byteLength(ok, 'ascii')})`)
+  // ONE spelling of the pair. The client compares constants; the guest compares
+  // bytes. If either side is "fixed" alone, every attach falls back to the blind
+  // lane — which works, and is exactly how it would go unnoticed.
+  check('J22-14: ...and the client uses the SAME pair, with no second spelling',
+    RELAY_OK === ok && RELAY_BAD === 'RELAY_BAD' && RELAY_DOWN === 'RELAY_DOWN'
+    && RELAY_PROBE_TTL_MS === 10000,
+    `${RELAY_OK}/${RELAY_BAD}/${RELAY_DOWN} ttl=${RELAY_PROBE_TTL_MS}`)
+  check('J22-14: the relay port default agrees on both sides of the wire (47999)',
+    pyPort === 47999 && RELAY_PORT_DEFAULT === 47999, `py=${pyPort} js=${RELAY_PORT_DEFAULT}`)
+  const savedPort = process.env.DSH_CUA_MCP_RELAY_PORT
+  try {
+    process.env.DSH_CUA_MCP_RELAY_PORT = '51234'
+    const overridden = relayPort()
+    process.env.DSH_CUA_MCP_RELAY_PORT = 'not-a-port'
+    const garbage = relayPort()
+    process.env.DSH_CUA_MCP_RELAY_PORT = '70000'
+    const outOfRange = relayPort()
+    delete process.env.DSH_CUA_MCP_RELAY_PORT
+    check('J22-14: DSH_CUA_MCP_RELAY_PORT overrides the port; garbage falls back instead of building a broken line',
+      overridden === 51234 && garbage === 47999 && outOfRange === 47999 && relayPort() === 47999,
+      `override=${overridden} garbage=${garbage} out-of-range=${outOfRange} unset=${relayPort()}`)
+  } finally {
+    if (savedPort === undefined) delete process.env.DSH_CUA_MCP_RELAY_PORT
+    else process.env.DSH_CUA_MCP_RELAY_PORT = savedPort
+  }
+  check('J22-14: the SSH child runs the relay CLIENT verbatim (`py -3 ...\\mcp-relay.py --connect`)',
+    RELAY_COMMAND === 'py -3 C:\\ProgramData\\cua\\mcp-relay.py --connect', RELAY_COMMAND)
+  // The probe is ONE ssh round trip, so no pty, no second session and no GUI:
+  // connect, send the ten literal bytes, read EIGHT, print the verdict.
+  const probeLine = relayProbeCommand(47999)
+  check('J22-14: relayProbeCommand sends RELAY_PING, reads 8 bytes and prints OK/BAD/DOWN in one line',
+    !/\n/u.test(probeLine)
+    && probeLine.includes("GetBytes('RELAY_PING')") && probeLine.includes('byte[] 8')
+    && probeLine.includes("Connect('127.0.0.1',47999)") && probeLine.includes("eq 'RELAY_OK'")
+    && probeLine.includes('RELAY_BAD') && probeLine.includes('RELAY_DOWN'),
+    probeLine.slice(0, 120))
+  check('J22-14: the session-0 fallback RECORDS why it is blind rather than looking identical',
+    SESSION0_FALLBACK_REASON === 'session-0 fallback (interactive relay not running; desktop automation will be blind)'
+    && /desktop automation will be blind/u.test(SESSION0_FALLBACK_REASON),
+    SESSION0_FALLBACK_REASON)
+  // THE DOCTOR'S FACTS ARE SYNCHRONOUS AND SIDE-EFFECT FREE. Creating a client
+  // dials nothing; before an attach there IS no lane, and the answer must be
+  // null rather than a guess (a guessed "relay" would report a blind bridge as
+  // healthy in exactly the case the doctor exists for).
+  const unattached = createDshCuaClient({ name: 'relay-unit', sshPort: 1 })
+  const facts = unattached.doctorFacts()
+  check('J22-14: doctorFacts() before any attach says transport null — never a guessed lane',
+    facts.transport === null && facts.relayOk === null && facts.relayStatus === null
+    && facts.transportCommand === null && facts.transportReason === ''
+    && facts.relayPort === RELAY_PORT_DEFAULT,
+    JSON.stringify(facts))
+}
+
+// ------------------------------------------------------------------ *
 // WP-7: THE RFB CLIPBOARD WIRE FORMAT (noVNC talks exactly this)
 // ------------------------------------------------------------------ *
 {
@@ -820,12 +900,14 @@ check('the Windows store paths are all under $STORE', Object.values(paths).every
 // These four checks pin the three properties that make it recoverable.
 {
   const repoOem = path.join(REPO, 'docker', 'windows-oem')
-  // WP-6: THE CLIPBOARD AGENT IS THE FIFTH PAYLOAD FILE. The four original
-  // files still make a directory a payload directory (OEM_PAYLOAD_REQUIRED);
-  // the agent is staged because firstboot can only copy what is in the medium.
-  check('the OEM payload list is the four required files plus the clipboard agent',
-    OEM_PAYLOAD_FILES.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1,Unattend.vbs,cua-clip-agent.ps1'
-    && OEM_PAYLOAD_REQUIRED.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1,Unattend.vbs',
+  // WP-6/J22-14: THE CLIPBOARD AGENT AND THE MCP RELAY ARE PAYLOAD FILES. The
+  // four original files still make a directory a payload directory
+  // (OEM_PAYLOAD_REQUIRED); the agent and the relay are staged because
+  // firstboot can only copy what is in the medium it stages from.
+  check('the OEM payload list is the four required files plus the clipboard agent and the MCP relay',
+    OEM_PAYLOAD_FILES.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1,Unattend.vbs,cua-clip-agent.ps1,cua-mcp-relay.py'
+    && OEM_PAYLOAD_REQUIRED.join(',') === 'Autounattend.xml,setupcomplete.cmd,cua-firstboot.ps1,Unattend.vbs'
+    && OEM_PAYLOAD_FILES.at(-1) === OEM_MCP_RELAY_FILE,
     OEM_PAYLOAD_FILES.join(','))
   check('a complete payload directory is recognised, an incomplete one is not', (() => {
     const partial = mkdtempSync(path.join(os.tmpdir(), 'oem-partial-'))

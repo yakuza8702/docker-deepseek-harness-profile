@@ -105,6 +105,67 @@ function Get-ClipStateStamps([string]$dir) {
   return $map
 }
 
+# THE ONLY LOCAL PROOF THAT THE MCP RELAY IS LISTENING (same idea as J22-13
+# above, for a process that publishes no file). The relay answers a connection
+# whose first bytes are RELAY_PING with RELAY_OK and closes it, BEFORE it touches
+# a child, so this probe is safe to run against a relay that is mid-session.
+#
+# TcpClient has no connect timeout of its own: BeginConnect + WaitOne is the
+# documented way to bound it, otherwise a host where the port is filtered (rather
+# than refused) makes firstboot hang instead of failing the step.
+function Test-RelayPing([int]$Port, [int]$TimeoutMs = 800) {
+  $client = $null
+  # ONE DEADLINE FOR THE WHOLE PROBE, tracked by a stopwatch instead of handed to
+  # each Read: a stream timeout is per-read, so N late bytes would otherwise buy
+  # N x $TimeoutMs of stall inside a check whose contract is 800 ms total.
+  $clock = [System.Diagnostics.Stopwatch]::StartNew()
+  try {
+    $client = New-Object System.Net.Sockets.TcpClient
+    $pending = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+    if (-not $pending.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+    $client.EndConnect($pending)
+    $client.ReceiveTimeout = $TimeoutMs
+    $stream = $client.GetStream()
+    $probe = [System.Text.Encoding]::ASCII.GetBytes('RELAY_PING')
+    $stream.Write($probe, 0, $probe.Length)
+    $stream.Flush()
+    # RELAY_OK IS EIGHT BYTES ("R","E","L","A","Y","_","O","K"). A 9-byte
+    # buffer here read one byte too many and compared a short read against the
+    # wrong length - which made this probe answer $false EVERY time, i.e. the
+    # idempotency check below would never fire and every run would start a
+    # second listener. The length is asserted, not assumed.
+    #
+    # AND ONE Read IS NOT THE ANSWER. RELAY_OK is "eight bytes" on the WIRE, not
+    # "eight bytes in one syscall": TCP is a byte stream, so a legal short read
+    # (the relay's sendall landing in two segments, a loopback/NIC oddity, a
+    # Winsock buffer that has 3 of 8 bytes when the read is issued) is NOT a
+    # failure - and treating it as one made this probe answer $false against a
+    # relay that was perfectly healthy. That false negative lands on the same
+    # /run path as a real outage: the next firstboot starts a SECOND relay, which
+    # loses the bind with WinError 10048 (the two-relays-on-one-port defect this
+    # whole function exists to prevent). So ACCUMULATE until 8 bytes or EOF, and
+    # let the shared stopwatch bound the loop.
+    $answer = New-Object byte[] 8
+    $read = 0
+    while ($read -lt $answer.Length) {
+      $remaining = $TimeoutMs - [int]$clock.ElapsedMilliseconds
+      if ($remaining -le 0) { return $false }
+      $client.ReceiveTimeout = $remaining
+      $got = $stream.Read($answer, $read, $answer.Length - $read)
+      # 0 means the peer closed: EOF before 8 bytes is a truncated answer, and a
+      # truncated answer is not RELAY_OK. Stop here rather than spin.
+      if ($got -le 0) { break }
+      $read += $got
+    }
+    if ($read -ne 8) { return $false }
+    return ([System.Text.Encoding]::ASCII.GetString($answer) -ceq 'RELAY_OK')
+  } catch {
+    return $false
+  } finally {
+    if ($client) { $client.Close() }
+  }
+}
+
 Step 'openssh' {
   # The capability is in the image; no internet needed for this step.
   $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
@@ -689,6 +750,168 @@ Step 'autostart-windowless' {
   Register-ScheduledTask -TaskName 'dsh-cua-server' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Hidden -Force | Out-Null
   Start-ScheduledTask -TaskName 'dsh-cua-server'
   Say 'dsh-cua-server task registered (interactive, windowless)'
+}
+
+# THE SESSION-0 DEFECT, FIXED AT ITS ROOT.
+#
+# THE OBSERVED FAILURE: the MCP server the harness starts over SSH runs in the
+# SSH SERVICE's session - Session 0 - and UIA is per-session. From there
+# `list_windows` returns ZERO windows, and a notepad started by a tool is created
+# "in Services": invisible to the logged-on user, unfindable by the next call.
+# The transport was never the problem; the session was.
+#
+# THE FIX: a loopback TCP <-> stdio relay. `python -m dsh_cua.server --stdio`
+# still speaks MCP on its stdio, but it is started by THIS task, in the
+# INTERACTIVE session, and its stdio is bridged to 127.0.0.1:47999 by
+# C:\ProgramData\cua\mcp-relay.py --serve. The SSH side runs
+# `mcp-relay.py --connect`, which touches no desktop and simply moves bytes
+# between the SSH channel's stdio and that socket. win-mcp.js keeps its stdio
+# contract; only the command it runs changes (python ... --connect), so none of
+# the SSH/transport code moves.
+#
+# /it IS THE ENTIRE POINT: without it the task would run in Session 0 again and
+# the relay would faithfully forward JSON-RPC to a server that still cannot see
+# a single window. /rl LIMITED = the user's own token, so the relay runs on the
+# same desktop (and at the same integrity level) as the windows it drives.
+#
+# WHY A 127.0.0.1 LISTENER IS NOT AN ATTACK SURFACE WORTH ARGUING ABOUT: the
+# relay binds loopback only. Reaching it already means code running on this
+# guest, which can start its own dsh_cua.server anyway.
+Step 'mcp-relay-task' {
+  New-Item -ItemType Directory -Force -Path 'C:\ProgramData\cua' | Out-Null
+  $relayScript = 'C:\ProgramData\cua\mcp-relay.py'
+
+  # THE BODY COMES FROM THE OEM PAYLOAD, searched exactly where
+  # cua-clip-agent.ps1 is searched: $PSScriptRoot (Setup\Scripts), the setup.img
+  # ROOT (the removable roots C:..H: the fallback boot path uses) and a copy an
+  # operator already put in place.
+  $relaySource = $null
+  $relayDirs = @($PSScriptRoot, 'C:\Windows\Setup\Scripts', 'C:\', 'D:\', 'E:\', 'F:\', 'G:\', 'H:\')
+  foreach ($relayDir in $relayDirs) {
+    if (-not $relayDir) { continue }
+    $relayCandidate = Join-Path $relayDir 'cua-mcp-relay.py'
+    if (Test-Path -LiteralPath $relayCandidate -ErrorAction SilentlyContinue) { $relaySource = $relayCandidate; break }
+  }
+  if ($relaySource) {
+    Copy-Item -LiteralPath $relaySource -Destination $relayScript -Force
+    Say "mcp relay: $relaySource -> $relayScript"
+  } elseif (Test-Path -LiteralPath $relayScript) {
+    # A re-run after the payload directory is gone: the script in ProgramData is
+    # still the same bytes, so keep it rather than registering a task that
+    # points at nothing.
+    Say "mcp relay: no staged copy found; keeping the existing $relayScript"
+  } else {
+    # A TASK WHOSE -File POINTS AT NOTHING "STARTS" AND DOES NOTHING - the
+    # failure mode this repository keeps naming. Fail the step instead.
+    throw 'cua-mcp-relay.py is in neither the OEM payload nor C:\ProgramData\cua; the relay would be a task that does nothing'
+  }
+
+  # THE INTERPRETER: the same real-python rule the provisioning steps use (no
+  # WindowsApps App Execution Alias), plus the `py -3` launcher as a second
+  # chance, which is the documented way to ask Windows for ITS python when PATH
+  # does not carry one yet (a firstboot that ran before a logoff).
+  $py = Get-RealPython
+  if (-not $py) {
+    $launcher = Get-Command py -ErrorAction SilentlyContinue
+    if ($launcher -and $launcher.Source) {
+      try {
+        $candidate = (& $launcher.Source -3 -c "import sys;print(sys.executable)" 2>$null | Select-Object -First 1)
+        if ($LASTEXITCODE -eq 0 -and $candidate) {
+          $candidate = ([string]$candidate).Trim()
+          if ($candidate -and $candidate -notmatch '\\WindowsApps\\' -and (Test-Path -LiteralPath $candidate)) { $py = $candidate }
+        }
+      } catch { $py = $null }
+    }
+  }
+  if (-not $py) { throw 'python is missing: cannot register the mcp relay' }
+
+  # WINDOWLESS, LIKE dsh-cua-server. python.exe ALWAYS allocates a console, and
+  # this task runs with /it - so the console would appear on the user's desktop
+  # as a permanently blank window (the U3 defect). pythonw.exe ships beside
+  # python.exe; an unusual layout falls back to python.exe, which at least keeps
+  # the relay working.
+  $relayPy = $py
+  $relayPyw = Join-Path (Split-Path -Parent $py) 'pythonw.exe'
+  if (Test-Path -LiteralPath $relayPyw) { $relayPy = $relayPyw }
+
+  $relayPort = 47999
+  if ($env:DSH_CUA_MCP_RELAY_PORT) {
+    $parsedPort = 0
+    if ([int]::TryParse($env:DSH_CUA_MCP_RELAY_PORT, [ref]$parsedPort) -and $parsedPort -gt 0 -and $parsedPort -lt 65536) { $relayPort = $parsedPort }
+  }
+
+  # THE COMMAND THE TASK MUST RUN (quoted, because python.org installs to
+  # "C:\Program Files\Python3xx\..."). This is the line that ends up in the
+  # launcher below, and the launcher is what /tr names.
+  $relayCommand = "`"$relayPy`" `"$relayScript`" --serve"
+
+  # WHY A LAUNCHER AND NOT THE COMMAND IN /tr DIRECTLY:
+  #   `schtasks /tr` is ONE command line that Windows RE-PARSES, and the repo
+  #   already documents that a nested quote there silently truncates the action
+  #   (a task that exists and does nothing). With the interpreter under
+  #   "C:\Program Files" the generated line is
+  #       /tr ""C:\Program Files\Python311\pythonw.exe" C:\...\mcp-relay.py --serve"
+  #   - doubled quotes that no two parsers agree on. Rather than depend on which
+  #   one wins, the quoting lives in a file that is NOT re-parsed, and /tr names
+  #   that file: a path with NO spaces and therefore no quotes inside /tr.
+  #
+  # WHY wscript.exe: a .cmd launcher would flash a console window on the very
+  # desktop this task exists to automate (cmd.exe is a console process); wscript
+  # is GUI-subsystem and `Run ..., 0, False` starts the relay hidden. Same
+  # trick as Unattend.vbs, the image's existing hidden launcher.
+  $relayLauncher = 'C:\ProgramData\cua\mcp-relay-host.vbs'
+  $relayRunLine = 'shell.Run """' + $relayPy + '"" ""' + $relayScript + '"" --serve", 0, False'
+  Set-Content -Path $relayLauncher -Encoding ASCII -Value @(
+    "' cua-mcp-host: start the interactive-session MCP relay, hidden, no console.",
+    "' Written by cua-firstboot.ps1 (step mcp-relay-task); regenerated on every run.",
+    "' The command lives here because schtasks /tr cannot carry nested quotes:",
+    # PARENTHESISED ON PURPOSE: inside @( ) the comma binds TIGHTER than +,
+    # so an unparenthesised `"'   " + $x` silently becomes TWO array items -
+    # the comment and the command on separate lines, which would turn the
+    # command line into a VBS statement and break the launcher.
+    ("'   " + $relayCommand),
+    'Set shell = CreateObject("WScript.Shell")',
+    $relayRunLine
+  )
+
+  # THROUGH A .cmd FILE for the reason the clipboard tasks document: Windows
+  # PowerShell 5.1 hands a variable containing spaces to a native program
+  # UNQUOTED, so `& schtasks /tr $relayTr` would arrive as `/tr wscript.exe
+  # //B ...` and schtasks would take only the first token as the action. cmd
+  # parses the quoted argument the documented way.
+  #
+  # /sc onlogon + /it: AT LOGON, IN THE INTERACTIVE SESSION - the one session
+  # whose desktop UIA can see. /rl LIMITED: the user's own token, same desktop,
+  # same integrity level as the windows the MCP server will drive.
+  $relayTr = "wscript.exe //B //NoLogo $relayLauncher"
+  $relayCmd = Join-Path $env:TEMP 'cua-mcp-relay-task.cmd'
+  @("schtasks /create /tn `"cua-mcp-host`" /sc onlogon /it /rl LIMITED /f /tr `"$relayTr`"") |
+    Set-Content -Path $relayCmd -Encoding ASCII
+  & cmd /c $relayCmd
+  $relayExit = $LASTEXITCODE
+  Remove-Item -Force $relayCmd -ErrorAction SilentlyContinue
+  if ($relayExit -ne 0) { throw "schtasks could not register cua-mcp-host (exit $relayExit)" }
+
+  # IDEMPOTENT: THE PORT IS THE EVIDENCE. If it already answers RELAY_PING the
+  # relay is up (started at logon, or by an earlier firstboot) and a /run here
+  # would race it for the bind - the loser dies with WinError 10048 while the
+  # marker still reads ok:true. Starting nothing is the correct outcome.
+  if (Test-RelayPing $relayPort) {
+    Say "mcp relay: already answering RELAY_PING on 127.0.0.1:$relayPort; not started again"
+  } else {
+    & schtasks /run /tn 'cua-mcp-host' | Out-Null
+    $relayRun = $LASTEXITCODE
+    if ($relayRun -ne 0) { throw "schtasks could not start cua-mcp-host (exit $relayRun)" }
+    # schtasks /run proves ACCEPTANCE, not a listener (J22-13's lesson). Poll the
+    # probe: 20 x 500 ms covers a cold pythonw.exe plus the import of dsh_cua.
+    $relayUp = $false
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+      Start-Sleep -Milliseconds 500
+      if (Test-RelayPing $relayPort) { $relayUp = $true; break }
+    }
+    if (-not $relayUp) { throw 'task-started-but-relay-not-listening' }
+  }
+  Say "mcp relay registered (cua-mcp-host: onlogon, INTERACTIVE, /rl LIMITED) and answering on 127.0.0.1:$relayPort as $relayPy"
 }
 
 $state.finished = (Get-Date).ToString('o')

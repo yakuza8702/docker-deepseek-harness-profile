@@ -1916,3 +1916,206 @@ pre-UEFI installer) and the stripped media (`tiny11`, `core11`) are the two plac
 where the shared pipeline meets an image that does not behave like a normal
 consumer Windows. Spot-check exactly those two before a release; nothing else in
 the catalog has a different code path.
+
+## 22. Branch `cua-vm-improve` — 2026-11-18: the MCP server moves into the session that has the desktop
+
+One defect, four shipped pieces, and a package that keeps them joined. The defect
+is not a bug in a function: `dsh-cua`'s MCP server was being started **in the wrong
+session**, and every symptom that looked like "UIA is broken" or "the click did
+nothing" was that one fact wearing different clothes.
+
+### R1 — the defect: the server ran in Session 0, which owns no desktop
+
+**Problem.** `win-mcp.js` started the guest server with the SSH command itself:
+
+```
+ssh cua@HOST "python -m dsh_cua.server --stdio"
+```
+
+`sshd` on Windows is a **service**, so the child inherits the SSH service's
+session — Session 0. UIA is per session. Measured on the live guest, not inferred:
+
+| what was asked from that server | what came back |
+|---|---|
+| `list_windows` | **0** windows (`count: 0`, no error) |
+| a notepad started by a tool | created **in "Services"** — the logged-on user never sees it |
+| `SendInput` / `tool_click_at` | delivered to a desktop nobody is looking at |
+
+Every one of those is a **successful** MCP call returning a well-formed answer.
+That is why the failure survived so long: the transport was healthy, so nothing in
+the harness, the gate or the logs said "wrong session". Retrying cannot fix a
+session, and no argument shape can either.
+
+### R2 — the fix chain: a loopback relay, not a new transport
+
+**Change.** `docker/cua-mcp-relay.py` (NEW, 623 lines, stdlib only, ASCII only) is
+ONE file with two modes, so both halves of the bridge cannot drift apart:
+
+```
+harness ──ssh stdio──▶ relay --connect ──127.0.0.1:47999──▶ relay --serve ──▶ python -m dsh_cua.server --stdio
+                        (the SSH child: no desktop,       (firstboot's `cua-mcp-host`   (a child of the /it task →
+                         raw bytes both ways)              task, /sc onlogon /it)        the user's own session)
+```
+
+* `--serve` (:449) binds **loopback only** (:449 `listener.bind((LOOPBACK, self.port))`),
+  one client at a time under a session lock, and **keeps its child across
+  reconnects** — an MCP client that reconnects must not discard the windows the
+  desktop is mid-way through, nor pay a fresh pywinauto warm-up. A child that died
+  is restarted for the next client (:275 `child()`), and its death is noticed by the
+  reader thread, which ends the attached client with EOF instead of a silent hang
+  (:295–:329).
+* `--connect` (:511) is what the SSH command runs: stdin/stdout ↔ the socket, raw
+  bytes, no pty, no line translation. It touches no desktop, so Session 0 is fine
+  by design — that is the whole trick: only the SERVER needs a desktop.
+* the probe pair (:85–:86): a connection whose first bytes are exactly
+  `b'RELAY_PING'` is answered `b'RELAY_OK'` (**8 bytes**) and closed **before a child
+  is spawned** (`classify()`, :350). A real client sends `{"jsonrpc":…` first, so
+  the two are unambiguous; the probe is handled outside the session lock, so a
+  health check can neither block nor be blocked by a live session.
+* the log (:107, `log_path()`): one line per event, appended to
+  `C:\ProgramData\cua\mcp-relay.log` (`DSH_CUA_MCP_RELAY_LOG` overrides; `event()`
+  never throws, because a broken log must not break the pump). `pythonw.exe` has no
+  console, so this file is the only diagnosis a logon task has.
+* the child is spawned with pipes, `bufsize: 0` and `CREATE_NO_WINDOW` (:226,
+  `spawn_child`): a `python.exe` child of an interactive task allocates a console,
+  and that console would sit on the user's desktop as a permanently blank window —
+  the U3 defect one process over.
+
+**Guest side** (`docker/windows-oem/cua-firstboot.ps1`, step `mcp-relay-task`, :755):
+
+1. the script is **staged from the payload, searched exactly where
+   `cua-clip-agent.ps1` is** — `$PSScriptRoot`, `C:\Windows\Setup\Scripts`, the
+   removable roots `C:`..`H:` (:766–:781). Nothing found and nothing already in
+   `C:\ProgramData\cua` **fails the step**
+   (`cua-mcp-relay.py is in neither the OEM payload nor C:\ProgramData\cua; the
+   relay would be a task that does nothing`) instead of registering a task whose
+   `-File` points at nothing.
+2. the interpreter follows the same real-python rule as the provisioning steps
+   (`Get-RealPython`, then the `py -3` launcher as a second chance — the documented
+   way to ask Windows for ITS python when PATH does not carry one yet), and
+   `pythonw.exe` is preferred beside it when it exists.
+3. `schtasks /create /tn "cua-mcp-host" /sc onlogon /it /rl LIMITED /f /tr …`
+   (:863). **`/it` is the entire point** — without it the task runs in Session 0
+   again and the relay faithfully forwards JSON-RPC to a server that still sees no
+   window. `/rl LIMITED` keeps the user's own token, i.e. the same desktop and
+   integrity level as the windows the server will drive.
+4. **idempotency is the PORT, not the task**: `if (Test-RelayPing $relayPort)`
+   (:874) means "already up, start nothing" — a `/run` here would race the logon
+   instance for the bind and the loser dies on `WinError 10048` while the marker
+   still reads `ok:true`. When it does start the task, `/run` only proves
+   ACCEPTANCE, so the step polls the probe 20 × 500 ms and fails with
+   `task-started-but-relay-not-listening` (:887) — J22-13's lesson, applied to a
+   process that publishes no file.
+
+**Why a `.vbs` launcher and not the command in `/tr`.** `schtasks /tr` is ONE
+command line that Windows **re-parses**. python.org installs under
+`"C:\Program Files\Python3xx\…"`, so the generated action would be
+
+```
+/tr ""C:\Program Files\Python311\pythonw.exe" C:\ProgramData\cua\mcp-relay.py --serve"
+```
+
+— doubled quotes that no two parsers agree on, and this repository already has the
+scars: **a nested quote in `/tr` silently truncates the action**, producing a task
+that exists, "starts", and does nothing. Rather than bet on which parser wins, the
+quoting lives in a file that is **not** re-parsed and `/tr` names that file by a
+path with no spaces (`C:\ProgramData\cua\mcp-relay-host.vbs`, :837). The launcher
+is **VBScript, not `.cmd`**, because `cmd.exe` is a console process and its window
+would flash on the very desktop this task exists to automate; `wscript.exe` is
+GUI-subsystem and `Run …, 0, False` starts the relay hidden (:838) — the same trick
+as the image's existing `Unattend.vbs`. Two smaller traps are documented in place:
+the `schtasks` call goes through a generated `.cmd` file because Windows PowerShell
+5.1 passes a variable containing spaces to a native program **unquoted** (:868), and
+the `@( )` array needs its `("'   " + $relayCommand)` item **parenthesised** because
+inside `@( )` the comma binds tighter than `+` (:847).
+
+**Backend / payload** (`docker/cua-vm-windows-qemu.mjs`):
+* `OEM_MCP_RELAY_FILE = 'cua-mcp-relay.py'` (:2727) is the ONE name staging, the
+  medium's root, the `$OEM$` copy and the byte-compare read;
+  `OEM_PAYLOAD_FILES = [...OEM_PAYLOAD_REQUIRED, OEM_CLIP_AGENT_FILE,
+  OEM_MCP_RELAY_FILE]` (:2760) — and it is **not** in `OEM_PAYLOAD_REQUIRED`,
+  because a checkout keeps it beside `docker/windows-oem/` and only the location of
+  the bytes differs.
+* one parameterised resolver (`resolveOemPayloadSourceFile()`, :2784) serves both
+  scripts — the clipboard agent's chain was the same shape, and two copies would
+  drift invisibly.
+* `stagePayloadFile(OEM_MCP_RELAY_FILE, 'MCP relay', …)` (:3934) copies it into
+  `$STORE/windows/<name>/oem/`; `SETUP_IMAGE_ENTRIES` (:2825) puts it at the
+  medium's root beside the answer file, and the `$OEM$/$$/Setup/Scripts` copy
+  (:3981) is what Setup turns into `C:\Windows\Setup\Scripts`. `verifySetupImage()`
+  now **requires and byte-compares it on both routes** (:3593, :3606) — a medium
+  that silently lacks it is exactly the "firstboot runs its embedded floor" failure.
+
+**Image** (`Dockerfile`): the runtime COPY (:937), the flat gate tree (:1017) and
+the uid-1000 proof loop `for f in … cua-clip-agent.ps1 cua-mcp-relay.py` (:1033) —
+a COPY that lands unreadable is the K6 defect one file over, so the proof reads it
+as the runtime user.
+
+### R3 — the lane: probe → `interactive-relay`, else a RECORDED fallback
+
+**Change** (`plugins/dsh-cua-vm/win-mcp.js`):
+
+* `RELAY_COMMAND = 'py -3 C:\ProgramData\cua\mcp-relay.py --connect'` (:153). It
+  says `py -3`, not `python`: on the live guest `python.exe` is not on the
+  non-interactive PATH while the launcher resolves — tested, not guessed.
+* `relayProbe()` (:244) runs `relayProbeCommand()` (:211) — ONE powershell round
+  trip that connects, writes the ten literal bytes `RELAY_PING`, reads **8**, and
+  prints `RELAY_OK` / `RELAY_BAD` / `RELAY_DOWN`; the exit status is always 0, so
+  the ANSWER is what is parsed. Answers are cached per SSH target **and port** for
+  `RELAY_PROBE_TTL_MS` (10 s), because the logon task can come up minutes after the
+  boot that made sshd reachable — a cached "down" that outlived boot would pin the
+  session to the blind lane for its whole life.
+* `resolveGuestMcpTransport()` (:345) decides per attach: `RELAY_OK` → the relay
+  command (`transport: 'interactive-relay'`); `RELAY_DOWN`/`RELAY_BAD` → the
+  session-0 command with `SESSION0_FALLBACK_REASON` (:162) on the record —
+  `session-0 fallback (interactive relay not running; desktop automation will be
+  blind)`. The lane is a property of the **command that will run**, not of the
+  probe, so `DSH_CUA_WIN_MCP_COMMAND` naming the relay still counts as the relay,
+  and an override that bypassed it says so.
+* `relayDoctorFacts()` (:385) returns the same facts for a caller that has no
+  client, and the client's own `doctorFacts()` (:638) is synchronous and
+  side-effect free: `transport`, `relayPort`, `relayOk`, `relayStatus`,
+  `transportCommand`, `transportReason` — `transport: null` when nothing was ever
+  attached in this process, never a guess.
+
+**Doctor** (`plugins/dsh-cua-vm/index.js`): `windowsMcpDoctor()` spreads those facts
+into the payload (`...(transportFacts ?? {})`, so a client-less doctor simply omits
+them) and adds ONE line, `transportText` (:1301), built by `windowsTransportLine()`
+(:1232) from the same object: `windows mcp transport: interactive-relay (port
+47999, relay up)` or `windows mcp transport: session-0 fallback: … desktop
+automation will be blind`, and `not attached yet (no lane decided in this process)`
+before an attach. The doctor **never dials** to fill them in — it has its own probe
+budget and must not open a second SSH session.
+
+### R4 — the package, and how it is verified
+
+The runtime sources above are not mine to touch in this pass; what changed with
+them is the part that **notices when one of them stops being true**.
+
+| file | change |
+|---|---|
+| `tests/modules-unit.mjs` | OEM payload list now the four required + the clipboard agent **+ the MCP relay** (:826), and a new `J22-14` block: the probe pair read out of the python file and both lengths (`RELAY_PING` 10, `RELAY_OK` **8**), the same pair spelled once on the JS side, the port default agreeing on both sides of the wire (47999), `DSH_CUA_MCP_RELAY_PORT` override + garbage → default, `RELAY_COMMAND` verbatim, `relayProbeCommand()`'s 8-byte read, the fallback sentence, and `doctorFacts()` answering `transport: null` before any attach |
+| `tools/check-cua-vm.mjs` | NEW `relay` section (both modes, loopback bind, the probe pair and its 8-byte answer, the probe outside the session lock, `bufsize: 0` + `CREATE_NO_WINDOW`, child restart/`child-exit`, `DSH_CUA_MCP_RELAY_PORT`/`_LOG`) plus needles on the backend (`OEM_MCP_RELAY_FILE`, staged to `oemDir`, the `$OEM$` copy and byte-compare), firstboot (`mcp-relay-task`, `cua-mcp-host`, `Test-RelayPing` + `byte[] 8` + `-ceq 'RELAY_OK'`, `task-started-but-relay-not-listening`), `win-mcp.js` (`RELAY_COMMAND` `py -3`, the fallback reason, `relayDoctorFacts`, `interactive-relay`/`session-0-direct`), `index.js` (`transportText`, both transport sentences), the Dockerfile (both COPYs + the proof loop) and `cua-mcp-relay.py` added to J1-6b's flat-tree set |
+| `README.md` | new "The MCP server runs in the interactive session — the loopback relay" section: the Session 0 evidence table, the lane-preference table, the doctor fields, and the two env rows |
+| `plugins/dsh-cua-vm/README.md` | "The interactive session — the MCP server lives there now (the relay)" replaces "…and what does not exist yet" (the note that said no long-lived user-session server could be reached), and the dsh-cua tools section now names the relay command instead of `ssh … --stdio` |
+| `BRANCH-NOTES.md` | this section |
+
+**Verify.** All of these, all exit 0, from the repo root:
+
+```bash
+node tools/check-cua-vm.mjs --root .      # 1020 assertions / 23 files; the relay's 24
+node tools/check-cua-rea.mjs --root .     # 67 needles / 5 files (unchanged surface)
+node tests/modules-unit.mjs               # includes J22-14 + the 6-file OEM payload list
+node tests/windows-boot.mjs
+node tests/windows-mcp-gate.mjs           # the real gate, fake guest: 19 tools, guard, doctor
+node tests/supervisor-smoke.mjs
+node tests/qmp-shutdown.mjs
+```
+
+**Residual risk, named honestly.** The relay is only as good as the logon task
+being *interactive*: a guest with no logged-on user (`/it` has nothing to run in)
+answers `RELAY_DOWN`, and the attach falls back to the blind lane — visibly, with
+the sentence in the doctor, but blind. A relay that dies mid-session costs one
+reconnect (the child is restarted); a relay caught by a firewall that
+*filters* the loopback port instead of refusing it costs the 800 ms probe timeout
+and lands on the same recorded fallback.

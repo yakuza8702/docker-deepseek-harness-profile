@@ -2707,6 +2707,26 @@ export const OEM_PAYLOAD_REQUIRED = Object.freeze(['Autounattend.xml', 'setupcom
 export const OEM_CLIP_AGENT_FILE = 'cua-clip-agent.ps1'
 
 /**
+ * THE MCP RELAY'S SCRIPT — payload, and it ships EXACTLY like the clipboard agent.
+ *
+ * `plugins/dsh-cua-vm/win-mcp.js` starts the stdio MCP server over SSH, and an
+ * SSH service command runs in Session 0, where UIA sees no desktop: `list_windows`
+ * returns zero windows and a notepad started by a tool lands in "Services". The
+ * relay closes that gap without changing the transport — `--connect` is a plain
+ * byte bridge on the SSH side, `--serve` runs the real server from a /it task in
+ * the logged-on user's session. Both halves are ONE file, so the guest only needs
+ * `cua-mcp-relay.py` to be present and readable.
+ *
+ * It travels on the SAME THREE routes as `cua-clip-agent.ps1`, for the same reason
+ * (firstboot can only stage what the medium carries): the medium's ROOT, the
+ * `$OEM$/$$/Setup/Scripts` tree Setup copies into `C:\Windows\Setup\Scripts`, and
+ * the flat image payload directory. It is NOT in OEM_PAYLOAD_REQUIRED, because a
+ * checkout keeps it BESIDE `docker/windows-oem/` rather than inside it — the
+ * resolver accepts both layouts and only the location of the bytes differs.
+ */
+export const OEM_MCP_RELAY_FILE = 'cua-mcp-relay.py'
+
+/**
  * J22-6: THE PRIVACY OFF-SWITCH, MATERIALIZED AS A FILE.
  *
  * `DSH_CUA_CLIP_AGENT=0` means "do not run the ambient clipboard loop", but the
@@ -2736,8 +2756,8 @@ export const OEM_CLIP_AGENT_FILE = 'cua-clip-agent.ps1'
  */
 export const CLIP_AGENT_SENTINEL_FILE = 'clip-agent-disabled'
 
-/** Every file the answer medium carries: the four answer-file members + the agent. */
-export const OEM_PAYLOAD_FILES = Object.freeze([...OEM_PAYLOAD_REQUIRED, OEM_CLIP_AGENT_FILE])
+/** Every file the answer medium carries: the four answer-file members + the agent + the relay. */
+export const OEM_PAYLOAD_FILES = Object.freeze([...OEM_PAYLOAD_REQUIRED, OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE])
 
 /**
  * The first place `cua-clip-agent.ps1` can be read from, or null.
@@ -2748,9 +2768,24 @@ export const OEM_PAYLOAD_FILES = Object.freeze([...OEM_PAYLOAD_REQUIRED, OEM_CLI
  * Exported so the error text and a test can name the same chain.
  */
 export function resolveOemClipAgentSource(candidates = []) {
+  return resolveOemPayloadSourceFile(candidates, OEM_CLIP_AGENT_FILE)
+}
+
+/**
+ * The first place ANY staged payload script can be read from, or null.
+ *
+ * The clip agent had this chain first and the MCP relay needs the identical one
+ * (checkout: `docker/cua-mcp-relay.py` beside `docker/windows-oem/`; image: the
+ * same directory as the answer files), so the search is one parameterised
+ * function rather than two copies that can drift. `fileName` is never
+ * interpreted as a path — a caller passing a subdirectory would silently search
+ * a tree nobody stages.
+ */
+export function resolveOemPayloadSourceFile(candidates = [], fileName = OEM_CLIP_AGENT_FILE) {
+  if (typeof fileName !== 'string' || fileName === '') return null
   for (const candidate of candidates) {
     if (typeof candidate !== 'string' || candidate === '') continue
-    for (const probe of [path.join(candidate, OEM_CLIP_AGENT_FILE), path.join(candidate, '..', OEM_CLIP_AGENT_FILE)]) {
+    for (const probe of [path.join(candidate, fileName), path.join(candidate, '..', fileName)]) {
       try {
         if (statSync(probe).isFile()) return probe
       } catch {}
@@ -2776,6 +2811,10 @@ export function resolveOemClipAgentSource(candidates = []) {
  * for it on `$PSScriptRoot`, `C:\Windows\Setup\Scripts` AND the removable
  * roots (C:..H:), so a copy at the medium root is what makes the agent survive
  * a firstboot that runs from the fallback path rather than from Setup\Scripts.
+ *
+ * `cua-mcp-relay.py` sits beside it for the same reason and no other: it is a
+ * guest-side script firstboot stages, so it must be on the medium it stages
+ * from — root and `$OEM$` both — not merely inside the image payload directory.
  */
 export const SETUP_IMAGE_ENTRIES = Object.freeze([
   'Autounattend.xml',
@@ -2783,6 +2822,7 @@ export const SETUP_IMAGE_ENTRIES = Object.freeze([
   'cua-firstboot.ps1',
   'Unattend.vbs',
   OEM_CLIP_AGENT_FILE,
+  OEM_MCP_RELAY_FILE,
   // J22-6: present ONLY when DSH_CUA_CLIP_AGENT=0 at staging time. Listed here
   // because the medium's root is one of the places firstboot searches (and the
   // copy it makes is what reaches C:\ProgramData\cua\); it is optional in
@@ -3550,7 +3590,7 @@ export function verifySetupImage({ paths: p } = {}) {
   // Scripts into C:\Windows\Setup\Scripts, which is one of the four places
   // firstboot searches for it. A listing that misses it means the guest gets
   // firstboot's embedded floor instead of the tested script — silently.
-  for (const script of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE]) {
+  for (const script of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]) {
     if (!oemScripts.includes(script)) {
       throw new Error(`setup.img's $OEM$/$$/Setup/Scripts is missing ${script} (listed: ${oemScripts.join(', ') || 'nothing'}) — Setup would never stage it into C:\\Windows\\Setup\\Scripts`)
     }
@@ -3563,7 +3603,7 @@ export function verifySetupImage({ paths: p } = {}) {
   }
   // BYTE COMPARE, exactly like dockur: the host copy and the image copy must be
   // indistinguishable. mtype emits the raw file.
-  const rootFiles = ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE]
+  const rootFiles = ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]
   if (existsSync(path.join(p.oemDir, CLIP_AGENT_SENTINEL_FILE))) rootFiles.push(CLIP_AGENT_SENTINEL_FILE)
   for (const name of rootFiles) {
     const staged = readFileSync(path.join(p.oemDir, name))
@@ -3854,10 +3894,12 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
     for (const [needle, value] of Object.entries(substitutions)) text = text.split(needle).join(value)
     writeFileSync(path.join(p.oemDir, file), text)
   }
-  // THE CLIP AGENT IS STAGED, NOT SUBSTITUTED. Its bytes are the agent's own
-  // (no {{PLACEHOLDER}} contract), and it comes from its own chain because a
-  // checkout keeps it beside `docker/windows-oem/` rather than inside it.
-  const agentSource = resolveOemClipAgentSource([
+  // THE CLIP AGENT AND THE MCP RELAY ARE STAGED, NOT SUBSTITUTED. Their bytes
+  // are their own (no {{PLACEHOLDER}} contract), and they come from their own
+  // chain because a checkout keeps them beside `docker/windows-oem/` rather
+  // than inside it. ONE chain, ONE resolver: two copies of this search would
+  // drift and the drift would be invisible until a guest missed a script.
+  const payloadFileDirs = [
     resolved,
     sourceDir,
     ...fallbackDirs,
@@ -3865,18 +3907,32 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
     path.resolve(MODULE_DIR, '..'),
     path.resolve(MODULE_DIR, '..', 'docker'),
     path.resolve(MODULE_DIR, '..', 'docker', 'windows-oem')
-  ])
-  if (agentSource === null) {
-    // A MISSING AGENT IS A BROKEN PAYLOAD, not a warning: firstboot would fall
-    // back to its embedded copy, but the point of shipping the file is that the
-    // guest runs the SAME script this repository tests. Naming every place that
-    // was searched is what turns this into a one-line fix.
-    throw new Error(`the clipboard agent ${OEM_CLIP_AGENT_FILE} is missing from the OEM payload: no copy under `
-      + `${[resolved, sourceDir, ...fallbackDirs, MODULE_DIR, path.resolve(MODULE_DIR, '..', 'docker')].filter(Boolean).join(', ')} `
-      + '(the image copies it into windows-oem/, a checkout keeps it beside it as docker/cua-clip-agent.ps1)')
+  ].filter(Boolean)
+  /**
+   * Stage one payload script from the chain into `p.oemDir`.
+   *
+   * A MISSING SCRIPT IS A BROKEN PAYLOAD, not a warning: firstboot would fall
+   * back to its embedded floor, but the point of shipping the file is that the
+   * guest runs the SAME script this repository tests. Naming every place that
+   * was searched is what turns this into a one-line fix.
+   */
+  const stagePayloadFile = (fileName, label, layoutHint) => {
+    const source = resolveOemPayloadSourceFile(payloadFileDirs, fileName)
+    if (source === null) {
+      throw new Error(`${label} ${fileName} is missing from the OEM payload: no copy under `
+        + `${payloadFileDirs.join(', ')} ${layoutHint}`)
+    }
+    copyFileSync(source, path.join(p.oemDir, fileName))
+    log(`windows: ${name} ${label} staged from ${source} (${statSync(source).size} bytes)`)
+    return source
   }
-  copyFileSync(agentSource, path.join(p.oemDir, OEM_CLIP_AGENT_FILE))
-  log(`windows: ${name} clipboard agent staged from ${agentSource} (${statSync(agentSource).size} bytes)`)
+  stagePayloadFile(OEM_CLIP_AGENT_FILE, 'clipboard agent',
+    '(the image copies it into windows-oem/, a checkout keeps it beside it as docker/cua-clip-agent.ps1)')
+  // The MCP relay rides the identical routes: the medium root and $OEM$ below,
+  // which is what makes it survive a firstboot that runs from Setup\Scripts or
+  // from the removable-root fallback.
+  stagePayloadFile(OEM_MCP_RELAY_FILE, 'MCP relay',
+    '(the image copies it into windows-oem/, a checkout keeps it beside it as docker/cua-mcp-relay.py)')
   // J22-6: THE PRIVACY OFF-SWITCH'S WRITER. `DSH_CUA_CLIP_AGENT=0` is a STAGING
   // variable; the guest can only see a file. This stages `clip-agent-disabled`
   // beside the payload, and buildSetupImage() carries it into both places
@@ -3922,7 +3978,7 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
   // S4: the SAME scripts Setup copies into C:\Windows\Setup\Scripts.
   // SetupComplete.cmd is the SYSTEM pass and Unattend.vbs is the hidden
   // first-logon launcher; both invoke cua-firstboot.ps1 idempotently.
-  for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE]) {
+  for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]) {
     copyFileSync(path.join(p.oemDir, file), path.join(setupDir, file))
   }
   // J22-6: THE SENTINEL RIDES THE SAME COPY when the switch is on, so it lands

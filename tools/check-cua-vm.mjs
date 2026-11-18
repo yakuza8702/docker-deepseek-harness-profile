@@ -83,6 +83,11 @@ const FILES = {
   oemSetup: { label: 'docker/windows-oem/setupcomplete.cmd', name: 'setupcomplete.cmd' },
   oemBoot: { label: 'docker/windows-oem/cua-firstboot.ps1', name: 'cua-firstboot.ps1' },
   clipAgent: { label: 'docker/cua-clip-agent.ps1', name: 'cua-clip-agent.ps1' },
+  // J22-14: the two-mode python relay. Guest-side, so it gets its own section
+  // instead of being folded into the Windows backend's 400 needles: `--serve`
+  // is the listener inside the interactive session and `--connect` is the byte
+  // bridge the SSH command starts, and BOTH live in this one file.
+  relay: { label: 'docker/cua-mcp-relay.py', name: 'cua-mcp-relay.py' },
   oemLauncher: { label: 'docker/windows-oem/Unattend.vbs', name: 'Unattend.vbs' },
   provision: { label: 'docker/cua-guest-provision.sh', name: 'cua-guest-provision.sh' },
   android: { label: 'docker/cua-guest-android.sh', name: 'cua-guest-android.sh' },
@@ -1087,7 +1092,24 @@ const NEEDLES = {
     ['.filter((name) => !isOptionalEntry(name) || existsSync(path.join(p.oemDir, name)))', 1],
     ['if (SETUP_IMAGE_OPTIONAL.includes(required) && !existsSync(path.join(p.oemDir, required))) continue', 1],
     ["if (existsSync(path.join(p.oemDir, CLIP_AGENT_SENTINEL_FILE)) && !oemScripts.includes(CLIP_AGENT_SENTINEL_FILE))", 1],
-    ['the clip-agent off-switch would not reach the guest', 1]
+    ['the clip-agent off-switch would not reach the guest', 1],
+    // J22-14: THE MCP RELAY RIDES THE SAME THREE ROUTES AS THE CLIPBOARD AGENT.
+    // `OEM_MCP_RELAY_FILE` is the single name the staging, the medium's root, the
+    // `$OEM$/$$/Setup/Scripts` copy and the byte-compare all read — a fifth file
+    // added without its COPY is exactly the drift that constant prevents.
+    ["export const OEM_MCP_RELAY_FILE = 'cua-mcp-relay.py'", 1],
+    ['OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]', 1],
+    // staged into $STORE/windows/<name>/oem/ from the resolver (checkout: beside
+    // docker/windows-oem/; image: inside it)
+    ["stagePayloadFile(OEM_MCP_RELAY_FILE, 'MCP relay',", 1],
+    ['a checkout keeps it beside it as docker/cua-mcp-relay.py', 1],
+    // ...then copied into $OEM$/$$/Setup/Scripts, which Setup turns into
+    // C:\Windows\Setup\Scripts — one of the four places firstboot searches.
+    ["for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE])", 1],
+    // ...and VERIFIED there, exactly like the other four (a listing that misses
+    // it means the guest runs firstboot's embedded floor instead — silently).
+    ["for (const script of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE])", 1],
+    ["const rootFiles = ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]", 1]
   ],
   /**
    * WP-2: THE CATALOG AND THE FIRMWARE SPLIT.
@@ -1224,7 +1246,30 @@ const NEEDLES = {
     // ...and the code the model branches on.
     ['vm-offline', 1],
     ['isOnline', 1],
-    ['onClosed', 1]
+    ['onClosed', 1],
+    // J22-14: THE LANE. The SSH child runs the relay CLIENT (`py -3`, because on
+    // the live guest python.exe is not on the non-interactive PATH while the
+    // launcher resolves); the probe decides the lane on EVERY attach (the logon
+    // task may come up minutes after boot), and the fallback RECORDS why it is
+    // blind instead of looking identical to a working bridge.
+    ["export const RELAY_COMMAND = 'py -3 ", 1],
+    ['mcp-relay.py --connect', 1],
+    ['export const RELAY_PORT_DEFAULT = 47999', 1],
+    ['export const RELAY_SCRIPT = ', 1],
+    ['export const SESSION0_FALLBACK_REASON = ', 1],
+    ['desktop automation will be blind', 1],
+    ['export const RELAY_PROBE_TTL_MS = 10000', 1],
+    ['export function relayProbeCommand(', 1],
+    ['export async function relayProbe(', 1],
+    ['export async function relayDoctorFacts(', 1],
+    ['export async function resolveGuestMcpTransport(', 1],
+    // the lane is a property of the COMMAND that will run, not of the probe: an
+    // override naming the relay still runs through the relay
+    ["transport: relayLane ? 'interactive-relay' : 'session-0-direct'", 1],
+    ['const relayLane = /mcp-relay\\.py/iu.test(wanted)', 1],
+    ['facts.reason = SESSION0_FALLBACK_REASON', 1],
+    ['DSH_CUA_MCP_RELAY_PORT', 1],
+    ['const relayProbeCache = { key: ', 1]
   ],
   oemAnswer: [
     ['<unattend xmlns="urn:schemas-microsoft-com:unattend">', 1],
@@ -1343,7 +1388,40 @@ const NEEDLES = {
     // predates the file (it runs under $ErrorActionPreference = 'Stop', hence the
     // SilentlyContinue probes).
     ["$stagedSentinel = Join-Path $stagedDir 'clip-agent-disabled'", 1],
-    ["if (Test-Path -LiteralPath (Join-Path $Dir 'clip-agent-disabled')) { exit 0 }", 1]
+    ["if (Test-Path -LiteralPath (Join-Path $Dir 'clip-agent-disabled')) { exit 0 }", 1],
+    // J22-14: THE INTERACTIVE MCP RELAY'S TASK. `/it` IS THE ENTIRE POINT: without
+    // it the task runs in Session 0 again and the relay faithfully forwards
+    // JSON-RPC to a server that still cannot see a single window. The .vbs
+    // launcher is the quoting fix — `schtasks /tr` is ONE command line Windows
+    // RE-PARSES, and a nested quote there silently truncates the action (a task
+    // that exists and does nothing), so the command lives in a file /tr names by
+    // a path with no spaces.
+    ["Step 'mcp-relay-task'", 1],
+    ["$relayScript = 'C:\\ProgramData\\cua\\mcp-relay.py'", 1],
+    ["Join-Path $relayDir 'cua-mcp-relay.py'", 1],
+    ['the relay would be a task that does nothing', 1],
+    ["/tn `\"cua-mcp-host`\" /sc onlogon /it /rl LIMITED /f /tr", 1],
+    ["$relayLauncher = 'C:\\ProgramData\\cua\\mcp-relay-host.vbs'", 1],
+    ['shell.Run', 1],
+    ['", 0, False', 1],
+    ['wscript.exe //B //NoLogo $relayLauncher', 1],
+    ['cua-mcp-relay-task.cmd', 1],
+    // THE PROBE IS THE IDEMPOTENCY PROOF, and its LENGTH is the bug: a 9-byte
+    // buffer read one byte too many and compared a short read against the wrong
+    // length, so Test-RelayPing answered $false EVERY time — every firstboot then
+    // ran a second listener, and the loser died on WinError 10048 while the marker
+    // still read ok:true. The eight is asserted, not assumed.
+    ['function Test-RelayPing(', 1],
+    ["GetBytes('RELAY_PING')", 1],
+    ['New-Object byte[] 8', 1],
+    ["-ceq 'RELAY_OK'", 1],
+    ['if (Test-RelayPing $relayPort)', 1],
+    ['already answering RELAY_PING on 127.0.0.1:$relayPort', 1],
+    ["throw 'task-started-but-relay-not-listening'", 1],
+    // the port is the same env override the relay and the client read
+    ['DSH_CUA_MCP_RELAY_PORT', 1],
+    // ...and the task is recorded as INTERACTIVE, like the clipboard tasks above
+    ['mcp relay registered (cua-mcp-host: onlogon, INTERACTIVE, /rl LIMITED)', 1]
   ],
   /**
    * THE CLIP AGENT ITSELF (J22-1/2/4/5/11): a separate file, gated separately,
@@ -1371,6 +1449,55 @@ const NEEDLES = {
     ['# TEXT FIRST, THEN THE STATE THAT VOUCHES FOR IT', 1],
     // J22-5: the size test is on the TEXT (chars), not on the escaped JSON file.
     ["$error = 'too-large'", 1]
+  ],
+  /**
+   * J22-14: THE INTERACTIVE-SESSION MCP RELAY.
+   *
+   * The relay is the fix for the session-0 problem: `ssh … python -m
+   * dsh_cua.server --stdio` answers JSON-RPC perfectly from a process that owns
+   * no desktop — UIA enumerates zero windows there, and a notepad started by a
+   * tool lands in "Services". `--serve` runs the SAME server from a `/it` logon
+   * task in the user's session; `--connect` is the byte bridge the SSH command
+   * starts. Both halves are this one file, so a rename or a dropped mode breaks
+   * the lane silently (the fallback still "works", which is the trap).
+   */
+  relay: [
+    // THE TWO MODES, and the only thing they share: a loopback socket.
+    ['--serve', 2],
+    ['--connect', 2],
+    ["LOOPBACK = '127.0.0.1'", 1],
+    ['listener.bind((LOOPBACK, self.port))', 1],
+    // LOOPBACK ONLY. A wider bind would let the VM's host bridge drive the
+    // desktop; the SSH channel is the door.
+    ['LOOPBACK ONLY.', 1],
+    // THE PROBE PAIR. Eight bytes is the whole contract (see firstboot's
+    // Test-RelayPing for the nine-byte defect this length exists to prevent).
+    ["PROBE_PING = b'RELAY_PING'", 1],
+    ["PROBE_OK = b'RELAY_OK'", 1],
+    ['PROBE_WINDOW = 2.0', 1],
+    // ...answered BEFORE the child is spawned and OUTSIDE the session lock, so a
+    // health check can neither be blocked by nor block a live MCP session.
+    ['PROBE_PING.startswith(buffered)', 1],
+    ['conn.sendall(PROBE_OK)', 1],
+    ['The probe took no lock', 1],
+    // THE CHILD IS THE REAL SERVER: pipes, no pty, no console on the desktop.
+    ["DEFAULT_SERVER = 'python -m dsh_cua.server --stdio'", 1],
+    ["'bufsize': 0", 1],
+    ['CREATE_NO_WINDOW = 0x08000000', 1],
+    // A DEAD CHILD IS RESTARTED FOR THE NEXT CLIENT, and its death is noticed by
+    // the reader thread — so a client sees EOF immediately, never a silent hang.
+    ['def child(self):', 1],
+    ['child-exit', 2],
+    ['the next client restarts it', 1],
+    // THE TWO ENVIRONMENT KNOBS, both read here (and mirrored by the client).
+    ['DEFAULT_PORT = 47999', 1],
+    ['DSH_CUA_MCP_RELAY_PORT', 2],
+    ['DSH_CUA_MCP_RELAY_LOG', 2],
+    ['mcp-relay.log', 2],
+    // RAW BYTES AT EVERY HOP: a pty would rewrite CR/LF and mangle the JSON.
+    ['def write_all(fd, data)', 1],
+    ['os.read(fd, size)', 1],
+    ['no encoding decision', 1]
   ],
   provision: [
     ['MARKER=/var/lib/cua-provision', 1],
@@ -1441,7 +1568,19 @@ const NEEDLES = {
     // though the tree was still correct. The loose needles here only say the
     // files are mentioned and the agent reaches BOTH destinations.
     ['docker/cua-vnc-clip.mjs', 1],
-    ['docker/cua-clip-agent.ps1 /opt/seek-harness/cua-check/', 1]
+    ['docker/cua-clip-agent.ps1 /opt/seek-harness/cua-check/', 1],
+    // J22-14: THE RELAY SHIPS ON BOTH PATHS AND IS PROVEN READABLE. The runtime
+    // COPY puts it where the supervisor stages it from; the flat-tree COPY is what
+    // makes the in-image gate (which reads the file by name) able to check it; and
+    // the uid-1000 loop is the proof — a COPY that lands unreadable is the K6
+    // defect one file over.
+    ['COPY --chown=1000:1000 --chmod=0644 docker/cua-mcp-relay.py /usr/local/share/cua-vm/windows-oem/cua-mcp-relay.py', 1],
+    // the flat-tree COPY is two lines above/below its neighbour depending on
+    // where the relay was inserted, so presence is asserted here by COUNT and the
+    // flat SET is proven semantically by J1-6b (adjacency needles broke the
+    // clipboard agent's line once already).
+    ['docker/cua-mcp-relay.py', 2],
+    ['cua-clip-agent.ps1 cua-mcp-relay.py; do', 1]
   ],
   client: [
     // the four labels are a contract: automation reads them
@@ -1625,7 +1764,21 @@ const NEEDLES = {
     ['const WIN_MCP_STREAM = {', 1],
     // the doctor answers the new questions too
     ["reason: 'implicit-single-target'", 1],
-    ['pendingName: WIN_MCP_AUX.inflightTicket === null ? null : String(WIN_MCP_AUX.inflightTicket.name ?? \'\')', 1]
+    ['pendingName: WIN_MCP_AUX.inflightTicket === null ? null : String(WIN_MCP_AUX.inflightTicket.name ?? \'\')', 1],
+    // J22-14: THE DOCTOR REPORTS THE LANE IT TOOK. The facts come from the
+    // client's own SYNCHRONOUS, side-effect-free doctorFacts() — the doctor has
+    // its own probe budget and must not open a second SSH session — and the
+    // sentence is built from the SAME object that is spread into the payload, so
+    // the text and the fields cannot disagree. `transportText` is null, never a
+    // guess, when nothing was attached in this process.
+    ['const transportFacts = WIN_MCP.client?.doctorFacts?.() ?? null', 1],
+    ['const transportText = transportFacts === null ? null : windowsTransportLine(transportFacts)', 1],
+    ['...(transportFacts ?? {})', 1],
+    ['    transportText,', 1],
+    ['windows mcp transport: interactive-relay (port ${facts.relayPort}, relay ${relay})', 1],
+    ["if (facts.transport === 'session-0-direct')", 1],
+    ['windows mcp transport: session-0 fallback: ${detail}', 1],
+    ['not attached yet (no lane decided in this process)', 1]
   ],
   proxy: [
     ['export function prefixRootPaths(text, prefix)', 1],
@@ -2325,6 +2478,9 @@ function sourceOf(label, name) {
     'cua-vm-supervisor.mjs', 'cua-vm-space.mjs', 'cua-vm-kvm.mjs', 'cua-vm-windows-qemu.mjs',
     'cua-vnc-clip.mjs', 'win-mcp.js', 'client.js', 'index.js',
     'Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', 'cua-clip-agent.ps1',
+    // J22-14: this gate reads the relay by NAME (NEEDLES.relay), so the flat tree
+    // must carry it or the image build fails on a file the checkout has.
+    'cua-mcp-relay.py',
     'cua-guest-provision.sh', 'cua-guest-android.sh', 'proxy.mjs',
     'compose.yaml', 'compose.windows.yaml', '.env.example', 'Dockerfile',
     'windows-iso-sources.md'

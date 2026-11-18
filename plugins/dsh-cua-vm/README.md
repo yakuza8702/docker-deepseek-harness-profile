@@ -484,11 +484,14 @@ host bridge, so it is **not** the default and is not wired here; the harness kee
 ### dsh-cua tools (element actions, lazily attached)
 
 While a Windows computer is `ready`, the plugin attaches the guest's MCP tool
-list through `ssh … python -m dsh_cua.server --stdio`
-(`plugins/dsh-cua-vm/win-mcp.js`) — **one stdio server per SSH session, 19
-tools**. There is no shared pipe server: upstream `dsh_cua.server main()` takes no
-`--pipe` argument, so one long-lived session-2 server cannot be reached from
-Session 0 yet (see [The interactive session, and what does not exist yet](#the-interactive-session-and-what-does-not-exist-yet)).
+list through the **interactive relay** — `ssh … py -3
+C:\ProgramData\cua\mcp-relay.py --connect` (`plugins/dsh-cua-vm/win-mcp.js`), 19
+tools. The server on the other end of that socket is `python -m
+dsh_cua.server --stdio`, started by the `cua-mcp-host` logon task **in the user's
+session**, which is the only session whose desktop UIA can see; see
+[The interactive session](#the-interactive-session--the-mcp-server-lives-there-now-the-relay).
+When the probe says the relay is not listening, the attach falls back to starting
+its own Session 0 server (MCP works, the desktop is blind) and records why.
 **Nothing is written to the profile.**
 
 #### The namespace is the harness's
@@ -721,25 +724,67 @@ the spec line with the below-floor warning (**10 GB**) in the error colour. A
 probe that cannot answer says `available: false` and why; it never prints 0 GB
 and never fails the status call.
 
-### The interactive session, and what does not exist yet
+### The interactive session — the MCP server lives there now (the relay)
 
-Honest state of the agent surface, because two parts of it used to be described
-as working when they were not:
+`sshd` on Windows is a **service**, so anything it starts inherits Session 0. UIA
+is per session, and that is not a detail: from Session 0 `list_windows` enumerated
+**0** windows while `notepad.exe` was running, and a notepad started by a tool was
+created in "Services" — invisible to the logged-on user. Measured, not inferred, and
+not fixable by retrying.
 
-* **What works.** `dsh-cua` (pywinauto) inside the guest, started PER SSH
-  SESSION as `python -m dsh_cua.server --stdio`; the plugin attaches its 19
-  tools while a Windows computer is ready. Session-2-only features (the
-  clipboard) go through the two `/it` tasks above.
-* **What does not exist.** A single long-lived server in the user's session that
-  SSH could attach to. Upstream `dsh_cua.server main()` has no `--pipe` option,
-  so the named pipe this plugin's firstboot task used to reference
-  (`\\.\pipe\dsh-cua`) was **never created** — the argument is gone, because
-  a flag that does not exist is a lie in two places at once.
-* **What that costs.** Each SSH attach starts its own server (it works, and it is
-  what the tools use), but there is no shared state between attaches and no way
-  to reach a session-2 listener. If upstream grows a pipe server, the firstboot
-  task can register it and `win-mcp.js` can proxy to it; until then this is a
-  documented limitation, not a pending bug.
+So the stdio transport stayed exactly as it was and the **server** moved:
+`docker/cua-mcp-relay.py` is a two-mode byte bridge, staged by firstboot to
+`C:\ProgramData\cua\mcp-relay.py` (payload: the medium's root and
+`$OEM$/$$/Setup/Scripts`, like `cua-clip-agent.ps1`).
+
+```
+harness ──ssh stdio──▶ relay --connect ──127.0.0.1:47999──▶ relay --serve ──▶ python -m dsh_cua.server --stdio
+                        the SSH child, no desktop,           firstboot's `cua-mcp-host`   a child of the /it task,
+                        raw bytes each way                   task: /sc onlogon /it        so UIA sees the desktop
+```
+
+* `--serve` binds **loopback only**, one client at a time, and keeps its child
+  across reconnects (a reconnect must not discard the windows the desktop is
+  mid-way through); a dead child is restarted for the next client and its death
+  ends the client's read with EOF instead of a hang. The child gets pipes,
+  `bufsize=0` and **no console** — `pythonw.exe`/`CREATE_NO_WINDOW`, because a
+  console on an interactive task is the blank-window defect again.
+* `--connect` is what the SSH command runs: stdin/stdout ↔ the socket, raw bytes, no
+  pty (a pty would rewrite CR/LF and mangle the JSON). It touches no desktop.
+* the probe: a connection whose first bytes are exactly `RELAY_PING` gets
+  `RELAY_OK` (**8 bytes**) and is closed before any child is touched; a real client
+  starts with `{"jsonrpc":`, so the two are unambiguous, and the probe is answered
+  outside the session lock. firstboot's `Test-RelayPing` is the guest-side twin —
+  its 8-byte buffer is what makes `mcp-relay-task` idempotent (the port is the
+  evidence; a second listener would die on `WinError 10048`).
+* the log: one line per event in `C:\ProgramData\cua\mcp-relay.log`
+  (`DSH_CUA_MCP_RELAY_LOG`), which is the only diagnosis a `pythonw.exe` task has.
+
+**Lane preference, re-decided on every attach** (the logon task can start minutes
+after the boot that made sshd reachable):
+
+| probe | command the SSH child runs | `transport` | `transportText` |
+|---|---|---|---|
+| `RELAY_OK` | `py -3 C:\ProgramData\cua\mcp-relay.py --connect` | `interactive-relay` | `windows mcp transport: interactive-relay (port 47999, relay up)` |
+| `RELAY_DOWN` / `RELAY_BAD` | `python -m dsh_cua.server --stdio` | `session-0-direct` | `windows mcp transport: session-0 fallback: … desktop automation will be blind` |
+
+The fallback still speaks MCP and cannot see the desktop, so it is recorded, never
+hidden: `relayOk: false`, the `SESSION0_FALLBACK_REASON` sentence in
+`transportReason`, a log line per attach, and the same facts in
+`windows_mcp_doctor` (`transport`, `relayPort`, `relayOk`, `transportText`) — all
+from the client's synchronous, side-effect-free `doctorFacts()`, which never opens
+an SSH session of its own. Before an attach the fields are `null` and the text says
+`not attached yet (no lane decided in this process)`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DSH_CUA_MCP_RELAY_PORT` | `47999` | relay port on both sides of the wire; garbage falls back to the default rather than building a broken command |
+| `DSH_CUA_MCP_RELAY_LOG` | `C:\ProgramData\cua\mcp-relay.log` | the relay's event log |
+
+`DSH_CUA_WIN_MCP_COMMAND` still overrides the command verbatim (the doctor records
+that the relay was bypassed on purpose). The relay's limits are honest ones: it
+forwards MCP only — the clipboard stays on its own `/it` tasks, and the live view
+stays on VNC.
 
 **Run command, not Terminal.** The panel's button opens a ONE-SHOT command form:
 one line, Run, and the captured output. It has no pty, no prompt, no job control

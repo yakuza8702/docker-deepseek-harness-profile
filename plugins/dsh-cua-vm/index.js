@@ -1223,6 +1223,31 @@ function revealWindowsTools(agent) {
 }
 
 /**
+ * ONE LINE for the doctor's text: the lane this process actually took.
+ *
+ * It is built from the client's own `doctorFacts()` — the SAME object spread
+ * into the JSON — so the sentence and the fields can never disagree. It dials
+ * nothing: "never attached" is a fact, not a reason to open an SSH session.
+ */
+function windowsTransportLine(facts) {
+  if (facts.transport === 'interactive-relay') {
+    const relay = facts.relayOk === true ? 'up' : facts.relayOk === false ? 'down' : 'unknown'
+    return `windows mcp transport: interactive-relay (port ${facts.relayPort}, relay ${relay})`
+  }
+  if (facts.transport === 'session-0-direct') {
+    // A fallback attach records a SENTENCE ("session-0 fallback (…)"); the line
+    // needs only the part that says WHY, not a second copy of the label.
+    const recorded = String(facts.transportReason ?? '').trim()
+      .replace(/^session-0 fallback\s*[:\-]?\s*/i, '')
+      .replace(/^\(/, '')
+      .replace(/\)$/, '')
+    const detail = recorded !== '' ? recorded : (facts.relayStatus || 'interactive relay not running')
+    return `windows mcp transport: session-0 fallback: ${detail}`
+  }
+  return 'windows mcp transport: not attached yet (no lane decided in this process)'
+}
+
+/**
  * THE DOCTOR. It answers the one question the bug was about: are any
  * `mcp__windows__*` schemas still on the global registry while the bridge is
  * down? Offline, `leaks` MUST be empty — anything else is `status: "leaking"`,
@@ -1267,6 +1292,13 @@ async function windowsMcpDoctor(execAgent) {
       reason: match.ok === true ? '' : match.text
     }
   })()
+  // THE LANE THIS PROCESS ACTUALLY TOOK — AND NEVER A SECOND SSH SESSION FOR IT.
+  // `doctorFacts()` is the client's own synchronous, side-effect-free answer;
+  // the doctor reports the transport that really ran instead of dialling the
+  // guest to ask (a probe here would race the attach and cost a session).
+  // No client means no lane was ever decided, so the keys are simply absent.
+  const transportFacts = WIN_MCP.client?.doctorFacts?.() ?? null
+  const transportText = transportFacts === null ? null : windowsTransportLine(transportFacts)
   return {
     status: WIN_MCP.online !== true && leaks.length > 0 ? 'leaking' : 'ok',
     enabled: windowsMcpEnabled() === true,
@@ -1322,6 +1354,13 @@ async function windowsMcpDoctor(execAgent) {
     ssh: WIN_MCP.client?.sshArgv?.() ?? (target !== null && Number(target.sshPort) > 0
       ? sshArgv({ host: target.host ?? '127.0.0.1', port: target.sshPort, user: target.user, keyPath: target.keyPath })
       : null),
+    // THE TRANSPORT FACTS, from the zero-SSH client method — the same object
+    // `...(WIN_MCP.client?.doctorFacts?.() ?? {})` would spread: transport /
+    // relayPort / relayOk / relayStatus / transportCommand / transportReason.
+    // Absent when no client exists — the doctor never dials to fill them in.
+    ...(transportFacts ?? {}),
+    // The same facts as the ONE human-readable line the doctor's text carries.
+    transportText,
     gateError: WIN_MCP_AUX.gateError
   }
 }

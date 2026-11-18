@@ -1236,6 +1236,107 @@ socket.
 all of the above — 19 registrations, every disposer called, the deny set on every
 live agent, the guard's refusal text, and the pre-step self-heal.
 
+### The MCP server runs in the interactive session — the loopback relay
+
+`dsh-cua` (pywinauto) is the only thing that can find a Windows element and prove
+an action landed, and for a while the SSH command started it directly:
+
+```
+harness ──ssh──▶ guest: sshd (a SERVICE, Session 0) ──▶ python -m dsh_cua.server --stdio
+```
+
+That server answers MCP perfectly and is **blind**, because UIA is per session:
+`sshd` runs as a service, so the command inherits Session 0, which owns no
+desktop. This was measured, not assumed:
+
+| what was asked | what Session 0 (the SSH session) answered |
+|---|---|
+| `list_windows` | **0** windows |
+| a notepad started by a tool | created **in "Services"** — invisible to the logged-on user |
+| `SendInput` | delivered to a desktop nobody is looking at |
+
+No amount of retrying fixes a session, so the fix is not a retry. The
+**transport** was never the problem either, so the transport did not change: a
+stdio relay keeps the SSH channel exactly as it was and moves only the *server*.
+
+```
+harness ──ssh stdio──▶ [relay --connect] ──127.0.0.1:47999──▶ [relay --serve] ──▶ python -m dsh_cua.server --stdio
+                        the SSH child:                     firstboot's `cua-mcp-host`   a child of the /it task,
+                        no desktop, moves bytes            task (`/sc onlogon /it`)     so it sees the real desktop
+```
+
+Both halves are **one file**, `docker/cua-mcp-relay.py`, which firstboot stages to
+`C:\ProgramData\cua\mcp-relay.py`. Like the clipboard agent it ships in the OEM
+payload on the medium's root *and* in `$OEM$/$$/Setup/Scripts` (which Setup copies
+into `C:\Windows\Setup\Scripts`), because firstboot can only stage what the medium
+carries.
+
+* **`--serve`** — binds **127.0.0.1 only**, one client at a time, and keeps the
+  child across reconnects: an MCP client that reconnects must not throw away the
+  windows it is mid-way through, nor pay a fresh pywinauto warm-up each time. A
+  child that **died** is restarted for the next client, and its death is noticed by
+  the reader thread — so the client sees EOF immediately instead of a silent hang.
+  The child is spawned with pipes, `bufsize=0` and **no console**: a `python.exe`
+  child of an interactive task would leave a permanently blank window on the very
+  desktop it automates.
+* **`--connect`** — the process the SSH command starts: stdin/stdout ↔ the loopback
+  socket, raw bytes, no pty, no line translation (a pty would rewrite CR/LF and
+  mangle the JSON). It touches no desktop, so running in Session 0 is fine by
+  design.
+* **the health probe** — a connection whose first bytes are exactly `RELAY_PING` is
+  answered `RELAY_OK` (**eight bytes**) and closed *before a child is touched*. A
+  real MCP client sends `{"jsonrpc":…` first, so the two are unambiguous, and the
+  probe is handled outside the single-session lock, so a health check can neither
+  block nor be blocked by a live session. The guest-side counterpart is firstboot's
+  `Test-RelayPing` (an 8-byte buffer, compared whole), and it is what makes the task
+  idempotent: the port is the evidence, so a re-run does not start a second
+  listener that then dies on `WinError 10048` while the marker still reads
+  `ok: true`.
+* **the log** — one line per event, appended to
+  `C:\ProgramData\cua\mcp-relay.log` (`DSH_CUA_MCP_RELAY_LOG` overrides it).
+  `pythonw.exe` has no console, so that file is the only diagnosis there is: child
+  start/exit, connects, ping answers, spawn failures.
+
+**The lane is decided on every attach, not once at boot** — the logon task can come
+up minutes after the boot that made sshd reachable, so a cached decision would pin
+a session to the blind lane for its whole life:
+
+| probe answer | what the SSH child runs | what `windows_mcp_doctor` says |
+|---|---|---|
+| `RELAY_OK` | `py -3 C:\ProgramData\cua\mcp-relay.py --connect` | `transport: "interactive-relay"`, `relayPort: 47999`, `relayOk: true`, `transportText: "windows mcp transport: interactive-relay (port 47999, relay up)"` |
+| `RELAY_DOWN` / `RELAY_BAD` | `python -m dsh_cua.server --stdio` (**Session 0**) | `transport: "session-0-direct"`, `relayOk: false`, `transportText: "windows mcp transport: session-0 fallback: … desktop automation will be blind"` |
+
+The fallback still answers MCP — which is exactly why it is dangerous: it looks
+like a working bridge and behaves blind. So the reason is recorded
+(`SESSION0_FALLBACK_REASON`), logged on attach, and carried in the doctor payload,
+and nothing pretends that lane can drive a desktop. `DSH_CUA_WIN_MCP_COMMAND` still
+wins verbatim; the doctor then says that the override bypassed (or forced) the
+relay lane instead of silently rewriting it. `py -3` rather than `python` is
+deliberate: on the live guest `python.exe` is not on the non-interactive PATH while
+the launcher resolves.
+
+`windows_mcp_doctor` reports the facts from the client's own **synchronous,
+zero-SSH** `doctorFacts()` — the doctor has its own probe budget and never opens a
+second SSH session to answer a question: `transport`, `relayPort`, `relayOk`, plus
+the one-line `transportText`, which is built from the same object that is spread
+into the payload so the sentence and the fields cannot disagree. Before an attach
+they are `null` (`transportText: "not attached yet (no lane decided in this
+process)"`), never a guess — a guessed `interactive-relay` would report a blind
+bridge as healthy in exactly the case the doctor exists for.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DSH_CUA_MCP_RELAY_PORT` | `47999` | the loopback port `--serve` binds and `--connect` dials. Unparseable or out-of-range values fall back to `47999` on **both** sides of the wire instead of building a broken PowerShell line |
+| `DSH_CUA_MCP_RELAY_LOG` | `C:\ProgramData\cua\mcp-relay.log` | where the relay appends its one-line-per-event log |
+
+The chain is gated, not assumed: `tools/check-cua-vm.mjs` asserts the relay's modes
+and probe pair (including the **8-byte** answer), both task names (`mcp-relay-task`
+and the `cua-mcp-host` logon task), the `py -3 … --connect` default, the fallback
+reason, the doctor's `transport`/`transportText` lines, the Dockerfile COPYs and the
+uid-1000 readability proof; `tests/modules-unit.mjs` pins the pure parts (the probe
+constants on both sides, the port rule, `doctorFacts()` answering `null` before an
+attach); `tests/windows-mcp-gate.mjs` drives the gate end to end.
+
 ### The clipboard, both ways
 
 A clipboard is per **interactive session**. `sshd` runs in Session 0, which has
