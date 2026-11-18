@@ -144,6 +144,17 @@ window.__ModuleLoader__.load({
       return Number.isFinite(size) ? size : null
     }
 
+    /**
+     * `64 GB` / `1.5 GB`, or `null` when the number is absent or not positive.
+     * A store readout that says "12.3 GB" cannot answer the only question the
+     * number raises — "out of how much?" — so every usage line carries the
+     * quota right next to it (dropped, not faked, when the payload lacks it).
+     */
+    function formatGb(value) {
+      const gb = Number(value)
+      return Number.isFinite(gb) && gb > 0 ? `${Number.isInteger(gb) ? gb : gb.toFixed(1)} GB` : null
+    }
+
     function windowsAliasMap(windows) {
       const aliases = windows?.aliases
       if (aliases !== null && typeof aliases === 'object' && !Array.isArray(aliases)) return aliases
@@ -835,13 +846,28 @@ window.__ModuleLoader__.load({
                 try {
                   const payload = await api('doctor')
                   const caps = payload.hostCaps ?? {}
-                  setNote(clean(`kvm ${caps.kvm} · render ${caps.renderNode} · virgl ${caps.virtioGpuGl ? 'yes' : 'no'} · docker ${caps.docker} · windows ${payload.windows?.enabled ? 'on' : 'off'} · store ${(payload.store?.usedBytes / 1024 ** 3).toFixed(1)} GB`))
+                  // U5: the quota is half the fact. `doctor` sends it as
+                  // `store.quotaBytes`; an older supervisor only has
+                  // `policy.diskQuotaGb`, so both are read and neither is invented.
+                  const usedGb = (payload.store?.usedBytes / 1024 ** 3).toFixed(1)
+                  const quotaGb = Number(payload.store?.quotaBytes) > 0
+                    ? Number(payload.store.quotaBytes) / 1024 ** 3
+                    : payload.policy?.diskQuotaGb
+                  const quota = formatGb(quotaGb)
+                  setNote(clean(`kvm ${caps.kvm} · render ${caps.renderNode} · virgl ${caps.virtioGpuGl ? 'yes' : 'no'} · docker ${caps.docker} · windows ${payload.windows?.enabled ? 'on' : 'off'} · store ${usedGb} GB${quota === null ? '' : ` / ${quota}`}`))
                 } catch (error) {
                   setNote(clean(error?.message ?? error))
                 }
               }
             }, 'Doctor'),
-            h('div', { style: { ...S.muted, marginLeft: 'auto' } }, `store ${(state.usedBytes / 1024 ** 3).toFixed(1)} GB`),
+            // U5: THE QUOTA IS IN THE SAME LINE AS THE USAGE. The store number
+            // used to be a bare "used GB", which cannot be judged: 12 GB is fine
+            // on a 64 GB quota and nearly full on a 16 GB one. `state.config`
+            // carries `diskQuotaGb` (the Policy tab's own field, relabelled
+            // "Store quota"), and the line falls back to the bare number when an
+            // older payload does not carry it.
+            h('div', { style: { ...S.muted, marginLeft: 'auto' } },
+              `store ${(state.usedBytes / 1024 ** 3).toFixed(1)} GB${formatGb(state.config?.diskQuotaGb) === null ? '' : ` / ${formatGb(state.config.diskQuotaGb)}`}`),
             h('div', { style: S.muted }, `${state.config.maxRunning} max running · ${state.config.autoSuspend ? `${state.config.idleSuspendMinutes} min idle` : 'no idle suspend'}`)
           ),
           showNew && h('div', { style: S.card },
@@ -939,7 +965,7 @@ window.__ModuleLoader__.load({
             // A SPARSE DISK OVER THE POLICY IS CREATED, NOT REFUSED: this is advice,
             // not a block (the supervisor sends warnings[code: disk-over-policy]).
             draft.rea === true && form.diskQuotaGb < Math.max(40, draft.diskGb) && h('div', { style: { ...S.muted, color: T.error } },
-              `The VM store quota is ${form.diskQuotaGb} GB. The ${Math.max(40, draft.diskGb)} GB REA disk is created anyway (it is sparse), but the guest will hit the real disk ceiling — raise Disk Size in the Policy tab first.`),
+              `The VM store quota is ${form.diskQuotaGb} GB. The ${Math.max(40, draft.diskGb)} GB REA disk is created anyway (it is sparse), but the guest will hit the real disk ceiling — raise Store quota in the Policy tab first.`),
             h('div', { style: S.row },
               h('button', { type: 'button', style: S.primary, disabled: pending !== null || draft.name.trim() === '', onClick: () => void create() }, pending?.action === 'create' ? 'Creating…' : 'Create computer')
             )
@@ -1220,7 +1246,7 @@ window.__ModuleLoader__.load({
             'Suspend idle computers automatically'
           ),
           field('idleSuspendMinutes', 'Idle timeout (minutes)', '0 disables. Checked every minute; a running command postpones it.'),
-          field('diskQuotaGb', 'Disk Size (GB)', 'Base image + QEMU + every disk, checkpoint, screenshot and the shared ISO cache in the store. A create that would exceed it is refused before it starts.'),
+          field('diskQuotaGb', 'Store quota (GB)', 'Disk quota for the VM store: base image + QEMU + every disk, checkpoint, screenshot and the shared ISO cache. A create that would exceed it is refused before it starts.'),
           field('maxRunning', 'Max running computers', 'Shutdown frees a slot, disks are untouched.'),
           field('shutdownTimeoutSec', 'Shutdown timeout (seconds)', 'How long an ACPI powerdown may take before the QMP quit forces it. 120 is right for a slow init.'),
           h('label', { style: { display: 'grid', gap: 4, fontSize: 13 } },
@@ -1278,7 +1304,7 @@ window.__ModuleLoader__.load({
     // stored-alias option without mounting the page.
     module.exports.__test = {
       hideSecretEntry, noteAfterHide, clean,
-      windowsCatalogRows, windowsVersionLabel, windowsVersionOptions, WINDOWS_CATALOG_FALLBACK
+      windowsCatalogRows, windowsVersionLabel, windowsVersionOptions, WINDOWS_CATALOG_FALLBACK, formatGb
     }
     return module.exports
   }

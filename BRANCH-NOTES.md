@@ -1674,3 +1674,37 @@ replaced while the knob is `0` (the normal create/delete paths build that tree
 from scratch, and the medium root is rebuilt on every install boot).
 `DSH_CUA_CLIP_AGENT` is read at staging time only, so flipping it on a running
 computer takes effect on the next re-stage, not on the fly.
+
+## 19. Branch `cua-vm-improve` — 2026-11-18: the quota control is findable
+
+**Problem.** Every quota refusal ended with "raise the quota under **Plugins →
+Personal VM (CUA) → Policy**", and the two READMEs sent the reader to the same
+place. There is no Policy section under the Plugins page: the panel is a SIDEBAR
+panel (`sidebar.panellist`, label "Personal VM (CUA)"), and its Policy tab is
+inside it. A refusal that names a path which does not exist is worse than no path
+— the reader concludes the quota cannot be raised at all, and a 64 GB create stays
+refused on a store whose only real problem is a 20 GB cap. The field was also
+labelled "Disk Size (GB)" next to a store that reports quota in GB, which read as
+a per-computer disk rather than a store-wide cap.
+
+**Change.**
+* The refusal sentence and both READMEs now name the real control: **sidebar panel
+  "Personal VM (CUA)" → Policy → Store quota (GB)**, and say that a saved change
+  applies to the NEXT create (the supervisor re-reads `config.json` every minute)
+  rather than implying the refused create retries itself.
+* The Policy tab relabels its field to **Store quota (GB)** with a description
+  that names every consumer (base image, QEMU, disks, checkpoints, screenshots,
+  the shared ISO cache), and the header line shows the store readout as **used /
+  quota** (`store 16.1 GB / 20 GB`), so the number the refusal quotes and the
+  number the user can change are visible on one screen.
+* `tools/check-cua-rea.mjs` no longer pins the dead path; its needle is the new
+  destination sentence, so a future refusal message cannot drift back to a
+  section that does not exist.
+
+**Verify.**
+```bash
+node tools/check-cua-rea.mjs --root .   # the supervisor's refusal names the real path
+node tools/check-cua-vm.mjs --root .    # nothing else in the chain moved
+grep -rn 'Plugins → Personal VM (CUA) → Policy' README* plugins/ docker/ tools/ docs/
+                                       # must print nothing (0 hits)
+```

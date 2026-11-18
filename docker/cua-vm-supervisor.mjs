@@ -292,8 +292,15 @@ async function refuseOverQuota(config, requestedBytes) {
   // size on top. The old wording printed the VIRTUAL request as if it were
   // consumption, which is the sentence that refused every Windows create.
   const requestedText = requested > 0 ? ` + ${(requested / 1024 ** 3).toFixed(1)} GB to be written` : ''
+  // WHERE THE QUOTA ACTUALLY LIVES. The old sentence sent the user to a
+  // Plugins *page row* section that does not exist, and a wrong path in a
+  // refusal is worse than no path: the user concludes the setting cannot be
+  // raised at all. The real input is in the sidebar panel "Personal VM (CUA)"
+  // on its Policy tab, labelled "Store quota (GB)" — and the supervisor re-reads
+  // config.json every minute, so a saved change applies to the NEXT create, not
+  // to the one that was just refused.
   return `VM store quota reached: ${(used / 1024 ** 3).toFixed(1)} GB of real store data${requestedText} `
-    + `> ${config.diskQuotaGb} GB. The store has ${freeGb} GB free. Delete a computer, run cua_vm_gc, or raise the quota under Plugins → Personal VM (CUA) → Policy.`
+    + `> ${config.diskQuotaGb} GB. The store has ${freeGb} GB free. Delete a computer, run cua_vm_gc, or raise the quota: sidebar panel "Personal VM (CUA)" → Policy → Store quota (GB) (raised quota applies to the next create).`
 }
 
 /**

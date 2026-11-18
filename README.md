@@ -783,9 +783,13 @@ carry it). Without it the device is visible and every open fails EACCES; see
 [`the Windows backend needs /dev/kvm` — but `/dev/kvm` **is** mounted](#the-windows-backend-needs-devkvm--but-devkvm-is-mounted)
 for the exact commands.
 
-The panel is **Plugins → Personal VM (CUA)**; the
-model drives the same computer through `cua_vm_*`. Disks live in the `cua-vm`
-volume, never in the workspace.
+The panel is the sidebar panel **Personal VM (CUA)**; the
+model drives the same computer through `cua_vm_*`. Its **Policy** tab is where
+the store policy lives — raise the quota in the sidebar panel "Personal VM (CUA)"
+→ Policy → Store quota (GB); the store readout beside it shows the **used** bytes
+against that quota, and a saved change applies to the next create (the supervisor
+re-reads `config.json` every minute). Disks live in the `cua-vm` volume, never in
+the workspace.
 
 ### One computer, two kinds
 

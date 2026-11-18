@@ -160,7 +160,11 @@ const NEEDLES = {
     // panel), so the field it reads is `spec.diskGb`. Same floor, same commit.
     ['const wantedDiskGb = Number(spec.diskGb) > 0 ? Number(spec.diskGb) : 20', 1],
     ['const effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb', 1],
-    ['Plugins → Personal VM (CUA) → Policy', 1],
+    // 2026-11: the quota path moved from a dead Plugins-page pointer to the
+    // real control: sidebar panel "Personal VM (CUA)" → Policy → Store quota (GB).
+    // The label was relabelled (it used to read "Disk Size (GB)"), so the needle
+    // pins the exact destination a refusal message must name.
+    ['sidebar panel "Personal VM (CUA)" → Policy → Store quota (GB)', 1],
     ['rea: rea === true,', 1],
     ['diskGb: effectiveDiskGb,', 1],
     ['if (effectiveDiskGb > 20) disk = await growGuestDisk(name, effectiveDiskGb)', 1],

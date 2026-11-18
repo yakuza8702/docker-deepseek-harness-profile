@@ -737,7 +737,7 @@ mistake. So the floor exists in three places: the panel raises the Disk field to
 store quota is *not* raised automatically — if `$STORE/config.json` still has
 `diskQuotaGb: 20`, the 40 GB disk is created anyway (it is sparse) and carries
 `warnings[code: disk-over-policy]`; the panel says the guest may hit the real
-disk ceiling and recommends raising Disk Size in the Policy tab. Only a store
+disk ceiling and recommends raising Store quota in the Policy tab. Only a store
 whose real usage is already over the quota refuses the create.
 
 **The environment reaches the guest three ways.** `/etc/profile.d/rea.sh` for
@@ -830,9 +830,11 @@ Runtime policy is **not** environment configuration: `$STORE/config.json` holds
 `autoSuspend`, `idleSuspendMinutes` (30, `0` disables), `diskQuotaGb` (20),
 `maxRunning` (1), `shutdownTimeoutSec` (120), `checkpointPolicy`
 (`shutdown` | `always` | `never`), `shotsKeepDays` (7) and
-`windowsInstallTimeoutMinutes` (60), and is edited from the Plugins page
-(Personal VM → Policy). The supervisor re-reads it every minute, so a saved change
-needs no restart; a command in flight postpones the suspend.
+`windowsInstallTimeoutMinutes` (60), and is edited from the sidebar panel
+"Personal VM (CUA)" → Policy → Store quota (GB) (the same tab shows the store
+readout: bytes **used** against the quota). The supervisor re-reads it every
+minute, so a saved change needs no restart; a command in flight postpones the
+suspend.
 
 Windows credentials are **not** in the registry: they live in
 `$STORE/windows/<name>/credentials.json`, mode `0600`, and the panel's Reveal
