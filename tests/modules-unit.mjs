@@ -48,6 +48,10 @@ import {
   windowsToolName, windowsGuestToolName, sshArgv, SSH_KEEPALIVE,
   // J22-14: the interactive MCP relay's lane, probe and zero-SSH doctor facts.
   RELAY_COMMAND, RELAY_PORT_DEFAULT, RELAY_OK, RELAY_BAD, RELAY_DOWN, RELAY_PROBE_TTL_MS,
+  // J22-14b: the `--ping` probe's 12 s wall and the upgrade watch that lets a
+  // late-starting relay take over a live session-0 attach.
+  RELAY_PROBE_TIMEOUT_MS, RELAY_UPGRADE_INTERVAL_MS, RELAY_UPGRADE_WATCH_MS, RELAY_UPGRADE_LOG,
+  shouldUpgradeToRelay,
   SESSION0_FALLBACK_REASON, relayPort, relayProbeCommand, createDshCuaClient
 } from '../plugins/dsh-cua-vm/win-mcp.js'
 
@@ -723,15 +727,44 @@ check('exactly two versions carry a live mido strategy (11 and 10, the two pages
   }
   check('J22-14: the SSH child runs the relay CLIENT verbatim (`py -3 ...\\mcp-relay.py --connect`)',
     RELAY_COMMAND === 'py -3 C:\\ProgramData\\cua\\mcp-relay.py --connect', RELAY_COMMAND)
-  // The probe is ONE ssh round trip, so no pty, no second session and no GUI:
-  // connect, send the ten literal bytes, read EIGHT, print the verdict.
+  // THE PROBE IS THE RELAY'S OWN `--ping`, NOT A POWERSHELL ONE-LINER.
+  //
+  // The one-liner was CORRECT and too SLOW: powershell.exe starts a CLR before
+  // its first socket call (~4.6 s cold on a tiny10 guest), so right after boot
+  // that cold start raced the then-8 s wall and answered "no answer within
+  // 8000 ms" for a relay that was perfectly alive — every attach then fell back
+  // to the blind session-0 lane. `cua-mcp-relay.py --ping [port]` performs the
+  // SAME handshake (send the ten literal bytes, read EIGHT, print one token)
+  // inside the interpreter that is already resolved: no child, no lock, no
+  // desktop. `py` (the launcher) and not `python`, because on the live guest
+  // python.exe is not on the non-interactive PATH — the same reason
+  // RELAY_COMMAND says `py -3`.
   const probeLine = relayProbeCommand(47999)
-  check('J22-14: relayProbeCommand sends RELAY_PING, reads 8 bytes and prints OK/BAD/DOWN in one line',
-    !/\n/u.test(probeLine)
-    && probeLine.includes("GetBytes('RELAY_PING')") && probeLine.includes('byte[] 8')
-    && probeLine.includes("Connect('127.0.0.1',47999)") && probeLine.includes("eq 'RELAY_OK'")
-    && probeLine.includes('RELAY_BAD') && probeLine.includes('RELAY_DOWN'),
-    probeLine.slice(0, 120))
+  check('J22-14: relayProbeCommand is the relay\'s own `--ping` (py launcher, port interpolated) — no PowerShell',
+    probeLine === 'py -3 C:\\ProgramData\\cua\\mcp-relay.py --ping 47999'
+    && relayProbeCommand(51234) === 'py -3 C:\\ProgramData\\cua\\mcp-relay.py --ping 51234'
+    && !/\n/u.test(probeLine)
+    && !/(powershell|GetBytes|TcpClient|byte\[\]|Connect\('127\.0\.0\.1')/iu.test(probeLine),
+    probeLine)
+  check('J22-14: ...and the probe budget is the 12 s wall the cold `py` start needs (not the 8 s the CLR blew)',
+    RELAY_PROBE_TIMEOUT_MS === 12000 && RELAY_PROBE_TIMEOUT_MS > 8000,
+    `probe budget=${RELAY_PROBE_TIMEOUT_MS} ms`)
+  // DEFECT 2: A LATE RELAY MUST BE ABLE TO TAKE OVER A *LIVE* SESSION-0 ATTACH.
+  // The lane is decided at attach and the logon task can come up after it, so
+  // without an upgrade a two-second-late relay left the computer blind for the
+  // whole session. The decision is pure, so it is asserted without an SSH child:
+  // only a live blind lane, never with a request in flight, never twice a minute.
+  const upgrade = (patch) => shouldUpgradeToRelay({ transport: 'session-0-direct', relayOk: null, lastUpgradeAttemptAt: 0, now: 600_000, inFlight: 0, ...patch })
+  check('J22-14b: shouldUpgradeToRelay upgrades ONLY a live blind lane, never mid-call, at most once per 60 s',
+    upgrade() === true
+    && upgrade({ transport: 'interactive-relay' }) === false
+    && upgrade({ relayOk: true }) === false
+    && upgrade({ inFlight: 1 }) === false
+    && upgrade({ lastUpgradeAttemptAt: 581_000 }) === false
+    && upgrade({ lastUpgradeAttemptAt: 540_000 }) === true
+    && RELAY_UPGRADE_INTERVAL_MS === 60000 && RELAY_UPGRADE_WATCH_MS === 15000
+    && RELAY_UPGRADE_LOG === 'upgrading mcp transport to the interactive relay',
+    `interval=${RELAY_UPGRADE_INTERVAL_MS} watch=${RELAY_UPGRADE_WATCH_MS}`)
   check('J22-14: the session-0 fallback RECORDS why it is blind rather than looking identical',
     SESSION0_FALLBACK_REASON === 'session-0 fallback (interactive relay not running; desktop automation will be blind)'
     && /desktop automation will be blind/u.test(SESSION0_FALLBACK_REASON),

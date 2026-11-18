@@ -522,7 +522,9 @@ dsh_cua.server --stdio`, started by the `cua-mcp-host` logon task **in the user'
 session**, which is the only session whose desktop UIA can see; see
 [The interactive session](#the-interactive-session--the-mcp-server-lives-there-now-the-relay).
 When the probe says the relay is not listening, the attach falls back to starting
-its own Session 0 server (MCP works, the desktop is blind) and records why.
+its own Session 0 server (MCP works, the desktop is blind) and records why — and
+keeps watching, so a relay that comes up later upgrades that attach instead of
+leaving it blind (see [the relay](#the-interactive-session--the-mcp-server-lives-there-now-the-relay)).
 **Nothing is written to the profile.**
 
 #### The namespace is the harness's
@@ -788,6 +790,14 @@ harness ──ssh stdio──▶ relay --connect ──127.0.0.1:47999──▶ 
   outside the session lock. firstboot's `Test-RelayPing` is the guest-side twin —
   its 8-byte buffer is what makes `mcp-relay-task` idempotent (the port is the
   evidence; a second listener would die on `WinError 10048`).
+* the **client's** probe: `py -3 C:\ProgramData\cua\mcp-relay.py --ping <port>`, one
+  SSH round trip that prints exactly one token (`RELAY_OK` / `RELAY_DOWN`). It
+  replaced a PowerShell one-liner that was correct and too slow — `powershell.exe`
+  starts a CLR before its first socket call (~4.6 s cold on a tiny10 guest), so
+  right after boot it raced the then-8 s budget and called a **live** relay DOWN,
+  which pinned the attach to the blind lane. The wall is now **12 s**
+  (`RELAY_PROBE_TIMEOUT_MS`): a cold ssh plus a cold `py`, with a dead relay still
+  costing only that because the probe settles the moment an answer arrives.
 * the log: one line per event in `C:\ProgramData\cua\mcp-relay.log`
   (`DSH_CUA_MCP_RELAY_LOG`), which is the only diagnosis a `pythonw.exe` task has.
 
@@ -807,10 +817,22 @@ from the client's synchronous, side-effect-free `doctorFacts()`, which never ope
 an SSH session of its own. Before an attach the fields are `null` and the text says
 `not attached yet (no lane decided in this process)`.
 
+**A late relay heals the live session.** Re-deciding per attach does not cover the
+case that actually bit: the `cua-mcp-host` logon task firing *after* the attach
+that found it down. A live `session-0-direct` attach therefore re-probes every
+15 s (`RELAY_UPGRADE_WATCH_MS`), and on `RELAY_OK` it logs
+`upgrading mcp transport to the interactive relay`, kills its own SSH child and
+lets the sync re-attach through the relay (the answer is cached, so the re-attach
+lands on the interactive lane). Picked up within ~15 s instead of staying blind for
+the whole session. Bounded: one attempt per `RELAY_UPGRADE_INTERVAL_MS` (60 s),
+never while a `tools/call` is in flight, and `DSH_CUA_VM_WIN_MCP_UPGRADE=0` disables
+the watch entirely.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `DSH_CUA_MCP_RELAY_PORT` | `47999` | relay port on both sides of the wire; garbage falls back to the default rather than building a broken command |
 | `DSH_CUA_MCP_RELAY_LOG` | `C:\ProgramData\cua\mcp-relay.log` | the relay's event log |
+| `DSH_CUA_VM_WIN_MCP_UPGRADE` | `1` | `0` keeps a blind `session-0-direct` attach on that lane instead of chasing a relay that starts later |
 
 `DSH_CUA_WIN_MCP_COMMAND` still overrides the command verbatim (the doctor records
 that the relay was bypassed on purpose). The relay's limits are honest ones: it

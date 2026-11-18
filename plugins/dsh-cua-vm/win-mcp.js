@@ -29,10 +29,14 @@
  * connection on 127.0.0.1 and bridges it byte-for-byte to the MCP server's
  * stdio. So the SSH child now runs the relay's `--connect` client, and the
  * guest's pywinauto server is finally in a session that has a desktop.
- * `RELAY_PING` / `RELAY_OK` (relayProbe()) is the one-shot health check, and
+ * the health check is `py -3 …mcp-relay.py --ping <port>` (relayProbe()), which
+ * does the RELAY_PING/RELAY_OK handshake in ~1-2 s of stdlib python instead of a
+ * ~4.6 s cold powershell.exe start (that cold start raced the probe budget right
+ * after boot and pinned a LIVE relay to the blind lane — see relayProbeCommand).
  * `python -m dsh_cua.server --stdio` is kept ONLY as the degraded fallback,
  * recorded with SESSION0_FALLBACK_REASON so nothing pretends it can drive the
- * desktop.
+ * desktop, and a fallback attach now UPGRADES itself onto the relay the moment
+ * the logon task makes the relay answer (see maybeUpgradeTransport).
  *
  * U3: THERE IS NO NAMED PIPE. The earlier diagram showed
  * `\\.\pipe\dsh-cua (interactive session)` with an interactive
@@ -209,36 +213,47 @@ export function guestMcpCommand() {
 }
 
 /**
+ * The probe's WALL budget: connect + run, not the ping itself.
+ *
+ * The old 8 s was sized for a PowerShell probe whose cold start alone was
+ * ~4.6 s on a tiny10 guest, so right after boot the budget was already half
+ * spent before the socket was opened — one slow CLR start and the probe
+ * answered RELAY_DOWN for a relay that was alive, which pinned the attach to
+ * the blind session-0 lane. The `--ping` mode is ~1-2 s and the SSH setup
+ * ~1 s, so 12 s covers a cold ssh plus a cold `py`. A genuinely dead relay
+ * still costs only 12 s, because the probe early-settles the instant an answer
+ * lands (see relayProbe) — only a silent guest ever spends the whole window.
+ */
+export const RELAY_PROBE_TIMEOUT_MS = 12000
+
+/**
  * The one-shot probe, as a single remote command.
  *
- * It is deliberately ONE powershell round trip: connect, send the 10 literal
- * bytes `RELAY_PING`, read EIGHT back, print RELAY_OK / RELAY_BAD, and print
- * RELAY_DOWN on any exception (no relay, refused, timeout). The exit status is
- * always 0, so the ANSWER — not ssh's exit code — is what is parsed.
+ * WHY IT IS `--ping` AND NOT A POWERSHELL ONE-LINER
+ * ------------------------------------------------
+ * This used to be a PowerShell TcpClient script: connect, write the 10 literal
+ * bytes `RELAY_PING`, read 8 back, print the verdict. It was CORRECT and it was
+ * too SLOW — powershell.exe has to start a CLR before the first socket call,
+ * ~4.6 s cold on a tiny10 guest. Right after boot that cold start raced the then
+ * 8 s probe budget and answered "no answer within 8000 ms" for a relay that was
+ * perfectly alive, so the attach fell back to the blind session-0 lane.
+ * `cua-mcp-relay.py --ping [port]` performs the SAME handshake in the
+ * interpreter that is already resolved: stdlib sockets, no child spawned, no
+ * session lock, no desktop access, ~1-2 s. It prints exactly one line —
+ * RELAY_OK, or RELAY_DOWN — and exits 0/1.
  *
- * TWO THINGS HERE ARE LOAD-BEARING, because both produced a false RELAY_BAD
- * (→ the blind session-0 lane) in the field:
+ * `py` (the launcher) and not `python`: on the live guest python.exe is not on
+ * the non-interactive PATH while the launcher resolves. That was proven live,
+ * and it is why RELAY_COMMAND says `py -3` too.
  *
- *   1. THE READ LOOPS. One `Read()` may legally return a SHORT read: TCP splits
- *      `RELAY_OK` into two segments and the single read returns 3 bytes, which
- *      then compares unequal against an 8-byte answer. Both ends are on
- *      127.0.0.1, so this is rare — rare enough to be misread as a dead relay.
- *      The loop accumulates until 8 bytes or the peer closes.
- *   2. THE ANSWER IS TRIMMED. The verdict is a line of text on the wire, and a
- *      CRLF tail (`RELAY_OK\r\n`) must not turn a healthy relay into RELAY_BAD;
- *      whitespace/CRLF is stripped before the exact compare.
+ * The ANSWER is parsed, never the exit status: a probe that cannot start prints
+ * nothing at all, and `--ping` exits 1 for DOWN, so both collapse to RELAY_DOWN.
+ * Parsing stays tolerant — relayProbe matches /RELAY_(OK|BAD|DOWN)/ over the
+ * accumulated stdout, so a CRLF tail or surrounding whitespace cannot turn a
+ * healthy relay into a blind attach.
  */
 export function relayProbeCommand(port = relayPort()) {
-  return 'powershell -NoProfile -Command "'
-    + '$c=New-Object Net.Sockets.TcpClient;'
-    + `try{$c.Connect('127.0.0.1',${port});$s=$c.GetStream();`
-    + "$b=[Text.Encoding]::ASCII.GetBytes('RELAY_PING');$s.Write($b,0,$b.Length);"
-    // Loop, do not assume: Read() can return a short count (down to 1 byte).
-    + '$r=New-Object byte[] 8;$n=0;'
-    + 'while($n -lt 8){$k=$s.Read($r,$n,8-$n);if($k -le 0){break};$n+=$k};'
-    + '$c.Close();$a=[Text.Encoding]::ASCII.GetString($r,0,$n);$a=$a.Trim();'
-    + "if($a -ceq 'RELAY_OK'){Write-Output RELAY_OK}"
-    + 'else{Write-Output RELAY_BAD}}catch{Write-Output RELAY_DOWN}"'
+  return `py -3 ${RELAY_SCRIPT} --ping ${port}`
 }
 
 /**
@@ -271,7 +286,7 @@ export async function relayProbe(options = {}) {
     port: sshPort,
     user = 'cua',
     keyPath,
-    timeoutMs = 8000,
+    timeoutMs = RELAY_PROBE_TIMEOUT_MS,
     ttlMs = RELAY_PROBE_TTL_MS,
     force = false,
     sshArgsFactory,
@@ -367,6 +382,56 @@ export async function relayProbe(options = {}) {
   relayProbeCache.answer = answer
   if (answer.ok !== true) log(`mcp-win: relay probe 127.0.0.1:${port} → ${answer.status}${answer.detail === '' ? '' : ` (${answer.detail})`}`)
   return answer
+}
+
+/**
+ * DEFECT 2 — A LATE RELAY MUST BE ABLE TO TAKE OVER A LIVE SESSION-0 ATTACH.
+ *
+ * The lane is decided at attach, and the relay is registered by an onlogon task
+ * that can come up AFTER the SSH attach that found it down. Nothing re-decided
+ * afterwards: the client stayed on the blind lane until the guest went away, so
+ * a computer whose relay was two seconds late stayed unusable for the whole
+ * session. The fix is an upgrade, not a re-decision: while the CURRENT attach is
+ * `session-0-direct`, probe again; the moment the probe answers RELAY_OK, tear
+ * this child down and let the plugin's sync path re-attach (the probe answer is
+ * cached, so the re-attach lands on the relay lane).
+ *
+ * BOUNDED ON PURPOSE. One attempt per RELAY_UPGRADE_INTERVAL_MS, so a relay that
+ * flaps (task restarts, logon race) costs at most one 1-2 s probe and one
+ * reconnect per minute, never a reconnect storm.
+ */
+export const RELAY_UPGRADE_INTERVAL_MS = 60_000
+
+/**
+ * How often the upgrade is CONSIDERED (the throttle above decides whether it is
+ * attempted). 15 s means a relay that starts is picked up within a poll or two,
+ * which is the same order as the plugin's own state poll.
+ */
+export const RELAY_UPGRADE_WATCH_MS = 15_000
+
+/** The one log line the upgrade writes; tests and the doctor match on it. */
+export const RELAY_UPGRADE_LOG = 'upgrading mcp transport to the interactive relay'
+
+/**
+ * The upgrade decision, pure so it can be asserted without an SSH child:
+ * only a LIVE session-0 attach, never while a request is in flight (closing the
+ * child underneath `tools/call` would fail the call the model is waiting on),
+ * and never more than once per RELAY_UPGRADE_INTERVAL_MS.
+ */
+export function shouldUpgradeToRelay({
+  transport = null,
+  relayOk = null,
+  lastUpgradeAttemptAt = 0,
+  now = Date.now(),
+  intervalMs = RELAY_UPGRADE_INTERVAL_MS,
+  inFlight = 0
+} = {}) {
+  if (transport !== 'session-0-direct') return false
+  if (relayOk === true) return false
+  if (Number(inFlight) > 0) return false
+  if (Number.isFinite(now) !== true) return false
+  const last = Number.isFinite(lastUpgradeAttemptAt) ? lastUpgradeAttemptAt : 0
+  return (now - last) >= intervalMs
 }
 
 /**
@@ -499,7 +564,13 @@ export function createDshCuaClient({
     transport: null,
     relayPort: relayPort(),
     relayOk: null,
-    reason: ''
+    reason: '',
+    /**
+     * DEFECT 2: when the last upgrade attempt was made. 0 means "never", and the
+     * throttle compares against RELAY_UPGRADE_INTERVAL_MS so a flapping relay
+     * cannot turn a blind session into a reconnect loop.
+     */
+    lastUpgradeAttemptAt: 0
   }
   /** The lane decision of the last attach (null until connect() ran). */
   let decided = null
@@ -599,6 +670,7 @@ export function createDshCuaClient({
     })
     child.on('exit', (code) => {
       const wasConnected = state.connected
+      stopUpgradeWatch()
       state.connected = false
       state.online = false
       failAll(mcpError('session-ended', `the guest MCP session ended (exit ${code})`))
@@ -612,6 +684,99 @@ export function createDshCuaClient({
         log(`mcp-win: onClosed handler failed: ${error?.message ?? error}`)
       }
     })
+  }
+
+  /* ------------------------------------------------------------------ *
+   * THE UPGRADE (defect 2): a late relay takes over a live session-0 attach
+   * ------------------------------------------------------------------ */
+
+  let upgradeTimer = null
+
+  const stopUpgradeWatch = () => {
+    if (upgradeTimer === null) return
+    clearInterval(upgradeTimer)
+    upgradeTimer = null
+  }
+
+  /** Kill this child and stop watching; `close()` and an upgrade both use it. */
+  const shutdown = () => {
+    stopUpgradeWatch()
+    try { child?.kill('SIGTERM') } catch { /* already dead */ }
+    child = null
+    state.connected = false
+    state.online = false
+  }
+
+  /**
+   * Consider (and, at most once per RELAY_UPGRADE_INTERVAL_MS, perform) the move
+   * from `session-0-direct` to `interactive-relay`.
+   *
+   * The upgrade is a TEARDOWN, not a second connect(): this client kills its own
+   * SSH child, `onClosed` tells the plugin, and the plugin's next sync re-probes
+   * — and now gets RELAY_OK, so it attaches through the relay. Reconnecting here
+   * would leave the plugin holding a client it never registered tools for.
+   *
+   * Never throws: it runs from a timer, and a health check must not take the
+   * process down.
+   */
+  async function maybeUpgradeTransport(now = Date.now()) {
+    if (state.connected !== true || child === null) return { upgraded: false, reason: 'not-connected' }
+    const decision = shouldUpgradeToRelay({
+      transport: state.transport,
+      relayOk: state.relayOk,
+      lastUpgradeAttemptAt: state.lastUpgradeAttemptAt,
+      now,
+      inFlight: pending.size
+    })
+    if (decision !== true) {
+      return {
+        upgraded: false,
+        reason: state.transport !== 'session-0-direct'
+          ? `lane is ${state.transport ?? 'unknown'}`
+          : (state.relayOk === true ? 'relay already known up' : (pending.size > 0 ? 'a request is in flight' : 'throttled'))
+      }
+    }
+    state.lastUpgradeAttemptAt = now
+    try {
+      // force: the cached answer may be the DOWN that put us on this lane, and
+      // it may be seconds old — a relay that started since then must be seen.
+      const probe = await relayProbe({
+        host, port: sshPort, user, keyPath, log, force: true, timeoutMs: RELAY_PROBE_TIMEOUT_MS
+      })
+      if (probe.ok !== true) {
+        state.relayOk = false
+        return { upgraded: false, reason: `relay still ${probe.status}` }
+      }
+      state.relayOk = true
+      // Re-checked AFTER the await: a tool call may have started while the probe
+      // ran, and closing the child underneath it would fail the call the model
+      // is waiting on.
+      if (state.connected !== true || child === null) return { upgraded: false, reason: 'gone during the probe' }
+      if (pending.size > 0) return { upgraded: false, reason: 'a request is in flight' }
+      log(`mcp-win: ${name}: ${RELAY_UPGRADE_LOG} (port ${probe.port})`)
+      shutdown()
+      return { upgraded: true, reason: RELAY_UPGRADE_LOG }
+    } catch (error) {
+      log(`mcp-win: relay upgrade failed: ${error?.message ?? error}`)
+      return { upgraded: false, reason: `upgrade failed: ${error?.message ?? error}` }
+    }
+  }
+
+  /**
+   * Watch ONLY on the blind lane. A relay attach has nothing to upgrade to, and
+   * DSH_CUA_VM_WIN_MCP_UPGRADE=0 turns the watch off (tests, or a user who would
+   * rather keep one session than chase a relay).
+   */
+  const startUpgradeWatch = () => {
+    stopUpgradeWatch()
+    if (state.transport !== 'session-0-direct') return
+    if (String(process.env.DSH_CUA_VM_WIN_MCP_UPGRADE ?? '1') === '0') return
+    // The `.catch` is belt-and-braces: maybeUpgradeTransport() already swallows
+    // its own failures, and an unhandled rejection from a health timer would take
+    // the harness down over a transport it was only trying to improve.
+    upgradeTimer = setInterval(() => { void maybeUpgradeTransport().catch(() => {}) }, RELAY_UPGRADE_WATCH_MS)
+    // Unref'd: a bridge must never be the reason the harness stays alive.
+    upgradeTimer.unref?.()
   }
 
   return {
@@ -651,6 +816,11 @@ export function createDshCuaClient({
       state.tools = Array.isArray(listed?.tools) ? listed.tools : []
       state.connected = true
       state.online = true
+      // DEFECT 2: on the blind lane, start watching for the relay that the
+      // onlogon task may still be bringing up. Without this the fallback was
+      // final for the life of the session, which is how a two-second-late relay
+      // made a perfectly usable desktop permanently blind.
+      startUpgradeWatch()
       log(`mcp-win: ${name} connected (${state.tools.length} tool(s) from ${state.serverInfo?.name ?? 'dsh-cua'})`)
       return { serverInfo: state.serverInfo, tools: state.tools }
     },
@@ -690,11 +860,23 @@ export function createDshCuaClient({
       const result = await request('tools/call', { name: windowsGuestToolName(toolName), arguments: args })
       return result
     },
+    /**
+     * DEFECT 2, THE CALL SITE: `syncWindowsMcp()` in index.js re-validates the
+     * attach on every poll and is where an upgrading bridge BELONGS (it owns the
+     * registrations this client must not touch). It can call this and ignore the
+     * answer — everything is throttled and guarded here:
+     *
+     *     void WIN_MCP.client?.maybeUpgradeTransport?.()
+     *
+     * Until it does, `connect()` starts an unref'd watch on the blind lane only,
+     * so the upgrade happens WITHOUT a plugin change. Returns
+     * `{ upgraded, reason }` and never throws.
+     */
+    maybeUpgradeTransport(now = Date.now()) {
+      return maybeUpgradeTransport(now)
+    },
     close() {
-      try { child?.kill('SIGTERM') } catch {}
-      child = null
-      state.connected = false
-      state.online = false
+      shutdown()
     }
   }
 }

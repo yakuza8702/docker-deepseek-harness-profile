@@ -1292,6 +1292,16 @@ carries.
   idempotent: the port is the evidence, so a re-run does not start a second
   listener that then dies on `WinError 10048` while the marker still reads
   `ok: true`.
+* **the probe the client runs** — `py -3 C:\ProgramData\cua\mcp-relay.py --ping
+  <port>`, one SSH round trip, answered in milliseconds: the relay answers
+  `RELAY_OK` or `RELAY_DOWN`, and the command prints exactly one token. It replaced
+  a PowerShell one-liner that was *correct and too slow*: `powershell.exe` starts a
+  CLR before its first socket call (~4.6 s cold on a tiny10 guest), so right after
+  boot that cold start raced the then-8 s budget and reported a **live** relay as
+  `RELAY_DOWN`, pinning the attach to the blind lane. The wall is now **12 s**
+  (`RELAY_PROBE_TIMEOUT_MS`) — enough for a cold ssh plus a cold `py`, and a
+  genuinely dead relay still costs only that, because the probe settles the instant
+  an answer lands.
 * **the log** — one line per event, appended to
   `C:\ProgramData\cua\mcp-relay.log` (`DSH_CUA_MCP_RELAY_LOG` overrides it).
   `pythonw.exe` has no console, so that file is the only diagnosis there is: child
@@ -1315,6 +1325,20 @@ relay lane instead of silently rewriting it. `py -3` rather than `python` is
 deliberate: on the live guest `python.exe` is not on the non-interactive PATH while
 the launcher resolves.
 
+**A relay that starts late heals the session instead of being missed.** Deciding
+per attach is not enough on its own: the logon task can fire *after* the attach
+that found it down, and before this the fallback was final for the life of the
+session. So a live `session-0-direct` attach polls the same probe every 15 s
+(`RELAY_UPGRADE_WATCH_MS = 15000`); the moment it answers `RELAY_OK`, the client
+logs `upgrading mcp transport to the interactive relay`, tears down **its own** SSH
+child and lets the plugin's sync re-attach through the relay (the probe answer is
+cached, so the re-attach lands on the interactive lane). A relay that came up two
+seconds late is therefore picked up within ~15 s. It is bounded: at most one
+attempt per 60 s (`RELAY_UPGRADE_INTERVAL_MS = 60000`, so a flapping relay cannot
+become a reconnect storm), never while a `tools/call` is in flight — closing the
+child under a call the model is waiting on would fail that call — and
+`DSH_CUA_VM_WIN_MCP_UPGRADE=0` turns the watch off.
+
 `windows_mcp_doctor` reports the facts from the client's own **synchronous,
 zero-SSH** `doctorFacts()` — the doctor has its own probe budget and never opens a
 second SSH session to answer a question: `transport`, `relayPort`, `relayOk`, plus
@@ -1326,15 +1350,20 @@ bridge as healthy in exactly the case the doctor exists for.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DSH_CUA_MCP_RELAY_PORT` | `47999` | the loopback port `--serve` binds and `--connect` dials. Unparseable or out-of-range values fall back to `47999` on **both** sides of the wire instead of building a broken PowerShell line |
+| `DSH_CUA_MCP_RELAY_PORT` | `47999` | the loopback port `--serve` binds and `--connect` dials. Unparseable or out-of-range values fall back to `47999` on **both** sides of the wire instead of building a broken command |
 | `DSH_CUA_MCP_RELAY_LOG` | `C:\ProgramData\cua\mcp-relay.log` | where the relay appends its one-line-per-event log |
+| `DSH_CUA_VM_WIN_MCP_UPGRADE` | `1` | `0` disables the upgrade watch, so a `session-0-direct` attach stays on that lane even if the relay comes up later |
 
-The chain is gated, not assumed: `tools/check-cua-vm.mjs` asserts the relay's modes
-and probe pair (including the **8-byte** answer), both task names (`mcp-relay-task`
-and the `cua-mcp-host` logon task), the `py -3 … --connect` default, the fallback
-reason, the doctor's `transport`/`transportText` lines, the Dockerfile COPYs and the
-uid-1000 readability proof; `tests/modules-unit.mjs` pins the pure parts (the probe
-constants on both sides, the port rule, `doctorFacts()` answering `null` before an
+The chain is gated, not assumed: `tools/check-cua-vm.mjs` asserts the relay's modes,
+the `--ping` mode and its `PING_BUDGET`/`read_probe_answer` reader, the probe pair
+(including the **8-byte** answer), the client's `py -3 … --ping <port>` command and
+its 12 s wall, the upgrade watch (`shouldUpgradeToRelay`, `maybeUpgradeTransport`,
+`startUpgradeWatch`, the one log line and the env escape hatch), both task names
+(`mcp-relay-task` and the `cua-mcp-host` logon task), the `py -3 … --connect`
+default, the fallback reason, the doctor's `transport`/`transportText` lines, the
+Dockerfile COPYs and the uid-1000 readability proof; `tests/modules-unit.mjs` pins
+the pure parts (the probe constants on both sides, the port rule, the `--ping`
+command shape, the upgrade decision, `doctorFacts()` answering `null` before an
 attach); `tests/windows-mcp-gate.mjs` drives the gate end to end.
 
 ### The clipboard, both ways

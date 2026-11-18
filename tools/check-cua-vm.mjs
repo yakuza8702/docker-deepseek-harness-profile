@@ -1303,7 +1303,36 @@ const NEEDLES = {
     ['const relayLane = /mcp-relay\\.py/iu.test(wanted)', 1],
     ['facts.reason = SESSION0_FALLBACK_REASON', 1],
     ['DSH_CUA_MCP_RELAY_PORT', 1],
-    ['const relayProbeCache = { key: ', 1]
+    ['const relayProbeCache = { key: ', 1],
+    // J22-14b: THE PROBE IS THE RELAY'S OWN `--ping`, AND ITS WALL IS 12 s.
+    // The old probe was a PowerShell one-liner: correct, and ~4.6 s cold because
+    // powershell.exe starts a CLR before its first socket call. Right after boot
+    // that start raced the then-8 s budget and answered RELAY_DOWN for a relay
+    // that was alive, so every attach fell back to the blind session-0 lane.
+    // `--ping` does the same handshake inside the interpreter that is already
+    // resolved (one socket, no child, no session lock), and 12 s covers a cold
+    // ssh plus a cold `py` launcher — a dead relay still costs only that, because
+    // the probe early-settles the instant an answer lands.
+    ['export const RELAY_PROBE_TIMEOUT_MS = 12000', 1],
+    ['export function relayProbeCommand(port = relayPort())', 1],
+    ['return `py -3 ${RELAY_SCRIPT} --ping ${port}`', 1],
+    // J22-14b: A LATE RELAY MUST BE ABLE TO TAKE OVER A LIVE BLIND ATTACH. The
+    // lane is decided per attach and the logon task can come up AFTER the SSH
+    // attach that found it down; without an upgrade nothing re-decided and the
+    // computer stayed blind for the whole session. One probe + one reconnect per
+    // minute at most, never during a `tools/call`, and an env escape hatch.
+    ['export const RELAY_UPGRADE_INTERVAL_MS = 60_000', 1],
+    ['export const RELAY_UPGRADE_WATCH_MS = 15_000', 1],
+    ["export const RELAY_UPGRADE_LOG = 'upgrading mcp transport to the interactive relay'", 1],
+    ['export function shouldUpgradeToRelay({', 1],
+    ['async function maybeUpgradeTransport(now = Date.now())', 1],
+    ['const startUpgradeWatch = () => {', 1],
+    ['startUpgradeWatch()', 1],
+    ['DSH_CUA_VM_WIN_MCP_UPGRADE', 2],
+    // the upgrade FORCES a fresh probe: the cached answer may be the DOWN that
+    // put the attach on this lane, and the whole point is that a relay started
+    // since then is now seen
+    ['force: true, timeoutMs: RELAY_PROBE_TIMEOUT_MS', 1]
   ],
   oemAnswer: [
     ['<unattend xmlns="urn:schemas-microsoft-com:unattend">', 1],
@@ -1514,6 +1543,21 @@ const NEEDLES = {
     ['PROBE_PING.startswith(buffered)', 1],
     ['conn.sendall(PROBE_OK)', 1],
     ['The probe took no lock', 1],
+    // J22-14b: THE PROBE MODE ITSELF. `--ping [port]` replaced the guest-side
+    // PowerShell one-liner (~4.6 s cold: a CLR start before the first socket
+    // call) with the same handshake inside `py`: one socket, two writes, no
+    // child, no session lock, no desktop. The answer is read as EXACTLY eight
+    // bytes in a LOOP (a single recv is a bug — TCP may split RELAY_OK), and
+    // PING_BUDGET bounds the whole run so a port that accepts and then says
+    // nothing cannot hold the client's 12 s probe window.
+    ['--ping [port]', 2],
+    ['PING_TIMEOUT = 1.5', 1],
+    ['PING_BUDGET = 2.0', 1],
+    ['def read_probe_answer(sock, deadline):', 1],
+    ['def run_ping(port):', 1],
+    ["elif arg == '--ping':", 1],
+    ['return run_ping(port)', 1],
+    ['emit_token(PROBE_OK if ok else PROBE_DOWN)', 1],
     // THE CHILD IS THE REAL SERVER: pipes, no pty, no console on the desktop.
     ["DEFAULT_SERVER = 'python -m dsh_cua.server --stdio'", 1],
     ["'bufsize': 0", 1],

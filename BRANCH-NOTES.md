@@ -2248,3 +2248,145 @@ longer waits for it, and `checkpointPending` says it is still in flight). A
 supervisor that is wedged for a reason other than the convert — a dead QMP socket,
 a hung `sb` — is still only cured by a restart; what changed is that the tool now
 SAYS which call it was and leaves the harness responsive.
+
+## 24. Branch `cua-vm-improve` — 2026-11-18: the probe that raced the boot, and the session that could not heal
+
+A freshly installed Windows computer came up with a working desktop, a live
+`cua-mcp-host` relay — and a bridge that was blind for the rest of the session.
+The relay was never broken. The *probe* was slow and the *fallback* was final, two
+independent defects that each looked like a working system.
+
+### The incident
+
+The first attach on a cold guest runs in a narrow window. `sshd` becomes
+reachable as soon as the service is up; the relay is started by an `/sc onlogon
+/it` task, and at first boot that task fires **after** the attach that looked for
+it. The attach ran `resolveGuestMcpTransport()` → `relayProbe()`, whose remote
+command was a PowerShell one-liner (`TcpClient`, `GetBytes('RELAY_PING')`, read
+`byte[] 8`, print the verdict) with a then-**8000 ms** wall.
+
+Measured on the tiny10 guest: `powershell.exe` takes **~4.6 s cold** before its
+first socket call — the CLR, not the relay. Half the budget was gone before a
+byte was sent, one slow start and the probe answered `no answer within 8000 ms`
+for a relay that was **alive**. That answer is `RELAY_DOWN`, and `RELAY_DOWN`
+means `python -m dsh_cua.server --stdio`: MCP works, UIA enumerates zero windows,
+every tool call lands on a desktop nobody is looking at.
+
+Then the second defect compounded it. The lane was decided once, inside
+`connect()`. Nothing re-decided afterwards — the state poll that follows only
+*publishes* `transport: 'session-0-direct'` — so the two-second-late relay was
+invisible for the life of the session. The log said "session-0 fallback
+(interactive relay not running; desktop automation will be blind)" and that was
+true at the instant it was written and false a second later.
+
+### A. The probe is the relay's own `--ping`, in the interpreter that is already there
+
+The PowerShell one-liner was *correct* and too expensive. The relay already owned
+the handshake, so it grew the mode and the client stopped paying for an
+interpreter it did not need:
+
+```js
+export function relayProbeCommand(port = relayPort()) {
+  return `py -3 ${RELAY_SCRIPT} --ping ${port}`
+}
+```
+
+`cua-mcp-relay.py --ping [port]` is `run_ping()`: one `create_connection`
+(`PING_TIMEOUT = 1.5`), one `sendall(PROBE_PING)`, and `read_probe_answer()`,
+which accumulates **exactly `len(PROBE_OK)` = 8 bytes in a loop** — a single
+`recv` is a bug, because TCP may deliver `RELAY_OK` in pieces and a short read must
+never be mistaken for a match. It prints one token plus newline (`emit_token`) and
+exits 0/1. The whole run is bounded by `PING_BUDGET = 2.0`, so a port that accepts
+and then says nothing cannot hold the caller. No child is spawned, no session lock
+is taken, no desktop is touched — the `--serve` side answers a probe *before* it
+looks at either.
+
+Two things about the budget, both load-bearing:
+
+* `RELAY_PROBE_TIMEOUT_MS = 12000`, not 8000. That is the **CI wall** (ssh setup
+  ~1 s + cold `py` 1–2 s), not the ping. It is not a longer wait for a dead relay:
+  `relayProbe()` settles on the first `/RELAY_(OK|BAD|DOWN)/` seen on stdout and
+  kills the child, so a live relay answers in ~1–2 s and only a **silent** guest
+  ever spends the window.
+* the verdict is read from stdout, never from the exit status, and the `close`
+  event (not `exit`) decides — `exit` fires before the pipes drain, and settling
+  there recorded a healthy relay as `RELAY_DOWN`, which is the same blind lane by
+  another route.
+
+`py` and not `python`: on the live guest `python.exe` is not on the
+non-interactive PATH while the launcher resolves. Same reason `--connect` says
+`py -3`.
+
+### B. A late relay upgrades the live attach
+
+The fallback can no longer be final. While the current attach is
+`session-0-direct`, the client probes again and — the moment the relay answers
+`RELAY_OK` — tears its own child down so the plugin's sync re-attaches through the
+relay (the answer is cached, so the re-attach lands on the interactive lane).
+
+```js
+export const RELAY_UPGRADE_INTERVAL_MS = 60_000   // at most one attempt a minute
+export const RELAY_UPGRADE_WATCH_MS = 15_000      // how often it is considered
+export const RELAY_UPGRADE_LOG = 'upgrading mcp transport to the interactive relay'
+```
+
+`shouldUpgradeToRelay()` is pure, so the policy is asserted without an SSH child:
+`transport === 'session-0-direct'`, `relayOk !== true`, **`inFlight === 0`** and
+`now - lastUpgradeAttemptAt >= RELAY_UPGRADE_INTERVAL_MS`. The in-flight guard is
+not decoration: closing the child underneath a `tools/call` fails the call the
+model is waiting on, so `maybeUpgradeTransport()` also re-checks `pending.size`
+**after** the probe's `await` (a call can start while it runs). The probe is
+`force: true` — the cached answer may be the very `RELAY_DOWN` that chose this
+lane, and the point is that a relay started since then is now seen.
+
+`maybeUpgradeTransport()` is a **teardown, not a second `connect()`**: it logs the
+one line, `shutdown()`s its own SSH child (which also stops the watch), `onClosed`
+tells the plugin, and the plugin's next sync re-probes. Reconnecting in place would
+leave the plugin holding a client it never registered tools for.
+
+`startUpgradeWatch()` arms a 15 s `setInterval` only when the lane is blind, is
+`unref`'d (a bridge must never be the reason the harness stays alive), swallows its
+own rejection (an unhandled rejection from a health timer would take the harness
+down over a transport it was only trying to improve), and honours
+`DSH_CUA_VM_WIN_MCP_UPGRADE=0`.
+
+| defect | measured | fix | where it is asserted |
+|---|---|---|---|
+| the probe measured the CLR's cold start, not the relay | ~4.6 s `powershell.exe` start against an 8 s wall → `RELAY_DOWN` for a live relay | `--ping` in `py`, `RELAY_PROBE_TIMEOUT_MS = 12000`, early settle on the first token, `close` decides | `check-cua-vm` (`--ping`, `run_ping`, `read_probe_answer`, `PING_BUDGET`, the 12 s constant, the command shape); `modules-unit` (the command is `py -3 … --ping <port>` with the port interpolated and no PowerShell token, the budget is 12000) |
+| the blind fallback was final for the session | the `/sc onlogon /it` task fires *after* the attach | the upgrade watch: re-probe every 15 s, one attempt per 60 s, never mid-call, `DSH_CUA_VM_WIN_MCP_UPGRADE=0` to disable | `check-cua-vm` (`RELAY_UPGRADE_INTERVAL_MS`, `RELAY_UPGRADE_WATCH_MS`, `shouldUpgradeToRelay`, `maybeUpgradeTransport`, `startUpgradeWatch`, `RELAY_UPGRADE_LOG`, the env knob, `force: true`); `modules-unit` (**J22-14b**: the decision table) |
+
+### The files
+
+| file | change |
+|---|---|
+| `docker/cua-mcp-relay.py` | `--ping [port]` mode: `run_ping`, `read_probe_answer` (exactly 8 bytes, in a loop), `PING_TIMEOUT = 1.5` / `PING_BUDGET = 2.0`, `emit_token` (one token, never a traceback), usage line and exit codes |
+| `plugins/dsh-cua-vm/win-mcp.js` | `relayProbeCommand()` is now `py -3 … --ping <port>`; `RELAY_PROBE_TIMEOUT_MS = 12000`; `RELAY_UPGRADE_INTERVAL_MS` / `RELAY_UPGRADE_WATCH_MS` / `RELAY_UPGRADE_LOG` / `shouldUpgradeToRelay` / `maybeUpgradeTransport` / `startUpgradeWatch` / `lastUpgradeAttemptAt` |
+| `tests/modules-unit.mjs` | **J22-14** rewritten for the `--ping` contract (exact string, port interpolation, no `powershell`/`GetBytes`/`TcpClient` token) + the 12 s budget; **J22-14b** added: `shouldUpgradeToRelay` upgrades only a live blind lane, never mid-call, at most once per 60 s |
+| `tools/check-cua-vm.mjs` | 12 winMcp needles (the 12 s constant, the `--ping` command shape, the three upgrade constants, `shouldUpgradeToRelay`, `maybeUpgradeTransport`, `startUpgradeWatch` + its call, the env knob, the forced probe) and 8 relay needles (`--ping [port]` usage, `PING_TIMEOUT`/`PING_BUDGET`, `read_probe_answer`, `run_ping`, the argv branch, `emit_token`) |
+| `README.md` / `plugins/dsh-cua-vm/README.md` | the probe is the relay's own `--ping` (fast, no PowerShell race) with a 12 s budget; a late-starting relay self-heals — a blind session-0 attach upgrades to the interactive relay within ~15 s, one attempt per 60 s, `DSH_CUA_VM_WIN_MCP_UPGRADE=0` to disable; `DSH_CUA_VM_WIN_MCP_UPGRADE` added to the variable tables |
+| `BRANCH-NOTES.md` | this section |
+
+### Verify
+
+All of these, all exit 0, from the repo root:
+
+```bash
+node tools/check-cua-vm.mjs --root .      # 1059 assertions / 23 files
+node tools/check-cua-rea.mjs --root .     # 67 needles / 5 files
+node tests/modules-unit.mjs               # 348 assertions (J22-14 / J22-14b are this section)
+node tests/windows-boot.mjs               # 63 assertions
+node tests/windows-mcp-gate.mjs           # 45 assertions
+node tests/supervisor-smoke.mjs           # 254 assertions
+node tests/qmp-shutdown.mjs               # 7 assertions
+```
+
+**Residual risk, named honestly.** The upgrade closes and rebuilds the bridge, so
+a session that was mid-something sees a reconnect at the moment the relay is
+discovered; that is why it never runs while a `tools/call` is in flight, and why
+the child is *detached* from the plugin rather than reconnected underneath it. The
+probe still depends on the guest's `py` launcher being on the non-interactive PATH
+(proven live, and the same bet `--connect` already makes); a guest where it is not
+would answer `RELAY_DOWN` in milliseconds instead of seconds, which is the old
+blind lane with a much shorter log line. And the 15 s watch is a poll: a relay that
+comes up and dies again between two ticks is seen as up once, and the 60 s throttle
+is what keeps that from becoming a reconnect loop.

@@ -52,6 +52,11 @@ MODES
   python cua-mcp-relay.py --serve     listen 127.0.0.1:<port>, one client at a
                                       time, child kept/restarted as needed
   python cua-mcp-relay.py --connect   bridge stdin/stdout <-> 127.0.0.1:<port>
+  python cua-mcp-relay.py --ping [port]
+                                      liveness probe: send RELAY_PING, read the
+                                      8-byte answer, print exactly RELAY_OK or
+                                      RELAY_DOWN. Bounded to ~2 s wall, no child,
+                                      no lock, no desktop access.
 
 ENVIRONMENT
 -----------
@@ -65,6 +70,18 @@ EXIT CODES
 ----------
   --connect  0 on a clean close (either side), 1 when the port refuses
   --serve    0 on Ctrl-C, 1 when the listener cannot bind
+  --ping     0 when the relay answered RELAY_OK, 1 on any failure
+             (refused / timeout / short read / EOF / bad answer)
+
+WHY --ping EXISTS (measured, not guessed)
+-----------------------------------------
+The Windows health check used to be a PowerShell one-liner over SSH. On a cold
+tiny10 guest that process takes ~4.6 s to start and warm up, which blew its 8 s
+budget right after boot and reported RELAY_DOWN while the relay was fine - so
+the harness fell back to the Session 0 path. This mode is the replacement: one
+socket, two writes, no child process, no interpreter spawn of anything but the
+guest's own `py -3`, so it answers in milliseconds warm and is still bounded
+when the port is dead.
 
 Stdlib only, ASCII only, and the pump is written so the whole file can be
 exercised on Linux (`DSH_CUA_MCP_SERVER=cat` is a byte-exact echo server).
@@ -85,10 +102,17 @@ import time
 # The probe pair. Fixed bytes, compared with ==, never stripped or decoded.
 PROBE_PING = b'RELAY_PING'
 PROBE_OK = b'RELAY_OK'
+PROBE_DOWN = b'RELAY_DOWN'
 # How long a fresh connection may take to prove itself a probe or a session.
 # An MCP client sends `initialize` immediately, so this only bounds the cost of
 # a connection that says nothing at all.
 PROBE_WINDOW = 2.0
+# --ping is the replacement for the ~4.6 s cold PowerShell health check, so its
+# budgets are hard: one socket, and the whole run is over well inside the
+# caller's 8 s. PING_TIMEOUT bounds each socket operation; PING_BUDGET bounds
+# the run (connect + send + read-all) even if an operation were to overrun.
+PING_TIMEOUT = 1.5
+PING_BUDGET = 2.0
 DEFAULT_PORT = 47999
 LOOPBACK = '127.0.0.1'
 DEFAULT_SERVER = 'python -m dsh_cua.server --stdio'
@@ -634,8 +658,87 @@ def run_connect(port):
 
 
 # --------------------------------------------------------------------------- #
+# --ping
+# --------------------------------------------------------------------------- #
+def read_probe_answer(sock, deadline):
+    """Read EXACTLY len(PROBE_OK) bytes, or fail.
+
+    A single recv() is not the answer: TCP may deliver the 8 bytes of
+    RELAY_OK in pieces, so the reader accumulates until the count is reached.
+    A short read, EOF before the count, or a deadline overrun is a failure -
+    it must never be mistaken for a match, and it must never hang.
+    """
+    want = len(PROBE_OK)
+    buffered = b''
+    while len(buffered) < want:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        try:
+            sock.settimeout(PING_TIMEOUT if remaining > PING_TIMEOUT else remaining)
+            chunk = sock.recv(want - len(buffered))
+        except InterruptedError:
+            continue
+        except (socket.timeout, OSError):
+            return None
+        if not chunk:
+            return None                      # EOF / short read
+        buffered += chunk
+    return buffered
+
+
+def emit_token(token):
+    """Exactly one token plus newline on stdout - and never a traceback.
+
+    The caller parses this stream, so a broken pipe must not turn a clean
+    RELAY_DOWN into a crash after the verdict is already known.
+    """
+    try:
+        sys.stdout.write(token.decode('ascii') + '\n')
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def run_ping(port):
+    """Liveness probe: RELAY_PING out, RELAY_OK in, one token on stdout.
+
+    Nothing here touches the desktop, the child, or the session lock - the
+    --serve side answers a probe before it looks at either - so this stays
+    cheap enough to run on a timer over SSH. Every failure mode collapses to
+    the same RELAY_DOWN/exit 1: connect refused, connect timed out, write
+    failed, short read, EOF, or a reply that is not exactly RELAY_OK.
+    """
+    deadline = time.time() + PING_BUDGET
+    sock = None
+    ok = False
+    reason = ''
+    try:
+        sock = socket.create_connection((LOOPBACK, port), timeout=PING_TIMEOUT)
+        sock.sendall(PROBE_PING)
+        answer = read_probe_answer(sock, deadline)
+        if answer is None:
+            reason = 'no answer (timeout/EOF/short read)'
+        elif answer != PROBE_OK:
+            reason = 'unexpected answer %r' % (answer,)
+        else:
+            ok = True
+    except Exception as exc:                 # refused, DNS, bad port, anything
+        reason = repr(exc)
+    finally:
+        if sock is not None:
+            close_socket(sock)
+    # Down is worth a log line (this is the signal the session-0 fallback keys
+    # off); up is not, or a 30 s probe would flood the relay log.
+    if not ok:
+        event('ping-probe-down', 'port=%d %s' % (port, reason))
+    emit_token(PROBE_OK if ok else PROBE_DOWN)
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
 def usage():
-    note('usage: cua-mcp-relay.py --serve | --connect [--port N]')
+    note('usage: cua-mcp-relay.py --serve | --connect | --ping [port] [--port N]')
 
 
 def env_port():
@@ -663,6 +766,21 @@ def main(argv):
             mode = 'serve'
         elif arg == '--connect':
             mode = 'connect'
+        elif arg == '--ping':
+            mode = 'ping'
+            # `--ping [port]`: the port is OPTIONAL and positional. Consume
+            # the next argv only when it is a bare number, so `--ping --port N`
+            # keeps working and `--ping` alone falls through to the env port.
+            if index + 1 < len(argv) and argv[index + 1].isdigit():
+                port = int(argv[index + 1])
+                index += 1
+        elif arg.startswith('--ping='):
+            mode = 'ping'
+            try:
+                port = int(arg.split('=', 1)[1])
+            except ValueError:
+                usage()
+                return 2
         elif arg == '--port':
             index += 1
             try:
@@ -687,6 +805,8 @@ def main(argv):
         port = env_port()
     if mode == 'serve':
         return Relay(port).run()
+    if mode == 'ping':
+        return run_ping(port)
     return run_connect(port)
 
 
