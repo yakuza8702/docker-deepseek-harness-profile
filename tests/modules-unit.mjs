@@ -2470,5 +2470,126 @@ check('windowsKvmPreflight is the shared module (no second message)',
       && /else if \(answer\.checkpoint\) parts\.push\(`Checkpoint: \$\{answer\.checkpoint\}\.`\)/u.test(source))
 }
 
+// ------------------------------------------------------------------ *
+// WP-10: THE WINDOWS put/get ARGV, AND THE DOCTOR'S VERDICT ORDER
+// ------------------------------------------------------------------ *
+// TWO BUGS, TWO PURE CHECKS. Neither needs a guest, QEMU or an SSH server.
+//
+// (1) `cua_vm_put` failed with `scp: stat local "47000"`: ssh's `-p PORT` was
+//     reused for scp, whose `-p` takes NO value, so the port fell through into
+//     a POSITIONAL slot — a source file. `buildScpArgv` is exported for exactly
+//     this assertion: the SHAPE is the defect.
+// (2) `windows_mcp_doctor` reported `online: true / state: ready / 19 tools`
+//     seconds after a power-off, because a cached probe was merged OVER the
+//     plugin's own verdict. The order of the code is the fix, so the order is
+//     what is asserted here (the doctor is not exported; needle + offset).
+{
+  // (1) Imported in a CHILD with a throwaway store, like parseGuestDf: this
+  // suite must never bind the supervisor's socket. With no key file in the
+  // store the argv carries no `-i`, which is why only the shape is asserted.
+  const store = mkdtempSync(path.join(os.tmpdir(), 'cua-scpargv-unit-'))
+  try {
+    const supervisorUrl = new URL('../docker/cua-vm-supervisor.mjs', import.meta.url).href
+    const program = `const m = await import(${JSON.stringify(supervisorUrl)});`
+      + `const meta = { name: 'winvm', user: 'cua', ports: { ssh: Number(process.argv[1]) } };`
+      + `process.stdout.write(JSON.stringify({`
+      + `toGuest: m.buildScpArgv(meta, process.argv[2], process.argv[3], { direction: 'to-guest' }),`
+      + `fromGuest: m.buildScpArgv(meta, process.argv[2], process.argv[3], { direction: 'from-guest' })`
+      + `}));process.exit(0)`
+    const local = '/tmp/notes.txt'
+    const guest = 'C:\\Users\\cua\\notes.txt'
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', program, '47000', local, guest], {
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, CUA_VM_STORE: path.join(store, 'store'), CUA_VM_HOME: path.join(store, 'home'), CUA_SUPERVISOR_SOCK: path.join(store, 's.sock') }
+    })
+    let argvs = null
+    try { argvs = JSON.parse(result.stdout ?? 'null') } catch { argvs = null }
+    // OPENSsh's grammar, reduced to what these argv actually contain: `-p`
+    // takes NO value (that is the trap), `-P` does, and anything else that does
+    // not start with `-` is a positional.
+    const parse = (argv) => {
+      const withValue = new Set(['-i', '-o', '-P', '-F', '-S', '-J', '-c', '-l'])
+      const noValue = new Set(['-q', '-p', '-r', '-T', '-v', '-B', '-C', '-3', '-4', '-6'])
+      const flags = new Map()
+      const positionals = []
+      for (let i = 0; i < argv.length; i += 1) {
+        const token = argv[i]
+        if (!token.startsWith('-') || token === '-') { positionals.push(token); continue }
+        if (withValue.has(token)) { flags.set(token, argv[i + 1]); i += 1; continue }
+        if (noValue.has(token)) { flags.set(token, true); continue }
+        flags.set(token, true)
+      }
+      return { flags, positionals }
+    }
+    const put = argvs === null ? null : parse(argvs.toGuest)
+    const get = argvs === null ? null : parse(argvs.fromGuest)
+    check('WP-10: buildScpArgv is exported and returns the complete argv (question mark, then flags)',
+      argvs !== null && Array.isArray(argvs.toGuest) && argvs.toGuest[0] === '-q',
+      `status=${result.status} out=${String(result.stdout ?? '').slice(0, 80)} err=${String(result.stderr ?? '').slice(0, 120)}`)
+    check('WP-10: to-guest = [-q, …opts, -P, PORT, LOCAL, user@host:GUEST] — LOCAL first',
+      put !== null && put.positionals.join('|') === `${local}|cua@127.0.0.1:${guest}`,
+      JSON.stringify(put?.positionals))
+    check('WP-10: from-guest is the exact mirror — the remote is the source',
+      get !== null && get.positionals.join('|') === `cua@127.0.0.1:${guest}|${local}`,
+      JSON.stringify(get?.positionals))
+    check("WP-10: the port is the VALUE of -P in both directions, and `-p` is absent (scp's -p means preserve)",
+      put !== null && get !== null
+        && put.flags.get('-P') === '47000' && get.flags.get('-P') === '47000'
+        && put.flags.has('-p') === false && get.flags.has('-p') === false,
+      `put=-P ${put?.flags.get('-P')} get=-P ${get?.flags.get('-P')}`)
+    check('WP-10: "47000" is NEVER a positional — the exact bug was the port in the source slot',
+      put !== null && get !== null
+        && [...put.positionals, ...get.positionals].every((value) => value !== '47000'),
+      JSON.stringify([...(put?.positionals ?? []), ...(get?.positionals ?? [])]))
+    check('WP-10: scp has no -T (a no-pty flag is ssh-only) and no -i without a key in the store',
+      put !== null && get !== null && !put.flags.has('-T') && !get.flags.has('-T')
+        && !put.flags.has('-i') && !get.flags.has('-i'))
+    // One shared option list: the SAME -o pairs, in the SAME order, in both
+    // directions — the property that stops ssh's flag set creeping back in.
+    const pairs = (argv) => argv.reduce((acc, token, index) => (token === '-o' ? [...acc, argv[index + 1]] : acc), [])
+    check('WP-10: both directions carry the SAME -o option list, in the same order (one shared WINDOWS_SSH_OPTS)',
+      argvs !== null && pairs(argvs.toGuest).length >= 5
+        && pairs(argvs.toGuest).join('|') === pairs(argvs.fromGuest).join('|'),
+      argvs === null ? 'no argv' : pairs(argvs.toGuest).join('|'))
+  } finally {
+    rmSync(store, { recursive: true, force: true })
+  }
+
+  // (2) THE DOCTOR'S VERDICT ORDER. The probe is DETAIL; the stream's newest
+  // `vm-state` and the plugin's own `WIN_MCP.online` are the VERDICT. Asserted
+  // as offsets, because "probe merged over the answer" was a location bug.
+  const doctorSource = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'index.js'), 'utf8')
+  const at = (needle) => doctorSource.indexOf(needle)
+  const verdictAt = at('// ---- THE VERDICT COMES FIRST (THE STALE-PROBE FIX) ----')
+  const onlineAt = at('const online = streamSaysOffline !== true && WIN_MCP.online === true')
+  const staleAt = at('const probeStale = online !== true && probeAgeMs !== null && probeAgeMs > WIN_MCP_PROBE_STALE_MS')
+  const overriddenAt = at('const probeOverridden = online !== true && probeFacts.online === true')
+  check('WP-10: the doctor computes the VERDICT before it reports a probe, and the conjunction excludes the probe',
+    verdictAt > 0 && onlineAt > verdictAt && staleAt > onlineAt && overriddenAt > onlineAt
+      && !/const online = [^\n]*probeFacts/u.test(doctorSource),
+    `verdict=${verdictAt} online=${onlineAt} stale=${staleAt} overridden=${overriddenAt}`)
+  check('WP-10: a not-online vm-state beats a live probe (stream → plugin → probe-as-detail)',
+    at('const streamSaysOffline = streamState !== null') > verdictAt
+      && at('WIN_MCP_NOT_ONLINE_STATES.has(String(streamState.state).toLowerCase())') > verdictAt
+      && /const WIN_MCP_NOT_ONLINE_STATES = new Set\(\[[\s\S]*?'powered-off'[\s\S]*?\]\)/u.test(doctorSource))
+  check('WP-10: the probe is aged (probeAgeMs), flagged stale past 5 s, and `overridden` when it lost',
+    at('const WIN_MCP_PROBE_STALE_MS = 5000') > 0
+      && at('const probeAgeMs = probeAt > 0 ? Math.max(0, Date.now() - probeAt) : null') > 0
+      && at('stale: probeStale') > 0
+      && at('overridden: probeOverridden') > 0)
+  check("WP-10: onlineSource is stream:<state> | plugin | plugin+probe | offline — never a bare 'probe'",
+    at("? (WIN_MCP_AUX.probe.online === true ? 'plugin+probe' : 'plugin')") > 0
+      && at("      : 'offline'") > 0
+      && !/onlineSource[^\n]*\?\s*'probe'\s*:/u.test(doctorSource))
+  check('WP-10: the payload puts the VERDICT fields before the probe detail (online, state, onlineSource, probeAgeMs, probe)',
+    at('\n    online,\n') > 0
+      && at('\n    probeAgeMs,\n') > at('\n    online,\n')
+      && at('\n    probe: {\n') > at('\n    probeAgeMs,\n')
+      && at('status: online !== true && leaks.length > 0') > 0)
+  check('WP-10: the doctor says WHY (guiNote: MCP tools are the element-level lane, a screenshot is the stream)',
+    at("const guiNote = 'desktop automation uses the MCP windows tools; cua_vm_gui screenshots are the noVNC stream, not a framebuffer'") > 0)
+}
+
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

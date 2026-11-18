@@ -5247,6 +5247,18 @@ async function windowsCreateManaged(spec) {
 }
 
 /**
+ * THE OPTIONS ssh AND scp SHARE — spelled once, so the two builders cannot
+ * drift apart on BatchMode or a host key check.
+ */
+const WINDOWS_SSH_OPTS = [
+  'BatchMode=yes',
+  'StrictHostKeyChecking=no',
+  'UserKnownHostsFile=/dev/null',
+  'ConnectTimeout=10',
+  'ServerAliveInterval=15'
+]
+
+/**
  * SSH IS THE AGENT SURFACE OF A WINDOWS COMPUTER.
  *
  * There is no cua-spacesd to talk to, so exec/put/get go through the OpenSSH
@@ -5259,18 +5271,72 @@ async function windowsCreateManaged(spec) {
  *     quoted with double quotes — NOT POSIX single quotes.
  */
 function sshBaseArgs(meta) {
-  const paths = windowsPaths(STORE, meta.name ?? '')
-  const keyPath = existsSync(paths.sshKey) ? paths.sshKey : null
   return [
     '-T',
-    ...(keyPath !== null ? ['-i', keyPath] : []),
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=no',
-    '-o', 'UserKnownHostsFile=/dev/null',
-    '-o', 'ConnectTimeout=10',
-    '-o', 'ServerAliveInterval=15',
-    '-p', String(meta.ports?.ssh ?? 0)
+    ...windowsKeyArgs(meta),
+    ...WINDOWS_SSH_OPTS.flatMap((opt) => ['-o', opt]),
+    '-p', windowsSshPort(meta)
   ]
+}
+
+/** The per-computer key, or nothing at all when it has not been generated. */
+function windowsKeyArgs(meta) {
+  const paths = windowsPaths(STORE, meta.name ?? '')
+  const keyPath = existsSync(paths.sshKey) ? paths.sshKey : null
+  return keyPath !== null ? ['-i', keyPath] : []
+}
+
+function windowsSshPort(meta) {
+  return String(meta.ports?.ssh ?? 0)
+}
+
+/**
+ * scp IS NOT ssh — THE PORT FLAG IS THE WHOLE BUG.
+ *
+ * ssh takes `-p PORT` (LOWERCASE, with a value). scp takes `-P PORT` (CAPITAL),
+ * and scp's own `-p` means "preserve times/modes" and takes NO VALUE. scp also
+ * has no `-T`. The old code reused sshBaseArgs and only stripped `-T`, so the
+ * argv was:
+ *
+ *   scp -q -i KEY -o … -p 47000 /host/file "cua@127.0.0.1:C:\guest"
+ *                              ^^ `-p` swallows nothing, so
+ *                                 "47000" became the FIRST POSITIONAL
+ *
+ * OpenSSH reads positionals back-to-front: the last one is the destination, and
+ * everything before it is a SOURCE. `47000` therefore landed in the source slot
+ * and scp said exactly what the user saw:
+ *
+ *   scp: stat local "47000": No such file or directory
+ *
+ * (and the real local file was silently taken as a second destination.) The
+ * builder below emits `-P` in the port slot and keeps the option list in the
+ * same order as sshBaseArgs, so the two cannot disagree again.
+ */
+function scpBaseArgs(meta) {
+  return [
+    ...windowsKeyArgs(meta),
+    ...WINDOWS_SSH_OPTS.flatMap((opt) => ['-o', opt]),
+    '-P', windowsSshPort(meta)
+  ]
+}
+
+/**
+ * THE COMPLETE scp ARGV FOR ONE COPY, BUILT FROM THE DIRECTION.
+ *
+ * scp positionals are [SOURCE…, DESTINATION] — a single source here. `to-guest`
+ * puts the LOCAL file in the source slot and the `user@host:path` behind it;
+ * `from-guest` is the exact mirror. Both directions go through this one
+ * function, which is the point: the port can never be a path in either of them.
+ *
+ * Exported so a test can assert the SHAPE (ports in the `-P` slot, the local
+ * file in the source slot) without a guest or an SSH server — `tools/
+ * scp-argv-check.mjs` goes one step further and drives the real path.
+ */
+export function buildScpArgv(meta, localPath, guestPath, { direction } = {}) {
+  const remote = `${meta?.user ?? 'cua'}@127.0.0.1:${String(guestPath)}`
+  const local = String(localPath)
+  const tail = direction === 'from-guest' ? [remote, local] : [local, remote]
+  return ['-q', ...scpBaseArgs(meta ?? {}), ...tail]
 }
 
 /** Quote for cmd.exe (double quotes; no single-quote convention). */
@@ -5292,10 +5358,17 @@ function quoteForWindows(value) {
   return /\s/u.test(text) ? `"${text.replace(/"/gu, '""')}"` : text
 }
 
+/**
+ * THE ssh BINARY — overridable ONLY so a test can point it at a stub that
+ * records its argv (the `-p PORT` half of the audit below). The default is the
+ * real one; nothing in production sets `DSH_CUA_SSH_BIN`.
+ */
+const SSH_BIN = process.env.DSH_CUA_SSH_BIN || '/usr/bin/ssh'
+
 /** Run one command in the guest over SSH; never throws on a non-zero exit. */
 function sshRun(meta, command, { timeoutMs = 330000 } = {}) {
   return new Promise((resolve) => {
-    const child = spawn('/usr/bin/ssh', [...sshBaseArgs(meta), `${meta.user ?? 'cua'}@127.0.0.1`, command], {
+    const child = spawn(SSH_BIN, [...sshBaseArgs(meta), `${meta.user ?? 'cua'}@127.0.0.1`, command], {
       stdio: ['ignore', 'pipe', 'pipe']
     })
     let stdout = ''
@@ -5319,16 +5392,21 @@ function sshRun(meta, command, { timeoutMs = 330000 } = {}) {
   })
 }
 
+/**
+ * THE scp BINARY — overridable ONLY so a test can point it at a stub that
+ * records its argv. The default is the real one; nothing in production sets
+ * `DSH_CUA_SCP_BIN`.
+ */
+const SCP_BIN = process.env.DSH_CUA_SCP_BIN || '/usr/bin/scp'
+
 /** Copy a file in or out with scp (the same key, the same port). */
 function scpRun(meta, localPath, guestPath, { direction }) {
   return new Promise((resolve) => {
-    const remote = `${meta.user ?? 'cua'}@127.0.0.1:${guestPath}`
-    const args = [
-      '-q',
-      ...sshBaseArgs(meta).filter((arg) => arg !== '-T'),
-      ...(direction === 'to-guest' ? [localPath, remote] : [remote, localPath])
-    ]
-    const child = spawn('/usr/bin/scp', args, { stdio: ['ignore', 'ignore', 'pipe'] })
+    // The argv comes from buildScpArgv: `-P` for the port, the local path in
+    // the source slot for `to-guest` and in the destination slot for
+    // `from-guest`. Building it inline is what let ssh's `-p` reach scp.
+    const args = buildScpArgv(meta, localPath, guestPath, { direction })
+    const child = spawn(SCP_BIN, args, { stdio: ['ignore', 'ignore', 'pipe'] })
     let stderr = ''
     let timedOut = false
     // M5: scp had NO timeout, so an unresponsive guest hung cua_vm_put/get

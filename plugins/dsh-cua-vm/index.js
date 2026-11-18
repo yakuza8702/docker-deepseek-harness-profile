@@ -361,6 +361,16 @@ const WIN_MCP_AUX = {
   /** When the isOnline() answer was last refreshed. */
   onlineCheckedAt: 0,
   /**
+   * THE LAST LIVENESS PROBE'S ANSWER — DIAGNOSTIC DETAIL, NEVER A VERDICT.
+   * `{ at, online, state, name }`. This is what the doctor reports as
+   * `probeAgeMs` / `probe.*`; it may NEVER put `online: true` over the plugin's
+   * own state. The bug it exists for: the supervisor probe kept answering with
+   * the last handshake it had seen, so during the shutdown window a doctor that
+   * merged probe facts over the (fresher) registry/stream said `online: true /
+   * state: ready / 19 tools` for seconds after the computer was gone.
+   */
+  probe: { at: 0, online: null, state: '', name: '' },
+  /**
    * What the SUPERVISOR said about the bound computer on the last probe.
    *
    * `isOnline` cannot mean "we are already attached": the initial handshake
@@ -434,6 +444,14 @@ const WIN_MCP_STREAM = {
   lastEventAt: 0,
   /** The last event, as `event:name:state` — the doctor prints it. */
   lastEvent: '',
+  /**
+   * THE NEWEST STATES THIS PLUGIN HAS SEEN (`[{ name, state, at }]`, newest
+   * last, capped at 8): the supervisor's own `vm-state` events, plus one
+   * `ready` when an attach completed. The doctor prefers these over any probe
+   * answer: an event is first-hand news, a probe is a round trip that can still
+   * be answering from the handshake it saw a moment ago.
+   */
+  stateLog: [],
   /** How many state events this plugin consumed (proves the stream works). */
   events: 0,
   /** Why the stream is not live, in words the doctor can print. */
@@ -450,6 +468,24 @@ const WIN_MCP_ATTACH_TIMEOUT_MS = 45_000
 const WIN_MCP_RETRY_MS = 30_000
 /** What the SSH channel is configured with, reported by the doctor. */
 const WIN_MCP_KEEPALIVE = Object.freeze({ interval: 10, countMax: 2 })
+
+/**
+ * PROBE AGE, NOT PROBE TRUTH. Past this, a cached probe answer is reported as
+ * `stale` while the bridge is not online — the shutdown window is seconds wide,
+ * so "the handshake answered five seconds ago" is not evidence about now.
+ */
+const WIN_MCP_PROBE_STALE_MS = 5000
+
+/**
+ * THE STATES THAT MEAN "no SSH session can be taken right now". A `vm-state`
+ * event carrying one of these is a not-online verdict the doctor must not
+ * argue with (the guest's own row says so, and the handshake is about to die).
+ */
+const WIN_MCP_NOT_ONLINE_STATES = new Set([
+  'powering-off', 'powered-off', 'shutting-down', 'shutdown', 'stopping',
+  'stopped', 'suspended', 'paused', 'installing', 'creating', 'deleting',
+  'absent', 'removed', 'error'
+])
 
 /** `DSH_CUA_MCP_STATE_POLL_MS`, read at call time so a test can shrink it. */
 function windowsMcpPollMs() {
@@ -901,13 +937,40 @@ async function resolveWindowsTarget() {
     const resolved = await resolveOneWindowsTarget(name)
     if (resolved.ok === true) {
       WIN_MCP_AUX.targetOnline = true
+      // DETAIL, NOT A VERDICT: recorded with its own timestamp so the doctor can
+      // age it, and never read as "the bridge is up".
+      WIN_MCP_AUX.probe = {
+        at: Date.now(),
+        online: true,
+        state: String(resolved.target.state ?? ''),
+        name: String(resolved.target.name ?? name)
+      }
       return resolved.target
     }
     if (first === '') first = resolved.reason
   }
   WIN_MCP_AUX.targetOnline = false
+  WIN_MCP_AUX.probe = {
+    at: Date.now(),
+    online: false,
+    state: winStateFromProbeReason(first),
+    name: names[0] ?? ''
+  }
   WIN_MCP.reason = first === '' ? 'not-the-target' : first
   return null
+}
+
+/**
+ * THE ROW STATE A REFUSAL IMPLIES, for the probe record only. `resolveOne…`
+ * folds the state into a sentence ("vm-state:powered-off (not online)"); the
+ * doctor wants the bare state next to its own verdict, not a second sentence.
+ */
+function winStateFromProbeReason(reason) {
+  const text = String(reason ?? '')
+  const stated = /vm-state:([^\s()]+)/u.exec(text)
+  if (stated !== null) return stated[1]
+  if (/^not-online:/u.test(text)) return 'not-online'
+  return ''
 }
 
 /**
@@ -976,6 +1039,11 @@ async function attachWindowsMcp(target) {
       WIN_MCP.lastError = ''
       WIN_MCP_AUX.onlineCheckedAt = Date.now()
       WIN_MCP_AUX.target = { ...target }
+      // A CONFIRMED ATTACH IS STATE, TOO: it dates the newest positive fact for
+      // this computer, so a `powered-off` event from BEFORE the restart can
+      // never demote a bridge that is attached right now (the verdict prefers
+      // the newest entry for the attached name).
+      recordVmState(target.name, 'ready')
       const failed = []
       WIN_MCP_AUX.tools = session.tools.map((tool) => ({
         name: windowsToolName(tool.name),
@@ -1246,6 +1314,27 @@ function handleStreamLine(event, finish) {
 }
 
 /**
+ * KEEP THE NEWEST FEW `vm-state` PAYLOADS. Bounded on purpose: a store with a
+ * hundred computers must not grow a log, and the verdict only ever asks about
+ * the names this session bound (at most four).
+ */
+function recordVmState(name, state) {
+  const row = { name: String(name ?? ''), state: String(state ?? ''), at: Date.now() }
+  if (row.name === '') return
+  WIN_MCP_STREAM.stateLog.push(row)
+  if (WIN_MCP_STREAM.stateLog.length > 8) WIN_MCP_STREAM.stateLog.splice(0, WIN_MCP_STREAM.stateLog.length - 8)
+}
+
+/** The newest stream event about ONE of `names`, or null when the bus is quiet. */
+function newestVmStateFor(names) {
+  for (let index = WIN_MCP_STREAM.stateLog.length - 1; index >= 0; index -= 1) {
+    const row = WIN_MCP_STREAM.stateLog[index]
+    if (row && names.has(String(row.name)) === true) return row
+  }
+  return null
+}
+
+/**
  * THE BUS → THE SAME TWO PATHS THE POLL USES.
  *
  * `vm-removed`  : the row is gone → forget the bindings and tear down (the
@@ -1263,6 +1352,10 @@ function handleVmEvent(event) {
   }
   if (what !== 'vm-state') return
   const state = String(event?.state ?? '')
+  // THE FRESHEST WORD ON THIS COMPUTER, KEPT EVEN AFTER A TEARDOWN CLEARS THE
+  // TARGET: the doctor's verdict reads this log, so a proxy answer that still
+  // remembers the handshake cannot outlive the power-off the bus just reported.
+  recordVmState(name, state)
   const online = state === 'ready'
   const attached = WIN_MCP.name === name
   const inflight = WIN_MCP_AUX.inflightTicket !== null && String(WIN_MCP_AUX.inflightTicket.name ?? '') === name
@@ -1419,10 +1512,15 @@ function windowsTransportLine(facts) {
 }
 
 /**
- * THE DOCTOR. It answers the one question the bug was about: are any
- * `mcp__windows__*` schemas still on the global registry while the bridge is
- * down? Offline, `leaks` MUST be empty — anything else is `status: "leaking"`,
- * which is exactly the state that used to persist for minutes after a delete.
+ * THE DOCTOR. It answers two questions. Are any `mcp__windows__*` schemas still
+ * on the global registry while the bridge is down? Offline, `leaks` MUST be
+ * empty — anything else is `status: "leaking"`, the state that used to persist
+ * for minutes after a delete. And is the bridge online RIGHT NOW? That verdict
+ * is built FIRST from this plugin's own state (the stream's newest `vm-state`,
+ * `WIN_MCP.online`, the registration map); a live probe is aged, reported as
+ * `probeAgeMs` / `probe.*`, and may only add detail — never overrule a
+ * not-online verdict, which is how `online: true / state: ready / 19 tools`
+ * outlived a power-off by seconds.
  */
 async function windowsMcpDoctor(execAgent) {
   try {
@@ -1463,6 +1561,48 @@ async function windowsMcpDoctor(execAgent) {
       reason: match.ok === true ? '' : match.text
     }
   })()
+  // ---- THE VERDICT COMES FIRST (THE STALE-PROBE FIX) ----
+  // One question: is the bridge online RIGHT NOW? The sources are ordered, and
+  // a live probe is NOT one of them:
+  //   1. the supervisor's own `vm-state` event — first-hand, newest;
+  //   2. the plugin's own state (`WIN_MCP.online`, the registration map);
+  //   3. the cached probe answer — DIAGNOSTIC DETAIL, aged and marked stale.
+  // The order IS the fix. The probe used to be merged over this answer, and a
+  // supervisor still answering from the handshake it watched kept
+  // `online: true / state: ready / 19 tools` alive for seconds after the
+  // power-off. A not-online event may therefore never be overridden.
+  const verdictNames = WIN_MCP.name !== ''
+    // Attached: only the ATTACHED computer's state can change this verdict —
+    // another bound computer powering off is not this bridge going away.
+    ? new Set([String(WIN_MCP.name)])
+    // Not attached: every name this session bound (and any attach in flight).
+    : new Set([
+        ...WIN_MCP_AUX.targets.values().map((row) => (row?.name === undefined ? '' : String(row.name))),
+        WIN_MCP_AUX.inflightTicket === null ? '' : String(WIN_MCP_AUX.inflightTicket.name ?? '')
+      ].filter((name) => name !== ''))
+  const streamState = newestVmStateFor(verdictNames)
+  const streamSaysOffline = streamState !== null
+    && WIN_MCP_NOT_ONLINE_STATES.has(String(streamState.state).toLowerCase())
+  const probeFacts = WIN_MCP_AUX.probe
+  const probeAt = Number(probeFacts.at) > 0 ? Number(probeFacts.at) : 0
+  const probeAgeMs = probeAt > 0 ? Math.max(0, Date.now() - probeAt) : null
+  const online = streamSaysOffline !== true && WIN_MCP.online === true
+  const onlineSource = streamSaysOffline === true
+    ? `stream:${String(streamState.state)}`
+    : WIN_MCP.online === true
+      ? (WIN_MCP_AUX.probe.online === true ? 'plugin+probe' : 'plugin')
+      : 'offline'
+  // PAST 5 s A NOT-ONLINE VERDICT MAKES THE PROBE FACTS STALE: "the handshake
+  // answered five seconds ago" is not evidence about a computer that is going
+  // down, and `overridden` states plainly that the plugin's own answer won.
+  const probeStale = online !== true && probeAgeMs !== null && probeAgeMs > WIN_MCP_PROBE_STALE_MS
+  const probeOverridden = online !== true && probeFacts.online === true
+  const offlineState = streamState !== null && String(streamState.state).toLowerCase() !== 'ready'
+    ? String(streamState.state)
+    : (probeFacts.online === false && String(probeFacts.state ?? '') !== '' ? String(probeFacts.state) : 'unknown')
+  const state = online !== true
+    ? offlineState
+    : (streamState !== null && String(streamState.state) !== '' ? String(streamState.state) : (target?.state ?? 'unknown'))
   // THE LANE THIS PROCESS ACTUALLY TOOK — AND NEVER A SECOND SSH SESSION FOR IT.
   // `doctorFacts()` is the client's own synchronous, side-effect-free answer;
   // the doctor reports the transport that really ran instead of dialling the
@@ -1470,12 +1610,41 @@ async function windowsMcpDoctor(execAgent) {
   // No client means no lane was ever decided, so the keys are simply absent.
   const transportFacts = WIN_MCP.client?.doctorFacts?.() ?? null
   const transportText = transportFacts === null ? null : windowsTransportLine(transportFacts)
+  // ONE LINE FOR THE HUMAN READING THE DOCTOR (and cheap enough to always send):
+  // the two desktop lanes are not interchangeable, and a noVNC screenshot is a
+  // stream, not the guest framebuffer — the MCP tools are the element-level lane.
+  const guiNote = 'desktop automation uses the MCP windows tools; cua_vm_gui screenshots are the noVNC stream, not a framebuffer'
   return {
-    status: WIN_MCP.online !== true && leaks.length > 0 ? 'leaking' : 'ok',
+    status: online !== true && leaks.length > 0 ? 'leaking' : 'ok',
     enabled: windowsMcpEnabled() === true,
     target: WIN_MCP.name === '' ? null : WIN_MCP.name,
-    online: WIN_MCP.online === true,
-    state: target?.state ?? 'unknown',
+    // THE TRANSPORT FACTS, from the zero-SSH client method — transport /
+    // relayPort / relayOk / relayStatus / transportCommand / transportReason.
+    // Spread FIRST, before the verdict: a client fact may add detail, never
+    // suppress `online`/`state`/`onlineSource` (see the verdict block above).
+    // Absent when no client exists — the doctor never dials to fill them in.
+    ...(transportFacts ?? {}),
+    // THE VERDICT, from the plugin's own state (see the block above) — a probe
+    // may never raise it back to true during a power-off.
+    online,
+    state,
+    // WHICH SOURCE DECIDED IT: `stream:<state>`, `plugin`, `plugin+probe`, or
+    // `offline`. Absent from this list on purpose: a bare `probe`, because a
+    // probe cannot be the only thing keeping a dead bridge "online".
+    onlineSource,
+    // The cached probe answer, as DETAIL. `ageMs` ages it, `stale` says it is
+    // too old to trust while the verdict is not online, and `overridden` says
+    // the plugin's own state beat a probe that still claimed the handshake.
+    probeAgeMs,
+    probe: {
+      at: probeAt > 0 ? probeAt : null,
+      ageMs: probeAgeMs,
+      online: probeFacts.online,
+      state: String(probeFacts.state ?? ''),
+      name: String(probeFacts.name ?? ''),
+      stale: probeStale,
+      overridden: probeOverridden
+    },
     registered,
     expected,
     // The leak surface as the HOST registry sees it (the global view), which is
@@ -1520,18 +1689,22 @@ async function windowsMcpDoctor(execAgent) {
       lastEventAt: WIN_MCP_STREAM.lastEventAt,
       readyAt: WIN_MCP_STREAM.readyAt,
       retryMs: WIN_MCP_STREAM.retryMs,
-      error: WIN_MCP_STREAM.error
+      error: WIN_MCP_STREAM.error,
+      // The newest states the supervisor ANNOUNCED (verdict source #1), so
+      // "why did it say offline?" is answerable from the payload alone.
+      lastState: WIN_MCP_STREAM.stateLog.length === 0
+        ? ''
+        : `${WIN_MCP_STREAM.stateLog[WIN_MCP_STREAM.stateLog.length - 1].name}:${WIN_MCP_STREAM.stateLog[WIN_MCP_STREAM.stateLog.length - 1].state}`,
+      stateEvents: WIN_MCP_STREAM.stateLog.length
     },
     ssh: WIN_MCP.client?.sshArgv?.() ?? (target !== null && Number(target.sshPort) > 0
       ? sshArgv({ host: target.host ?? '127.0.0.1', port: target.sshPort, user: target.user, keyPath: target.keyPath })
       : null),
-    // THE TRANSPORT FACTS, from the zero-SSH client method — the same object
-    // `...(WIN_MCP.client?.doctorFacts?.() ?? {})` would spread: transport /
-    // relayPort / relayOk / relayStatus / transportCommand / transportReason.
-    // Absent when no client exists — the doctor never dials to fill them in.
-    ...(transportFacts ?? {}),
     // The same facts as the ONE human-readable line the doctor's text carries.
     transportText,
+    // The GUI-vs-MCP line, one sentence, Windows only by construction (this
+    // doctor IS the Windows bridge's): the two lanes are not interchangeable.
+    guiNote,
     gateError: WIN_MCP_AUX.gateError
   }
 }

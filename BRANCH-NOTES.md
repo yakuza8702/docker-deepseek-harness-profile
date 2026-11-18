@@ -2390,3 +2390,196 @@ would answer `RELAY_DOWN` in milliseconds instead of seconds, which is the old
 blind lane with a much shorter log line. And the 15 s watch is a poll: a relay that
 comes up and dies again between two ticks is seen as up once, and the 60 s throttle
 is what keeps that from becoming a reconnect loop.
+
+---
+
+## 25. Branch `cua-vm-improve` — 2026-11-18: the port that became a filename, and the probe that outlived the power-off
+
+Two live Windows defects, both of the same shape: a value that was right in one
+place was reused in a second place where it meant something else, and both
+produced a confident, wrong answer.
+
+### The incidents
+
+**1. `cua_vm_put` failed with the SSH port as the source file.**
+
+```
+scp: stat local "47000": No such file or directory
+```
+
+The copy never reached the guest. `47000` is the per-computer forwarded SSH port;
+it had become the *local file to copy*. No user typo is possible here — the tool
+takes `local` and `guest` and the caller passed both.
+
+**2. `windows_mcp_doctor` said `online: true / state: ready / 19 registered tools`
+seconds after the computer had been powered off.** The panel had already flipped
+the row to `powered-off`; the doctor still described a live bridge, so the
+diagnostic that exists to explain a failure was the last thing to admit it.
+
+### A. `ssh -p PORT` and `scp -P PORT` are not the same flag
+
+ssh and scp share an argument *style*, not an argument *grammar*. ssh takes
+`-p PORT` (lowercase, with a value). scp takes `-P PORT` (**capital**), and scp's
+own `-p` means "preserve times/modes" and takes **no value**. scp also has no
+`-T`. `scpRun()` had been built by taking `sshBaseArgs()` and removing `-T`, which
+left the ssh port flag in place, so scp parsed it as a no-value flag and the port
+number was never consumed:
+
+```
+scp -q -i KEY -o … -p 47000 /host/file "cua@127.0.0.1:C:\guest"
+                           ^^ -p takes nothing, so 47000 is a POSITIONAL
+```
+
+OpenSSH reads scp positionals back-to-front: the **last** is the destination and
+everything before it is a **source**. `47000` landed in the source slot and the
+real local file became a second destination. The argv alone reproduces the error
+string, which is why it could be fixed and asserted without a guest.
+
+The fix is three small pieces, each with one job:
+
+```js
+// ONE option list, read by BOTH builders, so BatchMode / host-key policy /
+// ConnectTimeout / ServerAliveInterval cannot drift.
+const WINDOWS_SSH_OPTS = ['BatchMode=yes', 'StrictHostKeyChecking=no',
+  'UserKnownHostsFile=/dev/null', 'ConnectTimeout=10', 'ServerAliveInterval=15']
+
+function scpBaseArgs(meta) {                    // no -T: ssh-only
+  return [...windowsKeyArgs(meta),
+    ...WINDOWS_SSH_OPTS.flatMap((opt) => ['-o', opt]),
+    '-P', windowsSshPort(meta)]                 // scp's port flag, capital
+}
+
+export function buildScpArgv(meta, localPath, guestPath, { direction } = {}) {
+  const remote = `${meta?.user ?? 'cua'}@127.0.0.1:${String(guestPath)}`
+  const local = String(localPath)
+  const tail = direction === 'from-guest' ? [remote, local] : [local, remote]
+  return ['-q', ...scpBaseArgs(meta ?? {}), ...tail]
+}
+```
+
+`buildScpArgv` is **exported for the test**, not for a caller: the shape is the
+contract, and a shape can be asserted in a child process with a throwaway store.
+`scpRun()` now takes nothing but the direction and calls it, so no call site can
+build a second argv by hand. `put`, `get`, and the clipboard's temp-file copies all
+go through it.
+
+`tools/scp-argv-check.mjs` is the harness for the whole path: it points
+`DSH_CUA_SCP_BIN` and `DSH_CUA_SSH_BIN` at shell stubs that log their own argv,
+drives the **real** supervisor over its **real** unix socket (`{op:'put'}`,
+`{op:'get'}`, `windowsClipboardSet/Get`), and parses what the stubs recorded with
+OpenSSH's grammar. Two parsers, deliberately: ssh's `-p` takes a value, scp's does
+not — one parser cannot model both without hiding the bug.
+
+```
+put (to-guest)      [scp, …opts…, -P, PORT, LOCAL, user@host:GUEST]
+get (from-guest)    [scp, …opts…, -P, PORT, user@host:GUEST, LOCAL]
+```
+
+**48/48 checks**, including: the port is the value of `-P` and never a positional;
+ssh's `-p` is absent; `-T` is absent; both directions carry the same `-o` list in
+the same order; the Linux path is still `sb cp --local SRC DST` with no port flag;
+and a **control** that replays the old argv, parses `47000` as source positional 1,
+and prints the exact error string from the incident.
+
+### B. The doctor's verdict is the plugin's, not the probe's
+
+The probe was merged **over** the answer. `windowsMcpDoctor()` filled `online`
+from a cached probe result, so a handshake the supervisor had watched seconds
+earlier kept `online: true / state: ready / 19 tools` alive across a power-off.
+Read at face value, that is a diagnostic lying about the one thing it exists to
+report.
+
+The fix is an **order**, and the order is what is asserted:
+
+```js
+// ---- THE VERDICT COMES FIRST (THE STALE-PROBE FIX) ----
+//   1. the supervisor's own `vm-state` event — first-hand, newest;
+//   2. the plugin's own state (`WIN_MCP.online`, the registration map);
+//   3. the cached probe — DIAGNOSTIC DETAIL, aged and marked stale.
+const streamSaysOffline = streamState !== null
+  && WIN_MCP_NOT_ONLINE_STATES.has(String(streamState.state).toLowerCase())
+const online = streamSaysOffline !== true && WIN_MCP.online === true
+const probeStale = online !== true && probeAgeMs !== null && probeAgeMs > WIN_MCP_PROBE_STALE_MS
+const probeOverridden = online !== true && probeFacts.online === true
+```
+
+* **The verdict cannot consult the probe.** `online` is a conjunction of two
+  first-hand facts; `probeFacts` appears nowhere in it.
+* **A not-online `vm-state` is final.** `WIN_MCP_NOT_ONLINE_STATES` is
+  `powering-off, powered-off, shutting-down, shutdown, stopping, stopped,
+  suspended, paused, installing, creating, deleting, absent, removed, error` — any
+  of them makes `streamSaysOffline` true, and `online` is then false regardless of
+  what the probe remembers.
+* **The probe is still reported, as detail.** `probeAgeMs`, `probe.ageMs`,
+  `probe.stale` past `WIN_MCP_PROBE_STALE_MS = 5000`, and `probe.overridden` (the
+  probe still claimed a handshake and lost). It is not deleted: when the doctor
+  says offline, "the handshake answered 1.2 s ago and is now overridden" is useful
+  evidence, not noise.
+* **`onlineSource` has no bare `probe` value.** It is `stream:<state>`, `plugin`,
+  `plugin+probe` or `offline`. A probe alone can never be the reason a bridge
+  reads online.
+* **The payload order follows the decision order** — `online`, `state`,
+  `onlineSource`, then `probeAgeMs` and the `probe` block — and the transport
+  facts from `doctorFacts()` are spread **before** the verdict, so a client fact
+  can add detail but can never suppress `online`/`state`/`onlineSource`.
+* **`guiNote`** states the lane distinction in one sentence: the
+  `mcp__windows__*` tools are the element-level surface, `cua_vm_gui` screenshots
+  are the noVNC stream, not the guest framebuffer.
+
+The doctor still dials nothing extra: the probe it reports is the one the attach
+already made, and it answers in one fast round trip.
+
+| defect | measured | fix | where it is asserted |
+|---|---|---|---|
+| scp got ssh's `-p PORT` | `cua_vm_put` → `scp: stat local "47000": No such file or directory`; the port was source positional 1 | one `WINDOWS_SSH_OPTS` list, `scpBaseArgs` with `-P`, exported `buildScpArgv` owning both positionals by `direction` | `tools/scp-argv-check.mjs` (48 checks, stub binaries, real socket, control replays the old argv); `modules-unit` (WP-10: `-P` value, no `-p`, `47000` never a positional, same `-o` list both ways); `check-cua-vm` (13 supervisor needles) |
+| the doctor's probe outlived a power-off | `online: true / state: ready / 19 tools` seconds after the row went `powered-off` | verdict-first order (stream → plugin → probe-as-detail), `probeAgeMs`/`stale`/`overridden`, no bare `probe` in `onlineSource` | `modules-unit` (WP-10: the offsets — verdict before probe, `online` excludes `probeFacts`, the stale/overridden conjunctions, payload order); `check-cua-vm` (15 index.js needles) |
+
+### The files
+
+| file | change |
+|---|---|
+| `docker/cua-vm-supervisor.mjs` | `WINDOWS_SSH_OPTS` (the one shared list), `scpBaseArgs(meta)` (`-P`, no `-T`), exported `buildScpArgv(meta, localPath, guestPath, {direction})`, `scpRun` reduced to a call to it, `DSH_CUA_SCP_BIN` / `DSH_CUA_SSH_BIN` as test-only binary hooks |
+| `plugins/dsh-cua-vm/index.js` | `WIN_MCP_PROBE_STALE_MS`, `WIN_MCP_NOT_ONLINE_STATES`, `recordVmState` / `newestVmStateFor` / `stateLog`, verdict-first `windowsMcpDoctor` (`online`, `onlineSource`, `probeAgeMs`, `probe.stale`, `probe.overridden`), `guiNote` |
+| `tools/scp-argv-check.mjs` | **new** — the 48-check argv harness: two stub binaries, the real supervisor over its real socket, OpenSSH's grammar as two parsers, the old argv as a control |
+| `tools/check-cua-vm.mjs` | 13 supervisor needles (the shared list, `scpBaseArgs`, `buildScpArgv` + both `scpRun` directions, the two binary hooks, the error string) and 15 index.js needles (the stale window, the not-online set, `recordVmState`/`newestVmStateFor`, the verdict comment and conjunction, `probeAgeMs`/`stale`/`overridden`, `guiNote`) |
+| `tools/ci-gates.mjs` | `scp-argv-check.mjs` added to `REPO_GATES` — repository files only, so a push can always answer it |
+| `tests/modules-unit.mjs` | WP-10: `buildScpArgv` loaded in a child (throwaway store) and parsed as argv, plus the doctor's verdict order asserted by offset |
+| `README.md` / `plugins/dsh-cua-vm/README.md` | put/get on Windows is `scp` with `-P` (and scp's `-p` has no value), one shared option list and one argv builder; the doctor is verdict-first, a probe is detail (`probeAgeMs`/`stale`/`overridden`) and can never report a powered-off computer as online |
+| `BRANCH-NOTES.md` | this section |
+
+### Verify
+
+All of these, all exit 0, from the repo root:
+
+```bash
+node tools/check-cua-vm.mjs --root .      # 1087 assertions / 23 files
+node tools/check-cua-rea.mjs --root .     # 67 needles / 5 files
+node tools/scp-argv-check.mjs             # 48/48 checks
+node tests/modules-unit.mjs               # 361 assertions (WP-10 is this section)
+node tests/windows-boot.mjs               # 63 assertions
+node tests/windows-mcp-gate.mjs           # 45 assertions
+node tests/supervisor-smoke.mjs           # 254 assertions
+node tests/qmp-shutdown.mjs               # 7 assertions
+```
+
+Anchors, for a reviewer who wants to read the code instead of the tests:
+
+* `docker/cua-vm-supervisor.mjs` — `const WINDOWS_SSH_OPTS`, `function
+  scpBaseArgs(meta)`, `export function buildScpArgv(…, { direction } = {})`,
+  `const SCP_BIN`, `function scpRun(`.
+* `plugins/dsh-cua-vm/index.js` — `const WIN_MCP_PROBE_STALE_MS = 5000`, `const
+  WIN_MCP_NOT_ONLINE_STATES`, `function recordVmState(`, `function
+  newestVmStateFor(`, `---- THE VERDICT COMES FIRST`, `const online =
+  streamSaysOffline !== true && WIN_MCP.online === true`, `const probeStale`,
+  `const probeOverridden`, `const guiNote`.
+
+**Residual risk, named honestly.** The argv harness proves the *shape* and the
+*ordering*; it cannot prove the guest's `scp.exe` behaves like OpenSSH's on a path
+with a space (the remote side is parsed by `cmd.exe`, which is why guest paths with
+`"`, `&`, `|`, `<`, `>`, `^` are refused outright and only absolute drive paths are
+accepted). And the verdict order fixes *when* a probe may speak, not *how fresh*
+the stream is: if a supervisor is old enough to lack the `vm-state` subscription,
+source (2) — `WIN_MCP.online` — is the only source, and the poll beat
+(`DSH_CUA_MCP_STATE_POLL_MS`, 10 s) is what bounds the window. That is the pre-fix
+behaviour, deliberately, and the doctor says `stream.supported: false` when it
+happens.

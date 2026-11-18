@@ -457,12 +457,40 @@ itself.
 | Tool | How it works on Windows |
 |---|---|
 | `cua_vm_exec` | SSH → `cmd.exe` (the SSH key is per computer; `cwd` is `cd /d`) |
-| `cua_vm_put` / `cua_vm_get` | `scp` over the same key and port |
+| `cua_vm_put` / `cua_vm_get` | `scp` over the same key and port — **`-P`**, not ssh's `-p`; the local file is the source for a put and the destination for a get |
 | `cua_vm_gui` | QMP: `screendump` for a frame, `input-send-event` for clicks/keys |
 | `cua_vm_port` / Show VM | the **live view**: noVNC served by `cua-vnc-clip` (websockify as the fallback) and relayed at `/vm/port/<name>/` |
 | `cua_vm_suspend` | QMP `stop` (the VM pauses with its RAM); Start `cont`s it |
 | `cua_vm_shutdown` | QMP `system_powerdown` → a bounded 8 s wait → `powered-off` answered at once → the disk checkpoint converts in the background |
 | `cua_vm_disk`, Android, REA | not available (Linux-only), refused by name |
+
+**`put`/`get` are `scp`, and the port flag is the whole contract.** There is no 9p
+share on a Windows computer, so a copy rides the guest's OpenSSH server with the
+same per-computer key and the same forwarded port as `exec`. ssh's port flag is
+`-p PORT`; **scp's is `-P PORT`**, and scp's own `-p` means "preserve
+times/modes" and takes **no value**. A reused `sshBaseArgs()` (minus `-T`) therefore
+never consumed the port, and OpenSSH put it in a **positional** slot — and since
+scp reads positionals back-to-front (last = destination, the rest = sources) the
+port became a source file:
+
+```
+scp: stat local "47000": No such file or directory
+```
+
+The chain that replaces it is deliberately small: `WINDOWS_SSH_OPTS` is the ONE
+option list both builders read (so `BatchMode`, the host-key policy,
+`ConnectTimeout` and `ServerAliveInterval` cannot drift), `scpBaseArgs(meta)` emits
+`[…opts…, -P, port]` (no `-T`: that is ssh-only), and
+`buildScpArgv(meta, localPath, guestPath, { direction })` owns the positional pair —
+`to-guest` is `[LOCAL, user@host:GUEST]`, `from-guest` is the mirror. The whole
+argv is built in one place, which is what makes the shape assertable without a
+guest: `tools/scp-argv-check.mjs` points `DSH_CUA_SCP_BIN`/`DSH_CUA_SSH_BIN` at
+stub binaries, drives the real supervisor over its real socket (`put`, `get`, the
+clipboard's temp-file copies) and parses the recorded argv with OpenSSH's grammar —
+48 checks, including a control that replays the OLD argv and reproduces the error
+string above. `tests/modules-unit.mjs` pins the pure builder (`-P` holds the port,
+`-p` absent, `47000` never a positional, the same `-o` list in both directions) and
+`tools/check-cua-vm.mjs` pins the chain that feeds it.
 
 **Ceilings, stated plainly:** QMP typing is **ASCII-only** (physical keycodes —
 no `é`, no `中`), there is no accessibility tree and no window list on this path,
@@ -618,6 +646,28 @@ server.
 the revealed sessions, the keepalive and `gateError`. Offline, `leaks` MUST be
 empty; anything else is `status: "leaking"` and is exactly the bug this gate
 exists for.
+
+**Its verdict is computed FIRST, and a probe may never raise it.** The order of the
+sources is the contract:
+
+1. the supervisor's own `vm-state` stream — first-hand, newest, for the attached
+   computer (`newestVmStateFor`);
+2. the plugin's own state — `WIN_MCP.online` and the registration map;
+3. the cached probe answer — **diagnostic detail**, aged and labelled.
+
+`online` is `streamSaysOffline !== true && WIN_MCP.online === true`, so a
+`vm-state` carrying any of `WIN_MCP_NOT_ONLINE_STATES` (`powered-off`,
+`powering-off`, `stopped`, `suspended`, `deleting`, `error`, …) is final. The
+probe still runs — one fast round trip, never a second SSH session — but it is
+reported as `probeAgeMs`, `probe.ageMs`, `probe.stale` (past
+`WIN_MCP_PROBE_STALE_MS = 5000`) and `probe.overridden`, and `onlineSource` can
+only be `stream:<state>`, `plugin`, `plugin+probe` or `offline` — **never a bare
+`probe`**. This is the fix for a doctor that said `online: true / state: ready / 19
+tools` for seconds after a power-off: the probe used to be merged over the answer,
+and a handshake that answered five seconds ago is not evidence about a computer
+that is going down. The payload also carries `stream.stateEvents` and
+`stream.lastState`, so "why did it say offline?" is answerable from the payload
+itself.
 
 **It attaches only when the row is `ready` over SSH**, so it needs firstboot fixed:
 a computer whose `$OEM$` copy never ran has no `sshd`, never answers the banner,

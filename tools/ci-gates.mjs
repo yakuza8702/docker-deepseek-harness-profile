@@ -221,6 +221,12 @@ const REPO_GATES = [
   // coordinate space, the Windows backend, the proxy's console rewrite and the
   // compose wiring. All repository files, so a push can always answer it.
   { file: "check-cua-vm.mjs", args: [], label: "personal VM chain (spec → guest → proxy → compose)" },
+  // The Windows put/get chain, asserted as ARGV: a stub `scp`/`ssh` records its
+  // own argv, the real supervisor is driven over its real socket, and the
+  // recorded argv is parsed with OpenSSH's own grammar. `ssh -p` reused for scp
+  // put the port in a positional slot — `scp: stat local "47000"`. Repository
+  // files only (two shell stubs and a temp store), so a push can always answer.
+  { file: "scp-argv-check.mjs", args: [], label: "Windows put/get argv shape (scp -P, port never a path)" },
   { file: "check-recovery-page.mjs", args: [], label: "recovery page scripts parse" },
   { file: "check-tool-trim.mjs", args: [], label: "MCP catalogue trim policy" },
   // OFFLINE, and deliberately a HARD gate: the build-time bundle patches are

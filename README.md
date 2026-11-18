@@ -819,6 +819,29 @@ QEMU user-mode (SLIRP): outbound internet, host services at `10.0.2.2`, SSH
 forwarded to loopback. A bridge/tap is possible but not default — it needs
 `CAP_NET_ADMIN`.
 
+**Files in and out are `scp`, and the port flag is `-P`.** A Windows computer has
+no 9p share, so `cua_vm_put`/`cua_vm_get` copy over the guest's OpenSSH server
+with the same per-computer key and the same port `exec` uses. The trap is the flag
+itself: ssh takes **`-p PORT`** (lowercase, with a value), scp takes **`-P PORT`**
+(capital), and scp's own `-p` means "preserve times/modes" and takes **no value**.
+Reusing ssh's argument list therefore left the port unconsumed, and OpenSSH — which
+reads positionals back-to-front, last = destination, everything before = source —
+put it in a source slot. The copy failed with exactly:
+
+```
+scp: stat local "47000": No such file or directory
+```
+
+The two builders now share ONE option list (`WINDOWS_SSH_OPTS`: `BatchMode`, the
+host-key policy, `ConnectTimeout`, `ServerAliveInterval`) and `buildScpArgv(meta,
+localPath, guestPath, { direction })` owns the whole argv, so `to-guest` is
+`[…opts…, -P, PORT, LOCAL, user@host:GUEST]`, `from-guest` is its exact mirror, and
+the option list cannot drift back into ssh's spelling. `tools/scp-argv-check.mjs`
+drives the real supervisor over its real socket against stub `scp`/`ssh` binaries
+and parses the recorded argv with OpenSSH's own grammar — the port is never a
+positional, and the OLD argv is replayed as a control that still reproduces the
+error string (48 checks).
+
 **The hardware is INBOX-DRIVER hardware, for every code.** The disk is `ide-hd`
 on the q35 ICH9 **AHCI** controller and the NIC is **`e1000e`** — both drivers
 ship inside Windows itself, so a consumer image needs no extra media to see its
@@ -1229,6 +1252,25 @@ that surface (`leaks` is the raw prefix list, and offline it MUST be empty —
 `ServerAliveInterval=10` × `ServerAliveCountMax=2`, so a suspended or dead guest
 fails a call inside ~20 s with `vm-offline` instead of hanging on a half-open
 socket.
+
+**The doctor is verdict-first: a probe is detail, never the answer.**
+`windows_mcp_doctor` decides `online` from the plugin's own state — the stream's
+newest `vm-state` for the attached computer first, then its own `WIN_MCP.online`
+and registration map — and only then reports the live probe, as detail:
+`probeAgeMs`, `probe.ageMs`, `probe.stale` (past `WIN_MCP_PROBE_STALE_MS = 5000`)
+and `probe.overridden` (the probe still claimed a handshake and lost).
+`onlineSource` is therefore `stream:<state>`, `plugin`, `plugin+probe` or
+`offline` — there is deliberately no bare `probe` value, because a probe must
+never be the only thing holding a dead bridge online. A `vm-state` carrying a
+not-online state (`powered-off`, `powering-off`, `suspended`, `deleting`, …) is
+final: the probe cannot raise `online` back to true over it. That order is the fix
+for a doctor that reported `online: true / state: ready / 19 tools` for seconds
+after a power-off — the cached probe was merged *over* the verdict, and "the
+handshake answered five seconds ago" is not evidence about a computer that is
+going down. The probe still runs (one fast round trip, no second SSH session), so
+the payload gains detail without ever contradicting the state machine. The same
+`guiNote` line says which lane is which: the `mcp__windows__*` tools are the
+element-level surface, `cua_vm_gui` screenshots are the noVNC stream.
 
 `DSH_CUA_VM_WIN_MCP=0` disables the whole path (no tools, no attach).
 `DSH_CUA_MCP_STATE_POLL_MS` (default 10000, floor 1000) is the state-poll beat.

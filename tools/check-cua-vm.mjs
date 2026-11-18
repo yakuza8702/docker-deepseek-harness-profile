@@ -612,7 +612,29 @@ const NEEDLES = {
     ['const capabilities = relayCapabilities(snapshot, rawVncPort)', 1],
     ['view: capabilities.view, clipboard: capabilities.clipboard', 1],
     ['const CLIPBOARD_NO_VIEW_REASON', 1],
-    ['const CLIPBOARD_RAW_VNC_REASON', 1]
+    ['const CLIPBOARD_RAW_VNC_REASON', 1],
+    // WP-10: THE scp PORT BUG (`scp: stat local "47000"`).
+    // ssh's port flag is `-p PORT`; scp's `-p` means "preserve times/modes" and
+    // takes NO VALUE, so reusing sshBaseArgs made the port a POSITIONAL — a
+    // source file. The chain below is the fix: ONE shared option list, a
+    // dedicated scpBaseArgs with `-P`, a direction-driven positional pair, and a
+    // builder that owns the whole argv. `tools/scp-argv-check.mjs` drives this
+    // real path against stub binaries and parses the recorded argv.
+    ['const WINDOWS_SSH_OPTS = [', 1],
+    ["scp takes `-P PORT` (CAPITAL)", 1],
+    ['function scpBaseArgs(meta)', 1],
+    ["'-P', windowsSshPort(meta)", 1],
+    ['export function buildScpArgv(meta, localPath, guestPath, { direction } = {})', 1],
+    ["const tail = direction === 'from-guest' ? [remote, local] : [local, remote]", 1],
+    ["return ['-q', ...scpBaseArgs(meta ?? {}), ...tail]", 1],
+    ['const args = buildScpArgv(meta, localPath, guestPath, { direction })', 1],
+    ['scp: stat local "47000": No such file or directory', 1],
+    // The two binaries are test hooks ONLY: a stub records argv so the shape can
+    // be asserted without a guest. Nothing in production sets either one.
+    ['const SSH_BIN = process.env.DSH_CUA_SSH_BIN', 1],
+    ['const SCP_BIN = process.env.DSH_CUA_SCP_BIN', 1],
+    ['scpRun(putMeta, source, assertWindowsGuestPath(guest), { direction: \'to-guest\' })', 1],
+    ['scpRun(getMeta, absolute, assertWindowsGuestPath(guest), { direction: \'from-guest\' })', 1]
   ],
   space: [
     ['export const CAPTURE_MAX_PIXELS = 900_000', 1],
@@ -1856,7 +1878,28 @@ const NEEDLES = {
     ['windows mcp transport: interactive-relay (port ${facts.relayPort}, relay ${relay})', 1],
     ["if (facts.transport === 'session-0-direct')", 1],
     ['windows mcp transport: session-0 fallback: ${detail}', 1],
-    ['not attached yet (no lane decided in this process)', 1]
+    ['not attached yet (no lane decided in this process)', 1],
+    // WP-10: THE DOCTOR'S STALE PROBE (`online: true / state: ready` seconds
+    // after a power-off). The verdict is built FIRST from the stream's newest
+    // vm-state and the plugin's own state; a live probe is DETAIL, aged by
+    // `probeAgeMs`, flagged `stale` past WIN_MCP_PROBE_STALE_MS and `overridden`
+    // when the plugin's answer beat it. There is no bare `probe` in
+    // `onlineSource`, on purpose: a probe alone may never hold a dead bridge up.
+    ['const WIN_MCP_PROBE_STALE_MS = 5000', 1],
+    ['const WIN_MCP_NOT_ONLINE_STATES = new Set([', 1],
+    ['function recordVmState(name, state)', 1],
+    ['WIN_MCP_STREAM.stateLog.push(row)', 1],
+    ['function newestVmStateFor(names)', 1],
+    ['// ---- THE VERDICT COMES FIRST (THE STALE-PROBE FIX) ----', 1],
+    ['const streamSaysOffline = streamState !== null', 1],
+    ['const online = streamSaysOffline !== true && WIN_MCP.online === true', 1],
+    ['const onlineSource = streamSaysOffline === true', 1],
+    ['const probeAgeMs = probeAt > 0 ? Math.max(0, Date.now() - probeAt) : null', 1],
+    ['const probeStale = online !== true && probeAgeMs !== null && probeAgeMs > WIN_MCP_PROBE_STALE_MS', 1],
+    ['const probeOverridden = online !== true && probeFacts.online === true', 1],
+    ['probeAgeMs,', 1],
+    ['overridden: probeOverridden', 1],
+    ['const guiNote = \'desktop automation uses the MCP windows tools; cua_vm_gui screenshots are the noVNC stream, not a framebuffer\'', 1]
   ],
   proxy: [
     ['export function prefixRootPaths(text, prefix)', 1],
