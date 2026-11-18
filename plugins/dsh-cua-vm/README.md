@@ -88,6 +88,17 @@ the device handles all stay.
 6. `sb rm --force` — the sandbox is removed *because* the computer is off;
 7. `state: "powered-off"` + `restoreFrom: { kind: "checkpoint" | "image" }`.
 
+**A guest can also shut itself down, and the row follows.** `shutdown /s` in the
+console, Windows Update, a user in the noVNC page — none of those pass through
+this process, so the row used to keep claiming `ready`. While the row is live a
+QMP poll asks `query-status` every **3 s** (`DSH_CUA_VM_STATE_POLL_S`, clamped
+1–30): `shutdown` finalises it as `powered-off` with
+**`method: "guest-shutdown"`**, running the same checkpoint + `restoreFrom`
+bookkeeping the ACPI path uses (same quota/policy refusals), so Start cold-boots
+from a real restore point; `paused` becomes `suspended` (reversible — never a
+checkpoint of a live disk); a vanished QEMU is an unconfirmed `powered-off`
+(`mayBeTorn`, no clean restore point).
+
 **The trap:** `cua sb resume` only works while cua still knows the sandbox. A
 powered-off computer has none, so `resume` answers "sandbox not found" for ever
 and every Start button was a dead end. `cua_vm_start` therefore *never* resumes a
@@ -211,8 +222,8 @@ $STORE/windows/<name>/serial.log          the console — the install progress
 |---|---|
 | firmware | **OVMF** (`OVMF_CODE_4M.fd` shared, per-computer `efi-vars.qcow2`), so boot entries survive restarts |
 | TPM | **swtpm** on a unix socket, `tpm-crb` in the guest — a real TPM 2.0, not a registry bypass (the Secure Boot check *is* bypassed: OVMF here is the non-secure-boot build, and that is stated in the answer file) |
-| disk | qcow2, AHCI by default; **virtio-blk** when a virtio-win ISO is provided |
-| NIC | SLIRP user-mode networking, `e1000e` by default; virtio-net with the driver ISO |
+| disk | qcow2 on the q35 ICH9 **AHCI** controller (`ide-hd`, an IDE-class disk whose driver is inbox since Vista) for every Windows code |
+| NIC | SLIRP user-mode networking with **`e1000e`** (inbox) — the guest gets a lease and OpenSSH with no extra media. `DSH_CUA_WINDOWS_VIRTIO=1` (AND `virtio: true` on the create) swaps BOTH to `virtio-blk-pci` + `virtio-net-pci` for an image that carries the virtio-win drivers |
 | input | `usb-tablet` (absolute pointer — what QMP `input-send-event` needs) + `usb-kbd` |
 | display | `VGA` by default. With Enable GPU: `virtio-gpu-gl-pci` + `egl-headless` on the render node **when `qemu -device help` lists `virtio-gpu-gl-pci` and `/dev/dri/renderD128` exists** (the same probe the Linux guest uses); otherwise a plain `virtio-gpu-pci`. The choice is made once at create, stored on the row, and reused by every later boot |
 | control | QMP on loopback; VNC on loopback for the live view |
@@ -226,6 +237,12 @@ Direct3D runs on **WARP (CPU)** and OpenGL is not hardware-accelerated. Expect 2
 and desktop composition to be fine and anything 3D to be slow. On NVIDIA hosts the
 QEMU process may show an EGL handle in `nvidia-smi` — that is the host-side
 context of the display device, **not** acceleration inside the guest.
+
+**`gpu: true` for Windows means "a virtio display", full stop.** There is **no
+NVIDIA (or any) 3D acceleration** in the guest and no plan to pretend otherwise;
+GPU passthrough (**VFIO**) is not implemented — it is a roadmap item
+(`docs/cua-capability-roadmap.md`) and would need an IOMMU group, a second GPU and
+a host driver handoff this image does not perform.
 
 ### Install media
 
@@ -375,8 +392,18 @@ default that let one collision consume the whole window.
 An install-phase QEMU boots the Microsoft ISO (`cd0`) and the answer medium
 (`setup0`, a removable usb-storage stick), and that **same process** keeps
 running after Setup finishes. Without cleanup a freshly `ready` computer still
-showed the Windows DVD and the **SETUP (D:)** volume. At the ready transition the
-supervisor now calls `detachInstallMedia()`:
+showed the Windows DVD and the **SETUP (D:)** volume.
+
+**They leave when Setup finishes COPYING, not at Ready.** Ejecting at the ready
+transition needs the SSH banner, and a guest whose NIC has no driver never
+answers SSH — so the row stayed `installing` with SETUP (D:) mounted for the life
+of the session. A watcher re-reads the serial tail every 15 s and triggers on the
+first copy-done evidence (`Windows Setup is complete/completed/finished`, `Setup
+has finished copying`, `Setup is applying system settings`, or a boot-from-disk
+line), BEFORE SSH/MCP are up. It stops the cdboot presses first (a re-armed cycle
+must not type into the disk boot), requires QMP `running`, and is bounded by
+`DSH_CUA_WINDOWS_EJECT_WATCH_MIN` (90 min). The ready transition re-runs
+`detachInstallMedia()`, which is idempotent:
 
 1. `query-block` (so an already-clean session is silent),
 2. QMP `eject` on `cd0` with `force: true`,
@@ -848,6 +875,9 @@ re-ran a ten-minute script on every start and failed on the same line.
 | `DSH_CUA_WINDOWS_SWTPM` | `/usr/bin/swtpm` | the TPM2 emulator |
 | `DSH_CUA_WINDOWS_VIRTIO_ISO` | *(unset)* | a virtio-win ISO; without it the disk is AHCI and the NIC e1000e |
 | `DSH_CUA_WINDOWS_ISO_TIMEOUT_MS` | `3600000` | bound on the one-time ISO download |
+| `DSH_CUA_WINDOWS_VIRTIO` | *(unset)* | `1` + `virtio: true` swaps the inbox AHCI disk/`e1000e` NIC for `virtio-blk-pci`/`virtio-net-pci` (only for an image that carries the drivers) |
+| `DSH_CUA_WINDOWS_EJECT_WATCH_MIN` | `90` | how long the media watcher waits for "Setup finished copying" before it leaves the eject to the ready transition (clamped 1–600 min) |
+| `DSH_CUA_VM_STATE_POLL_S` | `3` | QMP `query-status` interval while a Windows row is live (clamped 1–30); this is how a guest-initiated shutdown becomes `powered-off` |
 | `DSH_CUA_WINDOWS_CDBOOT_PROMPT_MS` | `90000` | how long the serial log is watched for the cdboot prompt (300 ms poll; presses fire on the poll that sees it) |
 | `DSH_CUA_WINDOWS_CDBOOT_PRESS_MS` | `3000` | the QMP budget for ONE Enter press — the 15 s default let one busy-monitor collision consume the whole window |
 | `DSH_CUA_WINDOWS_CDBOOT_CYCLES` / `_WATCH_MS` | `12` / `180000` | re-arm budget when BDS reprints the prompt, bounded by the watch and by the QEMU staying alive |

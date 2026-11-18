@@ -540,6 +540,20 @@ const NEEDLES = {
     // loopback ports, so the next process lost the port race or relayed to a
     // bridge whose supervisor socket was gone.
     ['const SHUTDOWN_LIVE_VIEW_DEADLINE_MS = 2000', 1],
+    // P4: A GUEST-INITIATED SHUTDOWN IS OBSERVED, not inferred. A 3 s
+    // query-status poll turns `shutdown` into powered-off with the SAME checkpoint
+    // + restore-source bookkeeping the ACPI path uses (`method: guest-shutdown`),
+    // and `paused` into suspended (reversible; never a checkpoint of a live disk).
+    ['const QMP_STATE_POLL_DEFAULT_S = 3', 1],
+    ['function qmpStatePollMs()', 1],
+    ['DSH_CUA_VM_STATE_POLL_S', 1],
+    ['function startQmpStatePoll(name)', 1],
+    ['const watcher = startQmpStatePoll(name)', 1],
+    ['async function windowsCheckpointPlan(name, config)', 1],
+    ['async function finaliseGuestShutdown(name, { status = \'\', clean = false } = {})', 1],
+    ['async function finaliseGuestPause(name, status)', 1],
+    ['method: \'guest-shutdown\'', 1],
+    ["{ reason: 'guest-shutdown' }", 1],
     ['const QMP_CONNECT_TIMEOUT_MS = 2000', 1],
     ['function qmpCommands(port, commands, { timeoutMs = null, defaultTimeout = null, connectTimeoutMs = QMP_CONNECT_TIMEOUT_MS, host = \'127.0.0.1\' } = {})', 1],
     ['const fallbackTimeout = Number(defaultTimeout) > 0 ? Number(defaultTimeout) : 0', 1],
@@ -742,7 +756,16 @@ const NEEDLES = {
     ['user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22', 1],
     // The NIC follows the same profile as the disk and the firmware: a BIOS
     // guest gets e1000e (an inbox Windows 7 driver), never virtio.
-    ['legacyBios ? `${firmware.nic},netdev=net0`', 1],
+    // P2: THE DEVICE CLASS IS ONE DECISION. Default is the profile's INBOX
+    // hardware (ide-hd on q35 AHCI / e1000e) for EVERY code; virtio only when the
+    // operator opts in with DSH_CUA_WINDOWS_VIRTIO=1 (an image that carries the
+    // virtio-win drivers). The old `legacyBios ? ...` ternary made it a firmware
+    // question, which is how a UEFI guest got a NIC with no inbox driver.
+    ['const wantVirtio = String(process.env.DSH_CUA_WINDOWS_VIRTIO ?? \'\') === \'1\' && spec.virtio === true', 1],
+    ['const diskDevice = wantVirtio ? \'virtio-blk-pci\' : firmware.disk', 1],
+    ['const nicDevice = wantVirtio ? \'virtio-net-pci\' : firmware.nic', 1],
+    ["'-device', `${nicDevice},netdev=net0`", 1],
+    ['DSH_CUA_WINDOWS_VIRTIO', 1],
     // absolute pointer + keyboard: the QMP input path depends on both
     ["'-device', 'usb-tablet'", 1],
     ["'-device', 'usb-kbd'", 1],
@@ -822,6 +845,21 @@ const NEEDLES = {
     // and the caller reads RESULT refusals too (kept: the boot path's own sweep)
     ['const refused = cdbootPressFailure(result)', 1],
     ['const refused = cdbootPressFailure(replies)', 1],
+    // P1: THE MEDIA LEAVE WHEN SETUP FINISHES COPYING — not at READY, which
+    // needs the SSH banner. A guest whose NIC has no driver never answers SSH, so
+    // the row stayed `installing` with SETUP (D:) mounted for the session.
+    ['export const WINDOWS_SETUP_COPY_DONE_PATTERN', 1],
+    ['export function windowsSetupCopyFinished(serialText)', 1],
+    ['export const WINDOWS_MEDIA_EJECT_POLL_MS = 15000', 1],
+    ['export function windowsMediaEjectWatchMs()', 1],
+    ['DSH_CUA_WINDOWS_EJECT_WATCH_MIN', 1],
+    ['const startMediaWatcher = (mediaChild) => {', 1],
+    // both boot paths arm it: the first attempt AND the GPU-fallback retry
+    ['if (installPending) startMediaWatcher(first.child)', 1],
+    ['if (installPending) startMediaWatcher(retry.child)', 1],
+    ['install media detached after Setup finished copying (before SSH/MCP)', 1],
+    // P2: the profile table now names INBOX hardware for BOTH firmwares.
+    ["ovmf: Object.freeze({ machine: 'q35', bios: 'ovmf', tpm: true, efiVars: true, disk: 'ide-hd', nic: 'e1000e' })", 1],
     ['export function cdbootKeyScheduleMs()', 1],
     ['export async function runCdbootKeys({', 1],
     ['if (installPending && cdbootKeysEnabled() && child?.pid)', 1],
@@ -1072,8 +1110,9 @@ const NEEDLES = {
     ['export function windowsFirmwareForSpec(spec = {})', 1],
     ['...(firmware.efiVars', 1],
     ['...(firmware.tpm', 1],
-    ["? `${firmware.disk},drive=disk0,bus=ide.0,bootindex=${diskBootIndex}`", 1],
-    ['legacyBios ? `${firmware.nic},netdev=net0`', 1],
+    [": `${diskDevice},drive=disk0,bus=ide.0,bootindex=${diskBootIndex}`", 1],
+    ["? `virtio-blk-pci,drive=disk0,bootindex=${diskBootIndex}`", 1],
+    ["'-device', `${nicDevice},netdev=net0`", 1],
     // THE SELECTION IS DERIVED FROM THE CATALOG, so a code rename cannot leave
     // a hand-written table pointing at a spelling the catalog dropped.
     ['export function resolveWindowsImageSelection({', 1],
@@ -1802,7 +1841,10 @@ function sourceOf(label, name) {
     // the disk Autounattend.xml's <DiskID>0</DiskID> targets. This is an ORDER
     // assertion, not a presence one: reordering the argv silently partitions the
     // answer medium instead.
-    const diskAttach = windowsSource.indexOf('ide-hd,drive=disk0,bus=ide.0')
+    // P2: the disk device now comes from `diskDevice` (ide-hd by default, virtio
+    // on request), so the ORDER anchor is the bus, not the model name — a
+    // renamed model must not silently turn this assertion into a no-op.
+    const diskAttach = windowsSource.indexOf(',drive=disk0,bus=ide.0')
     const setupDrive = windowsSource.indexOf('id=setup0')
     const setupAttach = windowsSource.indexOf('usb-storage,drive=setup0,removable=on')
     const xhciAttach = windowsSource.indexOf('qemu-xhci,id=xhci')

@@ -1501,15 +1501,29 @@ async function guestWindowTitles(name) {
 }
 
 /** QMP's own power status for a Windows computer, or '' when it cannot answer. */
-async function windowsQmpStatus(meta) {
+/**
+ * `query-status`, with the two facts a poller needs kept APART: "what did the
+ * monitor say" and "did it say anything at all". The old one-string version
+ * could not distinguish a paused guest from a dead QEMU, which is exactly the
+ * distinction the guest-shutdown watcher turns into powered-off.
+ */
+async function windowsQmpStatusDetail(meta, { timeoutMs = 8000 } = {}) {
   const port = Number(meta?.ports?.qmp ?? 0)
-  if (!(port > 0)) return ''
+  if (!(port > 0)) return { answered: false, status: '', error: 'no QMP port on the row' }
   try {
-    const answer = await qmpCommands(port, [{ execute: 'query-status' }], { timeoutMs: 8000 })
-    return String(answer?.[0]?.return?.status ?? '')
-  } catch {
-    return ''
+    const answer = await qmpCommands(port, [{ execute: 'query-status' }], { timeoutMs })
+    const status = String(answer?.[0]?.return?.status ?? '')
+    if (status === '') return { answered: false, status: '', error: 'query-status answered without a status' }
+    return { answered: true, status, error: '' }
+  } catch (error) {
+    return { answered: false, status: '', error: String(error?.message ?? error) }
   }
+}
+
+/** The status string, or '' — the shape the effects read-back already used. */
+async function windowsQmpStatus(meta) {
+  const verdict = await windowsQmpStatusDetail(meta)
+  return verdict.answered === true ? verdict.status : ''
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -3439,6 +3453,9 @@ async function resumeVmLocked(name) {
       row.state = 'ready'
       row.lastUsed = new Date().toISOString()
     })
+    // The poll left when the row said `suspended`; a resumed guest is watched
+    // again from this second, or its next self-shutdown is invisible.
+    installQmpStateWatcher(name)
     // X7: suspend closed the preview; resume rebuilds it HERE, not on the next
     // status/view call (the panel showed a dead tab until then).
     await ensureWindowsConsoleRelay(name)
@@ -4246,9 +4263,138 @@ function scheduleQmpState(name, event) {
  * Windows start. Returns false — never throws — when the backend has no
  * `watchEvents`, because that is a supported configuration, not a failure.
  */
+/* ------------------------------------------------------------------ *
+ * THE SUPERVISOR-OWNED STATUS WATCHER (what actually sees a guest shutdown)
+ *
+ * `installQmpStateWatcher` below prefers an EVENT stream, but the backend has
+ * no `watchEvents` — so for as long as that is true this poll is the only thing
+ * in the process that notices a guest powering itself off. The user's path is
+ * Start → Shut down inside Windows (through noVNC): QEMU exits, and without an
+ * observer the row stayed `ready` and the panel kept offering a desktop that no
+ * longer existed.
+ *
+ * One loop per computer, alive only while the row is live: query-status every
+ * DSH_CUA_VM_STATE_POLL_S seconds (default 3, clamped 1-30), stop on anything
+ * that is not a running computer, stop on the first non-transient verdict.
+ * The timer is unref'd, so an idle supervisor can still exit.
+ * ------------------------------------------------------------------ */
+const QMP_STATE_POLL_DEFAULT_S = 3
+const QMP_STATE_POLL_MIN_S = 1
+const QMP_STATE_POLL_MAX_S = 30
+/** States in which a guest may legitimately disappear under us. */
+const QMP_POLLABLE_STATES = new Set(['ready', 'running', 'booting', 'installing'])
+/** Two consecutive unanswered polls before a READY row is called gone: one
+ *  miss is a restarting daemon or a busy monitor, two is six seconds. */
+const QMP_POLL_MAX_MISSES = 2
+
+/** The interval, from the environment, clamped to something sane. */
+function qmpStatePollMs() {
+  const raw = Number(process.env.DSH_CUA_VM_STATE_POLL_S)
+  const seconds = Number.isFinite(raw) && raw > 0 ? raw : QMP_STATE_POLL_DEFAULT_S
+  return Math.round(Math.min(QMP_STATE_POLL_MAX_S, Math.max(QMP_STATE_POLL_MIN_S, seconds)) * 1000)
+}
+
+function startQmpStatePoll(name) {
+  const intervalMs = qmpStatePollMs()
+  let stopped = false
+  let timer = null
+  let ticking = false
+  let misses = 0
+  const stop = () => {
+    stopped = true
+    if (timer !== null) clearTimeout(timer)
+    timer = null
+  }
+  const schedule = (delay = intervalMs) => {
+    if (stopped) return
+    timer = setTimeout(tick, delay)
+    timer.unref?.()
+  }
+  const liveRow = () => {
+    try {
+      const row = readRegistry().vms[name]
+      if (!row || row.kind !== 'windows') return null
+      return QMP_POLLABLE_STATES.has(String(row.state)) ? row : null
+    } catch {
+      // An unreadable registry is not evidence that the computer is gone.
+      return null
+    }
+  }
+  const tick = async () => {
+    timer = null
+    if (stopped || ticking) return
+    ticking = true
+    try {
+      const row = liveRow()
+      if (row === null) { stop(); return }
+      const verdict = await windowsQmpStatusDetail(row, { timeoutMs: Math.min(5000, Math.max(1500, intervalMs)) })
+      if (stopped) return
+      if (verdict.answered === true) {
+        misses = 0
+        if (verdict.status === 'shutdown') {
+          // THE CLEAN CASE: the guest asked QEMU to power off.
+          await finaliseGuestShutdown(name, { status: verdict.status, clean: true })
+          stop()
+          return
+        }
+        if (verdict.status === 'paused' || verdict.status === 'paused-incoming') {
+          // Not "powered off": paused is suspend, and our own suspend produces
+          // it. Record it as suspended and leave the loop (resume reinstalls).
+          await finaliseGuestPause(name, verdict.status)
+          stop()
+          return
+        }
+        return
+      }
+      // NO ANSWER. A dead pid is proof; a missing pidfile is not.
+      misses += 1
+      const pid = windowsBackend.qemuPid(name)
+      const alive = pid > 0 ? windowsBackend.pidAlive(pid) === true : null
+      if (pid > 0 && alive === false) {
+        await finaliseGuestShutdown(name, { status: '', clean: false })
+        stop()
+        return
+      }
+      const readyish = row.state === 'ready' || row.state === 'running'
+      if (pid === 0 && readyish && misses >= QMP_POLL_MAX_MISSES) {
+        // A ready computer with no pidfile AND no monitor is gone; the bare
+        // "port refused" case is covered by the same evidence.
+        await finaliseGuestShutdown(name, { status: '', clean: false })
+        stop()
+        return
+      }
+    } catch (error) {
+      log(`windows: ${name} state poll skipped a tick (${error?.message ?? error})`)
+    } finally {
+      ticking = false
+      schedule()
+    }
+  }
+  schedule(intervalMs)
+  return { stop, poll: true, intervalMs, active: () => stopped !== true }
+}
+
 function installQmpStateWatcher(name) {
-  if (typeof windowsBackend?.watchEvents !== 'function') return false
+  // IDEMPOTENT: this is called from every start, resume, ready transition and
+  // status poll. Re-installing on each of those would reset the poll's miss
+  // counter and its backoff, so a live watcher is left alone.
+  const existing = QMP_WATCHERS.get(name)
+  if (existing !== undefined && (typeof existing.active !== 'function' || existing.active() === true)) return true
   dismantleQmpStateWatcher(name)
+  if (typeof windowsBackend?.watchEvents !== 'function') {
+    // THE FALLBACK THAT IS TODAY'S ONLY PATH. The backend exposes no event
+    // stream, so the supervisor polls its own monitor; when `watchEvents` lands
+    // the branch below takes over and this is inert.
+    try {
+      const watcher = startQmpStatePoll(name)
+      QMP_WATCHERS.set(name, watcher)
+      log(`windows: ${name} state watch = QMP poll every ${watcher.intervalMs} ms (the backend has no event stream)`)
+      return true
+    } catch (error) {
+      log(`windows: ${name} state poll could not start (${error?.message ?? error}); a guest shutdown will only be seen by the next status call`)
+      return false
+    }
+  }
   try {
     const handle = windowsBackend.watchEvents(readRegistry().vms[name] ?? { name }, {
       onChange: (event) => scheduleQmpState(name, event)
@@ -4637,6 +4783,10 @@ function watchWindowsInstall(name) {
         })
         if (decision.stop) {
           if (decision.ready) await ensureWindowsConsoleRelay(name)
+          // A computer that became ready through the CREATE path (not through
+          // Start) needs the state watch too, or its first self-shutdown is the
+          // one nobody sees.
+          if (decision.ready) installQmpStateWatcher(name)
           // D2: THE MEDIA LEAVE WITH THE INSTALL. This is the READY transition:
           // the desktop is up, the SSH banner answered, firstboot has finished.
           // Ejecting here (and not at "the disk booted") matters because the
@@ -5608,6 +5758,139 @@ async function windowsEnsure(name, meta) {
  * are where the QMP socket lives (a row field, not a cua cmdline) and the swtpm
  * process, which is stopped with the guest.
  */
+/**
+ * THE CHECKPOINT A STOPPED WINDOWS COMPUTER SHOULD GET.
+ *
+ * One function, two callers (the shutdown op and the guest-shutdown watcher), so
+ * `checkpointPolicy`, the store quota and the "no disk" case can never mean two
+ * different things depending on WHO noticed that the guest was gone.
+ * Returns the path (or null), the human sentence and the structured skip record
+ * the row stores.
+ */
+async function windowsCheckpointPlan(name, config) {
+  let checkpoint = null
+  let checkpointSkipped = ''
+  let checkpointSkippedRecord = null
+  if (config.checkpointPolicy === 'never') {
+    checkpointSkipped = 'checkpointPolicy=never'
+    checkpointSkippedRecord = checkpointSkipRecord('policy', checkpointSkipped)
+    return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+  }
+  const paths = windowsPaths(STORE, name)
+  const diskBytes = (() => { try { return statSync(paths.disk).size } catch { return 0 } })()
+  const existing = (() => { try { return statSync(path.join(CHECKPOINT_DIR, `${name}.qcow2`)).size } catch { return 0 } })()
+  const over = await refuseOverQuota(config, Math.max(0, diskBytes - existing))
+  if (over !== null) {
+    checkpointSkipped = 'the checkpoint does not fit the store quota'
+    checkpointSkippedRecord = checkpointSkipRecord('quota', `${checkpointSkipped} (${over})`)
+    return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+  }
+  // WINDOWS: its disk is under $STORE/windows/<name>/, not the cua vmm tree.
+  const captured = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
+  checkpoint = checkpointPathOf(captured)
+  if (checkpoint === null) {
+    checkpointSkipped = 'no disk to checkpoint'
+    checkpointSkippedRecord = checkpointSkipRecord(captured?.reason ?? 'no-disk', captured?.detail ?? '')
+  }
+  return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+}
+
+/**
+ * THE GUEST SHUT ITSELF DOWN — record it exactly like the shutdown op would.
+ *
+ * This is the half the supervisor could not see before: a user powering off
+ * from inside Windows (Start → Shut down, seen through noVNC) exits QEMU, and
+ * nothing in this process was watching, so the row stayed `ready` and the panel
+ * kept offering a desktop that did not exist.
+ *
+ * The bookkeeping is the SAME as `windowsShutdown`'s: close the previews, take
+ * the checkpoint through the shared planner, write `powered-off` + `restoreFrom`
+ * so Start cold-boots the disk it was told about. The differences are honest
+ * ones:
+ *   * `method: 'guest-shutdown'`, because no ACPI request came from here;
+ *   * no `resetPointer`/`forced` handling — there is nothing left to force;
+ *   * a stop we did NOT see a clean status for (the socket went away and the
+ *     pid is gone) marks the checkpoint stale + `mayBeTorn`, so Start boots the
+ *     existing disk instead of trusting an image taken from a killed QEMU.
+ */
+async function finaliseGuestShutdown(name, { status = '', clean = false } = {}) {
+  return withVmLock(name, async () => {
+    const meta = readRegistry().vms[name]
+    if (!meta || meta.kind !== 'windows') return false
+    // ALREADY RECORDED, BY US OR BY THE SHUTDOWN OP: one write is the contract.
+    if (meta.state === 'powered-off') return false
+    const config = readConfig()
+    // The console and every forwarded port died with the guest. Closing them
+    // here is what stops /vm/port/<name>/ pointing at a dead VNC socket.
+    closePorts(name)
+    stopLiveView(name)
+    const { checkpoint, checkpointSkipped, checkpointSkippedRecord } = await windowsCheckpointPlan(name, config)
+    const abrupt = clean !== true
+    const at = new Date().toISOString()
+    await mutateRegistryWith((registry) => {
+      const row = registry.vms[name]
+      if (!row || row.kind !== 'windows' || row.state === 'powered-off') return
+      row.state = 'powered-off'
+      row.stateFrom = 'qmp-poll'
+      row.lastUsed = at
+      row.lastShutdown = {
+        at,
+        method: 'guest-shutdown',
+        reason: 'the guest shut itself down (QMP query-status)',
+        ...(status === '' ? {} : { qmpStatus: status }),
+        ...(abrupt ? { unconfirmed: true } : {}),
+        ...(checkpointSkipped !== '' ? { checkpointSkipped } : {})
+      }
+      row.restoreFrom = checkpoint !== null
+        ? {
+            kind: 'checkpoint',
+            file: checkpoint,
+            // A checkpoint from a QEMU that vanished without saying `shutdown`
+            // may be torn; Start must boot the existing disk instead of it.
+            ...(abrupt ? { stale: true, staleReason: 'QEMU disappeared without a clean QMP shutdown status' } : {})
+          }
+        : { kind: 'image', image: 'windows' }
+      if (checkpointSkippedRecord !== null) row.checkpointSkipped = checkpointSkippedRecord
+      else delete row.checkpointSkipped
+      if (abrupt) row.mayBeTorn = true
+      else delete row.mayBeTorn
+      // A finished computer has no install stage to describe any more.
+      delete row.installStage
+      delete row.bootedAt
+    }, { reason: 'guest-shutdown' })
+    emitVmState(name, 'powered-off', 'the guest shut itself down (QMP query-status)')
+    log(`windows: ${name} powered itself off (${status === '' ? 'QEMU disappeared' : `QMP ${status}`})${abrupt ? ', unconfirmed' : ', clean'}: ${checkpoint !== null ? 'checkpoint captured' : 'no checkpoint'} — Start cold-boots from it`)
+    return true
+  })
+}
+
+/**
+ * The guest is PAUSED, not gone.
+ *
+ * `paused`/`paused-incoming` is what QMP `stop` produces — including THIS
+ * process's own suspend op and the idle timer. Treating it as powered-off would
+ * checkpoint a live disk and throw away the guest's RAM, so it is recorded as
+ * `suspended`: true, reversible, and Start's `cont` resumes it where it was.
+ * Only `shutdown` (and a vanished QEMU) means powered-off.
+ */
+async function finaliseGuestPause(name, status) {
+  let wrote = false
+  await mutateRegistryWith((registry) => {
+    const row = registry.vms[name]
+    if (!row || row.kind !== 'windows') return
+    if (row.state === 'suspended' || row.state === 'powered-off') return
+    row.state = 'suspended'
+    row.lastUsed = new Date().toISOString()
+    row.stateFrom = 'qmp-poll'
+    wrote = true
+  }, { reason: 'guest-paused' })
+  if (wrote) {
+    emitVmState(name, 'suspended', `the guest is paused (QMP query-status: ${status})`)
+    log(`windows: ${name} → suspended (QMP ${status}); Start resumes it in place`)
+  }
+  return wrote
+}
+
 async function windowsShutdown(name, meta) {
   assertVmName(name)
   // WP-4.5: the watcher goes BEFORE the powerdown. A QMP `SHUTDOWN` event that
@@ -5638,30 +5921,10 @@ async function windowsShutdown(name, meta) {
     const reopened = await replaceLiveView(name, preview)
     return fail(`could not power ${name} off: QEMU is still running after a forced quit, so the disk is open and no checkpoint was taken.${marked ? ' Its restore point is now marked stale.' : ''}${reopened ? ' The live view was reopened.' : ' The live view could NOT be reopened.'} Use cua_vm_destroy to remove it.`)
   }
-  let checkpoint = null
-  let checkpointSkipped = ''
-  let checkpointSkippedRecord = null
-  if (config.checkpointPolicy === 'never') {
-    checkpointSkipped = 'checkpointPolicy=never'
-    checkpointSkippedRecord = checkpointSkipRecord('policy', checkpointSkipped)
-  } else {
-    const paths = windowsPaths(STORE, name)
-    const diskBytes = (() => { try { return statSync(paths.disk).size } catch { return 0 } })()
-    const existing = (() => { try { return statSync(path.join(CHECKPOINT_DIR, `${name}.qcow2`)).size } catch { return 0 } })()
-    const over = await refuseOverQuota(config, Math.max(0, diskBytes - existing))
-    if (over !== null) {
-      checkpointSkipped = 'the checkpoint does not fit the store quota'
-      checkpointSkippedRecord = checkpointSkipRecord('quota', `${checkpointSkipped} (${over})`)
-    } else {
-      // WINDOWS: its disk is under $STORE/windows/<name>/, not the cua vmm tree.
-      const captured = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
-      checkpoint = checkpointPathOf(captured)
-      if (checkpoint === null) {
-        checkpointSkipped = 'no disk to checkpoint'
-        checkpointSkippedRecord = checkpointSkipRecord(captured?.reason ?? 'no-disk', captured?.detail ?? '')
-      }
-    }
-  }
+  // THE CHECKPOINT DECISION IS SHARED WITH THE GUEST-SHUTDOWN WATCHER: both are
+  // "this computer stopped; capture its disk before Start needs it", and a
+  // second copy of the policy/quota rules is how the two would drift.
+  const { checkpoint, checkpointSkipped, checkpointSkippedRecord } = await windowsCheckpointPlan(name, config)
   await mutateRegistry((registry) => {
     const row = registry.vms[name]
     if (!row) return
@@ -6430,6 +6693,10 @@ const handlers = {
       })
     }
     if (state === 'ready') await ensureWindowsConsoleRelay(name)
+    // A supervisor restarted while this computer was READY has no watcher for
+    // it (boot only resumes the installing ones). The panel polls this op, so
+    // the first ready poll is the cheapest place to adopt it.
+    if (state === 'ready') installQmpStateWatcher(name)
     // D2: the transition to ready also happens HERE when the panel polls faster
     // than the watcher ticks (or after a supervisor restart). Once-only is
     // enforced by `installMediaDetached` inside the helper.

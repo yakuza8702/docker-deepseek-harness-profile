@@ -1800,3 +1800,119 @@ and NO header, an offer of `binary` gets it once, an unsupported offer gets
 none); `node tools/check-cua-vm.mjs --root .` (R8: exactly one emission, inside
 the guard, sourced from `selectSubprotocol(request.headers[...])`, and no
 unconditional constant anywhere).
+
+## 21. Branch `cua-vm-improve` — 2026-11-18: media that leave on time, hardware that has drivers, a guest that can power itself off
+
+Three fixes from the same live round, all consequences of one wrong assumption:
+"the install finishes when the ready transition fires". It does not — a guest can
+finish installing and never answer SSH, and a guest can shut itself down without
+telling this supervisor. Each entry is problem → change → verify, with the anchor
+of the shipped code.
+
+### P1 — the media leave when Setup finishes COPYING
+
+**Problem.** `detachInstallMedia()` ran only at the READY transition, and READY
+needs the SSH banner. A guest whose NIC has no driver (the very case P2 fixes)
+never answers SSH, so the row stayed `installing` with the Microsoft DVD and
+**SETUP (D:)** mounted for the life of the session — media nobody needs, on a
+computer that had finished installing. Every exemption sent the reader to Setup.
+
+**Change** (`docker/cua-vm-windows-qemu.mjs`):
+* `WINDOWS_SETUP_COPY_DONE_PATTERN` (:580) + `windowsSetupCopyFinished()` (:583)
+  read the serial evidence: `Windows Setup is complete/completed/finished`,
+  `Setup has finished copying`, `Setup is applying system settings`, and a
+  boot-from-disk line all mean the copy is done.
+* `startMediaWatcher()` (:4425) re-reads the serial tail every
+  `WINDOWS_MEDIA_EJECT_POLL_MS` (15 s), bounded by
+  `windowsMediaEjectWatchMs()` (:601, `DSH_CUA_WINDOWS_EJECT_WATCH_MIN`, default
+  90 min, clamped 1–600).
+* before ejecting it sets `mediaGate.setupCopied` (so a re-armed cdboot cycle
+  cannot type into the disk boot), requires QMP `running` (a paused guest queues
+  the eject and the tray never opens), then calls the SAME idempotent
+  `detachInstallMedia()` the ready transition uses; success logs
+  `install media detached after Setup finished copying (before SSH/MCP)` (:4450).
+* armed on BOTH boot paths — the first attempt (:4499) and the GPU-fallback retry
+  (:4564). Non-fatal: on any failure the ready transition keeps its backstop.
+
+**Verify.** `node tests/modules-unit.mjs` (P1: the pattern, the booted-from-disk
+shortcut, no-eject signals, 90 min default and `DSH_CUA_WINDOWS_EJECT_WATCH_MIN`
+clamps); `node tools/check-cua-vm.mjs --root .` (the watcher, both call sites and
+the log line).
+
+### P2 — the hardware is INBOX-driver hardware, for every code
+
+**Problem.** UEFI guests got `virtio-blk` + `virtio-net-pci`. A consumer Windows
+has no virtio driver in the box and a stripped variant (`tiny10`/`tiny11`/
+`core11`) has almost nothing else either: the guest installed with **no network**,
+never answered SSH, and the row sat at `installing` while every symptom pointed at
+Setup rather than at the NIC.
+
+**Change** (`docker/cua-vm-windows-qemu.mjs`):
+* ONE decision, taken once (:1773–1775): `wantVirtio = DSH_CUA_WINDOWS_VIRTIO ===
+  '1' && spec.virtio === true`; `diskDevice = wantVirtio ? 'virtio-blk-pci' :
+  firmware.disk`, `nicDevice = wantVirtio ? 'virtio-net-pci' : firmware.nic`.
+* both profiles now name `disk: 'ide-hd', nic: 'e1000e'` (:3103–3104) — q35's ICH9
+  AHCI is IDE-class to Windows and its driver is inbox since Vista; `e1000e` is
+  the same NIC Windows 7 already needed.
+* `DSH_CUA_WINDOWS_VIRTIO=1` (AND `virtio: true`) opts back in for an image that
+  really carries the virtio-win drivers; the opt-in alone is not enough.
+
+**Verify.** `node tests/modules-unit.mjs` (P2: with the knob unset even
+`virtio: true` gets `ide-hd` on `ide.0` + `e1000e`; with it set, `virtio-blk-pci`
+and `virtio-net-pci`; the profile table; the 11 profile is now "q35, TPM2, inbox
+AHCI disk + e1000e NIC"); `node tools/check-cua-vm.mjs --root .` (the single
+decision and both device strings).
+
+### P4 — a guest that shuts itself down is OBSERVED, not inferred
+
+**Problem.** `shutdown /s` in the console, Windows Update, a user in the noVNC
+page — none of those come through the supervisor. The row kept saying `ready`, the
+panel kept offering Shutdown, and the next Start tried to resume a process that
+was gone.
+
+**Change** (`docker/cua-vm-supervisor.mjs`):
+* `startQmpStatePoll()` (:4297) asks `query-status` every
+  `QMP_STATE_POLL_DEFAULT_S = 3` s (:4281, `DSH_CUA_VM_STATE_POLL_S`, clamped
+  1–30, unref'd), only while the row is live, and stops on the first
+  non-transient verdict.
+* `shutdown` → `finaliseGuestShutdown()` (:5816): `state: powered-off`,
+  **`method: 'guest-shutdown'`**, and the SAME `windowsCheckpointPlan()` (:5770)
+  checkpoint + `restoreFrom` bookkeeping (and the same quota/policy refusals) the
+  ACPI path uses, so Start cold-boots from a real restore point. A vanished QEMU
+  is an unconfirmed `powered-off` (`mayBeTorn`, no clean restore point).
+* `paused` → `finaliseGuestPause()` (:5876): `state: suspended` — reversible,
+  never a checkpoint of a live disk (QMP `stop` must not look like a power-off).
+
+**Verify.** `node tools/check-cua-vm.mjs --root .` (the 3 s default, the clamp,
+the poll starter, both finalisers, `windowsCheckpointPlan`, `method:
+'guest-shutdown'` and the `{ reason: 'guest-shutdown' }` write);
+`node tests/supervisor-smoke.mjs` (the shutdown/state machine still passes with
+the poll present).
+
+### P5 — what `gpu: true` means for Windows, stated plainly
+
+For a Windows computer `gpu: true` selects a **virtio display** (`virtio-gpu-gl-
+pci` + `egl-headless` when the image's QEMU advertises it and the render node
+exists, otherwise a plain `virtio-gpu-pci`). It is **not** NVIDIA acceleration and
+there is **no accelerated 3D in the guest**: Direct3D runs on **WARP (CPU)** and
+OpenGL is not hardware-accelerated. An EGL handle in `nvidia-smi` is the
+host-side QEMU context, not guest acceleration. GPU passthrough (**VFIO**) is
+**not implemented** — it is on the roadmap (`docs/cua-capability-roadmap.md`) and
+would need an IOMMU group, a second GPU and a host driver handoff this image does
+not perform. Both READMEs say this next to the feature, not in a footnote.
+
+### Version confidence
+
+All **eleven** consumer/Server codes (`11`, `11l`, `11e`, `10`, `10l`, `10e`,
+`2025`, `2022`, `2019`, `2016`, `2012`) share ONE pipeline: the same firmware
+profile, the same inbox device class, the same answer file, the same P1/P2/P4
+paths. There is therefore **no per-version testing requirement** — a green run on
+one of them exercises the code every one of them uses, and the per-code data
+(image selection, ISO chain, sizes) is already asserted by the gate against the
+module.
+
+**Residual risk, named honestly:** the `7u` legacy path (pc/SeaBIOS, no TPM, a
+pre-UEFI installer) and the stripped media (`tiny11`, `core11`) are the two places
+where the shared pipeline meets an image that does not behave like a normal
+consumer Windows. Spot-check exactly those two before a release; nothing else in
+the catalog has a different code path.

@@ -560,6 +560,52 @@ export function windowsInstallStageFromSerial(serialText) {
 }
 
 /**
+ * P1: THE SENTENCES WINDOWS SETUP PRINTS WHEN IT HAS FINISHED COPYING FILES.
+ *
+ * The install medium's whole job is done after the file-copy phase: everything
+ * that follows (specialise, OOBE, firstboot, OpenSSH) runs from the disk. Two
+ * kinds of evidence are accepted, in order of strength:
+ *
+ *   1. THE REBOOT HANDOFF (`windowsBootedFromDisk`): Setup copies `install.wim`
+ *      and reboots into the installed disk, and the firmware then names a HARD
+ *      DISK boot entry. A CD boot can never match that pattern (it requires the
+ *      `HD(…,GPT|MBR)` / QEMU HARDDISK hint), which is exactly why it is safe.
+ *   2. An explicit completion sentence, for a console that prints one.
+ *
+ * WHY THIS EXISTS AT ALL: the medium used to be ejected at the READY transition,
+ * which needs the SSH banner. A guest whose NIC has no driver never answers SSH,
+ * so the row stayed `installing` with SETUP (D:) mounted for the life of the
+ * session — media nobody needs, on a computer that had finished installing.
+ */
+export const WINDOWS_SETUP_COPY_DONE_PATTERN = /Windows Setup (?:is )?(?:complete|completed|finished)|Setup (?:has )?finished copying|Setup is applying system settings/iu
+
+/** True when the serial log says Setup has finished copying files. */
+export function windowsSetupCopyFinished(serialText) {
+  const text = String(serialText ?? '')
+  if (text === '') return false
+  if (windowsBootedFromDisk(text)) return true
+  return WINDOWS_SETUP_COPY_DONE_PATTERN.test(text)
+}
+
+/** How often the media watcher re-reads the serial tail (a stat + an 8 KB read). */
+export const WINDOWS_MEDIA_EJECT_POLL_MS = 15000
+
+/**
+ * How long the media watcher waits for the copy to finish, in minutes.
+ *
+ * 90 min: the same order as the install window (a 7 GB image over SLIRP-emulated
+ * install work), and only a BOUND — the watcher fires on the serial evidence, not
+ * on this clock. When it expires the media simply stay attached and the ready
+ * transition keeps its backstop role.
+ */
+export function windowsMediaEjectWatchMs() {
+  const raw = process.env.DSH_CUA_WINDOWS_EJECT_WATCH_MIN
+  const parsed = Number(raw)
+  const minutes = Number.isFinite(parsed) && parsed > 0 ? Math.min(600, Math.trunc(parsed)) : 90
+  return minutes * 60 * 1000
+}
+
+/**
  * D3/D5: THE TWO SENTENCES THE PANEL MUST PRINT VERBATIM.
  *
  * They are constants, not template text, because the user asked for the exact
@@ -1717,6 +1763,16 @@ export function buildQemuArgs(spec) {
   // q35/ICH9 for UEFI; pc/i440FX+PIIX for a BIOS guest, whose inbox drivers
   // cover IDE and e1000e and nothing else.
   const machine = legacyBios ? `${firmware.machine},accel=kvm` : `${firmware.machine},accel=kvm,smm=off`
+  // THE DEVICE CLASS IS ONE DECISION, TAKEN ONCE.
+  //
+  // Default: the profile's INBOX hardware (ide-hd on ICH9 AHCI / e1000e) for
+  // every Windows code, because no consumer Windows has a virtio driver in the
+  // box and a stripped image (tiny10/tiny11/core11) has almost nothing else
+  // either. `DSH_CUA_WINDOWS_VIRTIO=1` opts into virtio-blk + virtio-net for an
+  // operator whose image really does carry the virtio-win drivers.
+  const wantVirtio = String(process.env.DSH_CUA_WINDOWS_VIRTIO ?? '') === '1' && spec.virtio === true
+  const diskDevice = wantVirtio ? 'virtio-blk-pci' : firmware.disk
+  const nicDevice = wantVirtio ? 'virtio-net-pci' : firmware.nic
   const args = [
     '-name', `dsh-win-${spec.name}`,
     '-machine', machine,
@@ -1740,12 +1796,12 @@ export function buildQemuArgs(spec) {
       : []),
     // system disk — SECOND while installing (see diskBootIndex above)
     '-drive', `file=${qemuEscapeOptionValue(p.disk)},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap`,
-    '-device', legacyBios
-      // FROM THE PROFILE, so the argv cannot disagree with the table a reader
-      // consults: seabios says `ide-hd`, and an IDE disk is the only one whose
-      // driver Windows 7 has in the box.
-      ? `${firmware.disk},drive=disk0,bus=ide.0,bootindex=${diskBootIndex}`
-      : spec.virtio ? `virtio-blk-pci,drive=disk0,bootindex=${diskBootIndex}` : `ide-hd,drive=disk0,bus=ide.0,bootindex=${diskBootIndex}`,
+    // FROM diskDevice, so the argv cannot disagree with the profile a reader
+    // consults: inbox IDE on both firmwares (q35 AHCI is IDE-class to Windows,
+    // and its driver has been in the box since Vista), virtio only on request.
+    '-device', diskDevice === 'virtio-blk-pci'
+      ? `virtio-blk-pci,drive=disk0,bootindex=${diskBootIndex}`
+      : `${diskDevice},drive=disk0,bus=ide.0,bootindex=${diskBootIndex}`,
     // install medium (only while installing) + drivers + OEM payload.
     // R4: THE CD IS bootindex=1 DURING INSTALL. Booting a blank disk first made
     // OVMF create a Boot0002 HDD entry, try it, print "HDD Not Found" and only
@@ -1832,12 +1888,13 @@ export function buildQemuArgs(spec) {
     ...(boot
       ? ['-device', `usb-storage,drive=setup0,removable=on,bus=xhci.0,id=${INSTALL_MEDIA_DEVICE_IDS.setupDevice}`]
       : []),
-    // networking: SLIRP + the SSH forward. The NIC follows the profile: a BIOS
-    // guest gets e1000e (an inbox Windows 7 driver) even when this host could
-    // give it virtio — virtio needs the virtio-win ISO, and an unattended
-    // install with no NIC installs no SSH and every later step is dead.
+    // networking: SLIRP + the SSH forward. THE NIC MUST HAVE AN INBOX DRIVER or
+    // the guest has no network at all: no lease, no OpenSSH, no automation — and
+    // the symptom (an install that "completes" and a computer that never
+    // answers) points at everything except the NIC. e1000e by default; virtio
+    // only when the operator asked for it and supplied the driver ISO.
     '-netdev', `user,id=net0,hostfwd=tcp:127.0.0.1:${spec.sshPort}-:22`,
-    '-device', legacyBios ? `${firmware.nic},netdev=net0` : spec.virtio ? 'virtio-net-pci,netdev=net0' : `${firmware.nic},netdev=net0`,
+    '-device', `${nicDevice},netdev=net0`,
     // input: absolute pointer (QMP input-send-event) + keyboard
     '-device', 'usb-kbd',
     '-device', 'usb-tablet',
@@ -3028,7 +3085,22 @@ export function resolveWindowsImageSelection({ version = '', imageIndex = 0, ima
  *            only reason an unattended install can finish without virtio-win.
  */
 export const WINDOWS_FIRMWARE_PROFILES = Object.freeze({
-  ovmf: Object.freeze({ machine: 'q35', bios: 'ovmf', tpm: true, efiVars: true, disk: 'virtio-blk', nic: 'virtio-net-pci' }),
+  // INBOX DRIVERS ON PURPOSE, FOR EVERY CODE — not just Windows 7.
+  //
+  // virtio-blk / virtio-net have NO inbox driver in ANY consumer Windows: 10/11
+  // (and every trimmed rebuild — tiny10, tiny11, core11) only see them after the
+  // virtio-win package is installed. Measured on the tiny10 end-to-end run: the
+  // disk worked (it was already an ide-hd on q35's AHCI) while the NIC was
+  // `virtio-net-pci` with no driver, so SLIRP had no consumer, the guest never
+  // got a lease, OpenSSH was unreachable and the whole automation chain died on
+  // a device the image never had. q35's ICH9 AHCI and e1000e are both inbox
+  // (storahci/msahci, e1000 family) on Windows 7 SP1 through Server 2025, so the
+  // same four devices now work on every code without a driver ISO.
+  //
+  // VIRTIO IS STILL AVAILABLE, explicitly: DSH_CUA_WINDOWS_VIRTIO=1 rebuilds the
+  // disk and the NIC as virtio when the virtio-win ISO is attached. The default
+  // is the hardware that boots a stripped image with no driver at all.
+  ovmf: Object.freeze({ machine: 'q35', bios: 'ovmf', tpm: true, efiVars: true, disk: 'ide-hd', nic: 'e1000e' }),
   seabios: Object.freeze({ machine: 'pc', bios: 'seabios', tpm: false, efiVars: false, disk: 'ide-hd', nic: 'e1000e' })
 })
 
@@ -4205,6 +4277,17 @@ export function createWindowsBackend({ store, qmp, log = () => {}, transport = n
     // leaked swtpm keeps the TPM state directory open and the next boot fails
     // with "TPM is already in use" — the kind of failure that only appears on
     // the SECOND attempt, long after the first error was read.
+    /**
+     * P1: WHETHER SETUP HAS FINISHED COPYING, shared by the two watchers.
+     *
+     * One flag, two readers: the media watcher SETS it the moment the serial log
+     * shows the reboot handoff, and the cdboot press scheduler READS it to stop
+     * pressing Enter — after the handoff the CD is no longer the boot device, so
+     * a press would be aimed at a prompt that does not exist (or, worse, at
+     * Setup's next page on the disk boot).
+     */
+    const mediaGate = { setupCopied: false }
+
     const attempt = async (attemptSpec, { stderrFile = p.qemuStderr } = {}) => {
       // A STALE PIDFILE IS NOT THIS BOOT. `qemuPid()` is how the watchdog below
       // (and every other helper) decides "alive"; a pidfile left by a previous
@@ -4289,12 +4372,18 @@ export function createWindowsBackend({ store, qmp, log = () => {}, transport = n
           // than a dozen cycles and never after the QEMU is gone.
           cycles: cdbootRearmCycles(),
           watchMs: cdbootRearmWatchMs(),
-          isAlive: () => child.exitCode === null && child.signalCode === null,
+          // THE RE-ARM STOPS WHEN THE DISK OWNS THE BOOT. `mediaGate` is set by
+          // the media watcher on the reboot handoff; without this the second
+          // (disk) boot would still get Enter presses from a re-armed cycle.
+          isAlive: () => child.exitCode === null && child.signalCode === null && mediaGate.setupCopied !== true,
           log,
           name: spec.name,
           sendKey: (key) => {
             if (child.exitCode !== null || child.signalCode !== null) {
               throw new Error('this QEMU child exited before the key was due')
+            }
+            if (mediaGate.setupCopied === true) {
+              throw new Error('Setup finished copying and the install media are on their way out; the disk owns the boot now')
             }
             // A SHORT PER-PRESS BUDGET: a monitor busy with another command
             // refuses quickly, and waiting 15 s for the refusal burned the whole
@@ -4310,6 +4399,60 @@ export function createWindowsBackend({ store, qmp, log = () => {}, transport = n
         windowMs: qemuBootWindowMs()
       })
       return { child, display: attemptSpec.gpu && attemptSpec.virgl ? 'egl-headless' : 'none', ...settled }
+    }
+
+    /**
+     * P1: EJECT THE INSTALL MEDIA WHEN SETUP FINISHES COPYING — NOT WHEN SSH
+     * ANSWERS.
+     *
+     * The supervisor's ready transition is the only caller of
+     * detachInstallMedia(), and ready needs the SSH banner. A guest whose NIC has
+     * no inbox driver never answers SSH, so `ready` never fires and SETUP (D:)
+     * plus the answer stick stayed mounted for the life of the session — on a
+     * computer that had finished installing. The serial log is the evidence that
+     * does not depend on the network, so this watcher reads it, and on the reboot
+     * handoff (or an explicit Setup completion line) issues the SAME detach the
+     * ready transition does. `detachInstallMedia()` is idempotent (query-block
+     * first), so the two callers cannot fight: whichever runs second finds the
+     * media gone and says so.
+     *
+     * QMP `query-status` must say `running` first: ejecting a paused/stopped
+     * guest queues a command nobody will service and the tray never opens.
+     *
+     * NON-FATAL ALWAYS: a failure is logged and the ready transition keeps its
+     * backstop role. Nothing here can fail a create that otherwise works.
+     */
+    const startMediaWatcher = (mediaChild) => {
+      const begun = Date.now()
+      const budget = windowsMediaEjectWatchMs()
+      const watch = async () => {
+        for (;;) {
+          if (mediaChild.exitCode !== null || mediaChild.signalCode !== null) return
+          if (Date.now() - begun > budget) return
+          if (windowsSetupCopyFinished(readSerialTail(p.serialLog))) break
+          await new Promise((resolve) => setTimeout(resolve, WINDOWS_MEDIA_EJECT_POLL_MS))
+        }
+        // FROM HERE THE DISK OWNS THE BOOT: stop the cdboot presses first, so a
+        // re-armed cycle cannot type into the disk boot or into Setup's next page.
+        mediaGate.setupCopied = true
+        const verdict = await probe(spec).catch(() => null)
+        if (verdict?.status !== 'running') {
+          log(`windows: ${spec.name} Setup finished copying, but QMP is not running (${verdict?.qmp || 'no answer'}); leaving the media for the ready transition`)
+          return
+        }
+        const result = await detachInstallMedia(spec).catch((error) => ({
+          commands: [],
+          skipped: [],
+          errors: [{ command: 'detach', error: String(error?.message ?? error) }]
+        }))
+        const failed = (result.errors ?? []).filter((entry) => entry.command !== 'query-block')
+        if (failed.length === 0) {
+          log(`windows: ${spec.name} install media detached after Setup finished copying (before SSH/MCP)`)
+        } else {
+          log(`windows: ${spec.name} install media not detached after Setup finished copying (the ready transition retries): ${failed.map((entry) => `${entry.command}: ${entry.error}`).join('; ')}`)
+        }
+      }
+      void watch().catch(() => {})
     }
 
     const readStderr = (file = p.qemuStderr) => {
@@ -4350,7 +4493,12 @@ export function createWindowsBackend({ store, qmp, log = () => {}, transport = n
       stopBootResidue(spec.name)
       throw error
     }
-    if (first.ok) return { pid: first.pid, installPending, display: spec.gpu && spec.virgl ? 'egl-headless' : 'none', gpuFallback: false, firmware: p.firmware.bios, warnings: firmwareWarnings }
+    if (first.ok) {
+      // ONLY WHILE INSTALLING: a normal boot has no CD attached, and watching it
+      // would log a detach that has nothing to detach.
+      if (installPending) startMediaWatcher(first.child)
+      return { pid: first.pid, installPending, display: spec.gpu && spec.virgl ? 'egl-headless' : 'none', gpuFallback: false, firmware: p.firmware.bios, warnings: firmwareWarnings }
+    }
 
     const stderr = readStderr()
     const excerpt = qemuStderrExcerpt(stderr, 20)
@@ -4413,6 +4561,7 @@ export function createWindowsBackend({ store, qmp, log = () => {}, transport = n
           message: `virgl/EGL display unavailable on this host (${reason || 'QEMU could not initialize the egl-headless display'}); continuing without GPU display — Windows renders on emulated VGA/WARP as documented`
         }
         log(`windows: ${spec.name} ${warning.message}`)
+        if (installPending) startMediaWatcher(retry.child)
         return { pid: retry.pid, installPending, display: 'none', gpuFallback: true, firmware: p.firmware.bios, warnings: [warning, ...firmwareWarnings], stderrExcerpt: excerpt }
       }
       const retryStderr = readStderr(p.qemuStderrRetry)

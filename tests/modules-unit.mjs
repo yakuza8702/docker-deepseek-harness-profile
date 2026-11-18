@@ -30,6 +30,7 @@ import {
   windowsReadinessSignals, qemuBootWindowMs, waitForQemuBoot,
   windowsRowName, windowsQmpAdapter, cdbootKeyScheduleMs, cdbootKeysEnabled, runCdbootKeys, cdbootPromptSeen, readSerialTail, startupNshText,
   cdbootPressFailure, cdbootPromptWindowMs, cdbootRearmCycles, cdbootRearmWatchMs, cdbootPressTimeoutMs,
+  WINDOWS_SETUP_COPY_DONE_PATTERN, windowsSetupCopyFinished, windowsMediaEjectWatchMs,
   createWindowsBackend,
   // U4: the free-space probe's parser/formatter (pure), so the panel's number
   // and its below-floor warning are asserted without a guest.
@@ -208,9 +209,34 @@ check('kvm + host cpu are the acceleration', has('q35,accel=kvm,smm=off') && has
   check('R4: after install the disk boots FIRST (bootindex=1) and no CD is attached',
     postInstall.filter((item) => /drive=disk0.*bootindex=1$/u.test(item)).length === 1
     && !postInstall.join(' ').includes('id=cd0'), postInstall.filter((item) => item.includes('disk0')).join(','))
-  check('R4: the virtio disk follows the same phase rule',
-    buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: true })
-      .includes('virtio-blk-pci,drive=disk0,bootindex=2'))
+  // P2: VIRTIO IS OPT-IN. Every Windows code defaults to the profile's INBOX
+  // hardware — ide-hd on the q35 ICH9 AHCI controller (an IDE-class disk whose
+  // driver has shipped in the box since Vista) and e1000e — because a stripped
+  // image (tiny10/tiny11/core11) has no virtio driver and a guest with no disk
+  // or no NIC driver is an install that never finishes and never answers SSH.
+  {
+    const inbox = buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: false, virtio: true })
+    check('P2: with the knob unset, `virtio: true` still gets inbox hardware (ide-hd on ide.0 + e1000e)',
+      inbox.includes('ide-hd,drive=disk0,bus=ide.0,bootindex=1')
+      && !inbox.some((item) => /virtio-blk-pci|virtio-net-pci/u.test(item))
+      && inbox.includes('e1000e,netdev=net0'), inbox.filter((item) => /disk0|net0/u.test(item)).join(','))
+    const saved = process.env.DSH_CUA_WINDOWS_VIRTIO
+    try {
+      process.env.DSH_CUA_WINDOWS_VIRTIO = '1'
+      check('R4: with DSH_CUA_WINDOWS_VIRTIO=1 the virtio disk follows the same phase rule',
+        buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: true, virtio: true })
+          .includes('virtio-blk-pci,drive=disk0,bootindex=2'))
+      check('P2: ...and the NIC becomes virtio-net-pci only then (both halves are one decision)',
+        buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: false, virtio: true })
+          .includes('virtio-net-pci,netdev=net0'))
+      check('P2: the opt-in alone is not enough — the spec must still ask for virtio',
+        !buildQemuArgs({ name: 'win-1', cpu: 2, memory: 4, gpu: false, paths, isoPath: '/x.iso', driverIso: null, sshPort: 1, vncPort: 2, qmpPort: 3, installPending: false, virtio: false })
+          .some((item) => /virtio-blk-pci|virtio-net-pci/u.test(item)))
+    } finally {
+      if (saved === undefined) delete process.env.DSH_CUA_WINDOWS_VIRTIO
+      else process.env.DSH_CUA_WINDOWS_VIRTIO = saved
+    }
+  }
 }
 // S1/F1: THE ANSWER-FILE MEDIUM IS A PARTITIONED FAT32 IMAGE — AND SINCE THE
 // LIVE FORENSIC ROUND IT IS DELIVERED AS **REMOVABLE MEDIA**.
@@ -362,8 +388,9 @@ check('exactly two versions carry a live mido strategy (11 and 10, the two pages
 {
   const ovmf = windowsFirmwareProfile('11')
   const seabios = windowsFirmwareProfile('7u')
-  check('WP-2: 11 boots on the OVMF profile (q35, TPM2, virtio disk)',
-    ovmf.bios === 'ovmf' && ovmf.machine === 'q35' && ovmf.tpm === true && ovmf.efiVars === true && ovmf.disk === 'virtio-blk' && ovmf.legacy === false,
+  check('WP-2: 11 boots on the OVMF profile (q35, TPM2, inbox AHCI disk + e1000e NIC)',
+    ovmf.bios === 'ovmf' && ovmf.machine === 'q35' && ovmf.tpm === true && ovmf.efiVars === true
+    && ovmf.disk === 'ide-hd' && ovmf.nic === 'e1000e' && ovmf.legacy === false,
     JSON.stringify(ovmf))
   check('WP-2: 7u boots on SeaBIOS (pc, no TPM, IDE disk, e1000e) — the only shape Windows 7 Setup can install on',
     seabios.bios === 'seabios' && seabios.machine === 'pc' && seabios.tpm === false && seabios.efiVars === false
@@ -1466,6 +1493,41 @@ check('windowsKvmPreflight is the shared module (no second message)',
           if (value === undefined) delete process.env[env]
           else process.env[env] = value
         }
+      }
+    }
+
+    // ---- P1: THE MEDIA LEAVE WHEN SETUP FINISHES COPYING ----
+    //
+    // Ejecting at READY needs the SSH banner, and a guest whose NIC has no driver
+    // never answers SSH: the row stayed `installing` with SETUP (D:) mounted for
+    // the life of the session. The trigger is the serial evidence instead.
+    {
+      check('P1: the copy-done pattern is a serial signature, not a clock',
+        WINDOWS_SETUP_COPY_DONE_PATTERN instanceof RegExp
+        && windowsSetupCopyFinished('Windows Setup is complete.') === true
+        && windowsSetupCopyFinished('Setup has finished copying files') === true
+        && windowsSetupCopyFinished('Setup is applying system settings') === true)
+      check('P1: a booted-from-disk serial also means the copy is done',
+        windowsSetupCopyFinished('BdsDxe: starting Boot0004 "Windows Boot Manager" from HD(1,GPT,') === true)
+      check('P1: Setup is still copying / an empty tail is NOT an eject signal',
+        windowsSetupCopyFinished('Windows Setup is starting') === false
+        && windowsSetupCopyFinished('12%') === false
+        && windowsSetupCopyFinished('') === false
+        && windowsSetupCopyFinished(null) === false)
+      check('P1: the watch window defaults to 90 minutes and is bounded',
+        windowsMediaEjectWatchMs() === 90 * 60 * 1000, String(windowsMediaEjectWatchMs()))
+      const saved = process.env.DSH_CUA_WINDOWS_EJECT_WATCH_MIN
+      try {
+        process.env.DSH_CUA_WINDOWS_EJECT_WATCH_MIN = '5'
+        check('P1: ...and DSH_CUA_WINDOWS_EJECT_WATCH_MIN sets it (minutes)',
+          windowsMediaEjectWatchMs() === 5 * 60 * 1000)
+        process.env.DSH_CUA_WINDOWS_EJECT_WATCH_MIN = '9999'
+        check('P1: ...clamped to 600 minutes, and junk falls back to 90',
+          windowsMediaEjectWatchMs() === 600 * 60 * 1000
+          && (process.env.DSH_CUA_WINDOWS_EJECT_WATCH_MIN = 'nonsense', windowsMediaEjectWatchMs() === 90 * 60 * 1000))
+      } finally {
+        if (saved === undefined) delete process.env.DSH_CUA_WINDOWS_EJECT_WATCH_MIN
+        else process.env.DSH_CUA_WINDOWS_EJECT_WATCH_MIN = saved
       }
     }
 

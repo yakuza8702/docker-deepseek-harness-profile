@@ -819,6 +819,19 @@ QEMU user-mode (SLIRP): outbound internet, host services at `10.0.2.2`, SSH
 forwarded to loopback. A bridge/tap is possible but not default — it needs
 `CAP_NET_ADMIN`.
 
+**The hardware is INBOX-DRIVER hardware, for every code.** The disk is `ide-hd`
+on the q35 ICH9 **AHCI** controller and the NIC is **`e1000e`** — both drivers
+ship inside Windows itself, so a consumer image needs no extra media to see its
+disk or its network. This is not cosmetic: the earlier UEFI default was
+`virtio-blk` + `virtio-net-pci`, and a stripped variant (`tiny10`/`tiny11`/
+`core11`) has no virtio driver at all — the guest then installs with no network,
+never answers SSH, and the row sits at `installing` forever while every symptom
+points at Setup. `DSH_CUA_WINDOWS_VIRTIO=1` opts back into `virtio-blk-pci` +
+`virtio-net-pci` for an operator whose image really carries the virtio-win
+drivers; the opt-in alone is not enough — the create must also ask for virtio.
+The 7u legacy profile has always been `ide-hd`/`e1000e` (an inbox Windows 7
+driver and nothing else), so both firmwares now take the same decision.
+
 **A comma in a path is not an option separator.** Both QEMU's QemuOpts splitter
 and swtpm's own option grammar cut a value on commas, so a store path like
 `/srv/vms,beta/…` used to truncate `file=`/`path=`/`dir=` and hand the tool a
@@ -855,10 +868,11 @@ not the ISO size.
 | `tiny11` | Tiny11 (25H2) | 5.3 GB | OVMF | `/IMAGE/INDEX` 1 |
 | `tiny10` | Tiny10 (23H2) | 3.6 GB | OVMF | `/IMAGE/INDEX` 1 |
 
-**The firmware is a profile, not a boolean.** `ovmf` is q35 + UEFI + TPM2 +
-virtio-blk + virtio-net; `seabios` is `pc` (i440FX/PIIX) + no pflash + no TPM +
-IDE disk + e1000e NIC — every device Windows 7 has an **inbox** driver for, which
-is the only reason an unattended install can finish without a virtio-win ISO.
+**The firmware is a profile, not a boolean.** `ovmf` is q35 + UEFI + TPM2;
+`seabios` is `pc` (i440FX/PIIX) + no pflash + no TPM. BOTH now name the same
+**inbox** device class — `ide-hd` (q35 ICH9 AHCI is IDE-class to Windows) and
+`e1000e` — because every Windows code must install with no extra driver media; the
+virtio pair is an explicit opt-in (`DSH_CUA_WINDOWS_VIRTIO=1`).
 Handing OVMF to a Windows 7 ISO reaches "Press any key", then finds no bootable
 device and drops into the EFI Shell; handing pflash to a BIOS guest is QEMU's
 "unsupported machine configuration". The create also records the firmware in
@@ -947,10 +961,13 @@ QEMU lists `virtio-gpu-gl-pci` in `qemu -device help` and the render node exists
 `virtio-gpu-pci` framebuffer. The decision is made at create and stored on the
 row. Neither branch gives Windows accelerated 3D — see the ceilings below.
 
-**Honest ceilings:** the GPU option is a virtio-gpu backed by the host render
-node, but Windows has **no accelerated 3D driver** here — Direct3D falls back to
-WARP (CPU), and an EGL handle in `nvidia-smi` is the host-side QEMU context, not
-guest acceleration (see [Image provenance & known gaps](#image-provenance--known-gaps-linux)
+**Honest ceilings:** for Windows, `gpu: true` means a **virtio display** — it is
+not, and does not become, an NVIDIA (or any) 3D accelerator. Windows has **no
+accelerated 3D driver** here: Direct3D falls back to WARP (CPU), and an EGL handle
+in `nvidia-smi` is the host-side QEMU context, not guest acceleration. GPU
+passthrough (VFIO) is **not implemented** — it is on the roadmap
+(`docs/cua-capability-roadmap.md`), and it would need an IOMMU group, a second
+GPU and a host driver handoff that this image does not do (see [Image provenance & known gaps](#image-provenance--known-gaps-linux)
 for what happens when the render node is missing). QMP typing is ASCII-only, no
 accessibility tree, no window list and **no cursor overlay** (the pointer in the
 frame is the real one). The clipboard is **bidirectional through the guest's
@@ -1067,6 +1084,19 @@ use), so Windows classifies it as removable media and scans its root.
 when omitted (verified with `query-block`: omitted → `removable:false`;
 `removable=on` → `removable:true`). The image itself is unchanged: MBR + FAT32
 partition, `Autounattend.xml` at the root, rebuilt fresh on every create.
+
+**And they leave when Setup finishes COPYING, not when the computer is ready.**
+The ready transition needs the SSH banner, and a guest whose NIC has no driver
+never answers SSH — so before this change the row stayed `installing` with
+**SETUP (D:)** mounted for the life of the session, on a computer that had
+finished installing. A watcher re-reads the serial tail every 15 s and ejects the
+DVD and `setup0` on the first copy-done evidence (`Windows Setup is
+complete/completed/finished`, `Setup has finished copying`, `Setup is applying
+system settings`, or a boot-from-disk line), before SSH or MCP are up. It stops
+the cdboot presses first (a re-armed cycle must not type into the disk boot),
+requires QMP `running` (a paused guest queues the eject and the tray never
+opens), and is bounded by `DSH_CUA_WINDOWS_EJECT_WATCH_MIN` (90 min); on any
+failure the ready transition keeps its backstop role.
 
 Windows' documented answer-file search order, and where this lands:
 
@@ -1503,6 +1533,19 @@ on it — that was the "stopped VM can never resume" dead end. `cua_vm_start`
 therefore cold-boots it from the checkpoint (and deletes the `.restore.qcow2`
 temp afterwards). `DSH_CUA_VM_LEGACY_STOP=1` restores the old behaviour where
 `stop` meant suspend.
+
+**A guest can shut ITSELF down, and the row notices.** Windows Update, a user in
+the console, `shutdown /s` — none of those come through this supervisor, so the
+row used to keep saying `ready` (and the panel kept offering a Shutdown button
+for a computer that was already off). A per-computer QMP poll now asks
+`query-status` every **3 s** (`DSH_CUA_VM_STATE_POLL_S`, clamped 1–30) while the
+row is live: `shutdown` finalises the row as `powered-off` with
+**`method: "guest-shutdown"`**, running the SAME checkpoint + `restoreFrom`
+bookkeeping (and the same quota/policy refusals) the ACPI path uses, so Start
+cold-boots from a real restore point; `paused` finalises as `suspended`
+(reversible, never a checkpoint of a live disk); a vanished QEMU is an unconfirmed
+`powered-off` (`mayBeTorn`, no clean restore point). The poll is unref'd and stops
+on the first non-transient verdict.
 
 ### GPU
 
