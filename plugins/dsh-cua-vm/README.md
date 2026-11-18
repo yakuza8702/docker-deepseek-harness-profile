@@ -357,6 +357,19 @@ Three signals, in order, all visible in the panel:
   When firstboot is the failure, the Windows MCP cannot attach (it needs SSH) —
   the fix is the guidance above, not a different MCP configuration.
 
+**The install CD's prompt is dismissed on the PROMPT, not on a clock.** A cold
+q35/OVMF boot prints `Press any key to boot from CD or DVD` well after device
+enumeration, so the old spawn-relative 1.5/3.5/5.5 s presses landed before the
+prompt existed and the firmware fell into the EFI Shell (`EFI_TIMEOUT`). The
+watcher now polls the serial log every **300 ms** for up to **90 s** and fires
+Enter on the poll that sees it; the first-output growth anchor is **disabled at
+the call site** (`armDelayMs: 0`), the fixed offsets survive only as the
+silent-console fallback, and a re-printed prompt (BDS re-entering the DVD) is
+served again for at most **12 cycles / 180 s**. A press the monitor REFUSES
+answers `{error}` as a result — it is now logged as `could not press enter …`
+and never counted as sent — and each press gets **3 s**, not the 15 s monitor
+default that let one collision consume the whole window.
+
 #### The install media leave when the install is done
 
 An install-phase QEMU boots the Microsoft ISO (`cd0`) and the answer medium
@@ -417,6 +430,18 @@ falls back to `websockify` (or to the raw VNC relay when even that is absent), s
 broken bridge can never cost you the console. The relay row records what it got:
 `view: "novnc-clip" | "novnc" | "websockify" | "vnc-raw"` and a `clipboard`
 object saying whether the console clipboard is up and why not.
+
+Two details of that front door are contracts now:
+
+* **the relay exists from the first second.** `windowsCreateManaged` opens it
+  right after the row is written (non-fatal — one log line, and the install
+  watcher retries at Ready), so `/vm/port/<name>/` serves during the whole
+  20–40 minute Setup instead of only after `ready`;
+* **the subprotocol is negotiated.** `Sec-WebSocket-Protocol` is answered only
+  when the client OFFERED a supported protocol (`WS_SUBPROTOCOLS = ["binary"]`).
+  Debian's noVNC 1.6.0 offers none, and a server naming one the client did not
+  offer is a handshake RFC 6455 says the browser must abort — which is exactly
+  the reported "page loads, console says *not connected*".
 
 ### Networking
 
@@ -823,6 +848,9 @@ re-ran a ten-minute script on every start and failed on the same line.
 | `DSH_CUA_WINDOWS_SWTPM` | `/usr/bin/swtpm` | the TPM2 emulator |
 | `DSH_CUA_WINDOWS_VIRTIO_ISO` | *(unset)* | a virtio-win ISO; without it the disk is AHCI and the NIC e1000e |
 | `DSH_CUA_WINDOWS_ISO_TIMEOUT_MS` | `3600000` | bound on the one-time ISO download |
+| `DSH_CUA_WINDOWS_CDBOOT_PROMPT_MS` | `90000` | how long the serial log is watched for the cdboot prompt (300 ms poll; presses fire on the poll that sees it) |
+| `DSH_CUA_WINDOWS_CDBOOT_PRESS_MS` | `3000` | the QMP budget for ONE Enter press — the 15 s default let one busy-monitor collision consume the whole window |
+| `DSH_CUA_WINDOWS_CDBOOT_CYCLES` / `_WATCH_MS` | `12` / `180000` | re-arm budget when BDS reprints the prompt, bounded by the watch and by the QEMU staying alive |
 | `DSH_CUA_VM_WIN_MCP` | `1` | `0` disables the guest dsh-cua tools (and their token cost) |
 | `DSH_CUA_REA_SCRIPT` | `/usr/local/bin/cua-guest-rea.sh` | guest script path (debugging) |
 

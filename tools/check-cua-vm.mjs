@@ -540,6 +540,14 @@ const NEEDLES = {
     // loopback ports, so the next process lost the port race or relayed to a
     // bridge whose supervisor socket was gone.
     ['const SHUTDOWN_LIVE_VIEW_DEADLINE_MS = 2000', 1],
+    ['const QMP_CONNECT_TIMEOUT_MS = 2000', 1],
+    ['function qmpCommands(port, commands, { timeoutMs = null, defaultTimeout = null, connectTimeoutMs = QMP_CONNECT_TIMEOUT_MS, host = \'127.0.0.1\' } = {})', 1],
+    ['const fallbackTimeout = Number(defaultTimeout) > 0 ? Number(defaultTimeout) : 0', 1],
+    ['const connectTimeout = Number(connectTimeoutMs) > 0 ? Number(connectTimeoutMs) : QMP_CONNECT_TIMEOUT_MS', 1],
+    // R7: the relay is opened right after the row write, non-fatally, so
+    // /vm/port/<name>/ serves for the whole install (it used to exist only at ready).
+    ['const relayed = await ensureWindowsConsoleRelay(spec.name)', 1],
+    ['live view is not up yet (the display has not answered); the install watcher retries at ready', 1],
     ['function sweepLiveViews()', 1],
     ['const children = sweepLiveViews()', 1],
     // J22-12: A REOPENED RELAY KEEPS ITS CAPABILITIES. A relay is transport only;
@@ -784,6 +792,36 @@ const NEEDLES = {
     // R1: cdboot's "Press any key to boot from CD or DVD" is pressed over QMP
     // during the install phase only — the window is 5 s and EFI_TIMEOUT lands
     // the firmware in the Internal Shell, a dead end.
+    // R6: THE CDBOOT SCHEDULER IS PROMPT-ANCHORED, RE-ARMING AND HONEST.
+    //
+    // The live forensic child showed the fixed 1.5/3.5/5.5 s presses landing while
+    // OVMF was still enumerating, i.e. BEFORE cdboot printed its prompt; and a
+    // monitor REFUSING an event answers `{error}` as a RESULT, which the old code
+    // logged as "pressed". Four numbers and one reader are the fix.
+    ['export function cdbootPressFailure(result)', 1],
+    ['export function cdbootPromptWindowMs()', 1],
+    ['export function cdbootRearmCycles()', 1],
+    ['export function cdbootRearmWatchMs()', 1],
+    ['export function cdbootPressTimeoutMs()', 1],
+    ['DSH_CUA_WINDOWS_CDBOOT_PROMPT_MS', 1],
+    ['DSH_CUA_WINDOWS_CDBOOT_PRESS_MS', 1],
+    ['DSH_CUA_WINDOWS_CDBOOT_CYCLES', 1],
+    ['DSH_CUA_WINDOWS_CDBOOT_WATCH_MS', 1],
+    // the call site: 90 s prompt window, growth anchor OFF, 12 re-arms inside a
+    // 180 s watch, and a 3 s budget per press (the 15 s default burned the window
+    // on one refusal).
+    ['maxWindowMs: cdbootPromptWindowMs()', 1],
+    ['armDelayMs: 0,', 1],
+    ['cycles: cdbootRearmCycles()', 1],
+    ['watchMs: cdbootRearmWatchMs()', 1],
+    ['timeoutMs: cdbootPressTimeoutMs()', 1],
+    // an unparsable knob falls back, and the refusal is logged as a MISS
+    ['function cdbootNumber(name, fallback, min, max)', 1],
+    ['if (!Number.isFinite(parsed)) return fallback', 1],
+    ['could not press ${key} at ~${Math.round(at)} ms ${reason}', 2],
+    // and the caller reads RESULT refusals too (kept: the boot path's own sweep)
+    ['const refused = cdbootPressFailure(result)', 1],
+    ['const refused = cdbootPressFailure(replies)', 1],
     ['export function cdbootKeyScheduleMs()', 1],
     ['export async function runCdbootKeys({', 1],
     ['if (installPending && cdbootKeysEnabled() && child?.pid)', 1],
@@ -1103,7 +1141,18 @@ const NEEDLES = {
     ['vmWindowsClipboardGet', 1],
     ['export function startClipboardBridge(options = {})', 1],
     ['export function parseArgs(argv)', 1],
-    ['async function main()', 1]
+    ['async function main()', 1],
+    // R8: THE SUBPROTOCOL IS NEGOTIATED. noVNC 1.6.0 (Debian) offers NONE, and a
+    // server that answers `Sec-WebSocket-Protocol: binary` to a client that did
+    // not offer it is a handshake RFC 6455 says the CLIENT must abort — the page
+    // loaded and the console said "not connected". No offer means no header.
+    ['export const WS_SUBPROTOCOLS = Object.freeze([\'binary\'])', 1],
+    ['export function selectSubprotocol(headerValue, supported = WS_SUBPROTOCOLS)', 1],
+    ["const protocol = selectSubprotocol(request.headers['sec-websocket-protocol'])", 1],
+    ['if (protocol !== null) lines.push(`Sec-WebSocket-Protocol: ${protocol}`)', 1],
+    // the guard is the assertion: the unconditional line this replaced must not
+    // come back (it was `Sec-WebSocket-Protocol: binary` on every handshake).
+    ['NO UNCONDITIONAL `Sec-WebSocket-Protocol`', 1]
   ],
   winMcp: [
     ['export function windowsMcpEnabled()', 1],
@@ -2261,6 +2310,43 @@ function sourceOf(label, name) {
     failures += 1
     missing.push(`J1-6b: /opt/seek-harness/cua-check is FLAT, so the COPY set must carry the doc and every file the gate reads — ${flatDetail}`)
     console.log('  FAIL J1-6b flat gate tree')
+  }
+}
+
+/**
+ * R8: THE SUBPROTOCOL HEADER IS CONDITIONAL — ASSERTED, NOT ASSUMED.
+ *
+ * A needle can prove the guarded line EXISTS; only the absence of the old one
+ * proves the bridge cannot answer a protocol the client never offered. This reads
+ * the shipped source and requires exactly one emission, inside the `protocol !==
+ * null` guard, with `selectSubprotocol(request.headers[...])` as its only source
+ * of the value. The behavioural half (a real upgrade with and without the offer)
+ * lives in tests/modules-unit.mjs; this is the structural half that survives a
+ * refactor of the handshake function.
+ */
+{
+  const clipFile = pick('cua-vnc-clip.mjs')
+  total += 1
+  let ok = false
+  let detail = 'cua-vnc-clip.mjs not found'
+  if (clipFile !== null) {
+    const text = readFileSync(clipFile, 'utf8')
+    const emits = [...text.matchAll(/lines\.push\(([^\n]*Sec-WebSocket-Protocol[^\n]*)\)/gu)].map((match) => match[1])
+    const guarded = /if \(protocol !== null\) lines\.push\(`Sec-WebSocket-Protocol: \$\{protocol\}`\)/u.test(text)
+    const fromRequest = /selectSubprotocol\(request\.headers\['sec-websocket-protocol'\]\)/u.test(text)
+    // The exact shapes that made the handshake abort: a constant header, or a
+    // push that is not behind the negotiation.
+    const unconditional = /['"`]Sec-WebSocket-Protocol: (?:binary|base64)['"`]/u.test(text)
+      || /^\s*lines\.push\(`Sec-WebSocket-Protocol:/mu.test(text)
+    ok = emits.length === 1 && guarded && fromRequest && !unconditional
+    detail = JSON.stringify({ emissions: emits.length, guarded, fromRequest, unconditional })
+  }
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   R8 the console bridge answers Sec-WebSocket-Protocol ONLY when the client offered one')
+  } else {
+    failures += 1
+    missing.push(`R8: cua-vnc-clip.mjs must negotiate the subprotocol — no offer means NO header, and the only emission is the guarded push of selectSubprotocol(request.headers[...]) — ${detail}`)
+    console.log('  FAIL R8 subprotocol negotiation')
   }
 }
 

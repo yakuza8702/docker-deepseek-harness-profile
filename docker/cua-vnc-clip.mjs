@@ -85,6 +85,37 @@ import { extname, normalize, resolve, sep } from 'node:path'
 /** The WebSocket magic string from RFC 6455 §1.3. */
 export const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
+/**
+ * The subprotocols this bridge can speak. noVNC sends binary RFB frames, and
+ * that is the only encoding implemented here.
+ */
+export const WS_SUBPROTOCOLS = Object.freeze(['binary'])
+
+/**
+ * WHICH SUBPROTOCOL TO ECHO BACK, OR `null` TO OMIT THE HEADER ENTIRELY.
+ *
+ * RFC 6455 section 4.2.2: a server answering with `Sec-WebSocket-Protocol` MUST
+ * name one of the protocols the client offered. Naming one it did not offer is
+ * a handshake the CLIENT must abort — which is exactly the reported defect: the
+ * image's noVNC (Debian novnc 1.6.0) opens the socket with NO subprotocol
+ * header, the bridge answered `binary` unconditionally, and the browser dropped
+ * the socket. The page loaded; the screen never did.
+ *
+ * So: no offer -> no header. An offer -> the client's FIRST listed protocol we
+ * support, echoed with the client's own spelling (never a name it did not send).
+ * @param {string|undefined} headerValue the request's `Sec-WebSocket-Protocol`
+ * @param {readonly string[]} [supported]
+ * @returns {string|null}
+ */
+export function selectSubprotocol(headerValue, supported = WS_SUBPROTOCOLS) {
+  if (typeof headerValue !== 'string' || headerValue.trim() === '') return null
+  const offered = headerValue.split(',').map((token) => token.trim()).filter(Boolean)
+  for (const token of offered) {
+    if (supported.some((name) => name.toLowerCase() === token.toLowerCase())) return token
+  }
+  return null
+}
+
 /** 262144 characters and 1 MiB of bytes: the two caps, named once. */
 const MAX_MESSAGE_CHARS = 262144
 const MAX_MESSAGE_BYTES = 1024 * 1024
@@ -652,16 +683,19 @@ export function startClipboardBridge(options = {}) {
       socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
       return
     }
+    // NO UNCONDITIONAL `Sec-WebSocket-Protocol` (see selectSubprotocol): the
+    // header is a NEGOTIATION, and naming a protocol the client never offered
+    // is a handshake the browser must abort. Debian's novnc 1.6.0 sends none,
+    // so the normal answer here is no header at all.
+    const protocol = selectSubprotocol(request.headers['sec-websocket-protocol'])
     const lines = [
       'HTTP/1.1 101 Switching Protocols',
       'Upgrade: websocket',
       'Connection: Upgrade',
-      `Sec-WebSocket-Accept: ${wsAccept(key)}`,
-      // noVNC asks for `binary`; answering it keeps some clients from falling
-      // back to base64 text framing.
-      'Sec-WebSocket-Protocol: binary',
-      '', ''
+      `Sec-WebSocket-Accept: ${wsAccept(key)}`
     ]
+    if (protocol !== null) lines.push(`Sec-WebSocket-Protocol: ${protocol}`)
+    lines.push('', '')
     socket.write(lines.join('\r\n'))
     socket.setNoDelay?.(true)
 

@@ -1708,3 +1708,95 @@ node tools/check-cua-vm.mjs --root .    # nothing else in the chain moved
 grep -rn 'Plugins → Personal VM (CUA) → Policy' README* plugins/ docker/ tools/ docs/
                                        # must print nothing (0 hits)
 ```
+
+## 20. Branch `cua-vm-improve` — 2026-11-18: the boot prompt, the dead monitor, the dropped socket
+
+Three runtime fixes that all presented as "the Windows computer is stuck": the CD
+prompt was never dismissed, a dead monitor cost 15 s per probe (and per key), and
+the console page loaded but said *not connected*. Each is problem → change →
+verify, with the anchor of the shipped code.
+
+### A. The cdboot scheduler presses on the PROMPT, re-arms, and reports refusals
+
+**Problem.** Three separate lies in one 40-line watcher. (1) It pressed at 1.5 /
+3.5 / 5.5 s after **spawn**, while OVMF was still enumerating — before `cdboot`
+printed its prompt — so the 5 s window expired and the firmware fell into the EFI
+Shell (`EFI_TIMEOUT`). (2) A QMP refusal is a RESULT (`{error:{desc}}`), not a
+throw; the code only caught throws, so a run of refused presses logged *"pressed
+enter at ~1.7 s"* while the guest never saw a key. (3) Each press waited the 15 s
+monitor default, so ONE collision consumed the whole prompt window; and a prompt
+BDS re-printed (it re-enters the DVD when unanswered) was never served again.
+
+**Change** (`docker/cua-vm-windows-qemu.mjs`):
+* `runCdbootKeys()` (:878) is prompt-anchored: the serial log is polled every
+  **300 ms** (`pollMs`) for up to **90 s** (`cdbootPromptWindowMs`, :1154), and
+  the presses fire on the poll that sees the prompt signature (:4284).
+* the first-output growth anchor is **disabled at the call site**
+  (`armDelayMs: 0`, :4285); its `+1.5 s` survives only for a caller that opts in.
+* a re-printed prompt re-arms the schedule for at most `cdbootRearmCycles()`
+  (**12**, :1159) inside `cdbootRearmWatchMs()` (**180 s**, :1164), stopping early
+  when the QEMU child exits.
+* `cdbootPressFailure(result)` (:1116) reads the monitor's refusal out of a
+  `{error}` entry (string, `{desc}`, `{class}`, or an array containing one); a
+  refused press is logged `could not press enter …` and never counted as sent
+  (:926, :4597).
+* one press gets `cdbootPressTimeoutMs()` = **3 s** (:1176), passed as the
+  per-press QMP budget (:4302).
+* knobs: `DSH_CUA_WINDOWS_CDBOOT_PROMPT_MS`, `_CDBOOT_PRESS_MS`, `_CDBOOT_CYCLES`,
+  `_CDBOOT_WATCH_MS`, all clamped, junk → the default (never 0).
+
+**Verify.** `node tests/modules-unit.mjs` (R6: a refused result is not sent and
+says so; `cdbootPressFailure` shapes; 90 s / 12 / 180 s / 3 s defaults and clamps);
+`node tools/check-cua-vm.mjs --root .` (the four helpers, `armDelayMs: 0`,
+`maxWindowMs: cdbootPromptWindowMs()`, `timeoutMs: cdbootPressTimeoutMs()`).
+
+### B. A dead monitor costs 2 s, not 15 — and the console exists during Setup
+
+**Problem.** `qmpCommands()` used one 15 s budget for two different failures: a
+socket that never opens and a monitor that accepts and stays silent. Every probe
+against a computer whose monitor had gone away waited the full window — and the
+Windows backend presses a key per call, so a boot could spend 15 s *per press*
+waiting for a refusal. Separately, the create answer advertised
+`console: /vm/port/<name>/`, but the relay was only created by the install watcher
+at the READY transition: for the 20–40 minutes Setup ran, the proxy answered
+*"not connected"* on the one screen a human most wants to watch.
+
+**Change** (`docker/cua-vm-supervisor.mjs`):
+* `QMP_CONNECT_TIMEOUT_MS = 2000` (:2165) is its own budget; a refused port also
+  fails immediately on the socket's `error` event. The answer wait keeps the old
+  15 s default and accepts a per-call `defaultTimeout` (:2195), which is the
+  spelling the backend uses for `--press-ms`.
+* `windowsCreateManaged` opens `ensureWindowsConsoleRelay(name)` right after the
+  row write, inside a `try` (:4933): success logs
+  `live view ready at /vm/port/<name>/ … while Setup runs`, failure is one log
+  line and the install watcher retries at Ready. The create answer keeps
+  `console: /vm/port/<name>/` either way.
+
+**Verify.** `node tools/check-cua-vm.mjs --root .` (the 2 s constant, the
+`defaultTimeout` signature and fallback line, the create-site relay and its two
+log lines); `node tests/supervisor-smoke.mjs` (the shutdown/probe paths still
+answer against a dead monitor inside their own budgets).
+
+### C. The WebSocket subprotocol is negotiated, not announced
+
+**Problem.** The console bridge answered `Sec-WebSocket-Protocol: binary` on
+EVERY upgrade. RFC 6455 §4.2.2: a server naming a protocol the client did not
+offer is a handshake the CLIENT must abort. Debian's noVNC 1.6.0 sends no
+subprotocol header, so the browser dropped the socket — the page rendered, the
+canvas never did, and noVNC reported *not connected*. Nothing in the logs said
+why, because the bridge considered the handshake a success.
+
+**Change** (`docker/cua-vnc-clip.mjs`):
+* `WS_SUBPROTOCOLS = ["binary"]` (:92) and `selectSubprotocol(headerValue,
+  supported)` (:110): no offer → `null`; an offer → the client's first listed
+  protocol we support, echoed with the CLIENT's own spelling.
+* the handshake pushes the header only when `protocol !== null` (:697); the
+  unconditional constant is gone.
+
+**Verify.** `node tests/modules-unit.mjs` (J22-8b: `undefined`/empty →
+`null`; `'base64, binary'` → `'binary'`; `'BINARY'` echoed as `'BINARY'`;
+unsupported offer → `null`; **a real loopback upgrade** with no offer gets 101
+and NO header, an offer of `binary` gets it once, an unsupported offer gets
+none); `node tools/check-cua-vm.mjs --root .` (R8: exactly one emission, inside
+the guard, sourced from `selectSubprotocol(request.headers[...])`, and no
+unconditional constant anywhere).

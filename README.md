@@ -928,10 +928,17 @@ A code whose chain cannot run here is reported **before** the download as
 front door is the image's own **`cua-vnc-clip`** bridge (static noVNC + the
 WebSocket handshake + an RFB clipboard), and it falls back to websockify if that
 binary is absent, `DSH_CUA_VNC_CLIP=0`, or the bridge never listens — a broken
-bridge can never cost you the console. The relay is built once and REUSED —
-asking for the view again (a status poll, a second Start) returns the same row
-instead of restarting the front door. See
-[the clipboard, both ways](#the-clipboard-both-ways).
+bridge can never cost you the console. The relay is opened **at create, right
+after the row is written** (non-fatal: a failure is one log line and the install
+watcher retries it at Ready), so the port serves for the whole 20–40 minutes
+Setup runs — the window in which a human most wants to watch — instead of only
+existing once the computer is `ready`. It is then built once and REUSED: asking
+for the view again (a status poll, a second Start) returns the same row instead
+of restarting the front door. The handshake **negotiates the WebSocket
+subprotocol**: `Sec-WebSocket-Protocol` is answered only when the client offered
+a supported one (Debian's noVNC 1.6.0 offers none, and naming `binary` anyway is
+a handshake the browser must abort — the page loaded and the console said "not
+connected"). See [the clipboard, both ways](#the-clipboard-both-ways).
 
 **The GPU branch, precisely.** With Enable GPU, a Windows computer gets
 `virtio-gpu-gl-pci` + `egl-headless` on `/dev/dri/renderD128` **if** the image's
@@ -964,26 +971,38 @@ They are documented together because from the panel they all looked like "the
 install is stuck".
 
 **1. The install CD's "Press any key to boot from CD or DVD" is now pressed for
-you — and it is anchored on the serial console, not on a spawn-relative
-clock.** OVMF reached the DVD, `cdboot.efi 10.0.26100.1` printed that prompt,
-nobody pressed a key within its 5 s window, and the firmware printed
-`EFI_TIMEOUT` and fell into the **EFI Internal Shell** — a dead end no answer
-file can leave. `boot()` sends **Enter over QMP** (`input-send-event`, the same
-path the GUI uses), fired by a watcher on `$STORE/windows/<name>/serial.log`: it
-polls the log's size and tail and starts pressing as soon as the log carries the
-prompt signature (`Press any key to boot from CD`, or `BdsDxe: starting
-Boot0001`) — or, for a firmware that never prints that text, once ordinary boot
-output has appeared (+1.5 s). Presses repeat every 0.8 s; a prompt anchor stops
-after three, a growth anchor keeps retrying until the ~8 s window closes (an
-early guess must not be the last press). This is a **fix for a live-verified
-miss**: the old fixed **1.5 / 3.5 / 5.5 s after spawn** presses landed while OVMF
-was still enumerating — before the prompt existed — so the first boot never
-dismissed it. The fixed offsets survive only as the fallback (a silent console, or
-a store where QEMU never created the log) and are configurable
-(`DSH_CUA_WINDOWS_CDBOOT_KEYS_MS=1500,3500,5500`); the whole feature can be
-switched off (`DSH_CUA_WINDOWS_CDBOOT_KEYS=0`). It is **gated on the install
-phase**: booting an already-installed disk never types into the guest. A failed
-send is logged and skipped, never fatal.
+you — anchored on the prompt itself, re-armed if the firmware prints it again.**
+OVMF reached the DVD, `cdboot.efi 10.0.26100.1` printed that prompt, nobody
+pressed a key within its 5 s window, and the firmware printed `EFI_TIMEOUT` and
+fell into the **EFI Internal Shell** — a dead end no answer file can leave.
+`boot()` sends **Enter over QMP** (`input-send-event`, the same path the GUI
+uses), fired by a watcher on `$STORE/windows/<name>/serial.log`:
+
+* **the prompt is the anchor.** The log is polled every **300 ms** and the presses
+  fire on the poll that sees `Press any key to boot from CD` (or `BdsDxe: starting
+  Boot0001`). The window is **90 s**, because a cold q35/OVMF boot prints cdboot
+  well after the old 8 s bound — the wait used to end before the prompt existed.
+* **the spawn-relative guess is OFF in production.** The first-output growth
+  anchor (`+1.5 s` after the OVMF banner) is disabled at the call site
+  (`armDelayMs: 0`); it survives only for a caller that opts into it, because for
+  this guest it is the guess that was measured wrong. The fixed 1.5/3.5/5.5 s
+  offsets survive only as the fallback for a console that stays silent.
+* **a re-printed prompt is served again.** BDS re-enters the DVD when nobody
+  answers and prints the prompt anew; the watcher re-arms on it, for at most
+  **12 cycles inside a 180 s watch**, and stops early when the QEMU exits.
+* **a refused press is a MISS, not a press.** The QMP primitive RESOLVES the
+  monitor's refusal (`{error:{desc}}`) instead of throwing it, so the scheduler
+  reads the RESULT: a refusal is logged as `could not press enter …` and never
+  counted as sent. Each press gets **3 s** (`DSH_CUA_WINDOWS_CDBOOT_PRESS_MS`),
+  not the 15 s monitor default — one busy-monitor collision used to consume the
+  whole prompt window; the 0.8 s retry does the retrying instead.
+
+Knobs: `DSH_CUA_WINDOWS_CDBOOT_PROMPT_MS` (prompt window, 90 s),
+`DSH_CUA_WINDOWS_CDBOOT_CYCLES` / `_WATCH_MS` (re-arm budget), `_PRESS_MS` (one
+press), `_KEYS_MS` (the silent-console fallback offsets), and `_KEYS=0` to switch
+the whole feature off. It is **gated on the install phase**: booting an
+already-installed disk never types into the guest. A failed or refused send is
+logged and skipped, never fatal.
 
 **2. The boot order now follows the phase.** The argv used to put the disk at
 `bootindex=1` and the CD at `bootindex=2` while a comment claimed the ISO booted
@@ -1008,6 +1027,15 @@ reached the monitor, and every probe answered *"not answering"* — so even with
 fixed, the computer never became ready. `windowsQmpAdapter` joins the two, and
 `tools/check-cua-vm.mjs` + `tests/modules-unit.mjs` prove it with a faithful stub
 (the test first reproduces the throw, then shows the adapter fixing it).
+
+**4b. Two timers, because there are two failures, and a per-call budget.** A
+monitor whose socket never opens and a monitor that accepts and then says nothing
+are different failures, and they used to share one 15 s budget — so every probe
+against a computer whose monitor had gone away waited the full window, and since
+the Windows backend presses a key per call, that was 15 s **per press**. The
+connect now fails on its own **2 s** budget (`QMP_CONNECT_TIMEOUT_MS`, and
+immediately on `ECONNREFUSED`); the answer keeps the old 15 s default and accepts
+a per-call `defaultTimeout` (the spelling the backend uses for `-press-ms`).
 
 **Belt and braces (6):** the answer medium's root now also gets a `startup.nsh`
 that tries `\efi\boot\bootx64.efi` on every mapped filesystem (`FS0`..`FS5`). If a

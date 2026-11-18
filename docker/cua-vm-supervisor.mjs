@@ -2157,26 +2157,76 @@ function degradedSummary(rows) {
 }
 
 /**
+ * HOW LONG A MONITOR THAT ACCEPTS A CONNECTION MAY STAY SILENT BEFORE THE CALL
+ * GIVES UP. Separate from `answerTimeout` on purpose: a wedged QMP listener is
+ * a different failure from a port nobody is listening on, and the second one
+ * must not cost the caller fifteen seconds.
+ */
+const QMP_CONNECT_TIMEOUT_MS = 2000
+
+/**
  * QMP, because a disk can be grown *while the guest runs* — and that is the
  * only way to do it here. cua 0.7.0 has no `stop` (suspend pauses QEMU and
  * keeps the qcow2 open), so `qemu-img resize` has no window. QMP's
  * `block_resize` grows the virtual size under a live QEMU; the guest then
  * grows its partition and filesystem online. No downtime, no data loss.
+ *
+ * TWO TIMERS, BECAUSE THERE ARE TWO FAILURES:
+ *
+ *   connect  the socket never opens (refused, dropped, wrong port). This now
+ *            fails on its OWN short budget (2 s default) and, for a REFUSED
+ *            port, on the socket's `error` event — which is immediate. It used
+ *            to share the 15 s answer budget, so every probe against a computer
+ *            whose monitor had gone away waited the full window; the Windows
+ *            backend presses a key per call and that was 15 s per press.
+ *   answer   the socket is open and the monitor is silent. This keeps the old
+ *            budget, and callers may shorten it per call.
+ *
+ * BACKWARD COMPATIBLE: `timeoutMs` still means exactly what it meant. A caller
+ * that passes only `defaultTimeout` (the spelling the Windows backend uses for
+ * a per-press budget, e.g. 3000) gets that as the answer wait; neither option
+ * keeps the historical 15 s.
+ *
+ * ERRORS ARE RESULTS, NOT REJECTIONS: a refused command (`{"error":{...}}`)
+ * is pushed into `results` as its own entry, so the caller can see WHICH
+ * command failed and still read the answers around it. Rejection is reserved
+ * for "the monitor could not be talked to at all".
  */
-function qmpCommands(port, commands, { timeoutMs = 15000, host = '127.0.0.1' } = {}) {
+function qmpCommands(port, commands, { timeoutMs = null, defaultTimeout = null, connectTimeoutMs = QMP_CONNECT_TIMEOUT_MS, host = '127.0.0.1' } = {}) {
+  const explicitTimeout = Number(timeoutMs) > 0 ? Number(timeoutMs) : 0
+  const fallbackTimeout = Number(defaultTimeout) > 0 ? Number(defaultTimeout) : 0
+  const answerTimeout = explicitTimeout > 0 ? explicitTimeout : fallbackTimeout > 0 ? fallbackTimeout : 15000
+  const connectTimeout = Number(connectTimeoutMs) > 0 ? Number(connectTimeoutMs) : QMP_CONNECT_TIMEOUT_MS
   return new Promise((resolve, reject) => {
     const socket = netConnect(port, host)
     let buffer = ''
     let stage = 'caps'
     let index = 0
     let settled = false
+    let connected = false
+    let timer = null
     const results = []
-    const timer = setTimeout(() => {
+    // The refusal sentence NAMES the endpoint and keeps the socket's own code
+    // (ECONNREFUSED, EACCES…), because that is what the caller's answer quotes.
+    const failWith = (error) => {
       if (settled) return
       settled = true
-      socket.destroy()
-      reject(new Error(`QMP did not answer within ${timeoutMs} ms`))
-    }, timeoutMs)
+      clearTimeout(timer)
+      try { socket.destroy() } catch {}
+      reject(error)
+    }
+    const armConnect = () => {
+      clearTimeout(timer)
+      timer = setTimeout(() => {
+        failWith(new Error(`QMP ${host}:${port} did not accept a connection within ${connectTimeout} ms`))
+      }, connectTimeout)
+    }
+    const armAnswer = () => {
+      clearTimeout(timer)
+      timer = setTimeout(() => {
+        failWith(new Error(`QMP ${host}:${port} did not answer within ${answerTimeout} ms`))
+      }, answerTimeout)
+    }
     const write = (command) => socket.write(`${JSON.stringify(command)}\n`)
     const finish = () => {
       if (settled) return
@@ -2193,7 +2243,14 @@ function qmpCommands(port, commands, { timeoutMs = 15000, host = '127.0.0.1' } =
       write(commands[index])
     }
     socket.setEncoding('utf8')
-    socket.on('connect', () => write({ execute: 'qmp_capabilities' }))
+    // The connect budget starts BEFORE the handshake, so a black-holed port can
+    // never hang the caller for the answer window.
+    armConnect()
+    socket.on('connect', () => {
+      connected = true
+      armAnswer()
+      write({ execute: 'qmp_capabilities' })
+    })
     socket.on('data', (chunk) => {
       buffer += chunk
       let newline = buffer.indexOf('\n')
@@ -2210,16 +2267,19 @@ function qmpCommands(port, commands, { timeoutMs = 15000, host = '127.0.0.1' } =
           advance()
           continue
         }
+        // `{error:…}` lands here ON PURPOSE (see the comment above): the caller
+        // inspects `results[i].error` instead of catching a rejection that would
+        // also throw away the answers it already had.
         results.push(message)
         index += 1
         advance()
       }
     })
     socket.on('error', (error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      reject(error)
+      // FAST PATH: a refused/denied connection is answered here, in
+      // microseconds, instead of waiting out the answer budget.
+      const detail = error?.code ?? error?.message ?? String(error)
+      failWith(new Error(`QMP ${host}:${port} could not be reached${connected ? ' after connecting' : ''} (${detail})`))
     })
   })
 }
@@ -4855,6 +4915,27 @@ async function windowsCreateManaged(spec) {
       readiness: windowsReadinessSignals(spec.name)
     }
     await mutateRegistry((fresh) => { fresh.vms[spec.name] = row })
+    // THE LIVE VIEW EXISTS FROM THE FIRST SECOND — NOT FROM READY.
+    //
+    // The answer below advertises `console: /vm/port/<name>/`, and the panel
+    // renders it during the whole install; but the relay was only ever created
+    // by the install watcher at the READY transition (and by `view`/status for
+    // a ready row). So for the 20-40 minutes Setup runs, the port had no entry
+    // in ports.json and the proxy answered "not connected": the one window in
+    // which a human most wants to watch (OOBE, a stuck Setup) was the one with
+    // no console.
+    //
+    // NON-FATAL BY CONSTRUCTION: the relay points at the VNC port whether or not
+    // QEMU is listening yet, a failure is one log line, and the create answer
+    // keeps `console: /vm/port/<name>/` either way. The install watcher re-runs
+    // this at ready, so a relay that could not open now is retried there.
+    try {
+      const relayed = await ensureWindowsConsoleRelay(spec.name)
+      if (relayed === null) log(`windows: ${spec.name} live view is not up yet (the display has not answered); the install watcher retries at ready`)
+      else log(`windows: ${spec.name} live view ready at /vm/port/${spec.name}/ (${relayed.view ?? 'relay'}) while Setup runs`)
+    } catch (error) {
+      log(`windows: ${spec.name} live view could not be opened at create (${error?.message ?? error}); the install watcher retries at ready`)
+    }
     // Z2: THE ROW NOW OWNS THESE PORTS. The claim existed only for the window
     // between allocation and the row write; keeping it made every later
     // reconcile (and every other create) see them as taken.

@@ -8,6 +8,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
 import http from 'node:http'
+import net from 'node:net'
 import zlib from 'node:zlib'
 import {
   pngSize, formatSpace, formatSpaceWarning, spaceLine, relativeToPixels, toDisplayPixels, resolutionProblem, createSpace
@@ -28,6 +29,7 @@ import {
   formatWindowsInstallDetail, qmpStateLabel, endpointLabel, windowsTailLines, windowsPortsOf, windowsBootSpec,
   windowsReadinessSignals, qemuBootWindowMs, waitForQemuBoot,
   windowsRowName, windowsQmpAdapter, cdbootKeyScheduleMs, cdbootKeysEnabled, runCdbootKeys, cdbootPromptSeen, readSerialTail, startupNshText,
+  cdbootPressFailure, cdbootPromptWindowMs, cdbootRearmCycles, cdbootRearmWatchMs, cdbootPressTimeoutMs,
   createWindowsBackend,
   // U4: the free-space probe's parser/formatter (pure), so the panel's number
   // and its below-floor warning are asserted without a guest.
@@ -36,7 +38,10 @@ import {
 import {
   KVM_GID_COMMAND, deviceNodePresent, formatKvmStatus, kvmDoctorFacts, kvmPreflightError, kvmStatus
 } from '../docker/cua-vm-kvm.mjs'
-import { wsAccept, isClientCutText, parseClientCutText, serverCutTextFrame, encodeCutText } from '../docker/cua-vnc-clip.mjs'
+import {
+  wsAccept, isClientCutText, parseClientCutText, serverCutTextFrame, encodeCutText,
+  WS_SUBPROTOCOLS, selectSubprotocol, startClipboardBridge
+} from '../docker/cua-vnc-clip.mjs'
 import {
   DEFAULT_SERVER_NAME, TOOL_PREFIX, REVEAL_TOOL_NAME, DOCTOR_TOOL_NAME,
   windowsToolName, windowsGuestToolName, sshArgv, SSH_KEEPALIVE
@@ -660,6 +665,90 @@ check('exactly two versions carry a live mido strategy (11 and 10, the two pages
     latin.encoding === 'latin1' && wide.encoding === 'utf-8' && wide.length === 6, `${latin.encoding}/${wide.encoding}`)
   check('WP-7: encodeCutText strips NUL (both the wire and the Windows clipboard stop at one)',
     encodeCutText('a\u0000b').length === 2)
+}
+
+// ------------------------------------------------------------------ *
+// J22-8b: THE WEBSOCKET SUBPROTOCOL IS A NEGOTIATION, NOT A CONSTANT
+//
+// The reported defect: the bridge answered `Sec-WebSocket-Protocol: binary`
+// unconditionally. RFC 6455 §4.2.2 says a server naming a protocol the client
+// did not offer is a handshake the CLIENT MUST ABORT — and Debian's novnc 1.6.0
+// offers none. The page loaded, the socket was dropped, the console said "not
+// connected". selectSubprotocol() is the rule; these checks include a REAL
+// upgrade exchange so the emitted header (not just the helper) is asserted.
+// ------------------------------------------------------------------ *
+{
+  check('J22-8b: the only subprotocol this bridge speaks is `binary`',
+    WS_SUBPROTOCOLS.length === 1 && WS_SUBPROTOCOLS[0] === 'binary')
+  check('J22-8b: no offer → null (so the header is OMITTED, never guessed)',
+    selectSubprotocol(undefined) === null && selectSubprotocol('') === null
+    && selectSubprotocol('   ') === null && selectSubprotocol(null) === null)
+  check("J22-8b: 'base64, binary' → 'binary' (the client's first protocol we support)",
+    selectSubprotocol('base64, binary') === 'binary' && selectSubprotocol('binary, base64') === 'binary')
+  check('J22-8b: ...echoed with the CLIENT\'s spelling, and only when offered',
+    selectSubprotocol('BINARY') === 'BINARY' && selectSubprotocol('BINARY, base64') === 'BINARY'
+    && selectSubprotocol('permessage-deflate') === null
+    && selectSubprotocol('permessage-deflate, base64') === null)
+  check('J22-8b: an empty supported list never invents a protocol',
+    selectSubprotocol('binary', []) === null)
+
+  // THE REAL HANDSHAKE. A loopback-only bridge on ephemeral ports; the VNC and
+  // control endpoints are never dialled for an upgrade, so dummy values are fine.
+  const bridge = startClipboardBridge({
+    httpPort: '127.0.0.1:0',
+    vncPort: '127.0.0.1:1',
+    controlSock: path.join(os.tmpdir(), `cua-ws-probe-${process.pid}.sock`),
+    name: 'ws-probe',
+    pollMs: 60000,
+    log: () => {}
+  })
+  const upgrade = (headers) => new Promise((resolve, reject) => {
+    const port = Number(new URL(bridge.url).port)
+    const socket = net.connect(port, '127.0.0.1')
+    let buffer = ''
+    const timer = setTimeout(() => { try { socket.destroy() } catch {} ; resolve(buffer) }, 4000)
+    timer.unref?.()
+    socket.setEncoding('utf8')
+    socket.on('connect', () => {
+      const lines = [
+        'GET /websockify HTTP/1.1',
+        'Host: 127.0.0.1',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version: 13',
+        ...headers,
+        '', ''
+      ]
+      socket.write(lines.join('\r\n'))
+    })
+    socket.on('data', (chunk) => {
+      buffer += chunk
+      if (buffer.includes('\r\n\r\n')) {
+        clearTimeout(timer)
+        try { socket.destroy() } catch {}
+        resolve(buffer)
+      }
+    })
+    socket.on('error', reject)
+  })
+  try {
+    await bridge.ready
+    const none = await upgrade([])
+    check('J22-8b: an upgrade with NO Sec-WebSocket-Protocol gets 101 and NO protocol header',
+      /^HTTP\/1\.1 101/u.test(none) && !/sec-websocket-protocol:/iu.test(none),
+      none.split('\r\n').filter(Boolean).join(' | ').slice(0, 180))
+    const offered = await upgrade(['Sec-WebSocket-Protocol: binary'])
+    check('J22-8b: ...an upgrade that OFFERS binary gets the header back, named once',
+      /^HTTP\/1\.1 101/u.test(offered)
+      && (offered.match(/sec-websocket-protocol: binary/giu) ?? []).length === 1,
+      offered.split('\r\n').filter(Boolean).join(' | ').slice(0, 180))
+    const unsupported = await upgrade(['Sec-WebSocket-Protocol: permessage-deflate'])
+    check('J22-8b: ...an offer we cannot speak is NOT echoed (no header at all)',
+      /^HTTP\/1\.1 101/u.test(unsupported) && !/sec-websocket-protocol:/iu.test(unsupported))
+  } finally {
+    await bridge.close()
+  }
 }
 
 // ------------------------------------------------------------------ *
@@ -1308,6 +1397,76 @@ check('windowsKvmPreflight is the shared module (no second message)',
       check('R1: a failed send is NOT fatal and does not stop the schedule',
         keys.join(',') === '2,3' && sent.join(',') === '200,300', `keys=${keys.join(',')} sent=${sent.join(',')}`)
       check('R1: ...and it says so without throwing', lines.some((line) => /could not press/u.test(line)), lines.join(' | ').slice(0, 160))
+    }
+
+    // ---- R6: A REFUSED PRESS IS NOT A PRESS ----
+    //
+    // The QMP primitive RESOLVES the monitor's refusal (`{error:{desc}}`) instead of
+    // throwing it. The old scheduler only caught throws, so a run of refused
+    // presses logged "pressed enter at ~1.7 s" while the guest never saw a key.
+    {
+      const lines = []
+      const sent = await runCdbootKeys({
+        scheduleMs: [100],
+        log: (line) => lines.push(line),
+        wait: async () => {},
+        sendKey: async () => ({ error: { class: 'GenericError', desc: 'this feature is not supported' } })
+      })
+      check('R6: a press the monitor REFUSED is not counted as sent, and says so',
+        sent.length === 0
+        && lines.some((line) => /could not press enter/u.test(line) && /this feature is not supported/u.test(line)),
+        lines.join(' | ').slice(0, 200))
+      check('R6: ...and it is never logged as a successful press',
+        lines.every((line) => !/pressed enter/u.test(line)))
+    }
+    // R6: the refusal reader itself — the shapes QMP and this supervisor emit.
+    check('R6: cdbootPressFailure reads the monitor\'s refusal, and only the refusal',
+      cdbootPressFailure({ error: { desc: 'GenericError: not enabled' } }) === 'GenericError: not enabled'
+      && cdbootPressFailure([{ return: {} }, { error: 'refused' }]) === 'refused'
+      && cdbootPressFailure({ error: { class: 'Duplicate' } }) === 'Duplicate'
+      && cdbootPressFailure({ error: {} }) === 'the monitor refused the event'
+      && cdbootPressFailure({ return: { OK: 'sent' } }) === null
+      && cdbootPressFailure([{ return: {} }]) === null
+      && cdbootPressFailure(null) === null
+      && cdbootPressFailure('sent') === null,
+      JSON.stringify([
+        cdbootPressFailure({ error: { desc: 'x' } }),
+        cdbootPressFailure({ return: {} }),
+        cdbootPressFailure([{ error: 'y' }])
+      ]))
+
+    // R6: THE KNOBS. 90 s prompt window (measured: cdboot prints long after 8 s),
+    // 12 re-arms, 180 s watch, 3 s per press — all clamped, all defaulting on junk.
+    {
+      check('R6: the prompt window defaults to 90 s, not the old 8 s',
+        cdbootPromptWindowMs() === 90000, String(cdbootPromptWindowMs()))
+      check('R6: the re-arm budget is 12 cycles inside a 180 s watch',
+        cdbootRearmCycles() === 12 && cdbootRearmWatchMs() === 180000,
+        `${cdbootRearmCycles()}/${cdbootRearmWatchMs()}`)
+      check('R6: one press gets 3 s, not the monitor default of 15 s',
+        cdbootPressTimeoutMs() === 3000, String(cdbootPressTimeoutMs()))
+      const saved = {}
+      try {
+        for (const [env, value] of [
+          ['DSH_CUA_WINDOWS_CDBOOT_PROMPT_MS', '5'],
+          ['DSH_CUA_WINDOWS_CDBOOT_CYCLES', '999'],
+          ['DSH_CUA_WINDOWS_CDBOOT_WATCH_MS', '99999999'],
+          ['DSH_CUA_WINDOWS_CDBOOT_PRESS_MS', '1']
+        ]) { saved[env] = process.env[env]; process.env[env] = value }
+        check('R6: every knob is clamped on the way in (5→1000, 999→64, 99999999→3600000, 1→500)',
+          cdbootPromptWindowMs() === 1000 && cdbootRearmCycles() === 64
+          && cdbootRearmWatchMs() === 3600000 && cdbootPressTimeoutMs() === 500,
+          `${cdbootPromptWindowMs()}/${cdbootRearmCycles()}/${cdbootRearmWatchMs()}/${cdbootPressTimeoutMs()}`)
+        for (const env of Object.keys(saved)) process.env[env] = 'not-a-number'
+        check('R6: an unparsable value falls back to the default, never to 0',
+          cdbootPromptWindowMs() === 90000 && cdbootRearmCycles() === 12
+          && cdbootRearmWatchMs() === 180000 && cdbootPressTimeoutMs() === 3000)
+      } finally {
+        for (const [env, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[env]
+          else process.env[env] = value
+        }
+      }
     }
 
     // ---- F2: THE SCHEDULE IS ANCHORED ON SERIAL ACTIVITY, NOT ON SPAWN ----

@@ -831,40 +831,62 @@ export function readSerialTail(file, bytes = 8192) {
 }
 
 /**
- * R1/F2 (the mechanism): press Enter for the cdboot prompt, sequential only.
+ * R1/F2 (the mechanism): press Enter for the cdboot prompt, ANCHORED ON THE
+ * PROMPT ITSELF, and RE-ARMED when the firmware loops the CD boot again.
  *
- * `sendKey` is the backend's own `sendKeys`, `wait` is a sleep that can be
- * stubbed, `now` is the clock, and `readSerial` is the serial tail — ALL are
- * injected so the suite can prove the schedule against a stubbed serial
- * timeline (prompt at 4 s → presses at ~4.1/4.9/5.7 s; a silent console → the
- * fixed-time fallback at exactly the configured offsets) without a hypervisor
- * or a real clock.
+ * WHY THE OLD ANCHOR WAS WRONG (verified against a real QEMU): the watcher took
+ * "the first byte ever written to serial.log" as its anchor and pressed 1.5 s
+ * later. The first bytes are OVMF's banner at ~0.2 s, so the presses landed at
+ * ~1.7-7.4 s while `cdboot.efi` had not even started — and cdboot's "Press any
+ * key to boot from CD or DVD" appeared seconds later, unanswered, until it
+ * printed EFI_TIMEOUT and BDS fell into the EFI Shell. The prompt branch existed
+ * but could only win by accident: it was reached only when the prompt text was
+ * already in the tail BEFORE first-output + 1.5 s, which is almost never.
+ *
+ * THE SHAPE NOW:
+ *
+ *   1. WATCH THE PROMPT, not the banner. `readSerialTail()` (the tail, not the
+ *      whole log) is polled every ~300 ms for `CDBOOT_PROMPT_PATTERN`, for up to
+ *      `maxWindowMs` (~90 s from the call site). The press sequence starts on
+ *      the poll that SEES the prompt, not on a spawn-relative guess.
+ *   2. RE-ARM. BDS re-loops the CD boot when the first attempt is not answered
+ *      (and a re-loop reprints the prompt). After a cycle the watcher keeps
+ *      polling, and a prompt in output that ARRIVED AFTER the previous cycle
+ *      starts another cycle — bounded by `cycles` (12 at the call site) and by
+ *      `watchMs`, and stopped the moment `isAlive()` says the QEMU is gone.
+ *   3. DELIVERY IS PART OF THE PRESS. A monitor that refuses the event answers
+ *      `{error: …}` — a RESOLVED value, not a throw — so a press is only
+ *      reported as pressed when the QMP reply carries no error. A refused press
+ *      is logged as `could not press … : <error>` and the next attempt covers it.
+ *
+ * `sendKey`, `wait`, `now` and `readSerial` are INJECTED so the suite can prove
+ * the schedule against a stubbed serial timeline (prompt at 4 s → presses at
+ * ~4.2/5.0/5.8 s; a silent console → the fixed-time fallback) without a
+ * hypervisor or a real clock.
  *
  * Modes:
- *   * WITH a serial source (`readSerial` or `serialLog`): poll for the prompt
- *     (or for first output + `armDelayMs`), then press at the anchor and every
- *     `retryGapMs` up to `attempts` times. The detection window is bounded by
- *     `maxWindowMs` (~8 s). The fixed-time list is NOT raced in parallel —
- *     pressing at 1.5 s while a 4 s prompt is still coming is the bug itself.
- *     It is replayed, with its own relative gaps, only when (a) the window
- *     closes with no anchor at all, or (b) QEMU never created the serial log
- *     (`serialLog` given but the file is still missing at the first offset —
- *     the historical schedule, unchanged).
- *   * WITHOUT one: the original fixed-time loop, unchanged.
+ *   * NO serial source: the original fixed-time loop, byte for byte.
+ *   * WITH one: prompt-anchored presses. The GROWTH anchor (first output +
+ *     `armDelayMs`) survives only for a caller that opts into it — `armDelayMs
+ *     <= 0` disables it — because for this guest it is the guess that was
+ *     measured wrong. When no prompt appears inside `maxWindowMs`, the fixed
+ *     list is replayed with its own relative gaps and logged as the fallback.
  *
- * A failed send is logged and SKIPPED — the firmware may simply not have the
- * keyboard up yet, and the next attempt covers it. This function never throws
- * and never rejects: it is background belt-and-braces, not a boot precondition.
+ * A failed or refused send never throws and never stops the schedule: this is
+ * background belt-and-braces, not a boot precondition.
  */
 export async function runCdbootKeys({
   scheduleMs = cdbootKeyScheduleMs(),
   serialLog = null,
   readSerial = null,
-  pollMs = 100,
+  pollMs = 300,
   armDelayMs = 1500,
   retryGapMs = 800,
   attempts = 3,
   maxWindowMs = 8000,
+  cycles = 1,
+  watchMs = 0,
+  isAlive = null,
   now = null,
   sendKey,
   wait,
@@ -883,19 +905,35 @@ export async function runCdbootKeys({
   const reader = typeof readSerial === 'function'
     ? readSerial
     : (typeof serialLog === 'string' && serialLog !== '' ? () => readSerialTail(serialLog) : null)
-  const poll = Math.max(1, Math.min(2000, Number(pollMs) || 100))
+  const poll = Math.max(1, Math.min(2000, Number(pollMs) || 300))
   const gap = Math.max(0, Math.min(120000, Number(retryGapMs) || 0))
+  // `armDelayMs <= 0` DISABLES the growth anchor (see the header): the call site
+  // passes 0 because a real cdboot prints the prompt, and pressing before it
+  // appears is the bug this function now exists to not repeat.
   const armAfter = Math.max(0, Math.min(120000, Number(armDelayMs) || 0))
-  const window = Math.max(0, Math.min(120000, Number(maxWindowMs) || 0))
+  const growthAnchorEnabled = Number(armDelayMs) > 0
+  const window = Math.max(0, Math.min(180000, Number(maxWindowMs) || 0))
   const totalAttempts = Math.max(1, Math.min(20, Math.trunc(Number(attempts) || 1)))
+  const maxCycles = Math.max(1, Math.min(64, Math.trunc(Number(cycles) || 1)))
+  const watchLimit = Math.max(0, Math.min(3600000, Number(watchMs) || 0))
   const sent = []
   const press = async (reason, at) => {
     try {
-      await sendKey(key)
+      const result = await sendKey(key)
+      // A monitor that REFUSES the event answers `{error: …}` as a RESULT. The
+      // old code only caught throws, so a refused press was logged as "pressed"
+      // — the schedule looked healthy while nothing reached the keyboard.
+      const refused = cdbootPressFailure(result)
+      if (refused !== null) {
+        log(`windows: ${name} could not press ${key} at ~${Math.round(at)} ms ${reason} (not fatal, the next attempt covers it): ${refused}`)
+        return false
+      }
       sent.push(Math.round(at))
       log(`windows: ${name} pressed ${key} at ~${Math.round(at)} ms ${reason} to get past "Press any key to boot from CD or DVD"`)
+      return true
     } catch (error) {
       log(`windows: ${name} could not press ${key} at ~${Math.round(at)} ms ${reason} (not fatal, the next attempt covers it): ${error?.message ?? error}`)
+      return false
     }
   }
 
@@ -915,12 +953,6 @@ export async function runCdbootKeys({
     return sent
   }
 
-  // SERIAL-ANCHORED. Wait for an ANCHOR (the prompt signature, or first output
-  // + `armDelayMs`) inside a bounded window. The fixed-time list is NOT raced in
-  // parallel: pressing at 1.5 s while a 4 s prompt is still coming is exactly the
-  // bug this replaces. It is replayed only when the window closes without an
-  // anchor — as the last resort it is — and, byte for byte, when there is no
-  // serial console at all (a log file QEMU never created, e.g. a stub).
   const serialFile = typeof serialLog === 'string' && serialLog !== '' ? serialLog : null
   const serialFilePresent = () => {
     if (serialFile === null) return true
@@ -931,6 +963,25 @@ export async function runCdbootKeys({
       return false
     }
   }
+  /** The log's SIZE, or null for an injected reader (no file to stat). */
+  const serialSize = () => {
+    if (serialFile === null) return null
+    try {
+      return statSync(serialFile).size
+    } catch {
+      return null
+    }
+  }
+  const readTail = () => {
+    try {
+      return String(reader() ?? '')
+    } catch {
+      return ''
+    }
+  }
+  const alive = () => (typeof isAlive === 'function' ? isAlive() === true : true)
+  const outOfWatch = () => watchLimit > 0 && elapsed() >= watchLimit
+
   // REPLAY THE FIXED SCHEDULE WITH ITS OWN RELATIVE GAPS, starting now. The
   // nominal offsets are kept in the log line so the fallback is never mistaken
   // for an anchored press.
@@ -951,67 +1002,130 @@ export async function runCdbootKeys({
     return sent
   }
 
-  let firstGrowthAt = null
-  let anchor = null
-  let anchorReason = ''
-  let noConsole = false
-  for (;;) {
-    const t = elapsed()
-    let text = ''
-    try {
-      text = String(reader() ?? '')
-    } catch {
-      text = ''
-    }
-    if (text.length > 0 && firstGrowthAt === null) firstGrowthAt = t
-    if (cdbootPromptSeen(text)) {
-      anchor = t
-      anchorReason = '(serial: cdboot prompt seen)'
-      break
-    }
-    if (firstGrowthAt !== null && t - firstGrowthAt >= armAfter) {
-      anchor = t
-      anchorReason = `(serial: boot output seen at ~${firstGrowthAt} ms)`
-      break
-    }
-    // NO CONSOLE AT ALL: QEMU was told `-serial file:` but never created the
-    // file (a stub, or a QEMU that never got that far). Nothing can ever be
-    // anchored, so the historical schedule takes over — its first offset is the
-    // grace period a real QEMU needs to open the file.
-    if (firstGrowthAt === null && !serialFilePresent() && t >= (delays[0] ?? 1500)) {
-      noConsole = true
-      break
-    }
-    if (t >= window) break
-    const step = Math.max(1, Math.min(poll, window - t))
-    try {
-      await sleep(step)
-    } catch {
-      return sent
+  /**
+   * Wait for an anchor. `null` means the window closed with none.
+   *
+   * The prompt wins over everything: `cdbootPromptSeen` is checked BEFORE the
+   * growth anchor on every poll, so the first press can never fire on the
+   * banner while the prompt is still megabytes of serial log away.
+   */
+  const detectAnchor = async () => {
+    let firstGrowthAt = null
+    for (;;) {
+      const t = elapsed()
+      const text = readTail()
+      if (text.length > 0 && firstGrowthAt === null) firstGrowthAt = t
+      if (cdbootPromptSeen(text)) return { at: t, reason: '(serial: cdboot prompt seen)', prompt: true, text }
+      if (growthAnchorEnabled && firstGrowthAt !== null && t - firstGrowthAt >= armAfter) {
+        return { at: t, reason: `(serial: boot output seen at ~${firstGrowthAt} ms)`, prompt: false, text }
+      }
+      // NO CONSOLE AT ALL: QEMU was told `-serial file:` but never created the
+      // file (a stub, or a QEMU that never got that far). Nothing can ever be
+      // anchored, so the historical schedule takes over — its first offset is
+      // the grace period a real QEMU needs to open the file.
+      if (firstGrowthAt === null && !serialFilePresent() && t >= (delays[0] ?? 1500)) {
+        return { at: t, reason: '(fixed-time schedule: no serial console)', noConsole: true, text }
+      }
+      if (t >= window) return null
+      const step = Math.max(1, Math.min(poll, window - t))
+      try {
+        await sleep(step)
+      } catch {
+        return null
+      }
     }
   }
 
-  if (noConsole) return replayFixed('(fixed-time schedule: no serial console)')
-  if (anchor === null) return replayFixed('(fixed-time fallback: the prompt never appeared)')
-  // A PROMPT ANCHOR IS CERTAIN, so three presses cover a dropped event. A
-  // GROWTH anchor is only a guess ("the console woke up, the prompt should be
-  // near"), so it keeps retrying every `retryGapMs` until the window closes —
-  // the prompt may arrive later than the first output, and an early press must
-  // never be the last one.
-  const promptAnchored = anchorReason.startsWith('(serial: cdboot prompt')
-  for (let attempt = 0; ; attempt += 1) {
-    if (attempt > 0) {
+  /**
+   * One press cycle from an anchor.
+   *
+   * A PROMPT anchor is certain, so `attempts` presses cover a dropped event. A
+   * GROWTH anchor is only a guess, so it keeps retrying every `retryGapMs` until
+   * the window closes — an early press must never be the last one.
+   */
+  const pressCycle = async (anchor, cycle) => {
+    const promptAnchored = anchor.prompt === true
+    for (let attempt = 0; ; attempt += 1) {
+      if (attempt > 0) {
+        try {
+          await sleep(gap)
+        } catch {
+          return
+        }
+      }
+      await press(anchor.reason, elapsed())
+      if (!alive()) return
+      // CYCLE 1 keeps the historical bounds exactly (the fallback window for a
+      // guess anchor); a RE-ARMED cycle is already inside the prompt, so it gets
+      // the same bounded `attempts` a prompt anchor gets.
+      const finished = promptAnchored || cycle > 1 ? attempt + 1 >= totalAttempts : elapsed() + gap > window
+      if (finished) break
+    }
+  }
+
+  /**
+   * Wait for a prompt that ARRIVED AFTER the previous cycle.
+   *
+   * "After" is a byte offset, not a timestamp: the prompt we already answered is
+   * still in the tail (`readSerialTail` returns the last 8 KB), so matching the
+   * text alone would re-fire on the SAME line forever. When the reader is
+   * injected there is no size to compare, and the text itself must change.
+   */
+  const waitForNextPrompt = async ({ afterSize, afterText, afterAt }) => {
+    for (;;) {
+      if (!alive() || outOfWatch()) return null
+      const t = elapsed()
+      const text = readTail()
+      const size = serialSize()
+      const changed = size === null || afterSize === null ? text !== afterText : size > afterSize
+      if (changed && t > afterAt && cdbootPromptSeen(text)) {
+        return { at: t, reason: '(serial: cdboot prompt seen again)', prompt: true, text }
+      }
+      if (t - afterAt > (window > 0 ? window : 60000)) return null
       try {
-        await sleep(gap)
+        await sleep(poll)
       } catch {
-        return sent
+        return null
       }
     }
-    await press(anchorReason, elapsed())
-    const finished = promptAnchored ? attempt + 1 >= totalAttempts : elapsed() + gap > window
-    if (finished) break
+  }
+
+  let anchor = await detectAnchor()
+  if (anchor === null) return replayFixed('(fixed-time fallback: the prompt never appeared)')
+  if (anchor.noConsole === true) return replayFixed(anchor.reason)
+
+  for (let cycle = 1; ; cycle += 1) {
+    const afterSize = serialSize()
+    await pressCycle(anchor, cycle)
+    if (cycle >= maxCycles || !alive() || outOfWatch()) break
+    const next = await waitForNextPrompt({ afterSize, afterText: anchor.text, afterAt: anchor.at })
+    if (next === null) break
+    anchor = next
   }
   return sent
+}
+
+/**
+ * A press is only delivered when the QMP reply carries no `error`.
+ *
+ * The supervisor's qmp primitive RESOLVES the monitor's refusal (`{error: {desc}}`,
+ * `{error: '…'}` or an array with such an entry) instead of throwing it, so the
+ * caller must read the RESULT: treating it as success is how a run of refused
+ * presses read as "pressed enter at ~1.7 s" while the guest never saw a key.
+ */
+export function cdbootPressFailure(result) {
+  if (result === null || result === undefined || typeof result !== 'object') return null
+  const entries = Array.isArray(result) ? result : [result]
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== 'object') continue
+    if (entry.error === undefined || entry.error === null) continue
+    const error = entry.error
+    const message = typeof error === 'string'
+      ? error
+      : String(error.desc ?? error.message ?? error.class ?? '')
+    return (message || 'the monitor refused the event').slice(0, 300)
+  }
+  return null
 }
 
 /** A hard switch for a host that wants the old behaviour (keys not sent). */
@@ -1019,6 +1133,48 @@ export function cdbootKeysEnabled() {
   const raw = process.env.DSH_CUA_WINDOWS_CDBOOT_KEYS
   if (raw === undefined || raw === '') return true
   return !/^(0|false|no|off)$/iu.test(String(raw).trim())
+}
+
+/** An integer env knob with a floor and a ceiling; anything else is the default. */
+function cdbootNumber(name, fallback, min, max) {
+  const parsed = Number(process.env[name])
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.max(min, Math.min(max, Math.trunc(parsed)))
+}
+
+/**
+ * HOW LONG TO WATCH THE SERIAL CONSOLE FOR THE PROMPT.
+ *
+ * 90 s, not 8 s: on a cold q35+OVMF boot the DVD's `cdboot.efi` appears after
+ * device enumeration, a virtio/SCSI scan and the network option ROMs — measured
+ * well past the old 8 s window, which is why the wait ended before the prompt
+ * ever existed. The window is only a BOUND: the presses fire on the poll that
+ * sees the prompt, so a fast boot is served in milliseconds.
+ */
+export function cdbootPromptWindowMs() {
+  return cdbootNumber('DSH_CUA_WINDOWS_CDBOOT_PROMPT_MS', 90000, 1000, 600000)
+}
+
+/** How many prompt cycles one boot may serve (a re-looping BDS reprints it). */
+export function cdbootRearmCycles() {
+  return cdbootNumber('DSH_CUA_WINDOWS_CDBOOT_CYCLES', 12, 1, 64)
+}
+
+/** The re-arm watcher's own bound — it stops sooner when the QEMU exits. */
+export function cdbootRearmWatchMs() {
+  return cdbootNumber('DSH_CUA_WINDOWS_CDBOOT_WATCH_MS', 180000, 0, 3600000)
+}
+
+/**
+ * The QMP budget for ONE press.
+ *
+ * 3 s, not the 15 s default: a monitor that is mid-`query-status` refuses the
+ * event quickly, and a 15 s wait for a refusal consumed the whole cdboot window
+ * — one collision and the prompt timed out. A short budget leaves the retry gap
+ * to do the retrying.
+ */
+export function cdbootPressTimeoutMs() {
+  return cdbootNumber('DSH_CUA_WINDOWS_CDBOOT_PRESS_MS', 3000, 500, 60000)
 }
 
 /** The last `lines` NON-EMPTY lines of a stderr capture, or '' when empty. */
@@ -4121,13 +4277,29 @@ export function createWindowsBackend({ store, qmp, log = () => {}, transport = n
         void runCdbootKeys({
           scheduleMs: cdbootKeyScheduleMs(),
           serialLog: p.serialLog,
+          // THE PROMPT IS THE ANCHOR, AND IT IS WATCHED FOR 90 s (measured: on a
+          // cold q35/OVMF boot cdboot prints well after 8 s). `armDelayMs: 0`
+          // disables the first-output anchor, whose 1.5 s guess landed on the
+          // OVMF banner instead of on the prompt.
+          maxWindowMs: cdbootPromptWindowMs(),
+          armDelayMs: 0,
+          pollMs: 300,
+          // THE CD BOOT MAY BE LOOPED: BDS re-enters the DVD when nobody
+          // answers, and it reprints the prompt. Re-arm on it, but never more
+          // than a dozen cycles and never after the QEMU is gone.
+          cycles: cdbootRearmCycles(),
+          watchMs: cdbootRearmWatchMs(),
+          isAlive: () => child.exitCode === null && child.signalCode === null,
           log,
           name: spec.name,
           sendKey: (key) => {
             if (child.exitCode !== null || child.signalCode !== null) {
               throw new Error('this QEMU child exited before the key was due')
             }
-            return sendKeys(keyedSpec, { key })
+            // A SHORT PER-PRESS BUDGET: a monitor busy with another command
+            // refuses quickly, and waiting 15 s for the refusal burned the whole
+            // prompt window. The retry gap presses again instead.
+            return sendKeys(keyedSpec, { key, timeoutMs: cdbootPressTimeoutMs() })
           }
         }).catch(() => {})
       }
@@ -4390,7 +4562,7 @@ export function createWindowsBackend({ store, qmp, log = () => {}, transport = n
   }
 
   /** Keys and ASCII text, as physical qcodes with the right modifiers. */
-  async function sendKeys(rawSpec, { text = null, key = null } = {}) {
+  async function sendKeys(rawSpec, { text = null, key = null, timeoutMs = 0 } = {}) {
     const spec = namedSpec(rawSpec)
     const events = []
     const press = (qcode, { shift = false, ctrl = false, alt = false } = {}) => {
@@ -4417,7 +4589,13 @@ export function createWindowsBackend({ store, qmp, log = () => {}, transport = n
       }
     }
     if (events.length === 0) return { sent: 0 }
-    await qmpFor(spec, [{ execute: 'input-send-event', arguments: { events } }])
+    const budget = Number(timeoutMs) > 0 ? Math.min(120000, Math.trunc(Number(timeoutMs))) : 15000
+    const replies = await qmpFor(spec, [{ execute: 'input-send-event', arguments: { events } }], { timeoutMs: budget })
+    // A REFUSED EVENT IS A RESOLVED RESULT, NOT A THROW. Reporting `{sent: n}`
+    // without reading it is how the cdboot scheduler logged "pressed enter" for
+    // every key the monitor had refused (see cdbootPressFailure()).
+    const refused = cdbootPressFailure(replies)
+    if (refused !== null) return { sent: 0, error: refused }
     return { sent: events.length }
   }
 
