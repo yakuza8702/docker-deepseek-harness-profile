@@ -2394,5 +2394,48 @@ check('windowsKvmPreflight is the shared module (no second message)',
   check('U4: the floor is the documented 10 GB', WINDOWS_FREE_FLOOR_GB === 10)
 }
 
+
+// ------------------------------------------------------------------ *
+// J23: EVERY `cua_vm_*` TOOL CARRIES AN EXPLICIT TIMEOUT ENVELOPE
+// ------------------------------------------------------------------ *
+// The incident: a `cua_vm_shutdown` whose supervisor op sat in a synchronous
+// `qemu-img convert` of a 10 GB system disk hung the tool call for minutes. The
+// harness had no per-tool deadline for it, the chat abort could not unwind a body
+// blocked on a socket, and the user force-restarted the harness.
+//
+// The rule that came out of it: whatever the supervisor does, the TOOL layer must
+// settle and say what happened. That is a PURE contract here — ONE map, every
+// registration drawing from it, `registerCuaTool` refusing a mismatch, and every
+// body raced against its deadline with a machine-routable `tool-timeout`. The
+// behavioural half (a real hung call settling) has no cheap test; this is the
+// half that a rename or a new tool would otherwise break silently.
+{
+  const source = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'index.js'), 'utf8')
+  const uses = [...source.matchAll(/timeoutMs: TOOL_TIMEOUTS\.([a-z_]+),/gu)].map((match) => match[1])
+  const mapBody = /const TOOL_TIMEOUTS = Object\.freeze\(\{([\s\S]*?)\n\}\)/u.exec(source)?.[1] ?? ''
+  const keys = [...mapBody.matchAll(/^\s{2}([a-z_]+): [\d_]+/gmu)].map((match) => match[1])
+  check('J23: every registration draws its timeoutMs from the ONE TOOL_TIMEOUTS map',
+    uses.length >= 18 && keys.length === uses.length
+      && keys.every((key) => uses.includes(key)) && uses.every((key) => keys.includes(key)),
+    `registrations=${uses.length} map=${keys.length}`)
+  check('J23: registerCuaTool REFUSES a tool with no envelope, and one whose number disagrees',
+    /cua-vm: \$\{definition\.name\} has no TOOL_TIMEOUTS entry/u.test(source)
+      && /cua-vm: \$\{definition\.name\} declares timeoutMs=\$\{definition\.timeoutMs\}, TOOL_TIMEOUTS says \$\{declared\}/u.test(source))
+  check('J23: every body is ALSO raced against its own deadline (the harness guard is cooperative)',
+    /execute: boundedExecute\(definition\.name, declared,/.test(source)
+      && /const TIMEOUT_LEAD_MS = 250/u.test(source)
+      && /Promise\.race\(\[Promise\.resolve\(\)\.then\(\(\) => execute\(args, exec\)\), expiry\]\)/u.test(source))
+  check('J23: the failure is STRUCTURED — code: tool-timeout, repeated in the text the model reads',
+    /error\.code = 'tool-timeout'/u.test(source)
+      && /timed out after \$\{timeoutLabel\(timeoutMs\)\}s; the supervisor op may still be running/u.test(source)
+      && /code: tool-timeout`/u.test(source))
+  check('J23: the two caller-budgeted tools resolve their live deadline per call',
+    /cua_vm_exec: \(args\) => \(Math\.min\(3600, Math\.max\(1, Number\(args\?\.timeout\) \|\| 300\)\) \* 1000\) \+ EXEC_ENVELOPE_GRACE_MS/u.test(source)
+      && /cua_vm_create: \(args\) => \(args\?\.kind === 'windows' \? 60_000 : TOOL_TIMEOUTS\.cua_vm_create\)/u.test(source))
+  check('J23: the deferred checkpoint sentence says it is deferred AND that the badge is already powered-off',
+    /if \(answer\.checkpoint === 'deferred'\) parts\.push\('Checkpoint: deferred — runs in the background; the panel badge shows powered-off immediately\.'\)/u.test(source)
+      && /else if \(answer\.checkpoint\) parts\.push\(`Checkpoint: \$\{answer\.checkpoint\}\.`\)/u.test(source))
+}
+
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

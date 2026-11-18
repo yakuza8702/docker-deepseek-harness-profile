@@ -2119,3 +2119,132 @@ the sentence in the doctor, but blind. A relay that dies mid-session costs one
 reconnect (the child is restarted); a relay caught by a firewall that
 *filters* the loopback port instead of refusing it costs the 800 ms probe timeout
 and lands on the same recorded fallback.
+
+## 23. Branch `cua-vm-improve` — 2026-11-18: the shutdown that answers, the poll that could not die, a deadline for every tool
+
+One incident, three defects, and one rule that came out of it: **the thing the
+user is waiting for must not be behind the thing that takes minutes.**
+
+### The incident
+
+`cua_vm_shutdown` on a Windows computer hung for minutes. The tool call never
+settled, the panel's Shutdown button looked dead, and aborting the chat did not
+unwind it either — the user force-restarted the harness. What the supervisor was
+actually doing was one synchronous call:
+
+```js
+execFileSync(qemuImgPath(), ['convert', '-O', 'qcow2', disk, `${target}.tmp`], …)
+```
+
+`qemu-img convert` of a **10 GB system disk**, on the critical path of the
+ANSWER, on a computer the registry had already recorded as `powered-off`. Three
+independent failures made that unrecoverable rather than merely slow:
+
+1. the op did not answer until the convert finished, so the harness tool call had
+   nothing to return (its socket default is 30 minutes, and there was no
+   per-tool deadline);
+2. the chat's abort could not unwind a body blocked in `await request(...)` on a
+   socket that was still waiting — cooperative cancellation needs a body that
+   reaches an `await` of an abortable thing;
+3. the only observer of a guest power-off could die: a tick of the QMP state poll
+   that threw in `finaliseGuestShutdown` (a quota-refused checkpoint threw
+   *before* the row was written) left the row `ready` for the rest of the session
+   and stopped the loop.
+
+### A. The poll is unkillable, and the guest-shutdown path is state-first
+
+`finaliseGuestShutdown` now writes, **first and unconditionally**, the four facts
+a reader needs — `state: 'powered-off'`, `stateFrom: 'qmp-poll'`, `lastShutdown`
+with `method: 'guest-shutdown'`, and `restoreFrom: { kind: 'image', image:
+'windows' }` — and only then takes the checkpoint, in its **own** try/catch. A
+refused capture can therefore only ever ADD a `checkpointSkipped: { reason,
+detail }` (the live one was `quota`: a 9.9 GB disk + an 11.5 GB Linux checkpoint
++ a 3.6 GB ISO on a 20 GB store) and `lastShutdown.checkpointStatus:
+'skipped:quota'` to a row that already says powered-off. Nothing a checkpoint does
+decides whether the state is recorded.
+
+The poll loop itself (`startQmpStatePoll`) follows the same rule: a throw is
+logged through `noteTickFailure` **at most once a minute**
+(`STATE_POLL_ERROR_LOG_MS = 60000`, so a wedged monitor cannot make the log the
+tick rate), the loop is re-armed from `finally`, and `stop()` is only ever called
+on a verdict — never from a catch.
+
+### B. The shutdown answers first: a bounded QMP phase, then a detached convert
+
+The fix is an **order**, not a bigger timeout (`WINDOWS_STOP_BUDGET_MS = 8000`,
+`WINDOWS_STOP_QMP_MS = 5000`):
+
+| step | what runs | why it is where it is |
+|---|---|---|
+| 1 | `windowsStopPhase(meta)` — one probe; `cont` for a paused guest; `system_powerdown`; poll pid/`query-status` | an already-off computer answers **instantly** (`already-off`); a guest that exits in a few seconds is recorded as powered-off; a guest still flushing is handed to the backend's full `shutdownTimeoutSec` window **in the background** — it is never force-quit for being slower than the budget |
+| 2 | `recordWindowsPoweredOff()` writes `powered-off` + `lastShutdown` + `restoreFrom: { kind: 'image' }` + `checkpointPending: { token, at }` | this is what the panel badge, Start, the doctor and the state stream read, and it is written before anything slow |
+| 3 | the op returns `checkpoint: 'deferred'` + `checkpointDeferred: true` | the answer carries a WORD, not a path: a path here could only be a lie (it does not exist yet) |
+| 4 | `scheduleDeferredWindowsCheckpoint()` → `checkpointDiskFileAsync()` (spawn + await, 600 s) | the convert runs off the answer path, holds the computer's lifecycle lock (a Start cannot boot a disk that is mid-`convert`), and is **token-guarded**: if the row was started again while it ran, the result is dropped instead of resurrecting `restoreFrom` over a live row |
+
+When the convert lands, the row is **upgraded**: `restoreFrom: { kind:
+'checkpoint', file: '$STORE/checkpoints/<name>.qcow2' }` and
+`lastShutdown.checkpointStatus: 'saved'`; on a quota/policy refusal,
+`checkpointSkipped` is recorded, `restoreFrom` stays the disk, and the computer
+**still boots its installed disk** next Start. `continueWindowsStopInBackground`
+handles the other half of step 1 (a guest that outlives the budget, or a monitor
+that refused ACPI), and still marks the restore point stale when the guest
+survives `quit`.
+
+### C. A deadline for every `cua_vm_*` tool
+
+Whatever the supervisor does, the **tool layer** must settle and say what
+happened. `plugins/dsh-cua-vm/index.js` now carries one `TOOL_TIMEOUTS` map, and
+`registerCuaTool` REFUSES a registration whose `timeoutMs` is missing from the
+map or disagrees with it — a new tool cannot be added without an envelope. Two
+layers, because neither is enough:
+
+* the declared `timeoutMs` is what the harness timeout guard
+  (`@deepseek-ai/dsh-tool-call-timeout-policy`) arms — and that guard is
+  cooperative: it aborts `exec.signal` and then *awaits* the body, so a body
+  blocked on a dead supervisor never observes it;
+* each body is therefore ALSO raced against its own deadline
+  (`boundedExecute`, firing `TIMEOUT_LEAD_MS = 250` early so the specific
+  sentence wins) and returns a structured failure:
+  `… timed out after Ns; the supervisor op may still be running — check the
+  panel/registry before retrying` with `code: tool-timeout`. The losing body is
+  not orphaned: it keeps running to quiescence, which is what lets the supervisor
+  finish its `qemu-img` work.
+
+`PER_CALL_TIMEOUTS` exists for the two tools whose legitimate duration is an
+argument: `cua_vm_exec` (`timeout` s + 60 s, the same clamp the schema declares)
+and `cua_vm_create` (60 s for Windows — the create returns while Setup keeps
+installing — 30 min for Linux, which is synchronous).
+
+### The files
+
+| file | change |
+|---|---|
+| `docker/cua-vm-supervisor.mjs` | A: state-first `finaliseGuestShutdown` + `noteTickFailure`/`STATE_POLL_ERROR_LOG_MS`; B: `WINDOWS_STOP_BUDGET_MS`/`WINDOWS_STOP_QMP_MS`, `windowsStopPhase`, `recordWindowsPoweredOff`, `scheduleDeferredWindowsCheckpoint`, `checkpointDiskFileAsync`, `continueWindowsStopInBackground` |
+| `plugins/dsh-cua-vm/index.js` | C: `TOOL_TIMEOUTS`, `registerCuaTool` validation, `boundedExecute`, `toolTimeoutError` (`code: tool-timeout`), `PER_CALL_TIMEOUTS`; and the deferred sentence the model reads (`Checkpoint: deferred — runs in the background; the panel badge shows powered-off immediately.`) |
+| `tests/modules-unit.mjs` | **J23**: the tool-timeout envelope as a unit contract — every registration draws from `TOOL_TIMEOUTS`, the map has no unused/keyless entry, `registerCuaTool` refuses a missing or disagreeing number, every body is raced (`boundedExecute` + `TIMEOUT_LEAD_MS`), the failure carries `code: tool-timeout`, and the deferred sentence says the badge is already powered-off |
+| `tests/supervisor-smoke.mjs` | F1 rewritten for the deferred answer (answer → poll the registry ≤5 s / 200 ms → `restoreFrom.kind === 'checkpoint'` + file exists + `checkpointStatus: 'saved'`), the Windows-disk-not-the-vmm-disk proof adapted to the upgrade, and a new P4/D1 block: a fake QMP monitor + a 1 GB policy against a 2 GB disk, proving a quota-refused **guest-initiated** power-off still records `powered-off` + `checkpointSkipped: quota` |
+| `tools/check-cua-vm.mjs` | 18 new supervisor needles (the budget/QMP constants, every new function, the pending token + its guard, `checkpointDiskFileAsync`, `checkpoint: status`/`checkpointDeferred`, `noteTickFailure`, `stateFrom: 'qmp-poll'`) plus the **P5 order assertion** — `windowsStopPhase` before `recordWindowsPoweredOff`, `powered-off` before the deferred schedule, and `powered-off` before `windowsCheckpointPlan` in the guest path |
+| `README.md` / `plugins/dsh-cua-vm/README.md` | the shutdown contract: the button answers in seconds, the convert is deferred and upgrades the restore point, a quota refusal records `checkpointSkipped` and the computer still boots its installed disk, and a guest-initiated shutdown is recorded even when its checkpoint fails |
+| `BRANCH-NOTES.md` | this section |
+
+### Verify
+
+All of these, all exit 0, from the repo root:
+
+```bash
+node tools/check-cua-vm.mjs --root .      # 1039 assertions / 23 files
+node tools/check-cua-rea.mjs --root .     # 67 needles / 5 files
+node tests/modules-unit.mjs               # 346 assertions (J23 is the envelope)
+node tests/windows-boot.mjs               # 63 assertions
+node tests/windows-mcp-gate.mjs           # 45 assertions
+node tests/supervisor-smoke.mjs           # 254 assertions — F1/P4-D1 are the ones this section added
+node tests/qmp-shutdown.mjs               # 7 assertions
+```
+
+**Residual risk, named honestly.** The tool envelope settles the CALL; it cannot
+cancel the supervisor's `qemu-img` child, so a convert of a genuinely huge disk
+still runs to completion in the background (that is the design: the answer no
+longer waits for it, and `checkpointPending` says it is still in flight). A
+supervisor that is wedged for a reason other than the convert — a dead QMP socket,
+a hung `sb` — is still only cured by a restart; what changed is that the tool now
+SAYS which call it was and leaves the harness responsive.

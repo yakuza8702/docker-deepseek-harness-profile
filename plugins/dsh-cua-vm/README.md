@@ -42,7 +42,7 @@ write to a unix socket under `/tmp`, which `workspace-write` already allows.
 | `cua_vm_ensure` | create or resume the computer for this workspace (idempotent, carries the full spec) |
 | `cua_vm_create` | new computer: `name`, `kind`, vCPU, RAM, image, `gpu`, `diskGb`, `android`, `rea` (Windows: `windowsVersion` / `windowsIso`) |
 | `cua_vm_start` | start: resumes a suspended computer, **cold-boots** a powered-off one from its checkpoint |
-| `cua_vm_shutdown` | real ACPI powerdown → checkpoint → sandbox removed → `powered-off` |
+| `cua_vm_shutdown` | real ACPI powerdown, answered in seconds → `powered-off` immediately, the checkpoint convert runs in the background (deferred) |
 | `cua_vm_suspend` | pause, keep the sandbox; resume is instant |
 | `cua_vm_gc` | clean the store: orphan checkpoints (newest kept), restore temps, old shots, stale rows |
 | `cua_vm_doctor` | host facts: `/dev/kvm`, render node, QEMU virgl, Docker engine, store accounting, policy |
@@ -87,6 +87,37 @@ the device handles all stay.
    so the checkpoint has no backing chain);
 6. `sb rm --force` — the sandbox is removed *because* the computer is off;
 7. `state: "powered-off"` + `restoreFrom: { kind: "checkpoint" | "image" }`.
+
+**The panel/button answers in seconds; the checkpoint convert runs in the
+background.** A Windows shutdown used to run steps 2–5 *before* answering, so a
+10 GB system disk held the harness tool call — and the Shutdown button — for
+minutes, on a computer the row already said was powered off. The order is now:
+
+1. a **bounded QMP phase** — `WINDOWS_STOP_BUDGET_MS` = **8 s** (of which
+   `WINDOWS_STOP_QMP_MS` = 5 s is the handshake): an already-off computer answers
+   at once, a guest that exits is recorded as powered-off, and one still flushing
+   is handed to the backend's full window **in the background** — nothing is
+   force-quit merely for being slower than the budget;
+2. the **row is written at once**: `state: "powered-off"`, `lastShutdown`
+   (`method`, `reason`) and `restoreFrom: { kind: "image", image: "windows" }` —
+   the disk Start cold-boots — plus a `checkpointPending.token`;
+3. the answer carries `checkpoint: "deferred"` (a WORD, never a path: a path
+   cannot exist yet), and the detached task
+   (`scheduleDeferredWindowsCheckpoint` → `checkpointDiskFileAsync`) later
+   **upgrades** `restoreFrom` to
+   `{ kind: "checkpoint", file: "$STORE/checkpoints/<name>.qcow2" }` and sets
+   `lastShutdown.checkpointStatus: "saved"`. It holds the computer's lifecycle
+   lock (a Start can never boot a disk that is mid-`convert`) and is
+   token-guarded (a computer started again keeps the truth its Start wrote).
+
+**If the store quota cannot hold it, `checkpointSkipped` is recorded and the
+computer still boots its installed disk next Start.** The decision is taken
+*before* the convert: a `quota` refusal (or `checkpointPolicy: "never"` →
+`policy`) writes `checkpointSkipped: { reason, detail }` and
+`lastShutdown.checkpointStatus: "skipped:<reason>"`, leaves
+`restoreFrom.kind: "image"`, and the badge still shows powered-off immediately.
+A **guest-initiated** shutdown is recorded even when its checkpoint fails: the
+state is written first, the checkpoint in its own try/catch.
 
 **A guest can also shut itself down, and the row follows.** `shutdown /s` in the
 console, Windows Update, a user in the noVNC page — none of those pass through
@@ -430,7 +461,7 @@ itself.
 | `cua_vm_gui` | QMP: `screendump` for a frame, `input-send-event` for clicks/keys |
 | `cua_vm_port` / Show VM | the **live view**: noVNC served by `cua-vnc-clip` (websockify as the fallback) and relayed at `/vm/port/<name>/` |
 | `cua_vm_suspend` | QMP `stop` (the VM pauses with its RAM); Start `cont`s it |
-| `cua_vm_shutdown` | QMP `system_powerdown` → wait → `quit` → checkpoint → `powered-off` |
+| `cua_vm_shutdown` | QMP `system_powerdown` → a bounded 8 s wait → `powered-off` answered at once → the disk checkpoint converts in the background |
 | `cua_vm_disk`, Android, REA | not available (Linux-only), refused by name |
 
 **Ceilings, stated plainly:** QMP typing is **ASCII-only** (physical keycodes —

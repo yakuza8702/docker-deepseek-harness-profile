@@ -468,13 +468,64 @@ const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervi
 let stderr = ''
 child.stderr.on('data', (chunk) => { stderr += chunk })
 
-const waitFor = async (predicate, ms = 15000) => {
+const waitFor = async (predicate, ms = 15000, stepMs = 100) => {
   const deadline = Date.now() + ms
   while (Date.now() < deadline) {
     if (predicate()) return true
-    await new Promise((r) => setTimeout(r, 100))
+    await new Promise((r) => setTimeout(r, stepMs))
   }
   return false
+}
+
+/**
+ * A QMP MONITOR THAT IS ONLY A MONITOR — the one thing a guest power-off test
+ * needs and the stub QEMU cannot serve (it is a shell script that never listens).
+ *
+ * The supervisor's poll speaks the real handshake (`qmpCommands`): connect, read
+ * the greeting, write `qmp_capabilities`, wait for `{"return":{}}`, then write
+ * `query-status` per tick. This server answers exactly that, with the status
+ * read from `state.value` at the moment of the question — which is how the test
+ * models "the guest was running, then Windows was shut down from its Start menu"
+ * without a guest.
+ */
+const startFakeQmp = async (initialStatus) => {
+  const state = { value: initialStatus, queries: 0 }
+  const server = net.createServer((socket) => {
+    let buffer = ''
+    socket.setEncoding('utf8')
+    socket.on('error', () => {})
+    socket.write(`${JSON.stringify({
+      QMP: { version: { qemu: { major: 10, minor: 0, micro: 0 }, package: '' }, capabilities: [] }
+    })}\n`)
+    socket.on('data', (chunk) => {
+      buffer += chunk
+      let newline = buffer.indexOf('\n')
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        newline = buffer.indexOf('\n')
+        if (line.trim() === '') continue
+        let command = null
+        try { command = JSON.parse(line) } catch { continue }
+        if (command.execute === 'query-status') {
+          state.queries += 1
+          socket.write(`${JSON.stringify({ return: { status: state.value } })}\n`)
+          continue
+        }
+        // qmp_capabilities, cont, quit, anything else: an accepted no-op.
+        socket.write('{"return":{}}\n')
+      }
+    })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  return {
+    state,
+    port: server.address().port,
+    close: () => new Promise((resolve) => server.close(() => resolve()))
+  }
 }
 
 const call = (payload) => new Promise((resolve, reject) => {
@@ -778,11 +829,24 @@ try {
 
 
   // ---- F1: a WINDOWS computer checkpoints ITS disk, not the vmm one ----
+  //
+  // THE SHUTDOWN ANSWERS FIRST AND CONVERTS LATER. It used to run
+  // `qemu-img convert` of the whole system disk BEFORE it answered, so a 10 GB
+  // guest held the harness tool call (and the panel's button) hostage for
+  // minutes, on a computer the row already said was powered off — the incident
+  // behind WINDOWS_STOP_BUDGET_MS in the supervisor. The answer now carries
+  // `checkpoint: 'deferred'`, the row is written powered-off at once with
+  // `restoreFrom: {kind:'image'}`, and a detached task UPGRADES the row to
+  // `{kind:'checkpoint', file: $STORE/checkpoints/<name>.qcow2}` when the convert
+  // lands. So F1 asserts the ANSWER, then the UPGRADE — never a path in the
+  // answer, which cannot exist yet.
   {
     const winName = 'ws-win-cp'
     const winDir = path.join(STORE, 'windows', winName)
+    const winDisk = path.join(winDir, 'disk.qcow2')
+    const winCheckpoint = path.join(STORE, 'checkpoints', `${winName}.qcow2`)
     mkdirSync(winDir, { recursive: true })
-    writeFileSync(path.join(winDir, 'disk.qcow2'), 'a Windows system disk')
+    writeFileSync(winDisk, 'a Windows system disk')
     const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
     reg.vms[winName] = {
       workspace: '/workspace', kind: 'windows', backend: 'qemu', state: 'ready',
@@ -791,16 +855,136 @@ try {
     }
     writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(reg, null, 2)}\n`)
     const winShutdown = await call({ op: 'vmShutdown', name: winName })
+    check('the WINDOWS shutdown ANSWERS with a deferred checkpoint (no minutes-long convert)',
+      winShutdown.ok === true && winShutdown.checkpoint === 'deferred' && winShutdown.checkpointDeferred === true,
+      JSON.stringify({ checkpoint: winShutdown.checkpoint, deferred: winShutdown.checkpointDeferred, at: winShutdown.state }))
+    const instantRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[winName]
+    check('...the row is powered-off the moment it answers',
+      instantRow?.state === 'powered-off', `state=${instantRow?.state}`)
+    check('...its restore source is still the DISK, not a file that does not exist yet',
+      instantRow?.restoreFrom?.kind === 'image' && instantRow?.restoreFrom?.image === 'windows',
+      JSON.stringify(instantRow?.restoreFrom))
+    check('...and the pending token the deferred task will match on is on the row',
+      typeof instantRow?.checkpointPending?.token === 'string' && instantRow.checkpointPending.token !== '',
+      JSON.stringify(instantRow?.checkpointPending))
+    check('...lastShutdown says DEFERRED, not saved',
+      instantRow?.lastShutdown?.checkpointDeferred === true && instantRow?.lastShutdown?.checkpointStatus === undefined,
+      JSON.stringify(instantRow?.lastShutdown))
+    // THE UPGRADE. Detached, so it is a poll of the registry file, not an
+    // assertion on the answer: 5 s of 200 ms steps is ~100× the stub convert.
+    const upgraded = await waitFor(() => {
+      try {
+        return JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[winName]?.restoreFrom?.kind === 'checkpoint'
+      } catch { return false }
+    }, 5000, 200)
     const winRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[winName]
-    check('the WINDOWS shutdown checkpoints its $STORE disk', winShutdown.ok === true
-      && winShutdown.checkpoint === path.join(STORE, 'checkpoints', `${winName}.qcow2`)
-      && existsSync(winShutdown.checkpoint)
-      && winRow?.restoreFrom?.kind === 'checkpoint'
-      && winRow?.restoreFrom?.file === winShutdown.checkpoint, JSON.stringify(winShutdown).slice(0, 200))
+    check('the deferred checkpoint UPGRADES restoreFrom to $STORE/checkpoints/<name>.qcow2',
+      upgraded === true && winRow?.restoreFrom?.file === winCheckpoint && existsSync(winCheckpoint),
+      JSON.stringify({ upgraded, file: winRow?.restoreFrom?.file, exists: existsSync(winCheckpoint) }))
+    check('...the pending token is cleared and the outcome is recorded as saved',
+      winRow?.checkpointPending === undefined && winRow?.lastShutdown?.checkpointStatus === 'saved'
+        && winRow?.lastShutdown?.checkpointDeferred === undefined,
+      JSON.stringify({ pending: winRow?.checkpointPending, shutdown: winRow?.lastShutdown }))
     check('the Windows restore point is the Windows disk, not the Linux one', (() => {
-      const before = statSync(path.join(winDir, 'disk.qcow2')).size
-      return before > 0 && winRow?.restoreFrom?.file?.includes(winName)
-    })())
+      const before = statSync(winDisk).size
+      const captured = existsSync(winCheckpoint) ? readFileSync(winCheckpoint, 'utf8') : ''
+      // The stub qemu-img flattens by COPYING, so the checkpoint's bytes ARE the
+      // $STORE/windows/<name>/disk.qcow2 bytes. The Linux vmm tree never held a
+      // disk for this name, so a checkpoint with these contents can only have
+      // come from the Windows path.
+      return before > 0
+        && winRow?.restoreFrom?.file === winCheckpoint
+        && winRow.restoreFrom.file.includes(winName)
+        && captured === readFileSync(winDisk, 'utf8')
+        && !existsSync(path.join(HOME, '.cua', 'vmm', 'qemu', winName, 'disk.qcow2'))
+    })(), JSON.stringify({ file: winRow?.restoreFrom?.file, linuxDisk: existsSync(path.join(HOME, '.cua', 'vmm', 'qemu', winName, 'disk.qcow2')) }))
+  }
+
+  /**
+   * ---- P4/D1: A GUEST POWER-OFF IS RECORDED EVEN WHEN THE CHECKPOINT FAILS ----
+   *
+   * The live defect, reproduced in the supervisor's own /tmp proof shape: a
+   * 9.9 GB Windows disk + an 11.5 GB Linux checkpoint + a 3.6 GB ISO on a 20 GB
+   * store, so `windowsCheckpointDecision` refuses ("the checkpoint does not fit
+   * the store quota"). It used to throw out of `finaliseGuestShutdown` BEFORE
+   * the row was touched: the guest had powered itself off, and the row stayed
+   * `ready` for the rest of the session — the panel kept offering a desktop that
+   * did not exist, and the next shutdown answered `already-off`.
+   *
+   * Here the same failure is forced with a 1 GB policy and a 2 GB disk of
+   * APPARENT size (`du -sb`, which is what the quota measures), so no real bytes
+   * are written. The guest is a fake QMP monitor: it answers `running` while the
+   * row is adopted, then `shutdown` — exactly what `query-status` says after
+   * Start → Shut down inside Windows.
+   */
+  {
+    const guestName = 'ws-win-guest'
+    const guestDir = path.join(STORE, 'windows', guestName)
+    const guestDisk = path.join(guestDir, 'disk.qcow2')
+    const before = (await call({ op: 'configGet' })).config
+    mkdirSync(guestDir, { recursive: true })
+    writeFileSync(guestDisk, 'a Windows system disk')
+    // APPARENT size, no real blocks: the quota reads `du -sb`, the filesystem
+    // writes nothing.
+    truncateSync(guestDisk, 2 * 1024 ** 3)
+    const qmp = await startFakeQmp('running')
+    try {
+      const reg = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+      reg.vms[guestName] = {
+        workspace: '/workspace', kind: 'windows', backend: 'qemu', state: 'ready',
+        ports: { qmp: qmp.port, ssh: 47997, vnc: 5996 }, diskGb: 64, cpu: 2, memory: 6,
+        installComplete: true, createdAt: new Date().toISOString()
+      }
+      writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(reg, null, 2)}\n`)
+      // 1 GB of policy against a store that already holds 2 GB of apparent disk.
+      const squeezed = await call({ op: 'configSet', config: { ...before, diskQuotaGb: 1 } })
+      check('P4/D1: the store is over its quota before the guest powers off',
+        squeezed.ok === true && squeezed.config.diskQuotaGb === 1, `quota=${squeezed.config?.diskQuotaGb}GB`)
+      // Adopt the row: `resume` is the cheapest op that installs the QMP state
+      // watcher, and `unpause` (`cont`) is answered by the fake monitor.
+      const adopted = await call({ op: 'resume', name: guestName })
+      check('P4/D1: the live row is adopted (state watcher installed)', adopted.ok === true, JSON.stringify(adopted).slice(0, 180))
+      qmp.state.value = 'shutdown'
+      const poweredOff = await waitFor(() => {
+        try {
+          return JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[guestName]?.state === 'powered-off'
+        } catch { return false }
+      }, 20000, 200)
+      const guestRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[guestName]
+      check('P4/D1: a guest-initiated power-off keeps the computer POWERED-OFF even though the checkpoint failed',
+        poweredOff === true && guestRow?.state === 'powered-off',
+        `state=${guestRow?.state} queries=${qmp.state.queries}`)
+      check('...it is recorded as the guest\'s own shutdown, from the QMP poll',
+        guestRow?.stateFrom === 'qmp-poll' && guestRow?.lastShutdown?.method === 'guest-shutdown',
+        JSON.stringify({ stateFrom: guestRow?.stateFrom, method: guestRow?.lastShutdown?.method }))
+      check('...the refusal is on the row as checkpointSkipped:quota',
+        guestRow?.checkpointSkipped?.reason === 'quota' && /quota/u.test(String(guestRow?.checkpointSkipped?.detail ?? '')),
+        JSON.stringify(guestRow?.checkpointSkipped))
+      check('...the outcome is on lastShutdown too (skipped:quota)',
+        guestRow?.lastShutdown?.checkpointStatus === 'skipped:quota', String(guestRow?.lastShutdown?.checkpointStatus))
+      check('...and the restore source is still the disk Start will boot',
+        guestRow?.restoreFrom?.kind === 'image' && guestRow?.restoreFrom?.image === 'windows',
+        JSON.stringify(guestRow?.restoreFrom))
+      check('...and no checkpoint file was written',
+        !existsSync(path.join(STORE, 'checkpoints', `${guestName}.qcow2`)))
+    } finally {
+      // THE 2 GB APPARENT DISK MUST NOT SURVIVE THIS BLOCK: later cases measure
+      // the store against the real policy.
+      await call({ op: 'configSet', config: before }).catch(() => {})
+      await qmp.close().catch(() => {})
+      // THROUGH THE SUPERVISOR, not a hand-written registry write. `vmDelete`
+      // takes the computer's lifecycle lock and its own `mutateRegistry`, so it
+      // cannot lose a write that is in flight elsewhere — and it also kills the
+      // console relay `resume` opened for this row, which would otherwise keep
+      // polling for the rest of the suite.
+      const gone = await call({ op: 'vmDelete', name: guestName, force: true }).catch(() => ({ ok: false }))
+      rmSync(path.join(STORE, 'windows', guestName), { recursive: true, force: true })
+      if (gone.ok !== true) {
+        const cleanup = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+        delete cleanup.vms[guestName]
+        writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(cleanup, null, 2)}\n`)
+      }
+    }
   }
 
   // ---- FLOORS ARE WARNINGS: a below-floor Windows create succeeds and warns ----

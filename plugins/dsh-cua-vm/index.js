@@ -34,7 +34,178 @@ export const Config = z.object({
   maxOutputChars: z.number().step(1).min(512).max(200000).default(8000)
 })
 
+/**
+ * The SOCKET default: how long one supervisor request may stay unanswered. It
+ * is deliberately far above every tool envelope below — it is the transport's
+ * own backstop, NOT the tool's budget, and treating it as the budget is exactly
+ * the bug `TOOL_TIMEOUTS` exists to prevent.
+ */
 const TOOL_TIMEOUT_MS = 1_800_000
+
+/* ==================================================================== *
+ * THE TOOL-LEVEL TIMEOUT ENVELOPE (tool-timeout lane)
+ * ==================================================================== *
+ *
+ * THE PRODUCTION INCIDENT THIS FIXES. A `cua_vm_shutdown` tool call hung for
+ * ever: the supervisor op was sitting in a synchronous `qemu-img convert` for
+ * minutes, the harness had no per-tool deadline for it, the socket default
+ * above is THIRTY MINUTES, and the chat abort could not unwind the call either
+ * — the user had to force-restart the harness. Whatever the supervisor does,
+ * the TOOL layer must settle and SAY what happened.
+ *
+ * TWO LAYERS, BECAUSE ONE IS NOT ENOUGH.
+ *   * `timeoutMs` on the registered definition is the DECLARED budget the
+ *     harness timeout guard (`@deepseek-ai/dsh-tool-call-timeout-policy`) reads.
+ *     That guard is COOPERATIVE: it arms a deadline, aborts `exec.signal`, and
+ *     then awaits the body ("without racing or abandoning the tool promise").
+ *     A body blocked in `await request(...)` on a dead supervisor never observes
+ *     the signal, so the declared number alone cannot free a hung chat.
+ *   * So each body is ALSO raced against its own deadline here
+ *     (`boundedExecute`) and RETURNS a structured `tool-timeout` failure. That
+ *     race is the one that actually settles the call.
+ *
+ * The race fires `TIMEOUT_LEAD_MS` before the declared budget on purpose: the
+ * guard arms its timer at dispatch entry, this one arms a few microseconds
+ * later inside the body, so equal budgets would let the guard's generic
+ * `tool call timed out after Nms` replace the message below. The lead keeps the
+ * specific, actionable sentence (and `code: tool-timeout`) in front of the
+ * model, which is the whole point of the failure.
+ *
+ * HOW EACH NUMBER WAS CHOSEN — one line of evidence each:
+ *   * status / doctor / gc / disk / port — ONE supervisor socket round trip and
+ *     no guest work (`status` may add one `vmWindowsStatus` per installing
+ *     Windows row), so 30 s is already far above the healthy latency.
+ *   * start / suspend / shutdown / destroy — a lifecycle op, 60 s. These are the
+ *     ones that wedge in QEMU/QMP or in `qemu-img`; failing fast and saying "the
+ *     supervisor op may still be running" is the intended behaviour.
+ *   * put / get — a file copy over the 9p share / scp; 120 s for a large
+ *     artifact, still bounded.
+ *   * gui — a screenshot or one input event; 120 s covers `launch`/`open`
+ *     booting an application inside the guest.
+ *   * exec — its budget is the CALLER'S `timeout` argument (default 300 s, max
+ *     3600 s), so the live deadline is resolved per call (`PER_CALL_TIMEOUTS`)
+ *     and the number here is only the ceiling the harness guard may arm.
+ *   * create / ensure — the supervisor's own allowances, verified by reading it:
+ *     `createLinuxNow` awaits `cua sb create` with `timeoutMs: 1500000` and then
+ *     provisions the guest (REA up to 3_900_000 ms, Android up to 3_300_000 ms),
+ *     and `ensure` may rebuild the computer exactly the same way. A Linux create
+ *     is therefore SYNCHRONOUS for minutes: 60 s here would fail every real
+ *     first create, so Linux create/ensure get 30 min. A WINDOWS create answers
+ *     while the install keeps running in the background (`state: installing`),
+ *     so its per-call envelope is 60 s — see `PER_CALL_TIMEOUTS`.
+ *   * android — `provisionAndroidGuest` runs a ~7 GB SDK download with a
+ *     3_300_000 ms allowance; the envelope is that allowance plus a minute.
+ *   * windows_desktop / windows_mcp_doctor — the two ungated helpers. They are
+ *     not `cua_vm_*`, but they are registered here and the doctor awaits a
+ *     supervisor probe (which is the same hang class), so they take the same
+ *     rule: reveal is pure memory (30 s), the doctor may trigger an attach
+ *     (60 s, just over the bridge's own 45 s handshake).
+ *
+ * The dynamically bridged guest tools (`mcp__windows__*`) are NOT in this map:
+ * they are registered per attach and already declare
+ * `timeoutMs: WIN_MCP_ATTACH_TIMEOUT_MS` where they are built.
+ */
+const TOOL_TIMEOUTS = Object.freeze({
+  // the two ungated helpers (not `cua_vm_*`, same rule)
+  windows_desktop: 30_000,
+  windows_mcp_doctor: 60_000,
+  // one supervisor round trip, no guest work
+  cua_vm_status: 30_000,
+  cua_vm_doctor: 30_000,
+  cua_vm_gc: 30_000,
+  cua_vm_disk: 30_000,
+  cua_vm_port: 30_000,
+  // lifecycle ops: the ones that can wedge in QEMU/QMP/qemu-img
+  cua_vm_start: 60_000,
+  cua_vm_suspend: 60_000,
+  cua_vm_shutdown: 60_000,
+  cua_vm_destroy: 60_000,
+  // file transfer
+  cua_vm_put: 120_000,
+  cua_vm_get: 120_000,
+  // desktop driving
+  cua_vm_gui: 120_000,
+  // caller-budgeted: the CEILING only (the live deadline is per call)
+  cua_vm_exec: 3_660_000,
+  // legitimately multi-minute supervisor ops (evidence in the comment above)
+  cua_vm_create: 1_800_000,
+  cua_vm_ensure: 1_800_000,
+  cua_vm_android: 3_360_000
+})
+
+/**
+ * How much earlier than the declared budget the body-level race expires, so the
+ * specific `tool-timeout` sentence wins over the harness guard's generic
+ * `tool call timed out after Nms`. 250 ms is ~50× the gap between "dispatcher
+ * arms its timer" and "body arms its timer", and it is not a behaviour change:
+ * the envelope is still the declared number, rounded down by a quarter second.
+ */
+const TIMEOUT_LEAD_MS = 250
+
+/** `cua_vm_exec` stops the command in the GUEST at `timeout` s; the supervisor
+ * allows 30 s on top of it. The envelope gives the same budget plus a minute, so
+ * a legal long exec is never cut by the tool layer. */
+const EXEC_ENVELOPE_GRACE_MS = 60_000
+
+/**
+ * The two tools whose legitimate duration is an ARGUMENT, not a constant. Each
+ * resolver returns the live deadline; the registered `TOOL_TIMEOUTS` entry stays
+ * the ceiling the harness guard may arm, and `boundedExecute` takes the smaller
+ * of the two.
+ */
+const PER_CALL_TIMEOUTS = Object.freeze({
+  // default 300 s, max 3600 s — the same clamp the tool schema declares.
+  cua_vm_exec: (args) => (Math.min(3600, Math.max(1, Number(args?.timeout) || 300)) * 1000) + EXEC_ENVELOPE_GRACE_MS,
+  // A Windows create RETURNS while the install proceeds in the background; a
+  // Linux create is synchronous in the supervisor and keeps the 30 min ceiling.
+  cua_vm_create: (args) => (args?.kind === 'windows' ? 60_000 : TOOL_TIMEOUTS.cua_vm_create)
+})
+
+/** `seconds` as a short human number: `60000` → `60`, `360000` → `360`. */
+function timeoutLabel(timeoutMs) {
+  return Number.isInteger(timeoutMs / 1000) ? String(timeoutMs / 1000) : `${timeoutMs / 1000}`
+}
+
+/**
+ * The structured failure every envelope returns. It is thrown, so the harness
+ * records the call as `isError` with this message, and `.code` carries the
+ * machine-routable class the way `mcpError` does elsewhere in this plugin. The
+ * `code:` line is repeated in the text because the harness error payload does
+ * not hand `code` to the model.
+ */
+function toolTimeoutError(toolName, timeoutMs) {
+  const message = `${toolName} timed out after ${timeoutLabel(timeoutMs)}s; the supervisor op may still be running — check the panel/registry before retrying\ncode: tool-timeout`
+  const error = new Error(message)
+  error.name = 'ToolTimeoutError'
+  error.code = 'tool-timeout'
+  error.toolName = toolName
+  error.timeoutMs = timeoutMs
+  return error
+}
+
+/**
+ * Wrap ONE tool body in its envelope. Never races the body away silently: the
+ * losing body keeps running to quiescence (Promise.race subscribes to both, so a
+ * late rejection is not an unhandled one), which is what lets the supervisor
+ * finish its `qemu-img` work; the CALL is what settles.
+ */
+function boundedExecute(toolName, declaredMs, resolveMs, execute) {
+  return async function boundedToolExecute(args, exec) {
+    const envelopeMs = resolveMs === undefined ? declaredMs : Math.min(declaredMs, resolveMs(args))
+    let timer
+    const expiry = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(toolTimeoutError(toolName, envelopeMs)), Math.max(1, envelopeMs - TIMEOUT_LEAD_MS))
+      timer.unref?.()
+    })
+    try {
+      // start the body on a microtask so a synchronous throw settles as a
+      // rejection of the race instead of escaping before it is armed
+      return await Promise.race([Promise.resolve().then(() => execute(args, exec)), expiry])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}
 
 /** One request per connection: write a JSON line, read a JSON line. */
 function request(socketPath, payload, timeoutMs = TOOL_TIMEOUT_MS) {
@@ -1705,12 +1876,37 @@ export function apply(ctx, config = {}) {
   ctx.on('tools/change', () => { scheduleWindowsGates('tools/change') })
 
   /**
+   * EVERY static registration in this file goes through here, so a tool cannot
+   * be added without an envelope: the name must exist in `TOOL_TIMEOUTS`, and the
+   * definition must declare that same number. The `timeoutMs` handed to
+   * `ctx.tools.register` is the declared budget the harness timeout guard reads;
+   * the body is additionally raced here (`boundedExecute`) because that guard is
+   * cooperative and cannot free a supervisor call that never answers.
+   */
+  const registerCuaTool = (definition) => {
+    // `hasOwn`, not a truthiness read: a tool named `constructor` must fail here
+    // instead of picking a function off Object.prototype.
+    if (!Object.hasOwn(TOOL_TIMEOUTS, definition.name)) {
+      throw new Error(`cua-vm: ${definition.name} has no TOOL_TIMEOUTS entry — every tool registration must declare its timeout envelope`)
+    }
+    const declared = TOOL_TIMEOUTS[definition.name]
+    if (definition.timeoutMs !== declared) {
+      throw new Error(`cua-vm: ${definition.name} declares timeoutMs=${definition.timeoutMs}, TOOL_TIMEOUTS says ${declared}`)
+    }
+    return ctx.tools.register({
+      ...definition,
+      execute: boundedExecute(definition.name, declared, Object.hasOwn(PER_CALL_TIMEOUTS, definition.name) ? PER_CALL_TIMEOUTS[definition.name] : undefined, definition.execute)
+    })
+  }
+
+  /**
    * The two tools that are NEVER gated (they do not start with TOOL_PREFIX):
    *   * `windows_desktop` reveals the bridged tools for the calling session;
    *   * `windows_mcp_doctor` reports the leak surface and the keepalive.
    */
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => registerCuaTool({
     name: REVEAL_TOOL_NAME,
+    timeoutMs: TOOL_TIMEOUTS.windows_desktop,
     description: 'Reveal the Windows desktop: unhides this session\u2019s dsh-cua tools (element-level click/type/find over SSH) and returns their names, descriptions and parameters. No arguments.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     output: textOutput('Whether the tools are now visible, and their schemas.'),
@@ -1719,8 +1915,9 @@ export function apply(ctx, config = {}) {
     }
   }), 'cua-vm: windows desktop reveal')
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => registerCuaTool({
     name: DOCTOR_TOOL_NAME,
+    timeoutMs: TOOL_TIMEOUTS.windows_mcp_doctor,
     description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation, the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     output: textOutput('One JSON object: status, target, online, registered, schemas, leaks, grants, keepalive, gate.'),
@@ -1730,8 +1927,9 @@ export function apply(ctx, config = {}) {
   }), 'cua-vm: windows mcp doctor')
 
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_status',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_status,
     description: 'VM for this workspace: state, spec, last command.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     output: textOutput('Human-readable VM status.'),
@@ -1778,8 +1976,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_ensure',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_ensure,
     description: 'Create or resume the workspace VM. Idempotent; the first call downloads the image.',
     parameters: {
       type: 'object',
@@ -1823,8 +2022,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_create',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_create,
     description: 'New computer: name, kind, vCPU, RAM, image, gpu, diskGb, android, rea (Windows: windowsVersion/windowsIso). Ask the user for the spec first.',
     parameters: {
       type: 'object',
@@ -1892,8 +2092,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_gui',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_gui,
     description: 'Drive the VM desktop. x/y are pixels in the last screenshot and the tool maps them: click what you see. Start with `screenshot` or `geometry`; `zoom` a window for small controls.',
     parameters: {
       type: 'object',
@@ -1943,8 +2144,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_disk',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_disk,
     description: 'Grow the disk online (QMP block_resize + growpart). No reboot; cannot shrink.',
     parameters: {
       type: 'object',
@@ -1964,8 +2166,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_android',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_android,
     description: 'Install Google Android SDK + AVD inside the VM (~7 GB, needs 12 GB free). Boot with `cua-emulator`.',
     parameters: {
       type: 'object',
@@ -1986,8 +2189,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_exec',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_exec,
     description: 'Run a shell command in the computer: bash in the Linux guest, cmd.exe over SSH on a Windows one.',
     parameters: {
       type: 'object',
@@ -2038,8 +2242,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_put',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_put,
     description: 'Copy a workspace path into the VM.',
     parameters: {
       type: 'object',
@@ -2059,8 +2264,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_get',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_get,
     description: 'Copy an artifact out of the VM into the workspace.',
     parameters: {
       type: 'object',
@@ -2080,8 +2286,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_port',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_port,
     description: 'Expose a guest port as /vm/port/<name>/.',
     parameters: {
       type: 'object',
@@ -2114,8 +2321,9 @@ export function apply(ctx, config = {}) {
    * checkpoint — the model does not need to know why, only that this is the
    * button.
    */
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_start',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_start,
     description: 'Start a computer: resumes a suspended one, cold-boots a powered-off one from its checkpoint. Not for a Windows install in progress.',
     parameters: {
       type: 'object',
@@ -2151,8 +2359,9 @@ export function apply(ctx, config = {}) {
    * the difference matters because a suspended computer still holds its RAM and
    * its QEMU process.
    */
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_shutdown',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_shutdown,
     description: 'Power the computer off: ACPI powerdown, checkpoint, sandbox removed, state powered-off. Start cold-boots it. Only when the user asks.',
     parameters: {
       type: 'object',
@@ -2168,7 +2377,13 @@ export function apply(ctx, config = {}) {
       const parts = [`${answer.name} is ${answer.state} (${answer.method}).`]
       if (answer.fallback === 'acpi-unsupported') parts.push(answer.detail)
       else {
-        if (answer.checkpoint) parts.push(`Checkpoint: ${answer.checkpoint}.`)
+        // THE ANSWER LEAVES BEFORE THE CONVERT (WINDOWS_STOP_BUDGET_MS in the
+        // supervisor): `checkpoint: 'deferred'` means the disk is being captured
+        // in the background, so the sentence must not read like a path that was
+        // written — and must say the badge already shows powered-off, which is
+        // the whole point of answering first.
+        if (answer.checkpoint === 'deferred') parts.push('Checkpoint: deferred — runs in the background; the panel badge shows powered-off immediately.')
+        else if (answer.checkpoint) parts.push(`Checkpoint: ${answer.checkpoint}.`)
         if (answer.restoreFrom?.kind === 'image') parts.push('No checkpoint was written, so Start boots the base image.')
         if (answer.mayBeTorn) parts.push('The guest did not power down in time, so the image is marked mayBeTorn: the disk was captured after a forced quit.')
         if (Array.isArray(answer.notes) && answer.notes.length > 0) parts.push(`Notes: ${answer.notes.join('; ')}`)
@@ -2179,8 +2394,9 @@ export function apply(ctx, config = {}) {
   })
 
   /** Garbage collection, so a store does not fill with dead 6 GB files. */
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_gc',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_gc,
     description: 'Clean the VM store: orphan checkpoints (newest kept), restore temps, screenshots older than the retention, stale viewer rows, dead port rows.',
     parameters: {
       type: 'object',
@@ -2218,8 +2434,9 @@ export function apply(ctx, config = {}) {
   })
 
   /** Host capabilities, from the one process that can actually see them. */
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_doctor',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_doctor,
     description: 'Diagnose the host: /dev/kvm, render node, QEMU virgl support, Docker engine reachability, store accounting, policy.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     output: textOutput('Host capabilities, the Windows version codes this host can install, and the store policy, one line per fact.'),
@@ -2265,8 +2482,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_suspend',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_suspend,
     description: 'Pause the computer and keep its disk (resume is instant). Linux: cua sb suspend. Windows: QMP stop. For a real power-off use cua_vm_shutdown.',
     parameters: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] },
     output: textOutput('Suspend result.'),
@@ -2277,8 +2495,9 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  ctx.tools.register({
+  registerCuaTool({
     name: 'cua_vm_destroy',
+    timeoutMs: TOOL_TIMEOUTS.cua_vm_destroy,
     description: 'Delete the VM and everything it left in the store. Only when the user asks. `force: true` kills the QEMU/swtpm/websockify processes FIRST and then removes what is left — use it when a normal delete reported failures.',
     parameters: {
       type: 'object',

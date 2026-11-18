@@ -2450,12 +2450,10 @@ function checkpointSandbox(name) {
  * runs had nothing to read. The caller now gets a reason it can put on the row.
  */
 function checkpointDiskFile(name, disk) {
-  if (typeof disk !== 'string' || disk === '' || !existsSync(disk)) {
-    return { ok: false, reason: 'no-disk', detail: `no disk at ${typeof disk === 'string' && disk !== '' ? disk : '(no path given)'}` }
-  }
-  const target = path.join(CHECKPOINT_DIR, `${name}.qcow2`)
+  const preflight = checkpointPreflight(name, disk)
+  if (preflight.error !== undefined) return preflight.error
+  const { target } = preflight
   try {
-    mkdirSync(CHECKPOINT_DIR, { recursive: true })
     // FLATTEN. A plain copy keeps the backing chain, and a disk that was itself
     // created from the previous restore file turns that chain into a cycle
     // ("Could not open backing file … Too many open files"). `convert` follows
@@ -2463,14 +2461,109 @@ function checkpointDiskFile(name, disk) {
     // needs.
     execFileSync(qemuImgPath(), ['convert', '-O', 'qcow2', disk, `${target}.tmp`], { timeout: 180000 })
     renameSync(`${target}.tmp`, target)
-    const bytes = statSync(target).size
-    log(`checkpoint ${name}: ${(bytes / 1024 ** 2).toFixed(1)} MB (flattened)`)
-    return { path: target, bytes }
+    return checkpointCompleted(name, target)
   } catch (error) {
-    log(`checkpoint ${name} failed: ${error && error.message}`)
-    try { unlinkSync(`${target}.tmp`) } catch {}
-    return { ok: false, reason: 'convert-failed', detail: String(error?.message ?? error).slice(-600) }
+    return checkpointFailed(name, target, error)
   }
+}
+
+/**
+ * THE SAME CAPTURE, WITHOUT FREEZING THIS PROCESS.
+ *
+ * `checkpointDiskFile` is `execFileSync` on purpose (the Linux suspend/shutdown
+ * path already awaits it inside a lifecycle lock), but that is a minutes-long
+ * event-loop stall when a `qemu-img convert` reads a 10 GB Windows disk — the
+ * supervisor stops answering the panel's status beat, the state stream and every
+ * other computer's poll for the whole convert. The shutdown op now DEFERS its
+ * checkpoint (it answers before the disk is touched), so the deferred half must
+ * not block: same preflight, same flattened target, same records, one `spawn`
+ * this process awaits instead of blocks on.
+ */
+async function checkpointDiskFileAsync(name, disk) {
+  const preflight = checkpointPreflight(name, disk)
+  if (preflight.error !== undefined) return preflight.error
+  const { target } = preflight
+  try {
+    await runCaptureCommand(qemuImgPath(), ['convert', '-O', 'qcow2', disk, `${target}.tmp`], 600000)
+    renameSync(`${target}.tmp`, target)
+    return checkpointCompleted(name, target)
+  } catch (error) {
+    return checkpointFailed(name, target, error)
+  }
+}
+
+/** The two facts every capture shares before a byte is written. */
+function checkpointPreflight(name, disk) {
+  if (typeof disk !== 'string' || disk === '' || !existsSync(disk)) {
+    return { error: { ok: false, reason: 'no-disk', detail: `no disk at ${typeof disk === 'string' && disk !== '' ? disk : '(no path given)'}` } }
+  }
+  const target = path.join(CHECKPOINT_DIR, `${name}.qcow2`)
+  try {
+    mkdirSync(CHECKPOINT_DIR, { recursive: true })
+  } catch (error) {
+    // Kept as a LOG too: the row records why a capture was skipped, and the log
+    // is where a host-level reason (a read-only volume, a full filesystem) is
+    // found first.
+    log(`checkpoint ${name} failed: ${error && error.message}`)
+    return { error: { ok: false, reason: 'convert-failed', detail: String(error?.message ?? error).slice(-600) } }
+  }
+  return { target }
+}
+
+function checkpointCompleted(name, target) {
+  const bytes = statSync(target).size
+  log(`checkpoint ${name}: ${(bytes / 1024 ** 2).toFixed(1)} MB (flattened)`)
+  return { path: target, bytes }
+}
+
+function checkpointFailed(name, target, error) {
+  log(`checkpoint ${name} failed: ${error && error.message}`)
+  try { unlinkSync(`${target}.tmp`) } catch {}
+  return { ok: false, reason: 'convert-failed', detail: String(error?.message ?? error).slice(-600) }
+}
+
+/**
+ * A child process this process AWAITS instead of blocks on.
+ *
+ * `qemu-img` writes nothing we need on stdout, so stderr is the whole diagnosis
+ * and the last 600 characters of it travel in the error. The timeout is the
+ * convert's own ceiling (the sync path's 180 s was too short for a 64 GB disk on
+ * a slow volume; the deferred path gets 10 minutes and a SIGKILL, never a hang).
+ */
+function runCaptureCommand(command, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let child = null
+    try {
+      child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'] })
+    } catch (error) {
+      reject(error)
+      return
+    }
+    let stderr = ''
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { child.kill('SIGKILL') } catch {}
+      reject(new Error(`${command} did not finish in ${Math.round(timeoutMs / 1000)} s`))
+    }, Math.max(1000, timeoutMs))
+    timer.unref?.()
+    child.stderr?.setEncoding?.('utf8')
+    child.stderr?.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-2000) })
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.on('close', (code, signal) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (code === 0) resolve()
+      else reject(new Error(`${command} exited ${code ?? signal}: ${stderr.trim().slice(-600)}`))
+    })
+  })
 }
 
 /**
@@ -4286,6 +4379,9 @@ const QMP_POLLABLE_STATES = new Set(['ready', 'running', 'booting', 'installing'
 /** Two consecutive unanswered polls before a READY row is called gone: one
  *  miss is a restarting daemon or a busy monitor, two is six seconds. */
 const QMP_POLL_MAX_MISSES = 2
+/** A failing tick says so once a minute — a wedged monitor must not make the
+ *  log the tick rate (3 s × a whole afternoon). */
+const STATE_POLL_ERROR_LOG_MS = 60000
 
 /** The interval, from the environment, clamped to something sane. */
 function qmpStatePollMs() {
@@ -4300,6 +4396,27 @@ function startQmpStatePoll(name) {
   let timer = null
   let ticking = false
   let misses = 0
+  let lastFailureLogAt = 0
+  /**
+   * UNKILLABLE BY DESIGN.
+   *
+   * This loop is the ONLY thing that notices a guest powering itself off, so a
+   * throw inside it is not allowed to end it quietly. The live defect: a
+   * checkpoint that did not fit the store quota threw out of
+   * `finaliseGuestShutdown` BEFORE it wrote `powered-off`, and the row stayed
+   * `ready` for the rest of the session — the panel kept offering a desktop that
+   * was gone and the next shutdown answered `already-off`.
+   *
+   * Two rules, both enforced here and in `finaliseGuestShutdown`: the state is
+   * written before anything that can fail, and a failing tick logs ONE line a
+   * minute and is re-armed by the `finally` below, never left dead.
+   */
+  const noteTickFailure = (error) => {
+    const at = Date.now()
+    if (at - lastFailureLogAt < STATE_POLL_ERROR_LOG_MS) return
+    lastFailureLogAt = at
+    log(`windows: ${name} state poll tick failed: ${error?.message ?? error}`)
+  }
   const stop = () => {
     stopped = true
     if (timer !== null) clearTimeout(timer)
@@ -4364,7 +4481,10 @@ function startQmpStatePoll(name) {
         return
       }
     } catch (error) {
-      log(`windows: ${name} state poll skipped a tick (${error?.message ?? error})`)
+      // NEVER `return` FROM THE CATCH AND NEVER `stop()` HERE: a row that could
+      // not be recorded this tick is retried on the next one, and the only thing
+      // a persistent failure costs is one log line a minute.
+      noteTickFailure(error)
     } finally {
       ticking = false
       schedule()
@@ -5751,39 +5871,67 @@ async function windowsEnsure(name, meta) {
 }
 
 /**
- * SHUTDOWN a Windows computer: QMP `system_powerdown` → wait → `quit` →
- * checkpoint → `powered-off`.
+ * THE SHUTDOWN OP MUST ANSWER, AND IT MUST NOT WAIT FOR `qemu-img`.
  *
- * This is the SAME state machine the Linux computer uses — the only differences
- * are where the QMP socket lives (a row field, not a cua cmdline) and the swtpm
- * process, which is stopped with the guest.
+ * Two things used to hold the answer hostage. One is legitimate but long: the
+ * ACPI → `quit` window, which is `shutdownTimeoutSec` (120 s by default) because
+ * a real guest takes its time flushing. The other is the defect the user hit:
+ * the op ran the disk checkpoint — `qemu-img convert` of a 10 GB system disk —
+ * SYNCHRONOUSLY before answering, so the harness tool call timed out ("stuck")
+ * on a computer that had already been recorded as powered off, and the panel's
+ * shutdown button looked dead for minutes.
+ *
+ * The fix is not a bigger timeout, it is an ORDER:
+ *   1. a bounded QMP phase (`WINDOWS_STOP_BUDGET_MS`) that never force-quits a
+ *      guest merely because it is slower than the budget — an already-off
+ *      computer answers instantly, a guest that finishes in a few seconds is
+ *      recorded as powered-off, and one that is still shutting down is handed to
+ *      the backend's full window IN THE BACKGROUND;
+ *   2. the row written synchronously (`powered-off` + method/reason +
+ *      `restoreFrom`), because that is what the panel, Start and the doctor read;
+ *   3. the checkpoint DETACHED — `scheduleDeferredWindowsCheckpoint` patches the
+ *      row when it finishes, and the per-computer lifecycle lock is held across
+ *      the convert so a Start can never boot a disk that is mid-`convert`.
+ *
+ * The answer carries `checkpoint: 'deferred' | 'skipped:<reason>'` (and the row
+ * ends up with `restoreFrom.kind === 'checkpoint'` once the deferred step lands).
  */
+const WINDOWS_STOP_BUDGET_MS = 8000
+/** The QMP handshake's share of the budget; the rest is the poll for the exit. */
+const WINDOWS_STOP_QMP_MS = 5000
+
 /**
  * THE CHECKPOINT A STOPPED WINDOWS COMPUTER SHOULD GET.
  *
- * One function, two callers (the shutdown op and the guest-shutdown watcher), so
+ * One DECISION function, two capture planners (the synchronous one the
+ * guest-shutdown watcher uses, the deferred one the shutdown op uses), so
  * `checkpointPolicy`, the store quota and the "no disk" case can never mean two
  * different things depending on WHO noticed that the guest was gone.
  * Returns the path (or null), the human sentence and the structured skip record
  * the row stores.
  */
-async function windowsCheckpointPlan(name, config) {
-  let checkpoint = null
-  let checkpointSkipped = ''
-  let checkpointSkippedRecord = null
+async function windowsCheckpointDecision(name, config) {
   if (config.checkpointPolicy === 'never') {
-    checkpointSkipped = 'checkpointPolicy=never'
-    checkpointSkippedRecord = checkpointSkipRecord('policy', checkpointSkipped)
-    return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+    return { skip: 'checkpointPolicy=never', record: checkpointSkipRecord('policy', 'checkpointPolicy=never') }
   }
   const paths = windowsPaths(STORE, name)
   const diskBytes = (() => { try { return statSync(paths.disk).size } catch { return 0 } })()
   const existing = (() => { try { return statSync(path.join(CHECKPOINT_DIR, `${name}.qcow2`)).size } catch { return 0 } })()
   const over = await refuseOverQuota(config, Math.max(0, diskBytes - existing))
   if (over !== null) {
-    checkpointSkipped = 'the checkpoint does not fit the store quota'
-    checkpointSkippedRecord = checkpointSkipRecord('quota', `${checkpointSkipped} (${over})`)
-    return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+    const sentence = 'the checkpoint does not fit the store quota'
+    return { skip: sentence, record: checkpointSkipRecord('quota', `${sentence} (${over})`) }
+  }
+  return { disk: paths.disk }
+}
+
+async function windowsCheckpointPlan(name, config) {
+  let checkpoint = null
+  let checkpointSkipped = ''
+  let checkpointSkippedRecord = null
+  const decision = await windowsCheckpointDecision(name, config)
+  if (decision.skip !== undefined) {
+    return { checkpoint, checkpointSkipped: decision.skip, checkpointSkippedRecord: decision.record }
   }
   // WINDOWS: its disk is under $STORE/windows/<name>/, not the cua vmm tree.
   const captured = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
@@ -5796,6 +5944,101 @@ async function windowsCheckpointPlan(name, config) {
 }
 
 /**
+ * THE SAME PLAN, CAPTURED WITHOUT BLOCKING THE PROCESS THAT ANSWERS.
+ *
+ * Identical decisions (the same `windowsCheckpointDecision`, the same records,
+ * the same flatten step) — only the `qemu-img` child is awaited instead of
+ * blocking this event loop for the whole convert. That is what lets the shutdown
+ * op answer while the disk is still being copied.
+ */
+async function windowsCheckpointPlanDeferred(name, config) {
+  let checkpoint = null
+  let checkpointSkipped = ''
+  let checkpointSkippedRecord = null
+  const decision = await windowsCheckpointDecision(name, config)
+  if (decision.skip !== undefined) {
+    return { checkpoint, checkpointSkipped: decision.skip, checkpointSkippedRecord: decision.record }
+  }
+  const captured = await checkpointDiskFileAsync(name, windowsPaths(STORE, name).disk)
+  checkpoint = checkpointPathOf(captured)
+  if (checkpoint === null) {
+    checkpointSkipped = 'no disk to checkpoint'
+    checkpointSkippedRecord = checkpointSkipRecord(captured?.reason ?? 'no-disk', captured?.detail ?? '')
+  }
+  return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+}
+
+/**
+ * THE DETACHED HALF OF A SHUTDOWN: convert the disk, then patch the row.
+ *
+ * Detached means what it says — the caller never awaits this, and every failure
+ * is caught HERE (a missing disk, a full quota, a `qemu-img` that dies) so the
+ * `powered-off` the caller already wrote can never be taken back by a
+ * bookkeeping error. The write is TOKEN-GUARDED: if the computer was started
+ * again while the convert ran, the row no longer belongs to this shutdown and
+ * the result is dropped instead of resurrecting `restoreFrom` over a live row.
+ *
+ * The whole task runs on the computer's lifecycle lock (`withLock`, not
+ * `withVmLock`: this chain may still be inside the shutdown op's ALS context,
+ * and the re-entrant path would skip the lock it needs). That is what keeps a
+ * Start — or a GC sweep — off a disk that is being converted.
+ */
+function scheduleDeferredWindowsCheckpoint(name, token, config) {
+  const task = withLock(name, async () => {
+    // LET THE ANSWER LEAVE FIRST. The op returns in this tick; the convert's
+    // first byte must not be written before the caller has its JSON line.
+    await new Promise((resolve) => setImmediate(resolve))
+    let checkpoint = null
+    let checkpointSkipped = ''
+    let checkpointSkippedRecord = null
+    try {
+      const plan = await windowsCheckpointPlanDeferred(name, config)
+      checkpoint = plan.checkpoint
+      checkpointSkipped = plan.checkpointSkipped
+      checkpointSkippedRecord = plan.checkpointSkippedRecord
+    } catch (error) {
+      checkpointSkipped = `the checkpoint failed (${error?.message ?? error})`
+      checkpointSkippedRecord = checkpointSkipRecord('checkpoint-failed', String(error?.message ?? error).slice(-600))
+      log(`windows: ${name} deferred checkpoint threw: ${error?.stack ?? error}`)
+    }
+    try {
+      await mutateRegistry((registry) => {
+        const row = registry.vms[name]
+        if (!row) return
+        if (row.checkpointPending?.token !== token) return
+        delete row.checkpointPending
+        // The disk was booted again while we were converting: its truth is
+        // whatever the start wrote, and this result must not overrule it.
+        if (row.state !== 'powered-off') return
+        if (checkpoint !== null && existsSync(checkpoint)) {
+          row.restoreFrom = { kind: 'checkpoint', file: checkpoint }
+          delete row.checkpointSkipped
+          if (row.lastShutdown) {
+            row.lastShutdown.checkpointStatus = 'saved'
+            delete row.lastShutdown.checkpointSkipped
+            delete row.lastShutdown.checkpointDeferred
+          }
+        } else {
+          row.restoreFrom = { kind: 'image', image: 'windows' }
+          if (checkpointSkippedRecord !== null) row.checkpointSkipped = checkpointSkippedRecord
+          if (row.lastShutdown) {
+            row.lastShutdown.checkpointStatus = `skipped:${checkpointSkippedRecord?.reason ?? 'unknown'}`
+            if (checkpointSkipped !== '') row.lastShutdown.checkpointSkipped = checkpointSkipped
+            delete row.lastShutdown.checkpointDeferred
+          }
+        }
+      })
+    } catch (error) {
+      log(`windows: ${name} could not record its deferred checkpoint outcome (${error?.message ?? error}); the powered-off row stands and Start boots the existing disk`)
+    }
+    log(`windows: ${name} deferred checkpoint ${checkpoint !== null ? `saved (${path.basename(checkpoint)})` : `skipped: ${checkpointSkipped}`}`)
+  })
+  // `void` is the contract: nothing awaits this, and an unhandled rejection here
+  // would take the supervisor down for a bookkeeping failure.
+  void task.catch((error) => log(`windows: ${name} deferred checkpoint task failed: ${error?.message ?? error}`))
+}
+
+/**
  * THE GUEST SHUT ITSELF DOWN — record it exactly like the shutdown op would.
  *
  * This is the half the supervisor could not see before: a user powering off
@@ -5803,10 +6046,14 @@ async function windowsCheckpointPlan(name, config) {
  * nothing in this process was watching, so the row stayed `ready` and the panel
  * kept offering a desktop that did not exist.
  *
- * The bookkeeping is the SAME as `windowsShutdown`'s: close the previews, take
- * the checkpoint through the shared planner, write `powered-off` + `restoreFrom`
- * so Start cold-boots the disk it was told about. The differences are honest
- * ones:
+ * The bookkeeping is the SAME as `windowsShutdown`'s: close the previews, write
+ * `powered-off` + `restoreFrom` so Start cold-boots the disk it was told about,
+ * then take the checkpoint through the shared planner. THE ORDER IS THE FIX: the
+ * checkpoint used to run FIRST and inside the same `mutate`, so a checkpoint the
+ * store quota refused threw out of this function before a single field of the
+ * row was written — and the one observer of a guest power-off died with it.
+ * A checkpoint can now only ever ADD to a row that already says `powered-off`.
+ * The differences from the op are honest ones:
  *   * `method: 'guest-shutdown'`, because no ACPI request came from here;
  *   * no `resetPointer`/`forced` handling — there is nothing left to force;
  *   * a stop we did NOT see a clean status for (the socket went away and the
@@ -5824,42 +6071,99 @@ async function finaliseGuestShutdown(name, { status = '', clean = false } = {}) 
     // here is what stops /vm/port/<name>/ pointing at a dead VNC socket.
     closePorts(name)
     stopLiveView(name)
-    const { checkpoint, checkpointSkipped, checkpointSkippedRecord } = await windowsCheckpointPlan(name, config)
     const abrupt = clean !== true
     const at = new Date().toISOString()
-    await mutateRegistryWith((registry) => {
+    const sentence = 'the guest shut itself down (QMP query-status)'
+    /**
+     * 1. THE STATE, FIRST AND UNCONDITIONALLY.
+     *
+     * This write used to come AFTER the checkpoint, in the same mutate. When the
+     * checkpoint threw — the live case was `checkpointSkipped` "the checkpoint
+     * does not fit the store quota" (a 9.9 GB disk + an 11.5 GB Linux checkpoint
+     * + a 3.6 GB ISO on a 20 GB store) — the throw escaped BEFORE the row was
+     * touched, so the supervisor never recorded a guest-initiated power-off at
+     * all: the row stayed `ready`, the panel kept offering a desktop that was
+     * gone, and the later panel shutdown answered `already-off`. Nothing a
+     * checkpoint does may decide whether the state is recorded.
+     *
+     * `restoreFrom` is written here too, in the shape Start already understands
+     * (`kind: 'image'` = cold-boot the disk it has); step 2 upgrades it to
+     * `kind: 'checkpoint'` when the capture succeeds.
+     */
+    const recorded = await mutateRegistryWith((registry) => {
       const row = registry.vms[name]
-      if (!row || row.kind !== 'windows' || row.state === 'powered-off') return
+      if (!row || row.kind !== 'windows' || row.state === 'powered-off') return false
       row.state = 'powered-off'
       row.stateFrom = 'qmp-poll'
       row.lastUsed = at
       row.lastShutdown = {
         at,
         method: 'guest-shutdown',
-        reason: 'the guest shut itself down (QMP query-status)',
+        reason: sentence,
         ...(status === '' ? {} : { qmpStatus: status }),
-        ...(abrupt ? { unconfirmed: true } : {}),
-        ...(checkpointSkipped !== '' ? { checkpointSkipped } : {})
+        ...(abrupt ? { unconfirmed: true } : {})
       }
-      row.restoreFrom = checkpoint !== null
-        ? {
+      row.restoreFrom = { kind: 'image', image: 'windows' }
+      if (abrupt) row.mayBeTorn = true
+      else delete row.mayBeTorn
+      // A finished computer has no install stage to describe any more.
+      delete row.installStage
+      delete row.bootedAt
+      return true
+    }, { reason: 'guest-shutdown' })
+    emitVmState(name, 'powered-off', sentence)
+    if (recorded !== true) return false
+    /**
+     * 2. THE CHECKPOINT, IN ITS OWN TRY/CATCH.
+     *
+     * Whatever goes wrong here is BOOKKEEPING: a skip record on the row and a
+     * `restoreFrom` that still points at the disk. The powered-off state is
+     * already durable, so the poll loop is free to stop and the panel is right.
+     */
+    let checkpoint = null
+    let checkpointSkipped = ''
+    let checkpointSkippedRecord = null
+    try {
+      const plan = await windowsCheckpointPlan(name, config)
+      checkpoint = plan.checkpoint
+      checkpointSkipped = plan.checkpointSkipped
+      checkpointSkippedRecord = plan.checkpointSkippedRecord
+    } catch (error) {
+      checkpointSkipped = `the checkpoint failed (${error?.message ?? error})`
+      checkpointSkippedRecord = checkpointSkipRecord('checkpoint-failed', String(error?.message ?? error).slice(-600))
+      log(`windows: ${name} guest-shutdown checkpoint threw: ${error?.stack ?? error}`)
+    }
+    try {
+      await mutateRegistryWith((registry) => {
+        const row = registry.vms[name]
+        if (!row || row.kind !== 'windows' || row.state !== 'powered-off') return
+        if (checkpoint !== null && existsSync(checkpoint)) {
+          row.restoreFrom = {
             kind: 'checkpoint',
             file: checkpoint,
             // A checkpoint from a QEMU that vanished without saying `shutdown`
             // may be torn; Start must boot the existing disk instead of it.
             ...(abrupt ? { stale: true, staleReason: 'QEMU disappeared without a clean QMP shutdown status' } : {})
           }
-        : { kind: 'image', image: 'windows' }
-      if (checkpointSkippedRecord !== null) row.checkpointSkipped = checkpointSkippedRecord
-      else delete row.checkpointSkipped
-      if (abrupt) row.mayBeTorn = true
-      else delete row.mayBeTorn
-      // A finished computer has no install stage to describe any more.
-      delete row.installStage
-      delete row.bootedAt
-    }, { reason: 'guest-shutdown' })
-    emitVmState(name, 'powered-off', 'the guest shut itself down (QMP query-status)')
-    log(`windows: ${name} powered itself off (${status === '' ? 'QEMU disappeared' : `QMP ${status}`})${abrupt ? ', unconfirmed' : ', clean'}: ${checkpoint !== null ? 'checkpoint captured' : 'no checkpoint'} — Start cold-boots from it`)
+          delete row.checkpointSkipped
+          if (row.lastShutdown) {
+            row.lastShutdown.checkpointStatus = 'saved'
+            delete row.lastShutdown.checkpointSkipped
+          }
+        } else {
+          row.restoreFrom = { kind: 'image', image: 'windows' }
+          if (checkpointSkippedRecord !== null) row.checkpointSkipped = checkpointSkippedRecord
+          if (row.lastShutdown) {
+            row.lastShutdown.checkpointStatus = `skipped:${checkpointSkippedRecord?.reason ?? 'unknown'}`
+            if (checkpointSkipped !== '') row.lastShutdown.checkpointSkipped = checkpointSkipped
+          }
+        }
+      }, { reason: 'guest-shutdown-checkpoint' })
+    } catch (error) {
+      // The state is recorded; this line is the only thing the failure costs.
+      log(`windows: ${name} could not record its guest-shutdown checkpoint outcome (${error?.message ?? error}); the powered-off row stands and Start boots the existing disk`)
+    }
+    log(`windows: ${name} powered itself off (${status === '' ? 'QEMU disappeared' : `QMP ${status}`})${abrupt ? ', unconfirmed' : ', clean'}: ${checkpoint !== null ? 'checkpoint captured' : `no checkpoint (${checkpointSkipped || 'unknown'})`} — Start cold-boots from it`)
     return true
   })
 }
@@ -5891,6 +6195,214 @@ async function finaliseGuestPause(name, status) {
   return wrote
 }
 
+/**
+ * THE BOUNDED QMP PHASE OF A SHUTDOWN — the part the caller MAY wait for.
+ *
+ * It does exactly what `windowsBackend.shutdown` does, in the same order, but
+ * with a deadline instead of the full `shutdownTimeoutSec` window:
+ *
+ *   * an already-off computer is ONE probe and answers instantly (`already-off`);
+ *   * a paused guest is continued first, because `system_powerdown` is a no-op on
+ *     a paused machine and would otherwise burn the whole budget for nothing;
+ *   * `system_powerdown` is delivered, then the process table and `query-status`
+ *     are polled until the budget runs out.
+ *
+ * CRUCIALLY, IT NEVER FORCE-QUITS. A guest that takes longer than the budget is
+ * not a failure — Windows flushing its filesystems is the behaviour we WANT —
+ * so the caller hands it to the background (`handOff: true`), where the backend
+ * runs its full window (ACPI → `quit` → poll) and the finaliser records
+ * `powered-off` when it lands. Only a monitor that refuses ACPI (`quit`) hands
+ * off, because that decision belongs to the backend's own window.
+ */
+async function windowsStopPhase(meta) {
+  const deadline = Date.now() + WINDOWS_STOP_BUDGET_MS
+  const remaining = () => Math.max(0, deadline - Date.now())
+  const installInProgress = meta?.state === 'installing' || meta?.state === 'booting'
+  let verdict = null
+  try {
+    verdict = await windowsBackend.probe(meta)
+  } catch (error) {
+    verdict = null
+  }
+  if (verdict !== null && verdict.alive !== true) {
+    // NOTHING TO ASK: the guest is already gone. This is the case that used to
+    // spend minutes in `qemu-img` before saying so.
+    try { windowsBackend.stopSwtpm?.(meta) } catch {}
+    return { exited: true, method: 'already-off', installInProgress: false, confirmed: 'probe' }
+  }
+  if (verdict !== null && (verdict.status === 'paused' || verdict.status === 'suspended')) {
+    try {
+      await windowsBackend.qmpFor(meta, [{ execute: 'cont' }], { timeoutMs: Math.min(WINDOWS_STOP_QMP_MS, Math.max(1000, remaining())) })
+    } catch {
+      // A monitor that will not `cont` still has `quit`; the hand-off decides.
+    }
+  }
+  let method = 'acpi'
+  try {
+    const answer = await windowsBackend.qmpFor(meta, [{ execute: 'system_powerdown' }], { timeoutMs: Math.min(WINDOWS_STOP_QMP_MS, Math.max(1000, remaining())) })
+    if (answer?.[0]?.error) method = 'quit'
+  } catch {
+    method = 'quit'
+  }
+  const refused = method === 'quit'
+  if (refused) {
+    // THE MONITOR WILL NOT TAKE ACPI (or would not answer at all). Waiting out
+    // the budget proves nothing: whether to `cont`, force `quit` or declare the
+    // computer unreachable is the BACKEND's decision, taken in its own window.
+    return { exited: false, method, installInProgress, handOff: true, reason: 'monitor-refused' }
+  }
+  const pid = windowsBackend.qemuPid(meta)
+  const pidGone = () => pid > 0 && windowsBackend.pidAlive(pid) !== true
+  while (Date.now() < deadline) {
+    if (pidGone()) {
+      try { windowsBackend.stopSwtpm?.(meta) } catch {}
+      return { exited: true, method, installInProgress, confirmed: 'process' }
+    }
+    try {
+      const answer = await windowsBackend.qmpFor(meta, [{ execute: 'query-status' }], { timeoutMs: Math.min(1500, Math.max(500, remaining())) })
+      if (String(answer?.[0]?.return?.status ?? '') === 'shutdown') {
+        try { windowsBackend.stopSwtpm?.(meta) } catch {}
+        return { exited: true, method, installInProgress, confirmed: 'qmp' }
+      }
+    } catch {
+      // A closed monitor on a dead pid is proof; a closed monitor alone is not.
+      if (pidGone()) {
+        try { windowsBackend.stopSwtpm?.(meta) } catch {}
+        return { exited: true, method, installInProgress, confirmed: 'process' }
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  return { exited: false, method, installInProgress, handOff: true, reason: 'budget' }
+}
+
+/**
+ * THE REST OF A STOP THAT OUTLIVED THE BUDGET.
+ *
+ * The backend's own window runs here, with the configured `shutdownTimeoutSec`,
+ * so a genuine Windows shutdown is still allowed to finish and a monitor that
+ * needs `quit` still gets it. Every outcome ends in a row:
+ *   * exited    → `powered-off` + a DEFERRED checkpoint (the same recorder the
+ *                 synchronous path uses);
+ *   * not exited→ marked abandoned + a stale restore point, exactly as before;
+ *   * threw     → the same abandoned marking, with the error in the log.
+ */
+function continueWindowsStopInBackground(name, meta, config, method) {
+  const task = withLock(name, async () => {
+    let outcome = null
+    try {
+      outcome = await windowsBackend.shutdown(meta, { timeoutMs: config.shutdownTimeoutSec * 1000 })
+    } catch (error) {
+      const marked = await markWindowsShutdownAbandoned(name, 'its monitor did not answer')
+      // The computer may still be running, so it goes back under the poll: a
+      // guest that powers itself off later is then recorded by the same
+      // state-first path instead of being invisible until the next status call.
+      installQmpStateWatcher(name)
+      log(`shutdown ${name}: the background stop could not reach QMP (${error?.message ?? error})${marked ? ', restore point marked stale' : ''}`)
+      return
+    }
+    if (outcome?.exited !== true) {
+      const marked = await markWindowsShutdownAbandoned(name, 'it survived the QMP quit')
+      installQmpStateWatcher(name)
+      log(`shutdown ${name}: the guest was still running when the full window ended${marked ? ', restore point marked stale' : ''}`)
+      return
+    }
+    await recordWindowsPoweredOff(name, {
+      method: outcome.method ?? method,
+      config,
+      forced: outcome.forced === true,
+      installInProgress: outcome.installInProgress === true
+    })
+  })
+  void task.catch((error) => log(`shutdown ${name}: the background stop failed (${error?.message ?? error})`))
+}
+
+/**
+ * WRITE THE POWERED-OFF ROW — NOW — AND DETACH THE CHECKPOINT.
+ *
+ * This is step 2 + 3 of the answer-first shutdown: the registry write is
+ * synchronous because it is the truth every reader depends on (the panel, Start,
+ * the doctor, the state stream), and the checkpoint — the only slow thing left —
+ * becomes a detached task that can only ever ADD to this row.
+ *
+ * `checkpoint` in the answer is a WORD, not a path: `'deferred'` when the disk
+ * will be captured in the background, `'skipped:<reason>'` when the policy says
+ * there is nothing to capture. The ROW is where the path lands
+ * (`restoreFrom.kind === 'checkpoint'`), which is the only place a consumer
+ * should ever read it from — a path in the answer could only be a lie (it does
+ * not exist yet) or a minutes-long wait (which is the defect being fixed).
+ */
+async function recordWindowsPoweredOff(name, { method, config, forced = false, installInProgress = false } = {}) {
+  const at = new Date().toISOString()
+  const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  // The console and every forwarded port died with the guest. Idempotent when
+  // the synchronous path already closed them; REQUIRED on the background path,
+  // which reopened the live view so the user would not lose it while the guest
+  // was still flushing.
+  closePorts(name)
+  stopLiveView(name)
+  const policySkip = config.checkpointPolicy === 'never'
+    ? { sentence: 'checkpointPolicy=never', record: checkpointSkipRecord('policy', 'checkpointPolicy=never') }
+    : null
+  await mutateRegistry((registry) => {
+    const row = registry.vms[name]
+    if (!row) return
+    row.state = 'powered-off'
+    row.lastUsed = at
+    row.lastShutdown = {
+      at,
+      method,
+      reason: 'shutdown',
+      // F2: a shutdown during Setup is recorded as what it was, so nothing
+      // downstream has to infer "torn" from `mayBeTorn` alone.
+      ...(installInProgress ? { installInProgress: true } : {}),
+      ...(policySkip === null
+        ? { checkpointDeferred: true }
+        : { checkpointStatus: `skipped:${policySkip.record.reason}`, checkpointSkipped: policySkip.sentence })
+    }
+    // The disk the row names is ALWAYS a real restore source, from the moment
+    // the state exists — `kind: 'image'` is what Start already understands as
+    // "cold-boot the disk it has". The deferred step upgrades it in place.
+    row.restoreFrom = { kind: 'image', image: 'windows' }
+    if (policySkip === null) row.checkpointPending = { token, at }
+    else {
+      delete row.checkpointPending
+      row.checkpointSkipped = policySkip.record
+    }
+    if (forced) row.mayBeTorn = true
+    else delete row.mayBeTorn
+  })
+  emitVmState(name, 'powered-off', 'windows-shutdown')
+  const status = policySkip === null ? 'deferred' : `skipped:${policySkip.record.reason}`
+  if (policySkip === null) scheduleDeferredWindowsCheckpoint(name, token, config)
+  log(`shutdown ${name} (${method}${forced ? ', forced' : ''}): answered now — ${status === 'deferred' ? 'the disk checkpoint runs in the background' : 'no checkpoint (checkpointPolicy=never)'}`)
+  return ok({
+    name,
+    state: 'powered-off',
+    method,
+    // ADDITIVE: `checkpoint` used to carry the path, which forced this op to
+    // block on `qemu-img`. It is now the status word; `checkpointSkipped` still
+    // carries the structured record when there is one.
+    checkpoint: status,
+    checkpointSkipped: policySkip?.record ?? undefined,
+    checkpointDeferred: status === 'deferred' || undefined,
+    mayBeTorn: forced || undefined,
+    detail: `powered off via ${method}.${status === 'deferred'
+      ? ' The disk checkpoint is deferred: it runs in the background and the row names the disk Start cold-boots until it lands.'
+      : ' No checkpoint was taken (checkpointPolicy=never); Start boots the disk it already has.'}${installInProgress ? ' The install was still in progress: this ABORTED it, its disk is marked mayBeTorn, and Start will not resume Setup.' : ''}`
+  })
+}
+
+/**
+ * SHUTDOWN a Windows computer, ANSWER-FIRST.
+ *
+ * The order is the fix (see `WINDOWS_STOP_BUDGET_MS`): a bounded QMP phase, the
+ * row, the answer, then the checkpoint in the background. The two branches that
+ * do NOT record `powered-off` are the honest ones — a monitor that never
+ * answered and a QEMU that survived `quit` — and they keep the old payloads and
+ * the old restore-point marking, because a disk that is still open must never
+ * become a checkpoint.
+ */
 async function windowsShutdown(name, meta) {
   assertVmName(name)
   // WP-4.5: the watcher goes BEFORE the powerdown. A QMP `SHUTDOWN` event that
@@ -5901,10 +6413,13 @@ async function windowsShutdown(name, meta) {
   const preview = snapshotPorts(name)
   closePorts(name)
   stopLiveView(name)
-  let outcome
+  let phase = null
   try {
-    outcome = await windowsBackend.shutdown(meta, { timeoutMs: config.shutdownTimeoutSec * 1000 })
+    phase = await windowsStopPhase(meta)
   } catch (error) {
+    phase = { error }
+  }
+  if (phase.error !== undefined) {
     // H4: THE ABANDONED BRANCH MUST MARK THE RESTORE POINT, like Linux does.
     // A shutdown that throws because the monitor never answered leaves the disk
     // open; a restore point from before that is not trustworthy, and the next
@@ -5912,52 +6427,40 @@ async function windowsShutdown(name, meta) {
     const marked = await markWindowsShutdownAbandoned(name, 'its monitor did not answer')
     const reopened = await replaceLiveView(name, preview)
     log(`shutdown ${name}: abandoned — nothing was removed${marked ? ', restore point marked stale' : ''}${reopened ? '' : ', live view NOT reopened'}`)
-    return fail(`could not power ${name} off: ${error?.message ?? error}. Nothing was removed${marked ? '; its restore point is now marked stale (Start will boot the existing disk instead of trusting it)' : ''}${reopened ? '' : '; the live view could NOT be reopened'}.`)
+    return fail(`could not power ${name} off: ${phase.error?.message ?? phase.error}. Nothing was removed${marked ? '; its restore point is now marked stale (Start will boot the existing disk instead of trusting it)' : ''}${reopened ? '' : '; the live view could NOT be reopened'}.`)
   }
-  if (!outcome.exited) {
-    // It survived ACPI and `quit`: the disk is still open, so it is NOT
-    // checkpointed and the computer is still running.
-    const marked = await markWindowsShutdownAbandoned(name, 'it survived the QMP quit')
+  if (phase.exited !== true) {
+    /**
+     * STILL SHUTTING DOWN. The ACPI request is delivered and the guest is doing
+     * what it was asked; the budget only decides when THIS op stops waiting.
+     * Nothing is forced here: the backend's full window takes over in the
+     * background and the row is written when QEMU actually exits.
+     */
     const reopened = await replaceLiveView(name, preview)
-    return fail(`could not power ${name} off: QEMU is still running after a forced quit, so the disk is open and no checkpoint was taken.${marked ? ' Its restore point is now marked stale.' : ''}${reopened ? ' The live view was reopened.' : ' The live view could NOT be reopened.'} Use cua_vm_destroy to remove it.`)
+    continueWindowsStopInBackground(name, meta, config, phase.method)
+    // TWO DIFFERENT SENTENCES, because two different things happened: a guest
+    // that is still flushing after the budget, or a monitor that would not take
+    // the ACPI request at all (and therefore leaves the decision to the backend).
+    const because = phase.reason === 'monitor-refused'
+      ? 'its monitor would not take an ACPI powerdown, so the stop was handed to the supervisor\'s full window'
+      : `the guest is still shutting down after ${WINDOWS_STOP_BUDGET_MS / 1000} s`
+    log(`shutdown ${name}: ${phase.reason === 'monitor-refused' ? 'monitor refused ACPI' : `still shutting down after ${WINDOWS_STOP_BUDGET_MS / 1000} s`} (${phase.method}) — answered now, the background stop records powered-off if QEMU exits${reopened ? '' : '; the live view could NOT be reopened'}`)
+    const row = readRegistry().vms[name]
+    return ok({
+      name,
+      state: String(row?.state ?? 'running'),
+      method: phase.method,
+      checkpoint: 'deferred',
+      checkpointDeferred: true,
+      pending: true,
+      detail: `${because}. Nothing was forced: the supervisor keeps waiting in the background and records powered-off (then checkpoints the disk) when QEMU exits.${reopened ? '' : ' The live view could NOT be reopened.'}`
+    })
   }
-  // THE CHECKPOINT DECISION IS SHARED WITH THE GUEST-SHUTDOWN WATCHER: both are
-  // "this computer stopped; capture its disk before Start needs it", and a
-  // second copy of the policy/quota rules is how the two would drift.
-  const { checkpoint, checkpointSkipped, checkpointSkippedRecord } = await windowsCheckpointPlan(name, config)
-  await mutateRegistry((registry) => {
-    const row = registry.vms[name]
-    if (!row) return
-    row.state = 'powered-off'
-    row.lastUsed = new Date().toISOString()
-    row.lastShutdown = {
-      at: new Date().toISOString(),
-      method: outcome.method,
-      reason: 'shutdown',
-      // F2: a shutdown during Setup is recorded as what it was, so nothing
-      // downstream has to infer "torn" from `mayBeTorn` alone.
-      ...(outcome.installInProgress === true ? { installInProgress: true } : {}),
-      ...(checkpointSkipped !== '' ? { checkpointSkipped } : {})
-    }
-    row.restoreFrom = checkpoint !== null
-      ? { kind: 'checkpoint', file: checkpoint }
-      : { kind: 'image', image: 'windows' }
-    // WP-9.2: the same structured record the Linux path writes.
-    if (checkpointSkippedRecord !== null) row.checkpointSkipped = checkpointSkippedRecord
-    else delete row.checkpointSkipped
-    if (outcome.forced) row.mayBeTorn = true
-    else delete row.mayBeTorn
-  })
-  emitVmState(name, 'powered-off', 'windows-shutdown')
-  log(`shutdown ${name} (${outcome.method}${outcome.forced ? ', forced' : ''}): ${checkpoint !== null ? 'checkpoint captured' : 'no checkpoint'}`)
-  return ok({
-    name,
-    state: 'powered-off',
-    method: outcome.method,
-    checkpoint: checkpoint ?? undefined,
-    checkpointSkipped: checkpointSkippedRecord ?? undefined,
-    mayBeTorn: outcome.forced || undefined,
-    detail: `powered off via ${outcome.method}${checkpoint !== null ? '; its disk is checkpointed and Start cold-boots from it' : '; Start boots the disk it already has'}.${outcome.installInProgress === true ? ' The install was still in progress: this ABORTED it, its disk is marked mayBeTorn, and Start will not resume Setup.' : ''}`
+  return recordWindowsPoweredOff(name, {
+    method: phase.method,
+    config,
+    forced: phase.forced === true,
+    installInProgress: phase.installInProgress === true
   })
 }
 

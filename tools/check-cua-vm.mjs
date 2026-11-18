@@ -559,6 +559,40 @@ const NEEDLES = {
     ['async function finaliseGuestPause(name, status)', 1],
     ['method: \'guest-shutdown\'', 1],
     ["{ reason: 'guest-shutdown' }", 1],
+    // P5: THE SHUTDOWN ANSWERS FIRST. The op used to run the whole disk convert
+    // SYNCHRONOUSLY before it answered, so a 10 GB guest wedged the harness tool
+    // call and the panel's button for minutes — on a computer the row already
+    // said was powered off. The order is now: a BOUNDED QMP phase (8 s, of which
+    // 5 s is the handshake), the row write, the answer, then a DETACHED convert
+    // that upgrades `restoreFrom`. The needles below pin each piece by name; the
+    // order itself is asserted in the semantic block (P5).
+    ['const WINDOWS_STOP_BUDGET_MS = 8000', 1],
+    ['const WINDOWS_STOP_QMP_MS = 5000', 1],
+    ['async function windowsStopPhase(meta)', 1],
+    ['function continueWindowsStopInBackground(name, meta, config, method)', 1],
+    ['async function recordWindowsPoweredOff(name, { method, config, forced = false, installInProgress = false } = {})', 1],
+    ['function scheduleDeferredWindowsCheckpoint(name, token, config)', 1],
+    // the pending marker is the TOKEN-GUARDED handshake between the answer and
+    // the detached task: a row restarted while the convert ran is not resurrected.
+    ['row.checkpointPending = { token, at }', 1],
+    ['if (row.checkpointPending?.token !== token) return', 1],
+    ['await new Promise((resolve) => setImmediate(resolve))', 1],
+    // the DETACHED capture awaits its child instead of blocking the event loop
+    // (`execFileSync` froze every status beat, the state stream and every other
+    // computer's poll for the whole convert).
+    ['async function checkpointDiskFileAsync(name, disk)', 1],
+    ['await runCaptureCommand(qemuImgPath(), [\'convert\', \'-O\', \'qcow2\', disk, `${target}.tmp`], 600000)', 1],
+    // the answer carries the WORD, never a path that cannot exist yet
+    ['checkpoint: status,', 1],
+    ["checkpointDeferred: status === 'deferred' || undefined", 1],
+    ["const status = policySkip === null ? 'deferred' : `skipped:${policySkip.record.reason}`", 1],
+    // P6: the guest-shutdown path is STATE-FIRST. A tick that fails must log once
+    // a minute and be RE-ARMED, never die: it is the only observer of a guest
+    // power-off.
+    ['const STATE_POLL_ERROR_LOG_MS = 60000', 1],
+    ['const noteTickFailure = (error) => {', 1],
+    ['noteTickFailure(error)', 1],
+    ["row.stateFrom = 'qmp-poll'", 2],
     ['const QMP_CONNECT_TIMEOUT_MS = 2000', 1],
     ['function qmpCommands(port, commands, { timeoutMs = null, defaultTimeout = null, connectTimeoutMs = QMP_CONNECT_TIMEOUT_MS, host = \'127.0.0.1\' } = {})', 1],
     ['const fallbackTimeout = Number(defaultTimeout) > 0 ? Number(defaultTimeout) : 0', 1],
@@ -2145,6 +2179,59 @@ function sourceOf(label, name) {
         failures += 1
         missing.push(`docker/cua-vm-supervisor.mjs: detachWindowsInstallMedia() must run on the READY transition in BOTH the watcher and vmWindowsStatus, and the watcher's deadline must be 'bootedStage ? bootedMinutes > sshGraceMinutes : elapsedMinutes > timeoutMinutes' (watcher=${watcherWired} status=${statusWired}) — otherwise a desktop stays attached to D: and a successful install still times out at 60 minutes`)
         console.log('  FAIL D2/D3 ready-transition wiring')
+      }
+    }
+  }
+  // P5: THE SHUTDOWN OP ANSWERS BEFORE IT CONVERTS, AND THE STATE IS WRITTEN
+  // BEFORE ANYTHING THAT CAN FAIL. Three ORDER assertions, because each of the
+  // three defects was a correct-looking call in the wrong place:
+  //   1. inside `windowsShutdown`, the BOUNDED QMP phase runs before the row is
+  //      recorded — the phase is what decides `already-off`, exited, or hand-off
+  //      to the background, and it must never be replaced by "wait for the
+  //      convert first";
+  //   2. inside `recordWindowsPoweredOff`, `row.state = 'powered-off'` is written
+  //      BEFORE `scheduleDeferredWindowsCheckpoint` — the answer is the truth the
+  //      panel, Start and the doctor read, and the convert may only ADD to it;
+  //   3. inside `finaliseGuestShutdown`, the same write precedes
+  //      `windowsCheckpointPlan` — the throw that escaped from a quota-refused
+  //      checkpoint BEFORE the row was touched is why a guest-initiated
+  //      power-off went unrecorded for the rest of the session.
+  {
+    total += 1
+    const supervisor = sourceOf('P5', 'cua-vm-supervisor.mjs')
+    if (supervisor === null) {
+      failures += 1
+      missing.push('docker/cua-vm-supervisor.mjs: file not found (P5 answer-first shutdown ordering cannot be checked)')
+    } else {
+      const cut = (from, to) => {
+        const start = supervisor.indexOf(from)
+        const end = start === -1 ? -1 : supervisor.indexOf(to, start)
+        return start === -1 || end === -1 ? '' : supervisor.slice(start, end)
+      }
+      const shutdown = cut('async function windowsShutdown(name, meta) {', 'async function doctorReport()')
+      const record = cut('async function recordWindowsPoweredOff(name, {', 'async function windowsShutdown(name, meta) {')
+      const finalise = cut('async function finaliseGuestShutdown(name, {', 'async function finaliseGuestPause(name, status)')
+      const phaseFirst = shutdown.indexOf('await windowsStopPhase(meta)')
+      const recordAfter = shutdown.indexOf('recordWindowsPoweredOff(name, {')
+      const stateWrite = record.search(/row\.state = 'powered-off'/u)
+      const deferred = record.indexOf('scheduleDeferredWindowsCheckpoint(name, token, config)')
+      const guestState = finalise.search(/row\.state = 'powered-off'/u)
+      const guestPlan = finalise.indexOf('await windowsCheckpointPlan(name, config)')
+      // The answer is a WORD, never a path (`checkpoint: status` +
+      // `checkpointDeferred`), because a path in the answer can only be a lie
+      // (the file does not exist yet) or a minutes-long wait (the defect).
+      const wordAnswer = /checkpoint: status,/u.test(record) && /checkpointDeferred: status === 'deferred'/u.test(record)
+      const ok = shutdown !== '' && record !== '' && finalise !== ''
+        && phaseFirst !== -1 && recordAfter !== -1 && phaseFirst < recordAfter
+        && stateWrite !== -1 && deferred !== -1 && stateWrite < deferred
+        && guestState !== -1 && guestPlan !== -1 && guestState < guestPlan
+        && wordAnswer
+      if (ok) {
+        if (!quietMode) console.log('  ok   P5 the shutdown is answer-first: bounded QMP phase → powered-off row → deferred checkpoint (both paths state-first)')
+      } else {
+        failures += 1
+        missing.push(`docker/cua-vm-supervisor.mjs: the shutdown must ANSWER-FIRST — windowsStopPhase before recordWindowsPoweredOff in windowsShutdown, powered-off before scheduleDeferredWindowsCheckpoint in recordWindowsPoweredOff, powered-off before windowsCheckpointPlan in finaliseGuestShutdown, and the answer must carry checkpoint: status + checkpointDeferred (phase=${phaseFirst}, record=${recordAfter}, state=${stateWrite}, deferred=${deferred}, guestState=${guestState}, guestPlan=${guestPlan}, word=${wordAnswer}); otherwise either the panel's button blocks on a 10 GB qemu-img convert again, or a quota-refused checkpoint deletes the only observer of a guest power-off`)
+        console.log('  FAIL P5 answer-first shutdown ordering')
       }
     }
   }

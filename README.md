@@ -1629,6 +1629,41 @@ own sequence — ACPI `system_powerdown` over QMP, wait (up to
 `$STORE/checkpoints/<name>.qcow2`, remove the sandbox, record `powered-off`.
 Windows uses the same sequence, with QMP bound to the row's own port.
 
+**The panel/button answers in seconds; the checkpoint convert runs in the
+background.** A Windows shutdown used to run that whole sequence *before*
+answering, so a 10 GB system disk held the harness tool call (and the Shutdown
+button) for minutes — on a computer the registry already said was powered off.
+That is an ORDER defect, not a timeout one, and the order is now:
+
+1. a **bounded QMP phase** — `WINDOWS_STOP_BUDGET_MS` = **8 s** (the handshake
+   gets `WINDOWS_STOP_QMP_MS` = 5 s): an already-off computer answers instantly, a
+   guest that exits is recorded as powered-off, and a guest still flushing is
+   handed to the backend's full window **in the background** — nothing is
+   force-quit merely for being slower than the budget;
+2. the **row is written at once**, because it is what the panel badge, Start and
+   the doctor read: `state: "powered-off"`, `lastShutdown` (`method`, `reason`)
+   and `restoreFrom: { kind: "image", image: "windows" }` — the disk Start boots —
+   plus a `checkpointPending.token`;
+3. the answer carries `checkpoint: "deferred"` (a **word**, never a path: the file
+   cannot exist yet), and the detached task
+   (`scheduleDeferredWindowsCheckpoint` → `checkpointDiskFileAsync`) **upgrades**
+   the row when the convert lands: `restoreFrom: { kind: "checkpoint", file:
+   "$STORE/checkpoints/<name>.qcow2" }` and `lastShutdown.checkpointStatus:
+   "saved"`. It holds the computer's lifecycle lock, so a Start can never boot a
+   disk that is mid-`convert`, and it is token-guarded, so a computer started again
+   keeps the truth its Start wrote.
+
+**If the store quota cannot hold it, `checkpointSkipped` is recorded and the
+computer still boots its installed disk next Start.** The decision is taken
+*before* the convert: a `quota` refusal (or `checkpointPolicy: "never"` →
+`policy`) writes `checkpointSkipped: { reason, detail }` and
+`lastShutdown.checkpointStatus: "skipped:<reason>"`, leaves
+`restoreFrom.kind: "image"`, and the badge still shows powered-off immediately. A
+**guest-initiated** shutdown is recorded even when the checkpoint fails — the
+state is written first, the checkpoint in its own try/catch — which is why a
+quota-refused guest power-off no longer leaves a `ready` row offering a desktop
+that is gone.
+
 A powered-off computer has **no sandbox left**, so `cua sb resume` can never work
 on it — that was the "stopped VM can never resume" dead end. `cua_vm_start`
 therefore cold-boots it from the checkpoint (and deletes the `.restore.qcow2`
