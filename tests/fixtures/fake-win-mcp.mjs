@@ -120,9 +120,9 @@ export const GUEST_TOOLS = [
   { name: 'tool_move_to', description: 'Move the pointer to x,y', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'] } },
   { name: 'tool_drag', description: 'Drag from one pixel to another', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, x2: { type: 'number' }, y2: { type: 'number' } }, required: ['x', 'y', 'x2', 'y2'] } },
   { name: 'tool_type_text', description: 'Type text into the focused control', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
-  { name: 'tool_press_keys', description: 'Press a key or hotkey', inputSchema: { type: 'object', properties: { keys: { type: 'string' } }, required: ['keys'] } },
+  { name: 'tool_send_keys', description: 'Press a key or hotkey', inputSchema: { type: 'object', properties: { keys: { type: 'string' } }, required: ['keys'] } },
   { name: 'tool_scroll', description: 'Scroll at x,y', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, amount: { type: 'number' } }, required: ['x', 'y'] } },
-  { name: 'tool_screenshot', description: 'Capture the desktop', inputSchema: { type: 'object', properties: {} } },
+  { name: 'tool_capture_window', description: 'Capture the desktop', inputSchema: { type: 'object', properties: {} } },
   { name: 'find_elements', description: 'Find elements by name or control type', inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
   { name: 'tool_invoke', description: 'Invoke an element', inputSchema: { type: 'object', properties: { target: { type: 'string' } }, required: ['target'] } },
   { name: 'tool_get_text', description: 'Read an element text', inputSchema: { type: 'object', properties: { target: { type: 'string' } }, required: ['target'] } },
@@ -130,7 +130,7 @@ export const GUEST_TOOLS = [
   { name: 'tool_list_windows', description: 'List top-level windows', inputSchema: { type: 'object', properties: {} } },
   { name: 'tool_activate_window', description: 'Bring a window to the front', inputSchema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] } },
   { name: 'tool_close_window', description: 'Close a window', inputSchema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] } },
-  { name: 'tool_launch_app', description: 'Launch an application', inputSchema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+  { name: 'tool_open_application', description: 'Launch an application', inputSchema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
   { name: 'tool_wait_for', description: 'Wait for an element to appear', inputSchema: { type: 'object', properties: { query: { type: 'string' }, timeoutMs: { type: 'number' } }, required: ['query'] } },
   { name: 'tool_read_clipboard', description: 'Read the guest clipboard', inputSchema: { type: 'object', properties: {} } },
   { name: 'tool_write_clipboard', description: 'Write the guest clipboard', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } }
@@ -342,6 +342,136 @@ export function currentLane() {
 }
 
 /* ------------------------------------------------------------------ *
+ * APPENDIX B — THE DESKTOP SESSION'S OWN FACTS (WP-6.1)
+ *
+ * The relay (`--serve`, WP-3.3) writes ONE JSON object from inside the desktop
+ * session; `desktopFacts()` (WP-4.1) reads it over SSH and hands the doctor a
+ * shape it can publish. The fixture replaces ONLY the transport, so the client
+ * surface the plugin drives has to exist here too:
+ *
+ *   client.desktopFacts()          async — the read (one SSH in the real client)
+ *   client.refreshDesktopFacts()   async — the same read under its other name
+ *   client.desktopFactsCached()    sync  — what `windows_desktop` may return
+ *   state.desktop                  the last answer, or null
+ *
+ * THE DEFAULT IS A HEALTHY DESKTOP (`measured:true`, `elementLaneOk:true`,
+ * `workDirWritable:true`, `scaleFix:'applied'`), because the checks that
+ * predate this contract are about the LANE, not about a dead element lane: a
+ * fixture that defaulted to `measured:false` would turn every unrelated
+ * assertion into a false warning. A test that wants the dead lane calls
+ * `setDesktopFacts({ win32ui:false, elementLaneOk:false })` — the reported D1,
+ * on demand.
+ *
+ * THE UNMEASURED CASE IS A FIRST-CLASS ANSWER (§Appendix B): `measured !== true`
+ * means EVERY field is unknown, never `false`. `setDesktopFacts(null)` models a
+ * guest provisioned before the facts file existed, and the fake nulls the
+ * measured fields exactly as the real normaliser does.
+ * ------------------------------------------------------------------ */
+export const DESKTOP_FACTS_DEFAULT = Object.freeze({
+  schema: 1,
+  measured: true,
+  at: '2026-11-19T15:04:05Z',
+  user: 'cua',
+  session: 2,
+  python: 'C:\\Program Files\\Python312\\python.exe',
+  dshCuaVersion: '0.4.1',
+  pywin32Version: '306',
+  win32ui: true,
+  uiaLane: true,
+  uiaLaneOk: true,
+  elementLaneOk: true,
+  scaleFix: 'applied',
+  workDir: 'C:\\cua-work',
+  workDirWritable: true,
+  profileRootWritable: false,
+  source: 'cua-work',
+  error: ''
+})
+
+/** The measured fields that are UNKNOWN whenever `measured !== true`. */
+const DESKTOP_FACT_FIELDS = [
+  'schema', 'user', 'session', 'python', 'dshCuaVersion', 'pywin32Version',
+  'win32ui', 'uiaLane', 'uiaLaneOk', 'elementLaneOk', 'scaleFix',
+  'workDir', 'workDirWritable', 'profileRootWritable'
+]
+
+let DESKTOP_FACTS = { ...DESKTOP_FACTS_DEFAULT }
+
+/** How many reads/refreshes the plugin really performed (C3's spawn counter). */
+export const desktopFactCalls = { reads: 0, refreshes: 0 }
+
+/**
+ * `setDesktopFacts({ win32ui:false })` — the reported D1, on demand.
+ * `setDesktopFacts(null)` — a guest with NO facts file (`measured:false`).
+ * An explicit `{ measured:false }` is honoured as-is: the unknown fields are
+ * nulled, never defaulted to `false`.
+ */
+export function setDesktopFacts(value) {
+  if (value === null) {
+    DESKTOP_FACTS = null
+  } else {
+    const merged = { ...DESKTOP_FACTS_DEFAULT, ...value }
+    if (merged.measured !== true) {
+      for (const field of DESKTOP_FACT_FIELDS) merged[field] = null
+      merged.measured = false
+    }
+    DESKTOP_FACTS = merged
+  }
+  desktopFactCalls.reads = 0
+  desktopFactCalls.refreshes = 0
+  // A LIVE CLIENT MAY HAVE CACHED THE OLD ANSWER: `windows_desktop` returns
+  // `desktopFactsCached()` without blocking (WP-5.9), so a knob that only changed
+  // the next READ would be invisible to the path under test. Push the new answer
+  // into every client this process created — one source of truth, both paths.
+  for (const session of SESSIONS) {
+    try { session.state.desktop = DESKTOP_FACTS === null ? desktopFactsAnswer() : { ...DESKTOP_FACTS, cached: false } } catch { /* a closed session is still a session */ }
+  }
+  return DESKTOP_FACTS
+}
+
+/** The default healthy desktop, and the counters back to zero. */
+export function resetDesktopFacts() {
+  return setDesktopFacts({ ...DESKTOP_FACTS_DEFAULT })
+}
+
+/** The one answer both `desktopFacts()` and `refreshDesktopFacts()` return. */
+function desktopFactsAnswer() {
+  if (DESKTOP_FACTS === null) {
+    const unknown = {}
+    for (const field of DESKTOP_FACT_FIELDS) unknown[field] = null
+    return {
+      measured: false,
+      at: null,
+      stale: false,
+      source: 'none',
+      cached: false,
+      ...unknown,
+      error: 'fake-win-mcp: the guest has no desktop facts file'
+    }
+  }
+  return { ...DESKTOP_FACTS, stale: DESKTOP_FACTS.stale === true, cached: false }
+}
+
+/**
+ * WP-4.1's MODULE-LEVEL READER, SHADOWED ON PURPOSE (WP-6.1).
+ *
+ * `index.js` resolves the reader through the MODULE namespace
+ * (`winMcpApi.desktopFacts`) and calls it with the target's ssh options — that
+ * is the production seam, and it is the right one: the doctor must work before a
+ * client exists. A fixture that only defined the CLIENT method would therefore
+ * be invisible to the exact path under test, and the checks would read whatever
+ * `ssh` answered on the build host (nothing) instead of the contract.
+ *
+ * An EXPLICIT local export wins over `export *` from the real module, so this
+ * one line is what makes the desktop facts testable without a guest. It answers
+ * the same knob as the client methods, and it counts reads the same way.
+ */
+export async function desktopFacts() {
+  desktopFactCalls.reads += 1
+  return desktopFactsAnswer()
+}
+
+/* ------------------------------------------------------------------ *
  * THE SPAWN SEAM (§WP-2.4)
  *
  * The real client accepts `spawnImpl` so a unit test can feed it fake ssh
@@ -412,6 +542,11 @@ export function createDshCuaClient(options = {}) {
     serverInfo: { name: 'dsh-cua', version: 'fake' },
     tools: [],
     lastError: '',
+    // WP-4.3/WP-5.1: the KIND beside the text — `ssh-closed | auth | handshake |
+    // unknown`, `null` when nothing failed. Additive: `lastError` keeps its text.
+    lastFailureKind: null,
+    // WP-4.1/5.9: the last desktop-facts read, or null until one ran.
+    desktop: null,
     // THE LANE SURFACE (SOL §4.3/§4.10) — null until an attach decided it.
     transport: null,
     relayOk: null,
@@ -533,9 +668,34 @@ export function createDshCuaClient(options = {}) {
         probeMode: state.probeMode,
         relayDetail: state.relayDetail,
         interpreter: state.interpreter,
+        // WP-4.3/4.5: the two additive facts the real `doctorFacts()` carries.
+        lastFailureKind: state.lastFailureKind,
         repair: state.repair,
         payload: state.payload
       }
+    },
+    /**
+     * WP-4.1/5.6/5.9 — THE GUEST'S OWN DESKTOP FACTS.
+     *
+     * The real client has THREE names for one read (`desktopFacts`,
+     * `refreshDesktopFacts`, the synchronous `desktopFactsCached`), because
+     * `index.js` may call any of them depending on the path: the doctor awaits
+     * one, the post-attach nudge fires one, and `windows_desktop` returns the
+     * cache without blocking. The fixture answers all three from the same knob,
+     * so the plugin cannot pass here by calling a method the real client lacks.
+     */
+    async desktopFacts() {
+      desktopFactCalls.reads += 1
+      return desktopFactsAnswer()
+    },
+    async refreshDesktopFacts() {
+      desktopFactCalls.refreshes += 1
+      const facts = desktopFactsAnswer()
+      state.desktop = facts
+      return facts
+    },
+    desktopFactsCached() {
+      return state.desktop ?? null
     },
     /**
      * THE REPAIR VERB (§4.4): throttled, never throws, returns the parsed record.

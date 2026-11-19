@@ -118,6 +118,33 @@ const FILES = {
  */
 const NEEDLES = {
   supervisor: [
+    // =====================================================================
+    // WP-7.4 / WP-2 — THE PIN AND THE BOOT WAIT (SOL §7.4).
+    //
+    // These four needles are the whole difference between "a boot race" and
+    // "a permanent failure" reaching the model, and every one of them is a
+    // fact a revert breaks:
+    //
+    //   * `WINDOWS_DSH_CUA_DEFAULT` (2) — the EXPORTED default (so a unit test
+    //     can assert the pin without creating a computer) and the SPEC that
+    //     reads it. A bare literal in `WINDOWS_DSH_CUA_SPEC` would satisfy a
+    //     "the version is pinned" grep while leaving nothing a test can import,
+    //     and the env override must stay, so the default is the export.
+    //   * `dsh-cua==0.4.1` (1) — the build Appendix A's hash gate and the
+    //     relay's `dshCuaVersion` fact both assume. A float (`dsh-cua`) is the
+    //     defect this release closes; the exact wheel is the contract.
+    //   * `windowsSshBootWait` (2) — the helper AND at least one of
+    //     exec/put/get. A wait that exists but is never called leaves the old
+    //     `255` / `126 "no guest agent"` vocabulary in place (the defect) while
+    //     every needle about booting still passes.
+    //   * `code: booting` (1) — the give-up sentence's first line, verbatim, so
+    //     the model branches on the same string the tool prints instead of on a
+    //     paraphrase. It is `code: booting` (stderr text), not `code:'booting'`
+    //     (the put/get field), because this is the sentence §4.8 freezes.
+    ['WINDOWS_DSH_CUA_DEFAULT', 2],
+    ['dsh-cua==0.4.1', 1],
+    ['windowsSshBootWait', 2],
+    ['code: booting', 1],
     // U2/U4: THE CLIPBOARD (session 2 only) AND THE MEASURED FREE SPACE.
     // The backend owns the protocol (file, then task, then the task's own Last
     // Result); this file owns the channel (the per-computer key, scp). The
@@ -641,8 +668,8 @@ const NEEDLES = {
     // be asserted without a guest. Nothing in production sets either one.
     ['const SSH_BIN = process.env.DSH_CUA_SSH_BIN', 1],
     ['const SCP_BIN = process.env.DSH_CUA_SCP_BIN', 1],
-    ['scpRun(putMeta, source, assertWindowsGuestPath(guest), { direction: \'to-guest\' })', 1],
-    ['scpRun(getMeta, absolute, assertWindowsGuestPath(guest), { direction: \'from-guest\' })', 1],
+    ['scpRun(putMeta, source, assertWindowsGuestPath(guest), { direction: \'to-guest\', timeoutMs })', 1],
+    ['scpRun(getMeta, absolute, assertWindowsGuestPath(guest), { direction: \'from-guest\', timeoutMs })', 1],
     // WP-4 / SOL §7: THE SUPERVISOR'S RELAY RE-ASSERT.
     //
     // The SYNC MATRIX promised this needle and the gate did not have it: WP-4
@@ -1346,6 +1373,41 @@ const NEEDLES = {
     ['NO UNCONDITIONAL `Sec-WebSocket-Protocol`', 1]
   ],
   winMcp: [
+    // =====================================================================
+    // WP-7.2 / WP-3 + WP-4 — THE DESKTOP-SESSION FACTS AND THE THREE RECEIPTS
+    // (SOL §7.2). The relay measures the element lane WHERE IT IS USED (the
+    // desktop session, the token that failed); this file consumes that file
+    // and owns the three frozen sentences Appendix C adds to the descriptions.
+    //
+    //   * `desktopFacts` (2) — the export AND the call that makes it
+    //     reachable. A defined-but-never-called reader leaves every consumer on
+    //     `measured:false` and the doctor blind to a dead lane again; the
+    //     doctor's whole `desktop` block is built on this one function.
+    //   * `cua-desktop-facts.json` (2) — Appendix B's filename, twice because
+    //     the read tries `C:\cua-work` and `%TEMP%`. The fallback is the branch
+    //     that matters when the work dir's ACL is the defect (R2), so one path
+    //     alone would let a reader silently stop trying.
+    //   * `lastFailureKind` (2) — one assignment where the SSH child's
+    //     stderr/exit is classified, one read in `doctorFacts()`. `lastError`
+    //     stays byte-identical: the text is a receipt, this field is the branch
+    //     the doctor and the tests can assert.
+    //   * `connectionLevel` (1) — the ONE predicate WP-4.2 and WP-2.2 agree on.
+    //     A second hand-rolled regex in the supervisor is how the two drift.
+    //   * `WINDOWS_TOOL_CONTRACT` (1) — Appendix C's frozen object, the single
+    //     place the three sentences live, so the registry and
+    //     `windows_desktop`'s `tools[]` cannot disagree.
+    //   * `not that the app acted on them (this receipt has no effect_verified)`
+    //     (1) — Appendix C's `tool_send_keys` sentence, quoted verbatim. The
+    //     locked §7.2 needle line spells the same clause "acted on it", which
+    //     cannot match an appendix that says "them" — the appendix is the BYTE
+    //     contract §4.6 tells the plugin to publish, so the appendix's wording
+    //     is the needle; the §7.2 count (1) is unchanged.
+    ['desktopFacts', 2],
+    ['cua-desktop-facts.json', 2],
+    ['lastFailureKind', 2],
+    ['connectionLevel', 1],
+    ['WINDOWS_TOOL_CONTRACT', 1],
+    ['not that the app acted on them (this receipt has no effect_verified)', 1],
     ['export function windowsMcpEnabled()', 1],
     ["String(process.env.DSH_CUA_VM_WIN_MCP ?? '1') !== '0'", 1],
     ['export function sshArgv(', 1],
@@ -1616,6 +1678,52 @@ const NEEDLES = {
     ['C:\\Windows\\Setup\\Scripts\\cua-firstboot.ps1', 1]
   ],
   oemBoot: [
+    // =====================================================================
+    // WP-7.1 / WP-1 — THE PAYLOAD MAY NOT LIE ABOUT ITS OWN INSTALL (SOL §7.1).
+    //
+    // The reported dead element lane was a pywin32 whose DLLs were never
+    // copied, shipped through a `find_spec()` gate that never imports. These
+    // needles pin the three parts of the honest gate plus the work dir and the
+    // hash-gated scale patch:
+    //
+    //   * `pywin32_postinstall` — the step REPAIRS the wheel it just installed.
+    //     Without this command a broken pywin32 can never heal in place, and
+    //     `find_spec()` would still report the package as present.
+    //   * `import win32ui` — the gate IMPORTS instead of looking up. A revert
+    //     to a presence-only check turns this red; a spec finder cannot see a
+    //     `.pyd` that fails to load, which is exactly the state that shipped.
+    //   * `pywinauto.controls.uiawrapper` — the module every pattern action
+    //     goes through (`_wrapper_for`), measured AFTER the repair. Importing
+    //     only `win32ui` would pass on a tree where the automation lane is
+    //     still broken.
+    //   * `C:\cua-work` (2) — the one directory the desktop token can write:
+    //     the step that CREATES it and the write assertion that PROVES it. One
+    //     site is a directory nothing tests; the ACL is only a claim until the
+    //     token writes.
+    //   * `setintegritylevel` — the DACL alone is not enough: a Medium-IL
+    //     process cannot write a High-IL directory however the ACL reads.
+    //   * `Step 'cua-workdir'` / `Step 'dsh-cua-scale'` (1 each) — the marker
+    //     rows the JURY reads in `C:\cua-provision.json`. A rename cannot
+    //     leave the proof in a row nobody queries.
+    //   * `base_w` (1) — Appendix A's patch anchor, the exact line the
+    //     replacement rewrites. The gate is a SHA plus "the anchor occurs
+    //     exactly once"; without this needle a patch that no longer matches
+    //     could be replaced by a no-op that still reports `applied`.
+    //   * `SCALE_OK` (1) — the no-window probe's positive answer, so a patch
+    //     that lands but is never PROVEN is still red.
+    //   * `scaleFix` (2) — the fact must be RETURNED by the step and SAID in
+    //     the log the JURY reads (`applied` / `already` / `skipped:<why>`); the
+    //     refusal path is the one that must never be silent.
+    ['pywin32_postinstall', 1],
+    ['import win32ui', 1],
+    ['pywinauto.controls.uiawrapper', 1],
+    ['C:\\cua-work', 2],
+    ['setintegritylevel', 1],
+    ["Step 'cua-workdir'", 1],
+    ["Step 'dsh-cua-scale'", 1],
+    ['base_w', 1],
+    ['SCALE_OK', 1],
+    ['scaleFix', 2],
     ['OpenSSH.Server', 2],
     ['{{SSH_PUBKEY}}', 1],
     ['administrators_authorized_keys', 1],
@@ -2056,6 +2164,54 @@ const NEEDLES = {
     ['space.belowFloor === true', 1]
   ],
   index: [
+    // =====================================================================
+    // WP-7.3 / WP-5 — ATTACHING, THE FACTS, AND THE RECEIPTS ON THE TOOL
+    // SURFACE (SOL §7.3). Five surfaces get the same vocabulary; these needles
+    // are the ones a revert breaks, not a restatement of the field names:
+    //
+    //   * `code: 'attaching'` (2) — the guard (`windowsGuardDecision`) and the
+    //     reveal (`revealWindowsTools`). The doctor's `viewer` INHERITS the
+    //     third occurrence from `targetMatchFor`, which is why the count is 2
+    //     and not 3: a branch added only to `targetMatchFor` would make the
+    //     doctor say "attaching" while the tools still answer `not-the-target`,
+    //     and that is the lie this code exists to end.
+    //   * `retryAfterMs` (2) — the doctor's `attach` payload AND the reveal /
+    //     sentence. A bound that exists only in the doctor is a bound the tool
+    //     surface never hands the model, which is the retry the report asked
+    //     for.
+    //   * `attachingFor` (2) — the helper plus at least one call site. One
+    //     definition and zero calls is a vocabulary nothing speaks; the count
+    //     catches the revert that keeps the function and drops the branch.
+    //   * `attaching to ` (1) — the SENTENCE ("attaching to <name>: the SSH
+    //     handshake is in flight … retry in ~Ns"), so `not-the-target` cannot
+    //     come back as this state's words. The trailing space keeps the needle
+    //     on the phrase the verdict prints.
+    //   * `elementLaneOk` (2) / `workDirWritable` (2) — each fact appears in
+    //     the doctor description AND in the verdict branch that turns it into
+    //     advice. A description alone documents a dead lane nobody warns
+    //     about; a branch alone hides the fallback in prose the model never
+    //     reads (WP-5.6 / WP-5.8).
+    //   * `scaleFix` (1) — the doctor description lists it, because the guest's
+    //     scale mismatch is EXPECTED and a model that reads the numbers without
+    //     that sentence clicks from image pixels.
+    //   * `win32_mcp_shots` (1) / `dedupe by pid` (1) — Appendix C's two facts
+    //     repeated in the plugin's own surface. The registry note rides the
+    //     guest description; the prompt is what a model sees before its first
+    //     call, so both spellings must exist HERE, not only in `win-mcp.js`.
+    //   * `windowsToolContract` (2) — the registration expression and the
+    //     `WIN_MCP_AUX.tools` map (WP-5.7). The same note on both paths is the
+    //     whole point; one site means `windows_desktop` can disagree with the
+    //     registry it just published.
+    ["code: 'attaching'", 2],
+    ['retryAfterMs', 2],
+    ['attachingFor', 2],
+    ['attaching to ', 1],
+    ['elementLaneOk', 2],
+    ['workDirWritable', 2],
+    ['scaleFix', 1],
+    ['win32_mcp_shots', 1],
+    ['dedupe by pid', 1],
+    ['windowsToolContract', 2],
     ["name: 'cua_vm_start'", 1],
     ["name: 'cua_vm_shutdown'", 1],
     ["name: 'cua_vm_gc'", 1],
@@ -2319,7 +2475,11 @@ const NEEDLES = {
     // comment: `PLUGIN_VERSION` is the value the cross-file assertion at the end
     // of this file compares against `plugins/dsh-cua-vm/package.json`. Both
     // doctors report it, so "the fix is not in your plugin" stops being a guess.
-    ["export const PLUGIN_VERSION = '0.2.0'", 1],
+    // WP-7.1/WP-8.1: the RELEASE LITERAL tracks the identity — this is the one
+    // pre-existing needle whose payload changes with a version bump (the pair
+    // still has to agree: the cross-file assertion below compares both files, so
+    // a bump in one alone stays red). 0.2.1 is the release that ships WP-1..WP-8.
+    ["export const PLUGIN_VERSION = '0.2.1'", 1],
     ['pluginVersion: PLUGIN_VERSION', 1],
     // WP-3.4/C4 — A HIDDEN BRIDGE INVENTORIES NOTHING. Nineteen names used to come
     // back from a reveal that had FAILED (offline, grant off, wrong target), which
@@ -3287,7 +3447,8 @@ function sourceOf(label, name) {
  * versions disagree" is not. This assertion was RED the moment it was written —
  * index.js already exported 0.2.0 while the manifest still said 0.1.0 — and it is
  * the gate, not a review note, that made WP-7.1's bump unmissable. It is green
- * now that both say 0.2.0; a future bump in ONE file turns it red again.
+ * now that both say 0.2.1 (the WP-1..WP-8 release); a future bump in ONE file
+ * turns it red again.
  */
 {
   total += 1
@@ -3322,7 +3483,7 @@ function sourceOf(label, name) {
     if (!process.argv.includes('--quiet')) console.log(`  ok   WP-6.6 plugins/dsh-cua-vm/package.json version ${packageVersion} === index.js PLUGIN_VERSION`)
   } else {
     failures += 1
-    missing.push(`WP-6.6: plugins/dsh-cua-vm/package.json version ${JSON.stringify(packageVersion)} ≠ index.js PLUGIN_VERSION ${JSON.stringify(pluginVersion)} — §4.8/WP-7.1: both must be the same release (0.2.0), so the doctor's pluginVersion names the build that is actually installed. OWNER: writer G (WP-7.1 bumps package.json).`)
+    missing.push(`WP-6.6: plugins/dsh-cua-vm/package.json version ${JSON.stringify(packageVersion)} ≠ index.js PLUGIN_VERSION ${JSON.stringify(pluginVersion)} — §4.8/WP-7.1: both must be the same release (0.2.1), so the doctor's pluginVersion names the build that is actually installed. Bump BOTH (WP-5.10 / WP-8.1) or the release identity is a guess.`)
     console.log(`  FAIL WP-6.6 plugin identity: package.json ${packageVersion} ≠ PLUGIN_VERSION ${pluginVersion} (owner: WP-7.1 / writer G)`)
   }
 }

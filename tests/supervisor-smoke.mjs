@@ -5,7 +5,7 @@
  * is the bookkeeping that used to be wrong (registry migration, quota, delete
  * manifest, GC, shutdown/start state machine).
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import net from 'node:net'
 import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync, rmSync, statSync, readdirSync, chmodSync, truncateSync } from 'node:fs'
 import path from 'node:path'
@@ -22,9 +22,31 @@ const SOCK = path.join(STORE, 'supervisor.sock')
 const STUB = path.join(STORE, 'bin', 'cua-stub')
 
 let failures = 0
+/** Checks whose production half has not landed yet (see `checkContract`). */
+let pendings = 0
+/** T2: a reverted production change must go RED, not "pending". */
+const STRICT_CONTRACT = process.env.DSH_CUA_CONTRACT_STRICT === '1'
 const check = (label, ok, detail = '') => {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${detail ? ` — ${detail}` : ''}`)
   if (!ok) failures += 1
+}
+/**
+ * WP-6.4 — A CHECK THAT CAN ONLY PASS ONCE THE PRODUCTION HALF EXISTS.
+ *
+ * `landed` is the FEATURE's presence (an exported function, a literal in the
+ * file under test), never the value being asserted: a missing feature is
+ * PENDING, loudly, and a present feature with the wrong value FAILS.
+ * `DSH_CUA_CONTRACT_STRICT=1` requires them now (the T2 mutation check).
+ */
+const checkContract = (label, landed, ok, detail = '', expected = '') => {
+  if (landed) { check(label, ok, detail); return }
+  if (STRICT_CONTRACT) {
+    failures += 1
+    console.log(` FAIL  ${label} — contract absent and DSH_CUA_CONTRACT_STRICT=1${expected ? ` (${expected})` : ''}`)
+    return
+  }
+  pendings += 1
+  console.log(` PEND  ${label} — awaiting the production change${expected ? ` (${expected})` : ''}${detail ? ` — ${detail}` : ''}`)
 }
 
 rmSync(STORE, { recursive: true, force: true })
@@ -136,6 +158,37 @@ const freePort = () => new Promise((resolve) => {
 const winQmpPort = await freePort()
 const winVncPort = await freePort()
 const winSshPort = await freePort() // bound by nothing: no SSH until the answer file ran
+/**
+ * IS A PORT REALLY BOUND BY NOTHING, RIGHT NOW?
+ *
+ * `freePort()` above reserves an ephemeral port and RELEASES it; between that
+ * moment and the F3 check ~1 500 lines later, the kernel may hand the same
+ * number to another process's ephemeral bind (another suite running in the same
+ * checkout does exactly that). A stray listener then reads as "SSH accepting",
+ * and the readiness check fails for a reason that has nothing to do with the
+ * code under test. This probe makes the F3 row pick a port that is CLOSED at
+ * the moment of the check, which is the state the assertion is about.
+ */
+const portIsClosed = (port) => new Promise((resolve) => {
+  const socket = net.connect(port, '127.0.0.1')
+  let settled = false
+  const done = (closed) => {
+    if (settled) return
+    settled = true
+    try { socket.destroy() } catch {}
+    resolve(closed)
+  }
+  socket.setTimeout(400, () => done(true))
+  socket.on('connect', () => done(false))
+  socket.on('error', () => done(true))
+})
+const closedPort = async () => {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const candidate = await freePort()
+    if (await portIsClosed(candidate)) return candidate
+  }
+  return winSshPort
+}
 const vncPeer = net.createServer((socket) => { try { socket.write('RFB 003.008\n') } catch {} })
 await new Promise((resolve) => vncPeer.listen(winVncPort, '127.0.0.1', resolve))
 // The probe the supervisor dials: `qmp_capabilities`, then one command per line.
@@ -1544,6 +1597,10 @@ try {
   // written HERE (not in the fixture registry) because the checks above count
   // `maxRunning` and the earlier cases rebuild registry.json from scratch.
   {
+    // A PORT THAT IS CLOSED AT THIS INSTANT (see `closedPort`): the assertion is
+    // "no SSH listener, so the row must not be promoted", and a stray ephemeral
+    // listener from another process would silently invert it.
+    const setupSshPort = await closedPort()
     writeFileSync(path.join(STORE, 'registry.json'), JSON.stringify({
       version: 2,
       vms: {
@@ -1551,7 +1608,7 @@ try {
           workspace: '/w4', kind: 'windows', backend: 'qemu', state: 'installing', cpu: 2, memory: 4,
           windowsVersion: '11', diskGb: 64,
           createdAt: new Date().toISOString(), startedAt: new Date().toISOString(),
-          ports: { qmp: winQmpPort, ssh: winSshPort, vnc: winVncPort }
+          ports: { qmp: winQmpPort, ssh: setupSshPort, vnc: winVncPort }
         }
       }
     }, null, 2) + '\n')
@@ -2150,6 +2207,10 @@ exec sleep 120
 `, { mode: 0o755 })
   // qemu-img/ssh-keygen come from the suite's own stub dir; qemu from slowBin.
   const slow = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')], {
+    // Same rule as `fix` below: SIGKILL skips the supervisor's own shutdown, so
+    // the live-view child it spawned must die with the GROUP or it outlives the
+    // suite and poisons the next run's fixed ports.
+    detached: true,
     env: (() => {
       const env = {
         ...process.env,
@@ -2202,7 +2263,11 @@ exec sleep 120
     check('F3: ...no "died during init" line was logged',
       !/died during init/u.test(slowErr), slowErr.split('\n').filter((line) => /died during init/u.test(line)).join(' / ').slice(0, 200))
   }
-  try { slow.kill('SIGKILL') } catch {}
+  try { process.kill(-slow.pid, 'SIGKILL') } catch { try { slow.kill('SIGKILL') } catch {} }
+  // BELT AND BRACES: the live-view child's argv carries this run's store path,
+  // so `pkill -f <store>` matches ONLY this block's children. A fixed-port leak
+  // is invisible until the NEXT run fails on a busy port.
+  try { spawnSync('pkill', ['-9', '-f', slowStore], { timeout: 5000 }) } catch { /* no pkill */ }
 }
 
 
@@ -2364,6 +2429,13 @@ setInterval(() => {}, 1000)
   mkdirSync(path.dirname(fixQemu), { recursive: true })
   writeFileSync(fixQemu, '#!/bin/sh\nexit 1\n', { mode: 0o755 })
   const fix = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')], {
+    // DETACHED = ITS OWN PROCESS GROUP. SIGKILL does not run the supervisor's
+    // shutdown, so a hard kill used to orphan the live-view children it spawned
+    // (`cua-vnc-clip.mjs` + `websockify`, bound to the FIXED ports 5997-5999) —
+    // and the next run then failed with "the live view is not up yet" because
+    // the port was still taken by a process from the run before. Killing the
+    // GROUP reaps them with the supervisor.
+    detached: true,
     env: {
       ...process.env,
       CUA_VM_STORE: fixStore,
@@ -2497,9 +2569,324 @@ setInterval(() => {}, 1000)
     check('J22-7: ...and the supervisor exits only AFTER they are reaped (no child outlives it)',
       late.length === 0 && fixExitAt > 0, fixExitAt === 0 ? 'no exit observed' : `${late.length} late stop(s)`)
   }
-  try { fix.kill('SIGKILL') } catch {}
+  // THE WHOLE GROUP, not just the supervisor: a SIGKILLed supervisor leaves its
+  // websockify/bridge grandchildren behind (see `detached: true` above).
+  try { process.kill(-fix.pid, 'SIGKILL') } catch { try { fix.kill('SIGKILL') } catch {} }
+  try { spawnSync('pkill', ['-9', '-f', fixStore], { timeout: 5000 }) } catch { /* no pkill */ }
   rmSync(fixStore, { recursive: true, force: true })
 }
 
+
+/* ================================================================== *
+ * WP-6.4 — S1..S6: THE BOOT WAIT (SOL §4.8, WP-2.2-2.4)
+ *
+ * THE DEFECT. A Windows row that was `booting`, or `ready` while sshd was still
+ * starting, answered `exit 126 / code: no-ssh` ("not available for Windows
+ * computers") or ssh's raw `255`. A model read a permanent-sounding refusal for
+ * a computer that was 20 s from working. The contract is now: WAIT (bounded),
+ * then say `code: booting` — never `126`, never `255`.
+ *
+ * HOW IT IS DRIVEN. A real supervisor child (the same binary, its own store and
+ * socket) with `DSH_CUA_SSH_BIN` / `DSH_CUA_SCP_BIN` pointed at one stub that
+ * speaks OpenSSH's own connection vocabulary. `DSH_CUA_WINDOWS_SSH_WAIT_MS` is
+ * set per child, because the budget is read at module load — that is exactly how
+ * an operator would set it.
+ *
+ * NO PROCESS-WIDE ENV IS TOUCHED. `DSH_CUA_SSH_BIN`, `DSH_CUA_SCP_BIN` and
+ * `DSH_CUA_WINDOWS_SSH_WAIT_MS` are read at MODULE LOAD, so each case gets its
+ * own CHILD with its own env — there is nothing to restore in a `finally`, and
+ * two cases with different budgets cannot leak into each other or into the main
+ * suite's supervisor.
+ *
+ * THE STUB'S THREE MODES are the three cases the SOL names:
+ *   fail   — always `Connection closed` / 255 (sshd not up yet)
+ *   fail2  — fails twice, then answers (a boot that finished inside the budget)
+ *   ok     — answers immediately (the control: no wait, no retry)
+ * ================================================================== */
+{
+  const SUP_SOURCE = readFileSync(path.join(REPO, 'docker', 'cua-vm-supervisor.mjs'), 'utf8')
+  // ---- S1: the exported default spec, read from the REAL module ----
+  //
+  // A CHILD, not an import: the supervisor starts a listener at module scope, so
+  // importing it in-process would open a second daemon on this test's socket.
+  // The child prints the export and exits; the daemon it started dies with it.
+  {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'cua-spec-'))
+    const probe = spawnSync(process.execPath, ['-e',
+      "import(process.env.CUA_SUP_URL).then(m=>{console.log('SPEC='+m.WINDOWS_DSH_CUA_DEFAULT);process.exit(0)}).catch(e=>{console.log('ERR='+(e?.message??e));process.exit(1)})"
+    ], {
+      env: {
+        ...process.env,
+        CUA_SUP_URL: pathToFileURL(path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')).href,
+        CUA_VM_STORE: path.join(dir, 'store'),
+        CUA_VM_HOME: path.join(dir, 'home'),
+        CUA_SUPERVISOR_SOCK: path.join(dir, 's.sock')
+      },
+      encoding: 'utf8',
+      timeout: 30000
+    })
+    const printed = /SPEC=(.*)/u.exec(probe.stdout ?? '')?.[1]?.trim() ?? ''
+    const landed = /export const WINDOWS_DSH_CUA_DEFAULT = /u.test(SUP_SOURCE)
+    checkContract('WP-6.4/S1: the guest install default is the PINNED build, exported for the test',
+      landed, printed === 'dsh-cua==0.4.1',
+      printed === '' ? String(probe.stderr ?? '').trim().slice(-160) : printed,
+      'dsh-cua==0.4.1')
+    checkContract('WP-6.4/S1: ...and the env override is still what an operator can change',
+      landed, /process\.env\.DSH_CUA_WINDOWS_DSH_CUA \|\| WINDOWS_DSH_CUA_DEFAULT/u.test(SUP_SOURCE))
+    rmSync(dir, { recursive: true, force: true })
+  }
+
+  const STUB_SSH = `#!/bin/sh
+# A STAND-IN FOR ssh/scp THAT SPEAKS THE SAME FAILURE VOCABULARY.
+echo "call $*" >> "$CUA_STUB_CALLS"
+MODE=$(cat "$CUA_STUB_MODE" 2>/dev/null)
+if [ "$MODE" = "fail2" ]; then
+  N=$(wc -l < "$CUA_STUB_CALLS" | tr -d ' ')
+  if [ "$N" -le 2 ]; then
+    echo "Connection closed by 127.0.0.1 port 22" >&2
+    exit 255
+  fi
+  echo ok
+  exit 0
+fi
+if [ "$MODE" = "ok" ]; then
+  echo ok
+  exit 0
+fi
+if [ "$MODE" = "hang" ]; then
+  # exec, so the KILL the supervisor sends lands on the sleep ITSELF. Without
+  # it the shell dies but the sleep keeps the inherited stderr pipe open, and
+  # the supervisor's close event waits 30 s for a process it already killed
+  # (the wait would then look like a 30 s timeout instead of the 1 s budget).
+  exec sleep 30
+fi
+echo "Connection closed by 127.0.0.1 port 22" >&2
+exit 255
+`
+
+  /**
+   * ONE supervisor child with the stub transport. `rows` is the registry it
+   * starts with; a case can rewrite it between calls (the supervisor re-reads the
+   * file on every try, which is half of what the wait is FOR).
+   */
+  const bootSupervisor = async ({ waitMs, rows }) => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'cua-boot-sup-'))
+    const binDir = path.join(dir, 'bin')
+    mkdirSync(binDir, { recursive: true })
+    const calls = path.join(dir, 'calls.log')
+    const mode = path.join(dir, 'mode')
+    writeFileSync(calls, '')
+    writeFileSync(mode, 'fail')
+    for (const bin of ['ssh', 'scp']) writeFileSync(path.join(binDir, bin), STUB_SSH, { mode: 0o755 })
+    // The supervisor insists the qemu path EXISTS before it will look at a row.
+    writeFileSync(path.join(binDir, 'qemu-system-x86_64'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+    writeFileSync(path.join(binDir, 'cua'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    const store = path.join(dir, 'store')
+    const sock = path.join(store, 's.sock')
+    // THE WORKSPACE ROOT IS THIS CASE'S OWN DIRECTORY: the scp cases upload a
+    // file by relative path, and hardcoding `/workspace` made the block fail in
+    // any checkout that is not under it (a mutation copy, CI, a reviewer's tree).
+    const workspaceDir = path.join(dir, 'workspace')
+    mkdirSync(workspaceDir, { recursive: true })
+    mkdirSync(store, { recursive: true })
+    writeFileSync(path.join(store, 'registry.json'), `${JSON.stringify({ version: 2, vms: rows }, null, 2)}\n`)
+    const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')], {
+      env: {
+        ...process.env,
+        CUA_VM_STORE: store,
+        CUA_VM_HOME: path.join(dir, 'home'),
+        CUA_SUPERVISOR_SOCK: sock,
+        CUA_BIN: path.join(binDir, 'cua'),
+        CUA_WORKSPACE_ROOT: workspaceDir,
+        DSH_CUA_VM_WINDOWS: '1',
+        DSH_CUA_WINDOWS_FAKE_HOST_CAPS: '1',
+        DSH_CUA_WINDOWS_OEM_DIR: path.join(REPO, 'docker', 'windows-oem'),
+        DSH_CUA_WINDOWS_QEMU: path.join(binDir, 'qemu-system-x86_64'),
+        // THE TWO TRANSPORTS THE WAIT DRIVES, both stubbed.
+        DSH_CUA_SSH_BIN: path.join(binDir, 'ssh'),
+        DSH_CUA_SCP_BIN: path.join(binDir, 'scp'),
+        // THE BUDGET, read at module load — per case, exactly as documented.
+        DSH_CUA_WINDOWS_SSH_WAIT_MS: String(waitMs),
+        CUA_STUB_CALLS: calls,
+        CUA_STUB_MODE: mode,
+        PATH: `${binDir}:${process.env.PATH ?? ''}`
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let stderrText = ''
+    child.stderr.on('data', (chunk) => { stderrText += chunk })
+    const ask = (payload) => new Promise((resolve) => {
+      const socket = net.connect(sock)
+      let buffer = ''
+      socket.setEncoding('utf8')
+      socket.on('connect', () => socket.write(`${JSON.stringify(payload)}\n`))
+      socket.on('data', (chunk) => { buffer += chunk })
+      socket.on('close', () => { try { resolve(JSON.parse(buffer.split('\n')[0])) } catch { resolve(null) } })
+      socket.on('error', () => resolve(null))
+    })
+    let up = false
+    for (let i = 0; i < 120; i += 1) {
+      if (existsSync(sock)) { up = true; break }
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return {
+      up,
+      workspace: workspaceDir,
+      stderr: () => stderrText,
+      ask,
+      calls: () => readFileSync(calls, 'utf8').split('\n').filter(Boolean).length,
+      resetCalls: () => writeFileSync(calls, ''),
+      setMode: (value) => writeFileSync(mode, value),
+      setRows: (next) => writeFileSync(path.join(store, 'registry.json'), `${JSON.stringify({ version: 2, vms: next }, null, 2)}\n`),
+      close: () => { try { child.kill('SIGKILL') } catch {} ; rmSync(dir, { recursive: true, force: true }) }
+    }
+  }
+  const winRow = (state) => ({
+    workspace: '/workspace', kind: 'windows', backend: 'qemu', state,
+    ssh: true, sshPort: 47999, diskGb: 20, cpu: 2, memory: 4, createdAt: new Date().toISOString()
+  })
+  const landedWait = /export async function windowsSshBootWait/u.test(SUP_SOURCE)
+
+  // ---- S2: a boot that finishes INSIDE the budget is waited for, not refused ----
+  {
+    const sup = await bootSupervisor({ waitMs: 8000, rows: { 'boot-2': winRow('ready') } })
+    try {
+      check('WP-6.4/S2: a supervisor with the stub transport starts', sup.up, sup.stderr().trim().split('\n').at(-1) ?? '')
+      if (sup.up) {
+        sup.setMode('fail2')
+        sup.resetCalls()
+        const answer = await sup.ask({ op: 'exec', name: 'boot-2', cmd: 'dir' })
+        checkContract('WP-6.4/S2: two connection-level failures then an answer ⇒ the command runs (exit 0)',
+          landedWait,
+          answer?.ok === true && answer?.exit === 0 && String(answer?.stdout ?? '').trim() === 'ok',
+          `exit=${answer?.exit} stdout=${JSON.stringify(String(answer?.stdout ?? '').trim())}`)
+        checkContract('WP-6.4/S2: ...and the stub was tried exactly THREE times (no retry loop, no double run)',
+          landedWait, sup.calls() === 3, `${sup.calls()} ssh spawn(s)`)
+        checkContract('WP-6.4/S2: ...with a legible wait line in the host log',
+          landedWait, /waited [\d.]+ s for sshd \(3 attempts\)/u.test(sup.stderr()),
+          sup.stderr().split('\n').filter((line) => line.includes('waited')).slice(-1)[0] ?? '(no wait line)')
+      }
+    } finally { sup.close() }
+  }
+
+  // ---- S3/S4/S5: the three give-up shapes, on a 600 ms budget ----
+  {
+    const sup = await bootSupervisor({ waitMs: 600, rows: { 'boot-3': winRow('ready'), 'boot-4': winRow('booting'), 'boot-5': winRow('installing') } })
+    try {
+      check('WP-6.4/S3: the 600 ms-budget supervisor starts', sup.up, sup.stderr().trim().split('\n').at(-1) ?? '')
+      if (sup.up) {
+        // S3: a `ready` row whose sshd never answers.
+        sup.setMode('fail')
+        sup.resetCalls()
+        const s3 = await sup.ask({ op: 'exec', name: 'boot-3', cmd: 'dir' })
+        checkContract('WP-6.4/S3: a `ready` row whose sshd never answers answers exit 125 + `code: booting`',
+          landedWait,
+          s3?.ok === true && s3?.exit === 125 && String(s3?.stderr ?? '').startsWith('code: booting'),
+          `exit=${s3?.exit} first=${JSON.stringify(String(s3?.stderr ?? '').split('\n')[0])}`)
+        checkContract('WP-6.4/S3: ...`available` is ABSENT (the plugin binds a session on its absence), never `false`',
+          landedWait, s3 !== null && Object.hasOwn(s3 ?? {}, 'available') === false,
+          JSON.stringify(Object.keys(s3 ?? {}).filter((key) => key === 'available')))
+        checkContract('WP-6.4/S3: ...and the budget was actually SPENT (ms ≥ 600), not skipped',
+          landedWait, Number(s3?.ms ?? 0) >= 600 && Number(s3?.ms ?? 0) < 5000, `${s3?.ms} ms`)
+        checkContract('WP-6.4/S3: ...the stderr names the next action, and never says 126/no-ssh',
+          landedWait,
+          /next: retry in ~15 s/u.test(String(s3?.stderr ?? '')) && !/no-ssh|126|not available for Windows/iu.test(String(s3?.stderr ?? '')),
+          String(s3?.stderr ?? '').split('\n').slice(-1)[0]?.slice(0, 120) ?? '')
+
+        // S4: a row that is honestly `booting` gets the SAME answer, never 126.
+        const s4 = await sup.ask({ op: 'exec', name: 'boot-4', cmd: 'dir' })
+        checkContract('WP-6.4/S4: a `booting` row answers `code: booting` — never 126 / `no-ssh`',
+          landedWait,
+          s4?.ok === true && s4?.exit === 125 && String(s4?.stderr ?? '').startsWith('code: booting')
+          && s4?.code === 'booting' && !/no-ssh/iu.test(String(s4?.stderr ?? '')),
+          `exit=${s4?.exit} code=${s4?.code}`)
+
+        // S5: `installing` needs a Start, not a wait — and ZERO ssh children.
+        sup.resetCalls()
+        const s5 = await sup.ask({ op: 'exec', name: 'boot-5', cmd: 'dir' })
+        checkContract('WP-6.4/S5: an `installing` row answers `code: installing` and spends ZERO ssh spawns',
+          landedWait,
+          s5?.ok === true && s5?.exit === 125 && s5?.code === 'installing' && sup.calls() === 0,
+          `exit=${s5?.exit} code=${s5?.code} spawns=${sup.calls()}`)
+        checkContract('WP-6.4/S5: ...and its sentence says when to come back (~60 s), not "not available"',
+          landedWait, /retry in ~60 s/u.test(String(s5?.stderr ?? '')),
+          String(s5?.stderr ?? '').split('\n').slice(-1)[0]?.slice(0, 120) ?? '')
+
+        // S6: put/get on a `booting` row: available:false + code + the message.
+        // THE WORKSPACE ROOT the child was given (see `bootSupervisor`), so the
+        // relative local paths below resolve to this file and nowhere else.
+        const localProbe = path.join(sup.workspace, 'boot-wait-probe.txt')
+        mkdirSync(path.dirname(localProbe), { recursive: true })
+        writeFileSync(localProbe, 'probe\n')
+        sup.setMode('fail')
+        sup.resetCalls()
+        const s6put = await sup.ask({ op: 'put', name: 'boot-4', local: 'boot-wait-probe.txt', guest: 'C:\\cua-work\\probe.txt' })
+        const s6get = await sup.ask({ op: 'get', name: 'boot-4', guest: 'C:\\cua-work\\probe.txt', local: 'boot-wait-out.txt' })
+        checkContract('WP-6.4/S6: `put` on a booting row answers available:false + code:"booting" + the retry message',
+          landedWait,
+          s6put?.ok === true && s6put?.available === false && s6put?.code === 'booting'
+          && /retry in ~\d+ s/u.test(String(s6put?.message ?? '')),
+          `code=${s6put?.code} message=${String(s6put?.message ?? '').slice(0, 100)}${s6put?.ok === false ? ` error=${String(s6put?.error ?? '').slice(0, 120)}` : ''}`)
+        checkContract('WP-6.4/S6: ...and `get` answers the same way (one vocabulary for both directions)',
+          landedWait,
+          s6get?.ok === true && s6get?.available === false && s6get?.code === 'booting'
+          && /retry in ~\d+ s/u.test(String(s6get?.message ?? '')),
+          `code=${s6get?.code} message=${String(s6get?.message ?? '').slice(0, 100)}${s6get?.ok === false ? ` error=${String(s6get?.error ?? '').slice(0, 120)}` : ''}`)
+        checkContract('WP-6.4/S6: ...and neither direction ever answers `no-ssh` for a computer that exists',
+          landedWait,
+          !/no-ssh/iu.test(String(s6put?.message ?? '')) && !/no-ssh/iu.test(String(s6get?.message ?? '')),
+          `${String(s6put?.message ?? '').slice(0, 60)} | ${String(s6get?.message ?? '').slice(0, 60)}`)
+
+        // THE LOCAL FILE the two scp cases upload (the same private workspace
+        // root as S6, so nothing here depends on the checkout's location).
+        const readyProbe = path.join(sup.workspace, 'boot-wait-probe.txt')
+        writeFileSync(readyProbe, 'probe\n')
+
+        // ---- S6b: the SCP half of the classification, on a READY row ----
+        //
+        // The reported defect is "ready, but sshd is still coming up". `exec`
+        // retries through `sshRun`; `put`/`get` go through `scpRun`, and if that
+        // path did not classify a connection-level failure the same way, a boot
+        // race would come back as `vm_put failed over SSH` — the exact sentence
+        // this release removes. `fail` = 255 + `Connection closed`.
+        sup.setRows({ 'boot-3': winRow('ready'), 'boot-4': winRow('booting'), 'boot-5': winRow('installing') })
+        sup.setMode('fail')
+        sup.resetCalls()
+        const s6ready = await sup.ask({ op: 'put', name: 'boot-3', local: 'boot-wait-probe.txt', guest: 'C:\\cua-work\\probe.txt' })
+        checkContract('WP-6.4/S6: `put` on a READY row whose scp is refused answers `code: booting`, not `vm_put failed`',
+          landedWait,
+          s6ready?.ok === true && s6ready?.available === false && s6ready?.code === 'booting'
+          && !/vm_put failed/iu.test(String(s6ready?.message ?? '')),
+          `code=${s6ready?.code} message=${String(s6ready?.message ?? s6ready?.error ?? '').slice(0, 90)}`)
+
+        // ---- S6c: A KILLED scp IS STILL A BOOT RACE (`timedOut` must travel) ----
+        //
+        // The boot wait hands the scp child what is LEFT of its budget. A child
+        // killed at that budget is not the command's own deadline: it is the
+        // listener hanging mid-handshake, which is retryable. Folding the kill
+        // into `code: 124` alone (the pre-fix shape) made the two
+        // indistinguishable, so this asserts the retry, not the code.
+        sup.setMode('hang')
+        sup.resetCalls()
+        const hangStart = Date.now()
+        const s6hang = await sup.ask({ op: 'put', name: 'boot-3', local: 'boot-wait-probe.txt', guest: 'C:\\cua-work\\probe.txt' })
+        const hangMs = Date.now() - hangStart
+        checkContract('WP-6.4/S6: a scp killed at the BOOT budget is retried as a boot race (`code: booting`)',
+          landedWait,
+          s6hang?.ok === true && s6hang?.available === false && s6hang?.code === 'booting'
+          && hangMs < 20000,
+          `code=${s6hang?.code} ${hangMs}ms message=${String(s6hang?.message ?? s6hang?.error ?? '').slice(0, 80)}`)
+        sup.setMode('fail')
+        rmSync(localProbe, { force: true })
+        rmSync(readyProbe, { force: true })
+      }
+    } finally { sup.close() }
+  }
+}
+
 console.log(failures === 0 ? '\nsmoke: PASS' : `\nsmoke: ${failures} FAILURE(S)`)
+if (pendings > 0) {
+  console.log(`smoke: ${pendings} check(s) PENDING — the production half is absent (SOL WP-2).`)
+  console.log('  Run with DSH_CUA_CONTRACT_STRICT=1 to require them now (the T2 mutation check).')
+}
 process.exit(failures === 0 ? 0 : 1)

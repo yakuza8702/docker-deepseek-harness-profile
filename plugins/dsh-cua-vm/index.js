@@ -9,9 +9,35 @@ import {
   DOCTOR_TOOL_NAME,
   windowsToolName,
   windowsGuestToolName,
+  windowsToolContract,
   sshArgv,
   mcpError
 } from './win-mcp.js'
+import * as winMcpApi from './win-mcp.js'
+
+/**
+ * WP-5.6/5.9 — THE DESKTOP-FACT READER IS RESOLVED THROUGH THE MODULE NAMESPACE.
+ *
+ * `desktopFacts()` (WP-4.1) is the ONE owner of "what the desktop session
+ * measured": `win32ui` / `uiaLane`, the work directory's writability, the
+ * `scaleFix` verdict. This file only CONSUMES it — the doctor puts it in its
+ * payload, the reveal hands back the cached copy — so it must never grow a
+ * second reader, and it must never take the whole plugin down when the export is
+ * not there yet. A STATIC named import would do exactly that: `index.js` and
+ * `win-mcp.js` land as a pair (and the gate maps `./win-mcp.js` to the fixture),
+ * so a tree where only one half has landed would fail to LINK this module, and a
+ * plugin that cannot load reports nothing at all — strictly worse than the
+ * `measured:false` it should answer. `desktopFactsReader()` below is the single
+ * seam: absent reader ⇒ `measured:false` + `error`, never a throw, never a
+ * "false" standing in for "unknown".
+ *
+ * `windowsToolContract` (WP-4.4, Appendix C) keeps its named import: it is the
+ * frozen table of three sentences, it is already in this tree, and a description
+ * silently losing its contract note is the defect the table exists to prevent.
+ */
+function desktopFactsReader() {
+  return typeof winMcpApi.desktopFacts === 'function' ? winMcpApi.desktopFacts : null
+}
 
 /**
  * THE PLUGIN'S OWN IDENTITY (WP-3.7, SOL §4.8 "identity travels").
@@ -23,10 +49,13 @@ import {
  * IT MUST EQUAL `plugins/dsh-cua-vm/package.json`'s `version`. That is not a
  * comment-level promise: `tools/check-cua-vm.mjs` asserts the two agree (WP-6.6),
  * so bumping one place and not the other fails the gate instead of shipping two
- * identities for one file tree. The relay/blind-verdict release is 0.2.0 on both
- * sides (WP-7.1 owns the package.json bump; this file owns this constant).
+ * identities for one file tree. The relay/blind-verdict release was 0.2.0 on both
+ * sides; THIS release is 0.2.1 on both (WP-5.10 owns this constant, WP-8.1 owns
+ * `package.json`, and the gate's WP-6.6 equality is what stops a half-bump), and
+ * the number now also dates the three description contracts and the `attaching`
+ * state, so a report can tell a 0.2.0 guest from a 0.2.1 one.
  */
-export const PLUGIN_VERSION = '0.2.0'
+export const PLUGIN_VERSION = '0.2.1'
 
 export const name = 'cua-vm'
 export const inject = ['tools', 'systemPrompt', 'webServer']
@@ -447,7 +476,27 @@ const WIN_MCP_AUX = {
    */
   windowsRegistryNames: [],
   /** sessionIds that were let through by the 'implicit-single-target' rule. */
-  implicitTargets: new Set()
+  implicitTargets: new Set(),
+  /**
+   * THE LAST DESKTOP-FACTS ANSWER FOR THE ATTACHED COMPUTER (WP-5.6/5.9).
+   *
+   * `null` means "nothing measured in this process" and is the honest answer for
+   * a fresh plugin, an attach in flight and an offline bridge. It is filled by
+   * `refreshDesktopFactsCache()` (one bounded read, TTL-guarded inside the
+   * client) and cleared by `teardown()`, because the facts describe ONE guest's
+   * desktop session: carrying them across a re-attach to another computer would
+   * attribute winbox's dead `win32ui` to winbox2.
+   */
+  desktop: null,
+  /**
+   * WHEN THIS PROCESS READ `desktop` (its own clock, not the guest's `at`). The
+   * reveal uses it to decide whether the cached answer is worth re-reading; the
+   * guest's timestamp cannot serve, because the relay publishes its file once per
+   * start and a perfectly good answer is hours "old" by that measure.
+   */
+  desktopAt: 0,
+  /** The in-flight desktop-facts read, so a reveal storm spawns ONE ssh child. */
+  desktopRefresh: null
 }
 
 /**
@@ -633,6 +682,98 @@ function knownWindowsComputers() {
   return [...names]
 }
 
+/* ------------------------------------------------------------------ *
+ * WP-5.1/F3 — `attaching` IS A STATE, NOT A FAILURE (SOL §4.7)
+ * ------------------------------------------------------------------ *
+ *
+ * THE DEFECT THIS CLOSES. `targetMatchFor()` answered `not-the-target` +
+ * "no Windows computer is attached to this bridge right now" for BOTH
+ * situations it can see from `WIN_MCP.name`:
+ *
+ *   (a) nothing is attached, and nothing is being attached — the sentence is
+ *       true and the model should bind or create a computer;
+ *   (b) an attach is IN FLIGHT and its `connect()` is somewhere in its 45 s
+ *       window — `WIN_MCP.name` is '' by design (it is assigned only after the
+ *       handshake answers), the ticket already carries the name, and the
+ *       sentence is a LIE. The model reads "nothing is attached", so it creates
+ *       a second computer or loops on `windows_desktop`, and the one retry that
+ *       would have worked in a few seconds never happens.
+ *
+ * `WIN_MCP_AUX.inflightTicket` has carried `{ generation, name, dead, at }`
+ * since J20-4; nothing here is new bookkeeping. The helper is session-scoped on
+ * purpose: a session that bound ANOTHER computer must keep getting the plain,
+ * exact `not-the-target` — the in-flight attach is not its own, and pretending
+ * otherwise would hide a real mismatch for the length of a handshake.
+ *
+ * WHY `online === true` RETURNS null. An online bridge is not attaching: the
+ * handshake ANSWERED, which is precisely the fact `attaching` denies. The window
+ * it excludes is the few synchronous milliseconds between `WIN_MCP.name = …` and
+ * the end of the registration loop; during it the tools are real, and answering
+ * `attaching` would refuse a call the bridge can serve.
+ */
+
+/** The retry arithmetic of SOL §4.7, in one place (the doctor reads it too). */
+const WIN_MCP_ATTACH_RETRY_MIN_MS = 1_000
+const WIN_MCP_ATTACH_RETRY_MAX_MS = 20_000
+
+/**
+ * `clamp(45_000 − ageMs, 1000, 20000)`: wait a little less the longer the
+ * handshake has already been in flight, never less than a second (a caller that
+ * retries instantly turns a 45 s budget into a spin) and never more than 20 s
+ * (past that, re-reading the state is cheaper than a promise to wait).
+ */
+function windowsAttachRetryMs(ageMs) {
+  const age = Math.max(0, Number(ageMs) || 0)
+  return Math.min(
+    WIN_MCP_ATTACH_RETRY_MAX_MS,
+    Math.max(WIN_MCP_ATTACH_RETRY_MIN_MS, WIN_MCP_ATTACH_TIMEOUT_MS - age)
+  )
+}
+
+/** When the in-flight handshake started, or null when none is in flight. */
+function attachingSinceMs() {
+  const ticket = WIN_MCP_AUX.inflightTicket
+  if (ticket === null) return null
+  const at = Number(ticket.at)
+  return Number.isFinite(at) && at > 0 ? Math.max(0, Date.now() - at) : 0
+}
+
+/**
+ * The in-flight attach, IF it is this session's computer. `null` otherwise —
+ * and `null` is what keeps every pre-existing refusal byte-identical.
+ */
+function attachingFor(agent) {
+  const ticket = WIN_MCP_AUX.inflightTicket
+  if (ticket === null || ticket.dead === true) return null
+  if (WIN_MCP.online === true) return null
+  const pending = String(ticket.name ?? '')
+  if (pending === '') return null
+  const bound = boundTargetOf(agent)?.name ?? null
+  const known = knownWindowsComputers()
+  const mine = bound !== null
+    ? bound === pending
+    : (known.length === 1 && known[0] === pending)
+  if (mine !== true) return null
+  const pendingSinceMs = attachingSinceMs() ?? 0
+  const retryAfterMs = windowsAttachRetryMs(pendingSinceMs)
+  const generation = Number(ticket.generation) || 0
+  const oldS = Math.round(pendingSinceMs / 1000)
+  const retryS = Math.max(1, Math.ceil(retryAfterMs / 1000))
+  return {
+    ok: false,
+    code: 'attaching',
+    bound,
+    attached: '',
+    pending,
+    pendingSinceMs,
+    retryAfterMs,
+    generation,
+    // SOL §4.7 verbatim: the computer, the fact, the attempt and the wait.
+    text: `attaching to ${pending}: the SSH handshake is in flight (attempt ${generation}, ${oldS}s old); retry in ~${retryS}s`,
+    next: `retry in ~${retryS}s (cua_vm_start / cua_vm_exec on the same computer)`
+  }
+}
+
 /**
  * Does the executing agent's session own the attached computer?
  * Answers `{ ok: true, via }` or `{ ok: false, code, text }` — never throws, so
@@ -641,6 +782,13 @@ function knownWindowsComputers() {
 function targetMatchFor(agent) {
   const attached = WIN_MCP.name
   if (attached === '') {
+    // WP-5.1: ASK "IS IT ATTACHING FOR ME?" BEFORE SAYING "NOTHING IS ATTACHED".
+    // `WIN_MCP.name` is '' during the whole 45 s handshake, so the sentence below
+    // was reachable — and false — for a session whose computer was being dialled
+    // at that very moment. The ticket names it; this branch is the only thing
+    // that changes, and only while a ticket is alive.
+    const attaching = attachingFor(agent)
+    if (attaching !== null) return attaching
     return { ok: false, code: 'not-the-target', bound: null, attached: '', text: 'no Windows computer is attached to this bridge right now' }
   }
   const row = boundTargetOf(agent)
@@ -826,6 +974,31 @@ function disposeWindowsAgent(agent) {
 function windowsGuardDecision(execution) {
   const toolName = typeof execution?.name === 'string' ? execution.name : ''
   if (toolName.startsWith(TOOL_PREFIX) === false) return undefined
+  // WP-5.2 (§4.7): ATTACHING OUTRANKS OFFLINE, AND IT IS NOT A REFUSAL TO RETRY.
+  // The branch sits BEFORE the `online !== true` one because the honest code for
+  // "your computer's handshake is in flight" is `attaching`, not `vm-offline`:
+  // the second sends the model to start a computer that is already starting. The
+  // existing `vm-offline` and `not-the-target` texts below are untouched, and
+  // `attachingFor()` answers null unless the ticket names THIS session's
+  // computer — so a session bound elsewhere keeps the exact mismatch sentence.
+  const attaching = attachingFor(execution?.agent)
+  if (attaching !== null) {
+    return {
+      reason: [
+        `refused: the Windows bridge is attaching to ${attaching.pending}, so ${toolName} cannot run yet`,
+        'code: attaching',
+        `why: ${attaching.text}`,
+        `next: ${attaching.next}`
+      ].join('\n'),
+      info: {
+        name: toolName,
+        code: 'attaching',
+        pending: attaching.pending,
+        pendingSinceMs: attaching.pendingSinceMs,
+        retryAfterMs: attaching.retryAfterMs
+      }
+    }
+  }
   if (WIN_MCP.online !== true) {
     return {
       reason: [
@@ -923,6 +1096,11 @@ function teardown(reason) {
   WIN_MCP.name = ''
   WIN_MCP_AUX.target = null
   WIN_MCP_AUX.tools = []
+  // WP-5.6: THE DESKTOP FACTS BELONG TO THE ATTACH THEY WERE READ ON. Keeping
+  // them here would report winbox's measured truths (`win32ui:false`, a work dir
+  // that exists) for winbox2, which is a claim nobody made about that guest.
+  WIN_MCP_AUX.desktop = null
+  WIN_MCP_AUX.desktopAt = 0
   const disposers = [...WIN_MCP.registrations.values()]
   WIN_MCP.registrations.clear()
   for (const dispose of disposers) {
@@ -1055,6 +1233,37 @@ function winStateFromProbeReason(reason) {
   return ''
 }
 
+/* ------------------------------------------------------------------ *
+ * WP-5.7/F1-F2-F4 — WHAT THE THREE RECEIPTS MEAN (SOL §4.6, Appendix C)
+ * ------------------------------------------------------------------ *
+ *
+ * THE DEFECT. This plugin published the guest's tool descriptions VERBATIM and
+ * appended one suffix, so the model read upstream's schema and inferred a
+ * contract nobody verifies: `open_application` "succeeds" when `os.startfile`
+ * was accepted (no window need exist, and a retry launches a second instance),
+ * `send_keys` "succeeds" when the keys were injected into the FOREGROUND window
+ * (there is no `effect_verified`), and `capture_window` has NO redirect path at
+ * all — an empty `save_path` picks `%TEMP%\win32_mcp_shots`, which is a
+ * documented DEFAULT, not a silent relocation.
+ *
+ * THE FIX IS ONE SENTENCE PER RECEIPT, NOT A WRAPPER. `windowsToolContract()`
+ * (win-mcp.js, WP-4.4) is the frozen Appendix C table keyed by GUEST name and
+ * returns `''` for the other sixteen, so those sixteen descriptions stay
+ * byte-identical. The sentence is appended BEFORE the suffix — the suffix names
+ * the computer, and a contract that trailed after it would read as part of the
+ * name.
+ *
+ * ONE EXPRESSION, TWO CALL SITES. The registration loop and the
+ * `WIN_MCP_AUX.tools` inventory (which `windows_desktop` returns) both call this
+ * function, so a reveal can never disagree with the registry about what the
+ * model was told.
+ */
+function windowsToolDescription(guestName, guestDescription, computerName) {
+  const note = windowsToolContract(guestName)
+  const base = String(guestDescription ?? guestName)
+  return `${base}${note === '' ? '' : ` ${note}`} (dsh-cua, Windows computer ${computerName})`
+}
+
 /**
  * ATTACH — one SSH handshake, then register every guest tool under its public
  * `mcp__windows__*` name. Registration is by hand (NOT `ctx.effect`) so the
@@ -1137,9 +1346,13 @@ async function attachWindowsMcp(target) {
       // the newest entry for the attached name).
       recordVmState(target.name, 'ready')
       const failed = []
+      // WP-5.7: THE INVENTORY CARRIES THE SAME DESCRIPTIONS THE REGISTRY GOT.
+      // `windows_desktop`'s `tools[]` used to answer the bare guest description,
+      // so the reveal and the tool list could differ about the contract note —
+      // exactly the disagreement §4.6 forbids. Same function, same strings.
       WIN_MCP_AUX.tools = session.tools.map((tool) => ({
         name: windowsToolName(tool.name),
-        description: String(tool.description ?? tool.name),
+        description: windowsToolDescription(tool.name, tool.description ?? tool.name, target.name),
         parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} }
       }))
       for (const tool of session.tools) {
@@ -1150,7 +1363,7 @@ async function attachWindowsMcp(target) {
         const publicName = windowsToolName(tool.name)
         const definition = {
           name: publicName,
-          description: `${tool.description ?? tool.name} (dsh-cua, Windows computer ${target.name})`,
+          description: windowsToolDescription(tool.name, tool.description ?? tool.name, target.name),
           parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} },
           // The design's budget: a pywinauto round trip is fast, and the SSH
           // keepalive (10s × 2) decides a dead link long before this.
@@ -1190,6 +1403,17 @@ async function attachWindowsMcp(target) {
       WIN_MCP_AUX.retryAt = 0
       console.log(`[cua-vm] windows MCP attached to ${target.name} (${session.tools.length} tool(s))`)
       reapplyWindowsGates('attach')
+      // WP-5.9: THE FIRST `windows_desktop` AFTER A START THEN CARRIES THE FACTS.
+      // Two calls, both fire-and-forget, so the attach never waits on a fact read:
+      //   1. the client's own `refreshDesktopFacts()` (WP-4.1) warms ITS cache —
+      //      the same TTL cache `desktopFacts()` reads, so this keeps the two
+      //      readers on one answer instead of two ssh children;
+      //   2. `scheduleDesktopFacts()` stores that answer where the SYNCHRONOUS
+      //      reveal can return it. The latch inside it means one read in flight.
+      // `?.()`-guarded because a client that predates WP-4 must not cost the
+      // attach a TypeError — the facts would be absent, which is a fact.
+      try { void Promise.resolve(WIN_MCP.client?.refreshDesktopFacts?.()).catch(() => {}) } catch { /* older client */ }
+      scheduleDesktopFacts('attach')
     } catch (error) {
       try { client?.close() } catch { /* never opened */ }
       WIN_MCP.online = false
@@ -1710,16 +1934,34 @@ function revealWindowsTools(agent) {
   // it makes, instead of 19 visible names that refuse one by one.
   const match = targetMatchFor(agent)
   const revealed = online && granted && match.ok === true
+  // WP-5.3 (§4.7): THE REVEAL DURING A HANDSHAKE SAYS `attaching`, NOT
+  // `vm-offline`. `targetMatchFor()` already answered with the ticket's own
+  // sentence (5.1), so this only NAMES it: the tools stay hidden (`tools: []` is
+  // the existing rule for `revealed !== true`), and the note tells the model to
+  // retry in a few seconds instead of starting a computer that is starting.
+  const attaching = online !== true && match.ok !== true && match.code === 'attaching' ? match : null
   // WP-3.3 / WP-3.4: the reveal is also where a model finds out that the desktop
   // it just unhid is BLIND — one sentence here is cheaper than 19 calls that come
   // back empty because the lane has no interactive desktop.
   const laneFacts = windowsLaneFacts()
   const lane = windowsLaneVerdict(online, laneFacts)
   reapplyWindowsGates('reveal')
+  // WP-5.6/5.9 + defect 2: THE FACTS THE MODEL GETS, AND A RE-READ WHEN THEY
+  // CANNOT ANSWER. The answer is read ONCE here (the same object the payload
+  // returns, so the two cannot disagree), and the re-read is FIRE-AND-FORGET —
+  // `windows_desktop` owes the model an answer now and must never block on an ssh
+  // round trip. The kick used to be gated on `WIN_MCP_AUX.desktop === null`, which
+  // made ONE failed read permanent: it is now also re-read while unmeasured or
+  // older than `WIN_MCP_DESKTOP_FACTS_MAX_AGE_MS` (see `desktopFactsNeedsRefresh`).
+  const desktopFacts = cachedDesktopFacts()
+  if (online === true && desktopFactsNeedsRefresh(desktopFacts)) scheduleDesktopFacts('reveal')
   const code = revealed
     ? ''
     : online !== true
-      ? 'vm-offline'
+      // The literal `code: 'attaching'` has ONE owner (`attachingFor`); this
+      // branch only names it, so the four surfaces share one producer and a
+      // fourth copy of the string cannot drift.
+      ? (attaching === null ? 'vm-offline' : 'attaching')
       : granted !== true
         ? 'grant-off'
         : (match.code ?? 'not-the-target')
@@ -1738,14 +1980,32 @@ function revealWindowsTools(agent) {
     target: WIN_MCP.name === '' ? null : WIN_MCP.name,
     bound: boundTargetOf(agent)?.name ?? null,
     code,
+    // WP-5.3: THE TICKET'S OWN FACTS, so a caller can wait instead of guessing.
+    // The retry is the SOL §4.7 arithmetic, not a second one.
+    ...(attaching === null
+      ? {}
+      : {
+          pending: attaching.pending,
+          pendingSinceMs: attaching.pendingSinceMs,
+          retryAfterMs: attaching.retryAfterMs
+        }),
+    // WP-5.6/5.9: THE MEASURED DESKTOP, OR NULL. Never a read here (see the kick
+    // above), so the reveal cannot block on SSH; `measured:false` inside it means
+    // "nobody measured", never "everything is broken". One object, read once, so
+    // the answer and the decision to re-read cannot disagree either.
+    desktop: desktopFacts,
     // The lane, in the same words the doctor uses (`blindReason` is a §4.6 value
     // or null): a reveal on the blind lane succeeds — the names are real — but the
-    // note below refuses to pretend they can see a desktop.
+    // note below refuses to pretend they can see a desktop. WP-5.3 keeps both
+    // `null` while attaching: nothing about the desktop has been measured, so a
+    // verdict would be a guess.
     blind: lane.blind,
     blindReason: lane.blindReason,
     note: revealed !== true
       ? online !== true
-        ? `The Windows computer is not online yet (${WIN_MCP.reason}); start it and call windows_desktop again.`
+        ? attaching === null
+          ? `The Windows computer is not online yet (${WIN_MCP.reason}); start it and call windows_desktop again.`
+          : `${attaching.text}. The tools stay hidden until the handshake answers; ${attaching.next}.`
         : granted !== true
           ? 'The Computer Use grant is OFF for this session (turned off explicitly), so the tools stay hidden: the user turns it back on in the Personal VM panel (or POST /dsh-cua-vm/cua-grant with {"grant":true}); it is ON by default.'
           : `${match.text}. The tools went back to hidden for this session.`
@@ -2143,19 +2403,70 @@ function windowsLaneVerdict(online, transportFacts) {
 }
 
 /**
+ * WP-5.6 — THE DESKTOP-SESSION WARNINGS, ONE SENTENCE PER MEASURED FAULT.
+ *
+ * `status` stays `ok` for every row here (SOL §4.10): the BRIDGE is attached and
+ * the names are real, so calling the whole verdict blind would be a second lie.
+ * What the model needs is the narrower fact — "the element lane is dead", "that
+ * directory is not writable", "the scale numbers disagree" — plus the fallback
+ * that works. Each sentence exists only when a MEASURED answer says so; an
+ * unmeasured desktop (`measured:false`, a stale guest) produces none, which is
+ * whether §4.10's `ok` rows stay quiet instead of guessing.
+ *
+ * IT DOES NOT SPEAK ABOUT `attaching` ANY MORE (JURY co-juror-1, defect 1). An
+ * append is a SECOND story: the offline row's own sentence said "start the
+ * computer to attach" while this list added "the handshake is in flight, retry in
+ * ~20 s". Two opposite instructions in one verdict is worse than either alone, so
+ * the attaching row is now built ONCE by `windowsVerdictText()` — see the
+ * dedicated branch at the end of its base ladder — and this function only ever
+ * appends desktop facts.
+ */
+function windowsDesktopWarnings({ desktop }) {
+  const notes = []
+  const measured = desktop?.measured === true
+  if (measured && desktop.elementLaneOk === false) {
+    notes.push('the element lane is DEAD (win32ui did not import): tool_element_action*/click fail with ImportError — use tool_click_at + tool_type_text')
+  }
+  if (measured && desktop.workDirWritable === false) {
+    const workDir = typeof desktop.workDir === 'string' && desktop.workDir !== '' ? desktop.workDir : 'C:\\cua-work'
+    notes.push(`the desktop token cannot write ${workDir}: save_path must be under ${workDir} (an EMPTY save_path writes to %TEMP%\\win32_mcp_shots, which is the default; C:\\Users\\<user> is not a save target)`)
+  }
+  if (measured && typeof desktop.scaleFix === 'string' && desktop.scaleFix.startsWith('skipped:')) {
+    notes.push(`scale_x/scale_y are expected to disagree on this guest (scaleFix:${desktop.scaleFix}): do not click from image pixels`)
+  }
+  return notes
+}
+
+/**
  * ONE SENTENCE FOR THE HUMAN READING THE DOCTOR: what the verdict IS, why, and
  * what to do next. Built from the same fields the JSON carries, so the sentence
  * and the payload cannot disagree.
+ *
+ * WP-5.6 appends the desktop-session warnings (dead element lane, unwritable
+ * work dir, unpatched scale arithmetic) to the SAME sentence. The base sentence
+ * for every pre-existing row is byte-identical: the warnings are additions, and
+ * there are none unless something was measured.
+ *
+ * ONE VERDICT, ONE STORY (JURY co-juror-1, defect 1). `attaching` is a ROW of its
+ * own, not an append: the offline base clause told the model to "start the
+ * computer to attach", and appending "the handshake is in flight … retry in
+ * ~20 s" gave it both instructions at once. The attaching branch therefore
+ * REPLACES the not-attached clause — same status, same fields, one instruction
+ * (wait), and the same `attaching to <name>` sentence the guard and the reveal
+ * print, so the four surfaces stay one vocabulary.
  */
-function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts }) {
+function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts, attaching = null, desktop = null }) {
+  const warnings = windowsDesktopWarnings({ desktop })
+  /** The base sentence plus whatever the desktop actually measured. */
+  const say = (base) => (warnings.length === 0 ? base : `${base} ${warnings.join(' ')}`)
   if (leaking === true) {
-    return `leaking: ${leaks.length} mcp__windows__* schema(s) are still on the global registry while the bridge is offline; next: wait for the teardown (or remove the computer with cua_vm_destroy) and call windows_mcp_doctor again.`
+    return say(`leaking: ${leaks.length} mcp__windows__* schema(s) are still on the global registry while the bridge is offline; next: wait for the teardown (or remove the computer with cua_vm_destroy) and call windows_mcp_doctor again.`)
   }
   if (blind === true) {
     const lane = transportFacts?.transport === undefined || transportFacts?.transport === null
       ? 'no decided lane'
       : String(transportFacts.transport)
-    return `blind (${String(blindReason)}): the bridge is attached on ${lane}, so the desktop has no interactive lane and element-level tools cannot see windows. ${windowsBlindAction(blindReason)}`
+    return say(`blind (${String(blindReason)}): the bridge is attached on ${lane}, so the desktop has no interactive lane and element-level tools cannot see windows. ${windowsBlindAction(blindReason)}`)
   }
   if (online === true) {
     // DEFECT 1/2: THE LANE IS MOVING, NOT BLIND. When the relay has answered
@@ -2167,11 +2478,19 @@ function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transp
       const evidence = transportFacts?.relayOk === true && String(transportFacts?.relayStatus ?? '') === 'RELAY_OK'
         ? 'the probe answered RELAY_OK'
         : 'the repair measured RELAY_OK'
-      return `ok: the relay ANSWERED (${evidence}), so the lane upgrade from session-0-direct to the interactive relay is in motion and completes within one poll cycle — no repair is needed; desktop tools work now and the element-level lane follows on the next beat.`
+      return say(`ok: the relay ANSWERED (${evidence}), so the lane upgrade from session-0-direct to the interactive relay is in motion and completes within one poll cycle — no repair is needed; desktop tools work now and the element-level lane follows on the next beat.`)
     }
-    return `ok: attached through the interactive relay (port ${transportFacts?.relayPort ?? '?'}).`
+    return say(`ok: attached through the interactive relay (port ${transportFacts?.relayPort ?? '?'}).`)
   }
-  return 'ok: not attached and no prefixed schema is leaked (online: false; start the computer to attach).'
+  // NOT ONLINE — and, first, POSSIBLY ATTACHING. This branch REPLACES the
+  // "nothing is attached; start the computer" sentence instead of following it:
+  // the bridge is dialling a computer that already exists, and "start the
+  // computer" is the wrong verb for that state (it is how a model ends up with
+  // two). The next action is the retry, once, from `attaching.next`.
+  if (attaching !== null && attaching !== undefined) {
+    return say(`attaching: the Windows bridge is dialling ${attaching.pending}, so no dsh-cua tool is attached yet (online: false; nothing is leaked while the handshake runs). ${attaching.text}.`)
+  }
+  return say('ok: not attached and no prefixed schema is leaked (online: false; start the computer to attach).')
 }
 
 /**
@@ -2227,6 +2546,267 @@ function windowsTransportLine(facts, blindReason = null) {
  */
 const WIN_MCP_FORCE_REPAIR_MS = 30_000
 const WIN_MCP_FORCE_REPAIR_TIMED_OUT = Symbol('cua-vm: force repair timed out')
+
+/* ------------------------------------------------------------------ *
+ * WP-5.6 — THE DESKTOP SESSION'S OWN FACTS (SOL §4.2/§4.3, Appendix B)
+ * ------------------------------------------------------------------ *
+ *
+ * WHAT WAS MISSING. The doctor could say whether a bridge was attached and on
+ * which lane, and nothing about the two facts that decide whether the ELEMENT
+ * TOOLS can work at all: does `win32ui` import in the interpreter that runs the
+ * guest server (D1 — the dead lane that answered every `element_action*` with
+ * `ImportError`), and can the DESKTOP token write the directory we tell the
+ * model to save into (D2 — `C:\Users\cua` is not writable from the filtered
+ * token, and no amount of documentation fixes a permission dialog).
+ *
+ * The relay measures both IN THE DESKTOP SESSION and writes them to
+ * `C:\cua-work\cua-desktop-facts.json` (WP-3, Appendix B). This file never
+ * measures them: `desktopFacts()` (WP-4.1) is the one reader — bounded, 60 s
+ * TTL, never throws — and `normalizeDesktopFacts()` below applies Appendix B's
+ * CONSUMER contract to whatever it returned.
+ *
+ * THE CONTRACT IS THE POINT. `measured !== true` means EVERY field is UNKNOWN,
+ * never "false": a stale guest that writes no file must not report
+ * `win32ui:false` (a dead lane it never measured) or `workDirWritable:false` (a
+ * permission failure that never happened). Both would send a model a fix for a
+ * defect no probe found, which is the class of lie this release exists to end.
+ */
+const DESKTOP_FACT_KEYS = Object.freeze([
+  'schema', 'at', 'user', 'session', 'python', 'dshCuaVersion', 'pywin32Version',
+  'win32ui', 'uiaLane', 'uiaLaneOk', 'scaleFix', 'workDir', 'workDirWritable', 'profileRootWritable'
+])
+
+/** What the doctor answers when the bridge is not attached: unknown, not false. */
+const DESKTOP_FACTS_UNKNOWN = Object.freeze({
+  schema: 1,
+  measured: false,
+  at: null,
+  source: 'none',
+  error: 'the Windows bridge is not attached, so the desktop session\'s facts were not read'
+})
+
+/**
+ * HOW LONG THIS PLUGIN TRUSTS ITS OWN CACHED DESKTOP ANSWER (defect 2, second
+ * half). Two client TTL windows (60 s each, WP-4.1): long enough that a reveal
+ * does not re-read on every call, short enough that an answer this process holds
+ * for minutes is re-checked before it is served as current. It is NOT the guest
+ * file's age — the relay publishes once per start, so `stale:true` on a healthy
+ * guest is the normal state and must not trigger a read.
+ */
+const WIN_MCP_DESKTOP_FACTS_MAX_AGE_MS = 120_000
+
+/**
+ * Appendix B's consumer contract, in one function: unknown keys are kept, a
+ * missing key reads as `null`, and an unmeasured answer nulls every measurement
+ * (including a `false` that a producer left behind).
+ */
+function normalizeDesktopFacts(raw) {
+  const object = raw !== null && typeof raw === 'object' ? raw : {}
+  const measured = object.measured === true
+  const facts = { ...object, measured }
+  for (const key of DESKTOP_FACT_KEYS) {
+    if (!(key in facts)) facts[key] = null
+    // A VALUE WITHOUT A MEASUREMENT IS NOT EVIDENCE. `source`/`error` describe
+    // the READ (which file, why), not the guest, so they survive — everything
+    // else is nulled. `at` is nulled too: an unmeasured read has no timestamp
+    // that means anything about the desktop.
+    if (!measured && key !== 'source' && key !== 'error') facts[key] = null
+  }
+  if (facts.error === undefined) facts.error = ''
+  if (facts.source === undefined) facts.source = null
+  // `elementLaneOk` is the ONE derived field (D1): the focus-free element lane
+  // needs BOTH halves of pywin32 (`win32ui` is the DLL class pywinauto's
+  // `_wrapper_for()` imports). A reader that already derived it wins — the
+  // derivation lives in win-mcp.js and this is only the fallback for a guest
+  // facts file that predates the field.
+  if (measured) {
+    facts.elementLaneOk = typeof facts.elementLaneOk === 'boolean'
+      ? facts.elementLaneOk
+      : (facts.win32ui === true && facts.uiaLane === true)
+  } else {
+    facts.elementLaneOk = null
+  }
+  return facts
+}
+
+/**
+ * The ssh coordinates `desktopFacts()` needs, from the target this bridge
+ * attached. Both `port` and `sshPort` are set on purpose: `sshArgv()` in
+ * win-mcp.js takes `port`, `createDshCuaClient()` takes `sshPort`, and the fact
+ * reader reuses one of those seams — an `undefined` port would silently read the
+ * wrong machine or nothing at all.
+ */
+function windowsTargetSshOptions(target) {
+  const port = Number(target?.sshPort)
+  const usable = Number.isFinite(port) && port > 0 ? Math.floor(port) : null
+  return {
+    name: target?.name === undefined ? '' : String(target.name),
+    host: target?.host ?? '127.0.0.1',
+    port: usable === null ? undefined : usable,
+    sshPort: usable === null ? undefined : usable,
+    user: target?.user ?? 'cua',
+    keyPath: target?.keyPath
+  }
+}
+
+/**
+ * ONE bounded, never-throwing read of the desktop facts. The bound, the TTL cache
+ * and the ssh child all live in `desktopFacts()`; a tree without that export (or
+ * a reader that throws, or a target that vanished mid-read) answers
+ * `measured:false` with an `error` naming the reason — never a throw, because
+ * this runs inside the doctor and inside a fire-and-forget refresh, and a
+ * health tool that can take the process down is not a health tool.
+ */
+async function clientDesktopFacts(reason = 'doctor') {
+  const reader = desktopFactsReader()
+  if (reader === null) {
+    return normalizeDesktopFacts({
+      measured: false,
+      source: 'none',
+      error: `desktopFacts() is not available in this build (WP-4): the desktop facts are UNKNOWN, not false [${reason}]`
+    })
+  }
+  if (WIN_MCP_AUX.target === null) {
+    return normalizeDesktopFacts({ ...DESKTOP_FACTS_UNKNOWN, at: null, error: `${DESKTOP_FACTS_UNKNOWN.error} [${reason}]` })
+  }
+  try {
+    return normalizeDesktopFacts(await reader(windowsTargetSshOptions(WIN_MCP_AUX.target)))
+  } catch (error) {
+    return normalizeDesktopFacts({
+      measured: false,
+      source: 'none',
+      error: `desktop facts read failed (${reason}): ${error?.message ?? error}`
+    })
+  }
+}
+
+/**
+ * HOW FRESH ONE DESKTOP-FACTS ANSWER IS, for the comparator below.
+ *
+ * Two things make an answer better than another: it is MEASURED (a failed read
+ * proves nothing), and its guest file is NEWER (`at` is the relay's publish time,
+ * so a republished guest outranks an older copy). Everything else is a tie, and a
+ * tie goes to `cachedDesktopFacts()`'s second rule.
+ */
+function desktopFactsFreshness(facts) {
+  if (facts === null || facts === undefined) return null
+  const at = typeof facts.at === 'string' ? Date.parse(facts.at) : Number.NaN
+  return {
+    measured: facts.measured === true ? 1 : 0,
+    at: Number.isFinite(at) ? at : 0
+  }
+}
+
+/**
+ * THE CACHED ANSWER, FOR THE SYNCHRONOUS READERS (`windows_desktop`).
+ *
+ * TWO SOURCES, AND THE FRESHER ONE WINS (JURY co-juror-1, defect 2). There are
+ * two copies of the same read:
+ *
+ *   * `WIN_MCP_AUX.desktop` — this plugin's copy, written by the doctor
+ *     (`clientDesktopFacts()`) and by `scheduleDesktopFacts()` after an attach.
+ *     It is the copy the doctor's payload publishes.
+ *   * `WIN_MCP.client.desktopFactsCached()` — the client's copy (WP-4.1), written
+ *     only by `refreshDesktopFacts()`.
+ *
+ * The old rule was "the client wins", on the assumption that the client is
+ * fresher. It is not: `refreshDesktopFacts()` is called from ONE place (the
+ * attach), so a boot-race read that failed there was frozen into the client for
+ * the life of the attach, while every doctor refresh improved the module copy —
+ * and the reveal then showed the FAILED copy for ever, hiding a measured
+ * `elementLaneOk:true` behind a `measured:false`. Precedence is now the fact
+ * itself:
+ *
+ *   1. a MEASURED answer beats an unmeasured one (a failed read is not evidence,
+ *      in either direction);
+ *   2. between two measured answers, the NEWER guest file (`at`) wins;
+ *   3. a tie goes to this plugin's copy — it is the one re-read on every doctor
+ *      and the one the reveal re-kicks, so it is never the stale side of a tie;
+ *   4. `module === null` falls back to the client (a client warmed before this
+ *      process read anything, e.g. D's own refresh), and vice versa.
+ *
+ * `null` — not a synthetic `{measured:false}` — remains the honest "never
+ * measured in this process", which is what §4.10's offline rows answer.
+ */
+function cachedDesktopFacts() {
+  const moduleCopy = WIN_MCP_AUX.desktop
+  let clientCopy = null
+  try {
+    const cached = WIN_MCP.client?.desktopFactsCached?.()
+    if (cached !== null && cached !== undefined) clientCopy = normalizeDesktopFacts(cached)
+  } catch {
+    // A client mid-teardown is not a reason to lose the module's copy.
+  }
+  if (moduleCopy === null || moduleCopy === undefined) return clientCopy
+  if (clientCopy === null) return moduleCopy
+  const theirs = desktopFactsFreshness(clientCopy)
+  const ours = desktopFactsFreshness(moduleCopy)
+  if (theirs.measured > ours.measured) return clientCopy
+  if (theirs.measured === ours.measured && theirs.at > ours.at) return clientCopy
+  return moduleCopy
+}
+
+/**
+ * THE ONE SETTER FOR THIS PLUGIN'S COPY, so the value and its clock can never
+ * disagree: `desktopAt` is WHEN THIS PROCESS READ IT (the guest's own `at`
+ * cannot serve — a relay that published at boot is hours "old" by design, while
+ * the answer this process holds may be seconds old).
+ */
+function rememberDesktopFacts(facts) {
+  WIN_MCP_AUX.desktop = facts
+  WIN_MCP_AUX.desktopAt = Date.now()
+  return facts
+}
+
+/** One read, stored; the latch keeps a reveal storm down to one ssh child. */
+async function refreshDesktopFactsCache(reason = 'refresh') {
+  return rememberDesktopFacts(await clientDesktopFacts(reason))
+}
+
+/**
+ * IS THE CACHED ANSWER WORTH RE-READING? (defect 2, second half)
+ *
+ * The reveal used to re-kick only when `WIN_MCP_AUX.desktop === null`, so ONE
+ * failed read (a boot race, a relay that had not written its facts file yet) was
+ * never retried and `windows_desktop` served `measured:false` for the life of the
+ * attach. The answer is now re-read when it cannot answer the question:
+ *
+ *   • absent — nothing measured yet;
+ *   • UNMEASURED — a failed read is a retry, not a cache entry;
+ *   • older than `WIN_MCP_DESKTOP_FACTS_MAX_AGE_MS` on THIS process's clock — the
+ *     same "the answer is old, the guest is not" rule the file's `stale` flag
+ *     gets wrong (the relay publishes once per start).
+ *
+ * The re-read is fire-and-forget and single-flight (`scheduleDesktopFacts`), and
+ * the client's 60 s TTL makes the common case a cache hit, so a reveal can never
+ * become a poll. A client copy that outranks ours (rule 1/2 above) is not
+ * re-read from here: the doctor or the next attach already refreshed it.
+ */
+function desktopFactsNeedsRefresh(facts) {
+  if (facts === null || facts === undefined) return true
+  if (facts.measured !== true) return true
+  // Only OUR copy carries a read clock. When the effective answer is the
+  // client's, this plugin did not read it, so there is nothing here to date.
+  if (WIN_MCP_AUX.desktop !== facts) return false
+  const at = Number(WIN_MCP_AUX.desktopAt)
+  if (!Number.isFinite(at) || at <= 0) return true
+  return Date.now() - at > WIN_MCP_DESKTOP_FACTS_MAX_AGE_MS
+}
+
+/**
+ * FIRE-AND-FORGET: never awaited by a caller that owes the model an answer. The
+ * latch is the same rule the attach loop follows for its own handshake — one
+ * read in flight, so a session that calls `windows_desktop` in a loop cannot
+ * turn the fact reader into a poll.
+ */
+function scheduleDesktopFacts(reason = 'refresh') {
+  if (WIN_MCP_AUX.desktopRefresh !== null) return false
+  const run = refreshDesktopFactsCache(reason)
+  WIN_MCP_AUX.desktopRefresh = run
+  const clear = () => { if (WIN_MCP_AUX.desktopRefresh === run) WIN_MCP_AUX.desktopRefresh = null }
+  void run.then(clear, clear)
+  return true
+}
 
 /**
  * WP-3.6 — ONE REPAIR ATTEMPT, ON DEMAND, FROM `windows_mcp_doctor {"repair":true}`.
@@ -2365,10 +2945,21 @@ async function windowsMcpDoctor(execAgent, options = {}) {
       attached: WIN_MCP.name === '' ? null : WIN_MCP.name,
       match: match.ok === true,
       via: match.via ?? null,
+      // WP-5.5: UNCHANGED EXPRESSION — it inherits `attaching` from 5.1, which is
+      // the whole point of putting the ticket check inside `targetMatchFor()`.
+      // One string, four surfaces (doctor `viewer`/`verdict`, `windows_desktop`,
+      // the guard), so they cannot drift apart.
       code: match.ok === true ? null : match.code,
       reason: match.ok === true ? '' : match.text
     }
   })()
+  // WP-5.6 (§4.7): the SAME attaching answer, once, for the verdict and the
+  // `attach` block. Null unless the ticket names THIS session's computer.
+  const attaching = attachingFor(execAgent)
+  // One clock reading for both fields: `pendingSinceMs` and `retryAfterMs` are
+  // derived from the same age, so a caller can never see a wait that contradicts
+  // the elapsed time beside it.
+  const attachAgeMs = attachingSinceMs()
   // ---- THE VERDICT COMES FIRST (THE STALE-PROBE FIX) ----
   // One question: is the bridge online RIGHT NOW? The sources are ordered, and
   // a live probe is NOT one of them:
@@ -2425,7 +3016,21 @@ async function windowsMcpDoctor(execAgent, options = {}) {
   const lane = windowsLaneVerdict(online, transportFacts)
   const blind = lane.blind
   const blindReason = lane.blindReason
-  const verdict = windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts })
+  // ---- WP-5.6: THE DESKTOP SESSION'S OWN FACTS, MEASURED, BOUNDED, ONCE ----
+  // Only when the bridge is ONLINE: the read is one ssh child with an 8 s cap
+  // (WP-4.1) and the doctor's own budget is 60 s (R5), so an offline doctor must
+  // not pay it — and the answer would be `measured:false` anyway, because the
+  // facts describe a live desktop session. The client's 60 s TTL cache makes a
+  // repeated doctor within the window free.
+  const desktop = online === true
+    ? await clientDesktopFacts('windows_mcp_doctor')
+    : normalizeDesktopFacts({ ...DESKTOP_FACTS_UNKNOWN })
+  // WP-5.6 + defect 2: the doctor's copy is stored through the SAME setter the
+  // reveal's staleness rule reads, so `desktopAt` is always the clock of the copy
+  // that is cached. Assigning the field directly left the stamp ageing beside a
+  // fresh answer, and `desktopFactsNeedsRefresh()` then re-read on a false alarm.
+  if (online === true) rememberDesktopFacts(desktop)
+  const verdict = windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts, attaching, desktop })
   // A blind verdict REPLACES the bare lane line with lane + reason + next action;
   // a healthy one keeps the original sentence byte for byte.
   const transportText = transportFacts === null
@@ -2565,10 +3170,26 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     attach: {
       generation: WIN_MCP.generation,
       pendingName: WIN_MCP_AUX.inflightTicket === null ? null : String(WIN_MCP_AUX.inflightTicket.name ?? ''),
-      pendingDead: WIN_MCP_AUX.inflightTicket === null ? null : WIN_MCP_AUX.inflightTicket.dead === true
+      pendingDead: WIN_MCP_AUX.inflightTicket === null ? null : WIN_MCP_AUX.inflightTicket.dead === true,
+      // WP-5.4 (§4.7): WHEN the handshake started, HOW LONG a caller should wait
+      // before trying again, and WHICH state the row is in — so `pending:true`
+      // stops being a bare boolean a reader has to interpret. Computed from the
+      // TICKET (not from this session's view), because an in-flight attach is a
+      // process fact: a doctor called by a session that bound nothing still sees
+      // the timing. `null` (not 0) when nothing is in flight.
+      pendingSinceMs: attachAgeMs,
+      retryAfterMs: attachAgeMs === null ? null : windowsAttachRetryMs(attachAgeMs),
+      state
     },
     // J20-5: the executing session's view, and the ONE declared relaxation.
     viewer,
+    // WP-5.6 / SOL §4.10 — WHAT THE DESKTOP SESSION MEASURED, and the two facts
+    // the element tools depend on: `elementLaneOk` (D1: `win32ui` imported in the
+    // interpreter that runs the server) and `workDirWritable` (D2: the token that
+    // failed can write the directory we point `save_path` at). `measured:false`
+    // means UNKNOWN — a stale guest that writes no facts file is not a dead lane,
+    // and every measurement inside is null rather than a fabricated `false`.
+    desktop,
     implicitTarget: {
       active: WIN_MCP_AUX.implicitTargets.size > 0,
       reason: 'implicit-single-target',
@@ -2982,13 +3603,20 @@ export function apply(ctx, config = {}) {
    * about lanes. `windows_mcp_doctor` gains exactly one optional boolean, with
    * `additionalProperties: false`, so `{"repair":true}` is a real, schema-checked
    * request instead of a convention.
+   *
+   * WP-5.8 — WHAT THE MODEL READS HERE IS A CONTRACT, SO IT SAYS THE UNCOMFORTABLE
+   * PARTS: `code: attaching` + `retryAfterMs` (an attach in flight is a wait, not
+   * a missing computer), `elementLaneOk:false` (the focus-free element lane is
+   * dead, and there is a fallback), and the three receipts of Appendix C that look
+   * like more than they are. The doctor's own text names the `desktop` block it
+   * returns, because a field nobody was told about is a field nobody reads.
    */
   ctx.effect(() => registerCuaTool({
     name: REVEAL_TOOL_NAME,
     timeoutMs: TOOL_TIMEOUTS.windows_desktop,
-    description: 'Reveal the Windows desktop: unhides this session\u2019s dsh-cua tools (element-level click/type/find over SSH) and returns their names, descriptions and parameters. No arguments. Also says `blind: true` with a `blindReason` when the bridge is attached on the session-0 fallback lane, so a hidden desktop is never pretended to work.',
+    description: 'Reveal the Windows desktop: unhides this session\u2019s dsh-cua tools (element-level click/type/find over SSH) and returns their names, descriptions and parameters. No arguments. Also says `blind: true` with a `blindReason` when the bridge is attached on the session-0 fallback lane, so a hidden desktop is never pretended to work. If the handshake is still in flight it answers `code: attaching` with `pending`, `pendingSinceMs` and `retryAfterMs` instead of \u201cnothing is attached\u201d \u2014 wait that long, then call again. The result also carries `desktop` (the desktop session\u2019s measured facts, or null): `desktop.elementLaneOk === false` means `win32ui` did not import, so `tool_element_action*` and `tool_find_elements` fail with ImportError and the focus-free path is dead \u2014 fall back to `tool_click_at` + `tool_type_text`; `desktop.workDirWritable === false` means `save_path` must be under `desktop.workDir` (`C:\\cua-work`). The three receipts that look like more than they are: `tool_open_application` returns when Windows ACCEPTED the launch, so dedupe by pid before retrying; `tool_send_keys` has no `effect_verified`; and an EMPTY `save_path` writes to `%TEMP%\\win32_mcp_shots`, which is the default rather than a redirect.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
-    output: textOutput('Whether the tools are now visible, and their schemas (an EMPTY list unless revealed), plus the lane verdict (blind/blindReason).'),
+    output: textOutput('Whether the tools are now visible, and their schemas (an EMPTY list unless revealed), plus the lane verdict (blind/blindReason), the attaching facts when a handshake is in flight (code/pending/retryAfterMs) and the measured `desktop` facts (or null).'),
     async execute(_args = {}, exec) {
       return { text: JSON.stringify(revealWindowsTools(exec?.agent)) }
     }
@@ -2997,7 +3625,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => registerCuaTool({
     name: DOCTOR_TOOL_NAME,
     timeoutMs: TOOL_TIMEOUTS.windows_mcp_doctor,
-    description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation, the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error — plus the VERDICT (status ok|blind|leaking, blindReason, verdict sentence), pluginVersion, the payload identity (expectedRelayHash/relayHash/skew/portMismatch) and the repair record. Pass {"repair":true} to force ONE relay repair attempt before the report (throttled: it bypasses the poll window, not the client\u2019s safety rules).',
+    description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation and its retry arithmetic (`attach.pendingSinceMs`/`retryAfterMs`/`state`), the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error — plus the VERDICT (status ok|blind|leaking, blindReason, verdict sentence, which also carries the desktop warnings), pluginVersion, the payload identity (expectedRelayHash/relayHash/skew/portMismatch) and the repair record. `viewer.code` is `attaching` (not `not-the-target`) while this session\u2019s computer is being dialled. Also reports `desktop`: what the DESKTOP session measured \u2014 `measured`, `elementLaneOk` (does `win32ui` import), `workDir`/`workDirWritable` (can the desktop token write it), `scaleFix` (the scale-arithmetic patch, read from the installed source: `applied`, `skipped:no-file`, `skipped:anchor`, `unverified:<why>` — only `applied` means patched) and the version facts; `measured: false` means UNKNOWN, never false. Pass {"repair":true} to force ONE relay repair attempt before the report (throttled: it bypasses the poll window, not the client\u2019s safety rules).',
     parameters: {
       type: 'object',
       additionalProperties: false,

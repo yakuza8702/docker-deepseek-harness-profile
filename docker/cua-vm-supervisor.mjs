@@ -1896,8 +1896,24 @@ const WINDOWS_OEM_FALLBACK_DIRS = String(process.env.DSH_CUA_WINDOWS_OEM_FALLBAC
 /** Pinned python.org installer for the guest (silent install). */
 const WINDOWS_PYTHON_URL = String(process.env.DSH_CUA_WINDOWS_PYTHON_URL
   || 'https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe')
-/** What pip installs in the guest for the UI-automation server. */
-const WINDOWS_DSH_CUA_SPEC = String(process.env.DSH_CUA_WINDOWS_DSH_CUA || 'dsh-cua')
+/**
+ * WHAT THE GUEST INSTALLS FOR THE UI-AUTOMATION SERVER — PINNED (SOL §4.1).
+ *
+ * The spec used to float (`'dsh-cua'` → whatever pip resolved that day), while
+ * the D3 arithmetic patch is proven against exactly ONE build: `bridge.py`
+ * sha256 59280ee9…f9209 with the `_pixels_to_image_bytes` anchors below. A
+ * floating spec is how a guest ends up with a `bridge.py` the hash gate has to
+ * refuse — the pin is what makes "installed" and "patched" describe the same
+ * bytes.
+ *
+ * THE ENV OVERRIDE STAYS, deliberately: an operator may pin another build, and
+ * the gate then reports `skipped:hash-mismatch` instead of patching an unknown
+ * one (SOL §8 X8). Only the DEFAULT is this wheel.
+ *
+ * EXPORTED so a unit test can assert the pin without creating a guest (S1).
+ */
+export const WINDOWS_DSH_CUA_DEFAULT = 'dsh-cua==0.4.1'
+const WINDOWS_DSH_CUA_SPEC = String(process.env.DSH_CUA_WINDOWS_DSH_CUA || WINDOWS_DSH_CUA_DEFAULT)
 /** Free-port ranges for one Windows computer's three sockets. */
 const WINDOWS_QMP_RANGE = [46000, 46500]
 const WINDOWS_SSH_RANGE = [47000, 47500]
@@ -5400,6 +5416,264 @@ function sshRun(meta, command, { timeoutMs = 330000 } = {}) {
 }
 
 /* ------------------------------------------------------------------ *
+ * SOL §4.8 / WP-2.2: SSH DURING BOOT IS WAITED FOR, NOT CALLED A FAILURE
+ *
+ * THE OLD ANSWER WAS A LIE WITH TWO VOICES. `state !== 'ready'` answered
+ * `exit 126 / code: 'no-ssh' / available: false` ("not available for Windows
+ * computers"), which the plugin renders as a permanent-sounding refusal; and
+ * when the row WAS `ready` but sshd was still coming up, `sshRun`'s `exit 255`
+ * went through verbatim. `cua_vm_start` reports `ready` when the SSH BANNER
+ * answers, and the panel's own accept-loop/logon task takes ~25 s after that —
+ * so "an attach is in flight" and "nothing is there" were the same sentence.
+ *
+ * WHAT THIS DOES, AND NOTHING MORE:
+ *   * the row is RE-READ before every try (the file is the authority: a boot
+ *     that finished, or a shutdown that landed, must be seen);
+ *   * `installing` returns immediately with `code: 'installing'` and **zero**
+ *     spawns — pip/QEMU are running, sshd does not exist yet, and 20 failed
+ *     ssh children would only lengthen the wait;
+ *   * a row that is not bootable at all (`powered-off`, `error`, a name that
+ *     left the registry) answers `code: 'not-running'` with zero spawns: that
+ *     is a `cua_vm_start` away, not a boot race;
+ *   * `ready`/`booting`/`running`/`starting` run the attempt; a
+ *     connection-level failure sleeps `WINDOWS_SSH_BOOT_RETRY_MS` (clamped to
+ *     what is left of the budget, so a 600 ms budget is actually spent — S3)
+ *     and tries again until `WINDOWS_SSH_BOOT_WAIT_MS` is gone, then answers
+ *     `code: 'booting'`;
+ *   * a NON-connection-level answer ends the wait on the first try — that is
+ *     the guest talking, and re-running a command that already ran would be
+ *     the retry-starts-a-second-instance bug in ssh clothing.
+ *
+ * IT NEVER THROWS ON AN SSH ANSWER (`sshRun`/`scpRun` resolve on every exit),
+ * and it does NOT catch: a caller whose attempt throws (a missing local file in
+ * `put`) gets its own precise error instead of "still booting".
+ * ------------------------------------------------------------------ */
+/**
+ * Milliseconds from the environment, with UNSET meaning the default — NOT 0.
+ * `Number(process.env.X ?? '')` is the trap this file already paid for once
+ * (`supervisor-smoke.mjs:2119`): an unset variable became a zero budget.
+ */
+function windowsSshBudgetMs(raw, fallback) {
+  const text = String(raw ?? '').trim()
+  if (text === '') return fallback
+  const value = Number(text)
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback
+}
+
+/** How long a Windows ssh call may spend waiting for sshd before it says booting. */
+const WINDOWS_SSH_BOOT_WAIT_MS = windowsSshBudgetMs(process.env.DSH_CUA_WINDOWS_SSH_WAIT_MS, 60000)
+/**
+ * The gap between two tries, clamped to the budget left (never longer than it).
+ * Deliberately NOT another env knob: one budget is the whole contract (SOL
+ * §2.2), and a second tunable would let a deployment make exec slower than its
+ * own envelope without touching anything a reviewer reads.
+ */
+const WINDOWS_SSH_BOOT_RETRY_MS = 3000
+/** Only these rows are worth an ssh child: the rest need a Start, not a wait. */
+const WINDOWS_SSH_BOOT_STATES = new Set(['ready', 'booting', 'running', 'starting'])
+/**
+ * WHAT "THE CONNECTION FAILED" LOOKS LIKE, in one place. The word-for-word set
+ * is OpenSSH's own vocabulary for a listener that is not there yet; the plugin
+ * classifies the SAME failures for `lastFailureKind` (SOL §5 WP-4.2), so this
+ * pattern is the contract between the two files.
+ */
+const WINDOWS_SSH_CONNECTION_LEVEL = /Connection (closed|refused|reset)|kex_exchange_identification|Connection timed out/iu
+
+/**
+ * WAS THIS A TRANSPORT FAILURE (retryable) — and ONLY that?
+ *
+ * THE SIGNAL IS NOT A CLASSIFIER. An earlier version also answered `true` for
+ * `timedOut` and for a bare `exit 255` with no stderr, and both were wrong in
+ * the same direction: it RETRIED things that had already run.
+ *   * `timedOut` means the attempt was KILLED AT ITS TIMEOUT. For a command that
+ *     is the command's own deadline: retrying it would re-run something that
+ *     may already have acted, and labelling it `booting` loses the signal. It
+ *     is terminal and has its own code (`timeout`) — see `windowsSshTimedOut`.
+ *   * a bare `255` with EMPTY stderr cannot be told apart from `ssh`'s own
+ *     failure and a REMOTE command exiting 255. Guessing "connection" is how a
+ *     side-effecting command gets executed twice, so it is not retried either:
+ *     it is reported ONCE under its own code (`ssh-255`).
+ * What is left is the honest signal: OpenSSH's own vocabulary on stderr.
+ */
+function windowsSshConnectionLevel(result) {
+  if (result === null || result === undefined) return false
+  return WINDOWS_SSH_CONNECTION_LEVEL.test(String(result.stderr ?? ''))
+}
+
+/** Did the attempt die at a timeout (so `code` is 124 and the output is partial)? */
+function windowsSshTimedOut(result) {
+  return result !== null && result !== undefined && result.timedOut === true
+}
+
+/**
+ * Run `attempt` while a Windows computer may still be bringing sshd up.
+ *
+ * `attempt({ meta, timeoutMs })` is ONE ssh-or-scp call; `meta` is the row as
+ * just re-read, so a port that changed with a restart is picked up. A caller
+ * with a command of its own passes `envelopeMs` (the tool's own budget): the
+ * FIRST try on a `ready` row then gets the whole envelope, exactly as before,
+ * while every later try is clamped to the boot budget so the wait cannot
+ * multiply the tool timeout.
+ *
+ * Returns `{ ok, code, state, result, attempts, waitedMs, error?, timeoutMs? }`
+ * where code is `null` (ok) | `'failed'` (the guest answered with a non-zero
+ * exit) | `'timeout'` (killed at the CALLER's envelope — terminal, never
+ * `'booting'`) | `'ssh-255'` (a bare 255: ambiguous, reported once, never
+ * retried) | `'booting'` | `'installing'` | `'not-running'` | `'unreadable'`.
+ */
+export async function windowsSshBootWait(name, attempt, { label = 'ssh', envelopeMs = 0 } = {}) {
+  const key = String(name ?? '')
+  const started = Date.now()
+  let attempts = 0
+  let last = null
+  let state = 'unknown'
+  for (;;) {
+    // RE-READ BEFORE EVERY TRY — including the first: the caller's snapshot is
+    // already stale by the time a queue of execs drains.
+    let meta = null
+    try {
+      meta = readRegistry().vms[key] ?? null
+    } catch (error) {
+      // An unreadable registry is NOT a boot state, and `readRegistry` throws
+      // on purpose. Answer it as a fact instead of letting a corrupt file look
+      // like "still booting" for ever.
+      return {
+        ok: false,
+        code: 'unreadable',
+        state,
+        result: last,
+        attempts,
+        waitedMs: Date.now() - started,
+        error: `registry.json could not be read (${error?.message ?? error})`
+      }
+    }
+    state = meta === null ? 'missing' : String(meta.state ?? 'unknown')
+    if (meta === null) return { ok: false, code: 'not-running', state, result: last, attempts, waitedMs: Date.now() - started }
+    if (state === 'installing') return { ok: false, code: 'installing', state, result: last, attempts, waitedMs: Date.now() - started }
+    if (!WINDOWS_SSH_BOOT_STATES.has(state)) return { ok: false, code: 'not-running', state, result: last, attempts, waitedMs: Date.now() - started }
+    const spent = Date.now() - started
+    // FLOOR OF 1 s so a zero budget still makes ONE try (a caller that asked
+    // for no wait must still be told what the guest actually said).
+    const budgetLeft = Math.max(1000, WINDOWS_SSH_BOOT_WAIT_MS - spent)
+    const full = envelopeMs > 0 ? envelopeMs : budgetLeft
+    const timeoutMs = attempts === 0 && state === 'ready' ? full : Math.min(full, budgetLeft)
+    attempts += 1
+    const result = await attempt({ meta, timeoutMs })
+    last = result ?? null
+    // WHICH DEADLINE KILLED IT DECIDES THE LABEL. A kill at the CALLER'S OWN
+    // envelope is the command's deadline (terminal, `timeout`, its own text); a
+    // kill at the BOOT budget is the listener hanging mid-handshake, which is
+    // still the boot race and keeps waiting.
+    const killedByEnvelope = envelopeMs > 0 && timeoutMs >= envelopeMs
+    const timedOutNow = windowsSshTimedOut(last)
+    if (timedOutNow && killedByEnvelope) {
+      return { ok: false, code: 'timeout', state, result: last, attempts, waitedMs: Date.now() - started, timeoutMs }
+    }
+    const answered = !(timedOutNow || windowsSshConnectionLevel(last))
+    if (answered) {
+      const okResult = Number(last?.code) === 0
+      // A BARE 255 IS AMBIGUOUS, SO IT IS NAMED, NOT RETRIED (`ssh-255`): see
+      // `windowsSshConnectionLevel`. Everything else non-zero is `failed`, the
+      // guest having answered with its own exit code.
+      const ambiguous = !okResult && Number(last?.code) === 255
+      // ONE LINE PER WAIT (SOL §2.5): the JURY reads the host log to see that a
+      // retry happened at all, so the line is emitted only when a retry did.
+      if (attempts > 1) log(`windows: ${label} on ${key} waited ${((Date.now() - started) / 1000).toFixed(1)} s for sshd (${attempts} attempts)`)
+      return {
+        ok: okResult,
+        code: okResult ? null : (ambiguous ? 'ssh-255' : 'failed'),
+        state,
+        result: last,
+        attempts,
+        waitedMs: Date.now() - started
+      }
+    }
+    const spentNow = Date.now() - started
+    if (spentNow >= WINDOWS_SSH_BOOT_WAIT_MS) {
+      log(`windows: ${label} on ${key} gave up after ${(spentNow / 1000).toFixed(1)} s (${attempts} attempts, last exit ${last?.code ?? '?'})`)
+      return { ok: false, code: 'booting', state, result: last, attempts, waitedMs: spentNow }
+    }
+    // SLEEP THE SMALLER OF THE RETRY GAP AND WHAT IS LEFT: a budget shorter
+    // than the gap must be spent, not skipped (S3 asserts ms >= the budget).
+    await sleep(Math.min(WINDOWS_SSH_BOOT_RETRY_MS, Math.max(50, WINDOWS_SSH_BOOT_WAIT_MS - spentNow)))
+  }
+}
+
+/**
+ * THE ONE SENTENCE A GIVE-UP OWES THE CALLER (SOL §4.8).
+ *
+ * Four call sites (exec/put/get) used to invent their own wording, which is how
+ * "126 no guest agent" reached a model about a computer that exists. The code
+ * and the reason are produced here so they cannot drift; the caller only picks
+ * the envelope (an exit code for exec, `available:false` for put/get).
+ *
+ * TWO KINDS, ONE SOURCE. `terminal: true` (timeout / ssh-255) means the attempt
+ * RAN, so the caller reports the attempt's own exit and output plus this
+ * explanation; no `terminal` flag means nothing ran and the caller answers with
+ * the wait's envelope (`exit 125` / `available:false`).
+ */
+function windowsSshGiveUp(outcome) {
+  const state = String(outcome?.state ?? '') === '' ? 'unknown' : String(outcome.state)
+  // ---- TERMINAL (the attempt RAN; nothing was waited for) -------------------
+  if (outcome?.code === 'timeout') {
+    const seconds = Math.max(1, Math.round(Number(outcome?.timeoutMs ?? 0) / 1000))
+    return {
+      code: 'timeout',
+      // TERMINAL: the caller reports the attempt's own exit/`timedOut`, never a
+      // wait's envelope and never `booting` (that was the JURY's defect 1).
+      terminal: true,
+      head: 'code: timeout',
+      reason: `the command was still running at its own ${seconds} s timeout and was killed — nothing about its effect was confirmed`,
+      next: 'raise timeout= and re-run only if repeating it is safe; a killed command may already have taken effect'
+    }
+  }
+  if (outcome?.code === 'ssh-255') {
+    return {
+      code: 'ssh-255',
+      terminal: true,
+      head: 'code: ssh-255',
+      reason: 'ssh exited 255 and printed nothing: the connection may have failed, or the remote command exited 255 — it was reported ONCE and not retried, because a retry could run the command again',
+      next: 're-run once the computer is up, and check tool_list_windows before repeating anything that acts'
+    }
+  }
+  // ---- GIVE-UPS (nothing ran; the caller answers with its own envelope) -----
+  if (outcome?.code === 'installing') {
+    return {
+      code: 'installing',
+      head: 'code: installing',
+      reason: `the Windows install is still running (${state}); sshd exists only after it finishes`,
+      next: 'retry in ~60 s; cua_vm_start reports ready only when the SSH banner answers'
+    }
+  }
+  if (outcome?.code === 'not-running') {
+    return {
+      code: 'not-running',
+      head: 'code: not-running',
+      reason: state === 'missing' ? 'the computer is no longer in the registry' : `the computer is ${state}`,
+      next: 'cua_vm_start it, then retry'
+    }
+  }
+  if (outcome?.code === 'unreadable') {
+    return {
+      code: 'unavailable',
+      head: 'code: unavailable',
+      reason: String(outcome.error ?? 'the registry could not be read'),
+      next: 'fix the store registry.json (or its permissions), then retry'
+    }
+  }
+  const detail = String(outcome?.result?.stderr ?? '').split(/\r?\n/u).map((line) => line.trim()).find((line) => line !== '') ?? 'no stderr'
+  return {
+    code: 'booting',
+    // THE FROZEN FIRST LINE (SOL §4.8). This is the string a model branches on,
+    // so it is a literal here and not assembled from `code` — a paraphrase in
+    // one of the three surfaces is exactly the drift this release removes.
+    head: 'code: booting',
+    reason: `sshd did not answer within ${Math.max(1, Math.round(Number(outcome?.waitedMs ?? 0) / 1000))} s (${state}: ${detail.slice(0, 200)})`,
+    next: 'retry in ~15 s; cua_vm_start reports ready only when the SSH banner answers'
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * SOL §5 WP-4.1: RE-ASSERT THE RELAY TASK WHEN THE ROW BECOMES READY
  *
  * A checkpoint boot restores a DISK, not a logged-on desktop. If autologon has
@@ -5481,7 +5755,7 @@ async function windowsRelayReassert(name) {
 const SCP_BIN = process.env.DSH_CUA_SCP_BIN || '/usr/bin/scp'
 
 /** Copy a file in or out with scp (the same key, the same port). */
-function scpRun(meta, localPath, guestPath, { direction }) {
+function scpRun(meta, localPath, guestPath, { direction, timeoutMs = 0 } = {}) {
   return new Promise((resolve) => {
     // The argv comes from buildScpArgv: `-P` for the port, the local path in
     // the source slot for `to-guest` and in the destination slot for
@@ -5492,12 +5766,22 @@ function scpRun(meta, localPath, guestPath, { direction }) {
     let timedOut = false
     // M5: scp had NO timeout, so an unresponsive guest hung cua_vm_put/get
     // forever (the Linux path caps at 600 s).
-    const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL') } catch {} }, Number(process.env.DSH_CUA_WIN_SCP_TIMEOUT_MS || 300000))
+    //
+    // WP-2/JURY defect 2: A CALLER'S BUDGET WINS. The boot wait hands over what
+    // is LEFT of its 60 s, so a hung scp can no longer overshoot the wait it is
+    // part of (a 300 s child under a 60 s wait was the overshoot). The clipboard
+    // transport passes no budget and keeps the documented default unchanged.
+    const budgetMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : Number(process.env.DSH_CUA_WIN_SCP_TIMEOUT_MS || 300000)
+    const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL') } catch {} }, budgetMs)
     child.stderr.on('data', (chunk) => { stderr += chunk })
-    child.on('error', (error) => { clearTimeout(timer); resolve({ code: -1, stderr: `${error?.message ?? error}` }) })
+    child.on('error', (error) => { clearTimeout(timer); resolve({ code: -1, stderr: `${error?.message ?? error}`, timedOut: false }) })
     child.on('close', (code) => {
       clearTimeout(timer)
-      resolve({ code: timedOut ? 124 : (code ?? -1), stderr: timedOut ? `${stderr}\nscp timed out` : stderr })
+      // `timedOut` TRAVELS: the boot wait classifies a kill by it (a kill at the
+      // BOOT budget is still a boot race; a kill at the CALLER's envelope is the
+      // command's own deadline and is terminal). Folding it into `code: 124`
+      // alone would make the two indistinguishable.
+      resolve({ code: timedOut ? 124 : (code ?? -1), stderr: timedOut ? `${stderr}\nscp timed out` : stderr, timedOut })
     })
   })
 }
@@ -7056,17 +7340,69 @@ const handlers = {
       // command runs through the OpenSSH server the answer file installs; the
       // remote shell is cmd.exe by default and `cwd` is passed to `cd /d`.
       const started = Date.now()
-      if (meta.state !== 'ready') {
-        return ok({ exit: 126, stdout: '', stderr: WINDOWS_NO_AGENT('exec'), ms: 0, available: false, code: 'no-ssh' })
-      }
+      const envelopeMs = (Number(timeout) || 300) * 1000 + 30000
       const remote = cwd ? `cd /d ${quoteForWindows(cwd)} && ${cmd}` : cmd
-      const result = await sshRun(meta, remote, { timeoutMs: (Number(timeout) || 300) * 1000 + 30000 })
-      await mutateRegistry((registry) => {
+      // A BOOT RACE IS A WAIT (SOL §4.8). The old `state !== 'ready'` → `126
+      // no-ssh` answer was a permanent-sounding refusal for a computer that was
+      // merely still bringing sshd up, and a `ready` row with sshd starting
+      // returned ssh's `255` verbatim. The wait re-reads the row, spends at most
+      // WINDOWS_SSH_BOOT_WAIT_MS on connection-level failures only, and never
+      // spawns at all for a row that needs a Start instead.
+      const outcome = await windowsSshBootWait(
+        name,
+        ({ meta: row, timeoutMs }) => sshRun(row, remote, { timeoutMs }),
+        { label: 'exec', envelopeMs }
+      )
+      // THE COMMAND RAN — record it, whichever way it ended. One helper so the
+      // three "it ran" exits below cannot disagree about `lastUsed`.
+      const touchRow = () => mutateRegistry((registry) => {
         const row = registry.vms[name]
         if (!row) return
         row.lastUsed = new Date().toISOString()
         row.lastCommand = cmd.slice(0, 500)
       })
+      // THE GUEST ANSWERED — hand its exit code through untouched. Re-running a
+      // command that already ran is the "a retry starts a second instance" bug.
+      if (!outcome.ok && outcome.code === 'failed') {
+        const answered = outcome.result ?? { code: -1, stdout: '', stderr: '', timedOut: false }
+        await touchRow()
+        return ok({ exit: answered.code, stdout: answered.stdout, stderr: answered.stderr, ms: Date.now() - started, timedOut: answered.timedOut === true })
+      }
+      // TERMINAL, HONESTLY LABELLED (JURY defect 1). A command killed at ITS OWN
+      // timeout is `exit 124` + `timedOut:true` + its partial output, and a bare
+      // 255 is reported once — neither is ever dressed up as `booting`, and
+      // neither is retried (both may already have acted).
+      if (!outcome.ok && (outcome.code === 'timeout' || outcome.code === 'ssh-255')) {
+        const answered = outcome.result ?? { code: -1, stdout: '', stderr: '', timedOut: false }
+        const terminal = windowsSshGiveUp(outcome)
+        await touchRow()
+        const explanation = `${terminal.head}\nwhy: ${terminal.reason}\nnext: ${terminal.next}`
+        const own = String(answered.stderr ?? '').trim()
+        return ok({
+          exit: outcome.code === 'timeout' ? 124 : Number(answered.code ?? 255),
+          stdout: answered.stdout ?? '',
+          stderr: own === '' ? explanation : `${own}\n${explanation}`,
+          ms: Date.now() - started,
+          timedOut: outcome.code === 'timeout',
+          code: outcome.code
+        })
+      }
+      if (!outcome.ok) {
+        const giveUp = windowsSshGiveUp(outcome)
+        // EXIT 125 — NEVER 255 AND NEVER 126: `available` is deliberately
+        // ABSENT, because the plugin binds a session on its absence (index.js),
+        // and a caller must be able to SEE that this was not a refusal.
+        return ok({
+          exit: 125,
+          stdout: '',
+          stderr: `${giveUp.head}\nwhy: ${giveUp.reason}\nnext: ${giveUp.next}`,
+          ms: Date.now() - started,
+          timedOut: false,
+          code: giveUp.code
+        })
+      }
+      const result = outcome.result
+      await touchRow()
       return ok({ exit: result.code, stdout: result.stdout, stderr: result.stderr, ms: Date.now() - started, timedOut: result.timedOut })
     }
     const args = ['sb', 'exec', '--local', name, '--timeout', String(Math.max(1, Number(timeout) || 300))]
@@ -7096,14 +7432,41 @@ const handlers = {
 
   async put({ name, local, guest }) {
     if (!name) throw new Error('name is required')
-    const putMeta = readRegistry().vms[name]
+    // The row this branch dials, refreshed by the boot wait before EVERY try: a
+    // restart re-allocates the SSH port, so the scp must use the row that was
+    // just inspected rather than the snapshot taken when the call arrived.
+    let putMeta = readRegistry().vms[name]
     if (putMeta?.kind === 'windows') {
-      if (putMeta.state !== 'ready') return ok({ available: false, name, local, guest, message: WINDOWS_NO_AGENT('put'), code: 'no-ssh' })
-      const source = workspacePath(local, { mustExist: true })
-      // scp speaks POSIX paths; Windows OpenSSH accepts forward slashes and
-      // `/c/...`-style is NOT valid, so a drive path is normalised here.
-      const result = await scpRun(putMeta, source, assertWindowsGuestPath(guest), { direction: 'to-guest' })
-      if (result.code !== 0) return fail(`vm_put failed over SSH: ${result.stderr.trim().slice(-600)}`)
+      // THE BOOT WAIT FIRST (SOL §4.8), the local paths inside the FIRST try:
+      // a row that cannot be waited for (`installing`, `powered-off`, gone from
+      // the registry) still answers with ITS reason — the precedence this
+      // branch always had — while a real local/guest path error surfaces on the
+      // try that actually needed the file instead of being masked by "booting".
+      let source = ''
+      const outcome = await windowsSshBootWait(name, ({ meta, timeoutMs }) => {
+        putMeta = meta
+        if (source === '') source = workspacePath(local, { mustExist: true })
+        // scp speaks POSIX paths; Windows OpenSSH accepts forward slashes and
+        // `/c/...`-style is NOT valid, so a drive path is normalised here.
+        // `timeoutMs` is what is LEFT of the boot budget (JURY defect 2): the
+        // copy is bounded by the same wait it belongs to, not by 300 s of its own.
+        return scpRun(putMeta, source, assertWindowsGuestPath(guest), { direction: 'to-guest', timeoutMs })
+      }, { label: 'put' })
+      if (!outcome.ok && outcome.code === 'failed') {
+        return fail(`vm_put failed over SSH: ${String(outcome.result?.stderr ?? '').trim().slice(-600)}`)
+      }
+      if (!outcome.ok && (outcome.code === 'timeout' || outcome.code === 'ssh-255')) {
+        // TERMINAL, LABELLED: the copy ran and ended ambiguously (a kill at its
+        // own deadline, or a bare 255). No retry, and no `booting` costume.
+        const terminal = windowsSshGiveUp(outcome)
+        return ok({ available: false, name, local, guest, code: terminal.code, message: `${terminal.head} — ${terminal.reason}; next: ${terminal.next}` })
+      }
+      if (!outcome.ok) {
+        // `available:false` + `code` + the ONE message: the plugin prints
+        // `result.message` verbatim, so a boot race is legible where it lands.
+        const giveUp = windowsSshGiveUp(outcome)
+        return ok({ available: false, name, local, guest, code: giveUp.code, message: `${giveUp.head} — ${giveUp.reason}; next: ${giveUp.next}` })
+      }
       return ok({ local: source, guest })
     }
     if (typeof guest !== 'string' || !guest.startsWith('/')) throw new Error('guest must be an absolute guest path')
@@ -7115,15 +7478,33 @@ const handlers = {
 
   async get({ name, guest, local }) {
     if (!name) throw new Error('name is required')
-    const getMeta = readRegistry().vms[name]
+    let getMeta = readRegistry().vms[name]
     if (getMeta?.kind === 'windows') {
-      if (getMeta.state !== 'ready') return ok({ available: false, name, guest, local, message: WINDOWS_NO_AGENT('get'), code: 'no-ssh' })
-      const root = realpathSync(WORKSPACE_ROOT)
-      const absolute = path.isAbsolute(local) ? path.normalize(local) : path.join(root, local)
-      if (absolute !== root && !absolute.startsWith(root + path.sep)) throw new Error(`path escapes the workspace: ${local}`)
-      mkdirSync(path.dirname(absolute), { recursive: true })
-      const result = await scpRun(getMeta, absolute, assertWindowsGuestPath(guest), { direction: 'from-guest' })
-      if (result.code !== 0) return fail(`vm_get failed over SSH: ${result.stderr.trim().slice(-600)}`)
+      // The same shape as put: wait for sshd, resolve the local destination
+      // inside the first try (a path that escapes the workspace must raise its
+      // own error, not a boot sentence).
+      let absolute = ''
+      const outcome = await windowsSshBootWait(name, ({ meta, timeoutMs }) => {
+        getMeta = meta
+        if (absolute === '') {
+          const root = realpathSync(WORKSPACE_ROOT)
+          absolute = path.isAbsolute(local) ? path.normalize(local) : path.join(root, local)
+          if (absolute !== root && !absolute.startsWith(root + path.sep)) throw new Error(`path escapes the workspace: ${local}`)
+          mkdirSync(path.dirname(absolute), { recursive: true })
+        }
+        return scpRun(getMeta, absolute, assertWindowsGuestPath(guest), { direction: 'from-guest', timeoutMs })
+      }, { label: 'get' })
+      if (!outcome.ok && outcome.code === 'failed') {
+        return fail(`vm_get failed over SSH: ${String(outcome.result?.stderr ?? '').trim().slice(-600)}`)
+      }
+      if (!outcome.ok && (outcome.code === 'timeout' || outcome.code === 'ssh-255')) {
+        const terminal = windowsSshGiveUp(outcome)
+        return ok({ available: false, name, guest, local, code: terminal.code, message: `${terminal.head} — ${terminal.reason}; next: ${terminal.next}` })
+      }
+      if (!outcome.ok) {
+        const giveUp = windowsSshGiveUp(outcome)
+        return ok({ available: false, name, guest, local, code: giveUp.code, message: `${giveUp.head} — ${giveUp.reason}; next: ${giveUp.next}` })
+      }
       return ok({ guest, local: absolute, bytes: statSync(absolute).size })
     }
     if (typeof guest !== 'string' || !guest.startsWith('/')) throw new Error('guest must be an absolute guest path')

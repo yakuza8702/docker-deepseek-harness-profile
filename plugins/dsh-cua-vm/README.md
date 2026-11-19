@@ -501,6 +501,38 @@ overlay**: the CUA agent cursor is an X11 overlay on the Linux guest and nothing
 equivalent exists here, so the pointer you see in a frame is the real one (VNC
 draws it for a human).
 
+**The guest installs a pinned build, and the two numbers that used to lie are
+measured.** Firstboot installs `dsh-cua==0.4.1` — not a floating `dsh-cua`;
+`DSH_CUA_WINDOWS_DSH_CUA` still overrides the spec — installs `pywin32`, runs
+`pywin32_postinstall -install -silent` when `import win32ui` fails, and then
+**executes** `import win32ui, win32gui` and `import pywinauto.controls.uiawrapper`
+before the step reports `ok: true` (a `find_spec()` never imported a submodule, so
+a pywin32 with no DLLs passed the gate and failed at the first element action).
+The scale arithmetic in `dsh_cua.bridge` is corrected **in place under a hash
+gate** — version `0.4.1` **and** `sha256(bridge.py) == 59280ee9…f9209` **and**
+both anchors occurring exactly once — and proven by a no-window probe that
+returns `SCALE_BAD` on the shipped wheel (`scale_x 1.333333`, `scale_y 1.5` for a
+64×48 buffer cropped to 48×32) and `SCALE_OK` after it (`1.0` / `1.0`, `width` =
+the crop's width). When the gate refuses, nothing is written and the reason is
+recorded **twice, in two different vocabularies** (spelled out in
+[the element lane](#the-element-lane)): the provisioning **marker**
+`C:\cua-provision.json` (step `dsh-cua-scale`) says one of
+`skipped:version-mismatch`, `skipped:hash-mismatch`, `skipped:anchor-missing`,
+`skipped:anchor-ambiguous`, `skipped:write-failed`, `skipped:import-failed`,
+`skipped:probe-failed`, `skipped:no-python` or `skipped:no-file` — and `already`
+when an earlier pass applied it — while the **published fact the model reads**,
+`desktop.scaleFix`, says `skipped:anchor` (the installed source carries no
+`base_w`) or `unverified:<why>` (it could not be read). Every `skipped:*` and
+`unverified:*` means **NOT patched**, and when the published value starts with
+`skipped:` the doctor's verdict also warns that `scale_x`/`scale_y` are
+**expected** to disagree on this guest — do not click from image pixels there. The
+three refusals that had to UNDO a write keep their `skipped:<why>` value and add
+an additive **`restoreOk`** boolean to the same marker row (`false` = the rollback
+failed too, `bridge.py` may be left patched — see
+[the element lane](#the-element-lane)). The same honesty covers boot:
+`exec`/`put`/`get` wait for a booting guest's sshd and answer `exit 125` +
+`code: booting`, never ssh's bare `255`.
+
 ### Live view
 
 The display is QEMU VNC on `127.0.0.1:<allocated>`. The supervisor starts a front
@@ -562,7 +594,7 @@ blind (see [the relay](#the-interactive-session--the-mcp-server-lives-there-now-
 |---|---|
 | `mcp__windows__<guest tool>` | one per guest tool — `tool_click_at`, `find_elements`, `tool_type_text`, … The prefix is `TOOL_PREFIX = "mcp__windows__"` and `windowsToolName()` is the only place it is added (a name that arrives prefixed is not prefixed twice) |
 | `windows_desktop` | **reveal** — no arguments; unhides this session's bridged tools and returns their names, descriptions and parameters (an empty `tools` list with a `code` until they are really visible, and `blind` + `blindReason` when the lane cannot see a desktop) |
-| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` surface on the global registry (`leaks`), the grants, the keepalive and the last error — plus the **verdict** (`status: ok\|blind\|leaking`, `blindReason`, `verdict`), `pluginVersion`, the payload identity (`expectedRelayHash`/`relayHash`/`skew`/`portMismatch`) and the last `repair` record; `{"repair": true}` forces one attempt first |
+| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` surface on the global registry (`leaks`), the grants, the keepalive and the last error — plus the **verdict** (`status: ok\|blind\|leaking`, `blindReason`, `verdict`), `pluginVersion`, the payload identity (`expectedRelayHash`/`relayHash`/`skew`/`portMismatch`), the last `repair` record and the guest's measured `desktop` facts (`measured`, `elementLaneOk`, `workDir`, `workDirWritable`, `scaleFix`); `{"repair": true}` forces one attempt first |
 
 Why it is worth its cost: `find_elements` + `type_text` return a compact JSON
 receipt (`action_sent`, `effect_verified`) in a few hundred bytes, where the
@@ -603,7 +635,7 @@ one of them lives in the plugin's process (module-level state, not per-mount):
 3. **the guard** — `tools.guard` vetoes the CALL at dispatch time, so a name that
    is still visible (a race, a step admission captured before a teardown) is
    **refused, never run**, with a structured `code:` line the model can branch on:
-   `vm-offline`, `grant-off`, `reveal-required`.
+   `attaching`, `vm-offline`, `grant-off`, `reveal-required`.
 
 #### Which computer, and which session
 
@@ -623,6 +655,180 @@ re-checked on every call and on every gate application:
   the same 30 s call that keeps the REA cache warm), a never-bound session may use
   it. The doctor records it (`viewer.via`, `implicitTarget.sessions`), so it is
   never silent, and a second computer withdraws it immediately.
+
+#### What the receipts mean
+
+The 19 guest tools are upstream `dsh-cua` tools, and the plugin publishes
+upstream's descriptions **verbatim** — before this change it appended only
+`" (dsh-cua, Windows computer <name>)"`. So the model was reading a contract
+nobody had checked, and three of those descriptions implied more than the receipt
+proves. The fix is the honest sentence in the description, not a wrapper around
+the result: the relay is a byte bridge and the plugin rewrites nothing
+(`open_application` has no polling surface to wrap, and inventing a
+`path_redirected` flag for a redirect that does not exist would be a second lie).
+
+| tool | what the receipt really is |
+|---|---|
+| `tool_open_application` | `os.startfile(target)` returns when the SHELL accepted the association. `success: true` does **not** mean a window appeared, and a retry launches a **second instance** — two Notepads is the expected, described outcome |
+| `tool_send_keys` | the success branch returns `hwnd/keys/arbiter/time_ms` and **no** `effect_verified` (unlike `tool_type_text`). Success means the keys were injected into the FOREGROUND window, not that the app acted on them |
+| `tool_capture_window` | there is **no redirect path** at all. An EMPTY `save_path` is a documented default (`%TEMP%\win32_mcp_shots`); a non-empty path that cannot be written raises `PermissionError` (Errno 13), and nothing relocates it |
+
+The three notes are frozen in `WINDOWS_TOOL_CONTRACT` (`win-mcp.js`), keyed by
+guest tool name and appended **before** the `(dsh-cua, Windows computer <name>)`
+suffix. `windowsToolContract()` returns `''` for every other tool, so the other
+sixteen descriptions stay byte-identical — that is how the scope of the change is
+provable, and `windows_desktop`'s `tools[]` and the registry cannot disagree
+because they call the same function:
+
+> **`tool_open_application`** — Contract: returns when Windows ACCEPTED the launch, not when a window appeared — poll tool_list_windows and dedupe by pid before retrying, or a retry starts a second instance.
+>
+> **`tool_send_keys`** — Contract: success means the keys were injected into the FOREGROUND window, not that the app acted on them (this receipt has no effect_verified) — confirm with tool_capture_window or a tool_list_windows read-back before assuming it worked.
+>
+> **`tool_capture_window`** — Contract: an EMPTY save_path writes under %TEMP%\win32_mcp_shots (that is the default, not a redirect); a non-empty save_path that cannot be written FAILS with PermissionError and does not fall back — use C:\cua-work\... inside the guest.
+
+#### The element lane
+
+The focus-free path — `find_elements`, `tool_element_action`,
+`tool_element_action_at` — goes through pywinauto's UIA wrapper, and
+`pywinauto.controls.uiawrapper` imports **`win32ui`** unguarded. So a pywin32
+whose DLLs were never copied imports as a *package*, passes a `find_spec()` gate
+(a submodule finder never imports anything), and dies at the first pattern action
+with `ImportError: DLL load failed while importing win32ui`; upstream returns that
+verbatim as `reason: "action_failed", action_sent: false`. The read verbs
+(`skyshot`, `find_elements`) never touch that wrapper, which is why they kept
+working on the same guest.
+
+Two things changed. **The install is pinned and executed, not found:** firstboot
+installs `dsh-cua==0.4.1` (not a floating `dsh-cua`; `DSH_CUA_WINDOWS_DSH_CUA`
+still overrides the spec), installs `pywin32`, runs
+`pywin32_postinstall -install -silent` when the import fails, and then *runs*
+`import win32ui, win32gui` and `import pywinauto.controls.uiawrapper` before the
+step reports `ok: true` — a failure throws, so the logon pass retries and the
+marker records `ok: false` with the DLL error. **And the lane is measured where
+it is used:** the relay's `--serve` entry starts one background self-check (bound
+20 s, never blocks the listener, never raises) and writes
+`C:\cua-work\cua-desktop-facts.json`, falling back to
+`%TEMP%\cua-desktop-facts.json`; `win-mcp.js` reads it with one bounded SSH
+(`8 s`, 60 s TTL, never throws) and both public tools report it as `desktop`:
+
+| field | meaning |
+|---|---|
+| `measured` | `true` only when the guest actually measured. `false` means **every other field is unknown** (a pre-change guest, no file, an unreadable one) — never "false" |
+| `win32ui`, `uiaLane` | the two imports, executed by the interpreter that runs the server |
+| `elementLaneOk` | `win32ui && uiaLane` — the one field to branch on |
+| `dshCuaVersion`, `pywin32Version`, `python` | what the guest really has (the version the patch gate reads) |
+| `workDir`, `workDirWritable`, `profileRootWritable` | the write probes, from the desktop token — see [Where to save](#where-to-save) |
+| `scaleFix` | the patch as the **installed source** shows it: `applied`, or a not-applied code (`skipped:no-file` · `skipped:anchor` · `unverified:*`). The marker's own, finer vocabulary is below |
+| `source`, `at`, `stale`, `error` | which file was read, when, and why nothing was |
+
+**`scaleFix` has two producers, and they do not speak the same vocabulary.**
+`desktop.scaleFix` is the relay's **source read** of the module the server
+imports, and it is what the model is told: `applied` when that `bridge.py`
+contains `base_w`; `skipped:no-file` when nothing importable with a source origin
+could be found (not installed at all, or only a `.pyc`); `skipped:anchor` when
+the source exists but carries no `base_w` (**not patched**); and
+`unverified:no interpreter`, `unverified:unreadable source` or
+`unverified:not measured` when it could not be checked. The firstboot **marker**
+(`C:\cua-provision.json`, step `dsh-cua-scale`) records the gate's own decision,
+which is finer — `applied` · `already` (an earlier pass applied it; the file was
+not written again) · `skipped:no-python` · `skipped:no-file` ·
+`skipped:version-mismatch` · `skipped:hash-mismatch` · `skipped:anchor-missing` ·
+`skipped:anchor-ambiguous` · `skipped:write-failed` · `skipped:import-failed` ·
+`skipped:probe-failed`. **A refusal that had to UNDO a write keeps its
+`skipped:<why>` value and adds `restoreOk` (a boolean) to the same marker row** —
+the three rollback-attempting ones (`skipped:write-failed`,
+`skipped:import-failed`, `skipped:probe-failed`): `restoreOk: true` means the
+original bytes are **measured** back (the SHA-256 is re-checked against the
+pre-patch hash and the stale `bridge.pyc` cleared, so "reverted" is a measurement
+and not an intention); `restoreOk: false` means the rollback failed too —
+`bridge.py` may be truncated or left **patched**, the guest log says
+`NOT RESTORED … reinstall dsh-cua==0.4.1`, and the marker is the only thing that
+knows. There is deliberately **no rollback-failure code of its own**: the doctor's
+pixel warning fires on a `scaleFix` that **starts with `skipped:`**
+(`windowsDesktopWarnings()`), so a new prefix for "the revert failed" would
+silence exactly the sentence a half-restored guest needs — the rollback fact
+therefore rides `restoreOk`, and `scaleFix` keeps the frozen `skipped:` family.
+Read the pair as: **`applied` is patched now, `already` is patched from an
+earlier pass, and every `skipped:*` / `unverified:*` is NOT patched.** The marker
+is where the *why* lives (read it in the guest); the published fact is what the
+doctor reports and what the model branches on. **The one case where they disagree
+by design:** `restoreOk: false` leaves the patched file in place, so the relay's
+source read can say `applied` while the marker says `skipped:probe-failed` — when
+the marker reports a failed rollback, trust the marker and reinstall.
+
+**When `elementLaneOk` is `false`, stop retrying the element tools.** Use the
+pair that does not need the wrapper — `tool_click_at` with the numbers a capture
+reports, and `tool_type_text` into the focused window — then verify with
+`tool_capture_window`. The doctor's `verdict` says that sentence with the same
+facts, and `windows_desktop`'s payload carries `desktop` too, so a dead lane is a
+sentence rather than 19 identical `ImportError`s. A guest provisioned before this
+change answers `measured: false`: the documented upgrade is a **re-create**
+(nothing re-stages the relay or re-runs pip on start).
+
+#### Where to save
+
+`C:\Users\cua` is **not** a save target. The SSH login is `cua`, but the account
+is in Administrators, so `ssh cua@…` lands on the **high-integrity** token while
+the relay and the desktop run `/rl LIMITED` — the filtered token the user's own
+PowerShell gets. A Medium-IL process cannot write the profile root; that is one
+account with two tokens, not two accounts (a `C:\Users\CUA~1.CUA` in an error
+message is the same profile seen through its 8.3 short name).
+
+firstboot creates one directory it explicitly grants, and labels it Medium so the
+filtered token can write it:
+
+```
+icacls C:\cua-work /inheritance:r /grant SYSTEM:(OI)(CI)F /grant Administrators:(OI)(CI)F /grant "%COMPUTERNAME%\cua:(OI)(CI)F"
+icacls C:\cua-work /setintegritylevel (OI)(CI)M
+```
+
+The relay then proves the write **from the desktop token** (create and delete
+`.cua-write-probe`) and publishes `workDir` + `workDirWritable`. The rule for
+`save_path` is therefore one line:
+
+| `save_path` | where the bytes go |
+|---|---|
+| `C:\cua-work\shot.jpg` | there, and `success: true` |
+| empty | `%TEMP%\win32_mcp_shots` (`os.path.join(os.environ.get("TEMP", "."), "win32_mcp_shots")`, with yesterday's shots pruned) — the documented DEFAULT (the tool's own choice), never a silent redirect of a path you gave; with `include_data_uri: true` no file is written and the bytes come back inline |
+| anything else it cannot write (e.g. `C:\Users\cua\shot.jpg`) | **fails** with `PermissionError` (Errno 13). No fallback, and no `path_redirected` field pretending one happened |
+
+`workDirWritable: false` means the ACL or the label did not take (a guest created
+before this change, or a hand-edited DACL): the verdict names `C:\cua-work` and
+the `%TEMP%` default, and `save_path` should stay empty until the guest is
+re-created. The facts file follows the same rule — `C:\cua-work\…` first,
+`%TEMP%\…` second, and `source` (`"cua-work"` \| `"temp"`) records which one was
+used.
+
+#### Attaching is not not-the-target
+
+`not-the-target` used to be the answer to **two** different situations: "no
+Windows computer is attached" and "an attach is in flight right now". The second
+is a boot race — the SSH handshake needs up to 45 s and a relay's logon task can
+take ~25 s — and answering it with the sentence for "nothing is attached" sent
+the reader to fix nothing. The in-flight ticket now has its own code, and it is
+strictly additive: the `not-the-target` texts below are byte-identical to before,
+and `attaching` is unreachable without a live ticket.
+
+| code | when | what it means / next |
+|---|---|---|
+| `attaching` | an attach is in flight for a computer this session is bound to (or for the only known one). `attach.pendingName` names it | **not a failure**: the handshake is still dialling. `attach.retryAfterMs ∈ [1000, 20000]`, `attach.pendingSinceMs` is the age, and the verdict says `attaching to <name>: … retry in ~<n>s` |
+| `not-the-target` | the bridge is attached to another computer, this session bound a different one (or nothing), or nothing is attached at all | unchanged texts — `this session is bound to <a>; the Windows bridge is attached to <b>; bind this session first` · `this session is bound to nothing; the Windows bridge is attached to <b>; bind this session first (…)` · `no Windows computer is attached to this bridge right now` |
+| `vm-offline` | the guard fires on a name that survived a teardown | the computer is not online; `cua_vm_start`, then `windows_desktop` — or `cua_vm_gui` for a screenshot loop |
+| `grant-off` | Computer Use is denied for this session | the user turns it back on (Personal VM panel, or `POST /dsh-cua-vm/cua-grant {"grant": true}`); it is ON by default and memory-only |
+| `reveal-required` | granted, not revealed for this session, and the `implicit-single-target` allowance does not apply | call `windows_desktop` (no arguments) first |
+
+One string, four surfaces: the doctor's `viewer.code` + `verdict`, the guard's
+refusal (`code:` line), `windows_desktop`'s `code` (with `tools: []` while it
+holds — nothing was measured, so `blind`/`blindReason` stay `null`), and
+`attach.retryAfterMs`. They agree because each one reads the same
+`targetMatchFor()`, and a session bound to a DIFFERENT computer still gets the
+exact `not-the-target` sentence. The supervisor's half of the same race is
+answered the same way: `cua_vm_exec` during boot waits for sshd (default
+`DSH_CUA_WINDOWS_SSH_WAIT_MS=60000`, retried 3 000 ms apart) and then answers
+`exit: 125` with `code: booting` + `next: retry in ~15 s`; `cua_vm_put`/`get`
+answer `available: false, code: "booting"` with a `message`. ssh's bare `255`, and
+the old `126` "no guest agent", are never the answer for a Windows computer that
+exists.
 
 #### Offline means GONE, not dead — and the stream is why it is fast
 
@@ -1069,7 +1275,7 @@ nothing else is ever written into it; the doctor also prints a `verdict` sentenc
 built from the same fields, so the sentence and the JSON cannot disagree.
 `windows_desktop` says `blind` with the same reason in its note, and its `tools`
 list is empty until the names are really visible. Both doctors report
-**`pluginVersion: "0.2.0"`** — this README describes `dsh-cua-vm 0.2.0`, and
+**`pluginVersion: "0.2.1"`** — this README describes `dsh-cua-vm 0.2.1`, and
 `package.json` must equal `PLUGIN_VERSION` (the gate compares the two strings, so
 "the fix is not in your plugin" is a fact rather than a guess).
 

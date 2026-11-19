@@ -94,10 +94,29 @@
  *       is auto-revealed with no manual reveal call, and the doctor carries
  *       `pluginVersion` + `payload.relayHash`.
  *
- * A check whose verdict depends on a field WP-3 adds is PENDING (loudly, never
- * silently green) when the field is absent, so this file can run before that
- * production change lands; `DSH_CUA_CONTRACT_STRICT=1` turns every pending into
- * a failure, which is the mutation check (T2).
+ * WP-6.2 — ATTACHING, THE CONTRACT NOTES AND THE DESKTOP FACTS (§4.7/§4.10)
+ * ------------------------------------------------------------------------
+ * A boot race is not a permanent failure. With the handshake HELD OPEN
+ * (`fake.holdConnect()`), the checks below drive the same window a model hits
+ * one second after `cua_vm_start`:
+ *
+ *   (k) the doctor says `attaching` (not `not-the-target`) with the pending name,
+ *       `pendingSinceMs` and a `retryAfterMs` inside [1000, 20000], and a verdict
+ *       sentence that names the computer and the retry;
+ *   (l) the dispatch guard answers `attaching` for the session bound to the
+ *       pending name, and does NOT swallow a session bound to another computer;
+ *   (m) `windows_desktop` answers `attaching` with an EMPTY inventory;
+ *   (n) releasing the handshake clears the state, and the mismatch that really
+ *       exists still gets the EXACT `not-the-target` sentence;
+ *   (o) the three Appendix C notes are appended verbatim to the three tools and
+ *       every other description is byte-identical (the scope proof);
+ *   (p) a measured dead element lane / an unwritable work dir are verdict
+ *       WARNINGS naming the fallback, never a silent `ok`.
+ *
+ * A check whose verdict depends on a field a WP adds is PENDING (loudly, never
+ * silently green) when the field is ABSENT — never when it is present and wrong;
+ * `DSH_CUA_CONTRACT_STRICT=1` turns every pending into a failure, which is the
+ * mutation check (T2).
  */
 import net from 'node:net'
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
@@ -323,6 +342,14 @@ const plugin = await import(new URL('../plugins/dsh-cua-vm/index.js', import.met
 plugin.apply(ctx, { socketPath: SOCK })
 
 const fake = await import(new URL('./fixtures/fake-win-mcp.mjs', import.meta.url).href)
+/**
+ * THE REAL MODULE, imported directly (the resolve hook only redirects
+ * `./win-mcp.js` when its PARENT is `index.js`). The gate needs it for ONE
+ * reason: to tell "the contract has not landed yet" (pending) from "the contract
+ * landed with a different string" (a red). The fixture re-exports the real
+ * module, so a fake cannot make this answer differ.
+ */
+const realWinMcp = await import(new URL('../plugins/dsh-cua-vm/win-mcp.js', import.meta.url).href)
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const waitFor = async (predicate, ms = 8000) => {
@@ -782,7 +809,7 @@ try {
     'pluginVersion' in jDoctor,
     typeof jDoctor.pluginVersion === 'string' && /^\d+\.\d+\.\d+/u.test(jDoctor.pluginVersion),
     `pluginVersion=${jDoctor.pluginVersion}`,
-    'WP-3.7 + WP-7.1: PLUGIN_VERSION 0.2.0 === package.json')
+    'WP-3.7 + WP-7.1: PLUGIN_VERSION 0.2.1 === package.json')
   checkContract('(j) ...and payload.relayHash (WHICH guest payload answered the probe)',
     'payload' in jDoctor,
     /^[0-9a-f]{64}$/u.test(String(jDoctor.payload?.relayHash ?? '')),
@@ -926,6 +953,217 @@ try {
     JSON.stringify(withdrawnViewer).slice(0, 240))
   check('J20-5: ...the doctor shows both computers, so "why did it stop working" is answerable',
     (await doctor(agentC.agent)).implicitTarget.computers.length === 2)
+
+  /* ================================================================== *
+   * (k)-(p) — ATTACHING IS A STATE, NOT A FAILURE (WP-5.1-5.6, §4.7)
+   *
+   * THE DEFECT. `targetMatchFor()` answered `not-the-target` + "no Windows
+   * computer is attached to this bridge right now" for BOTH "nothing is
+   * attached" and "an attach is in flight". A model that called the doctor one
+   * second after `cua_vm_start` therefore read a permanent failure and gave up
+   * on a computer that was still coming up. `attaching` is the state between
+   * those two answers; `not-the-target` keeps its exact text for the case that
+   * really has nothing attached — checks (d) and J20-5 above are the control.
+   *
+   * THE WINDOW IS REAL, NOT SIMULATED. `fake.holdConnect()` parks the next
+   * `connect()` on a promise (the same seam J20-4 uses), so the ticket, the
+   * generation and the elapsed time are the plugin's own.
+   *
+   * PENDING vs FAILING. A check whose verdict needs a field WP-5 adds is PENDING
+   * (loudly) while the field is ABSENT — never because a value is wrong: a
+   * present field with the wrong value FAILS. `DSH_CUA_CONTRACT_STRICT=1` turns
+   * every pending into a failure, which is the T2 mutation check.
+   * ================================================================== */
+  const CONTRACT_NOTES = {
+    tool_open_application: 'Contract: returns when Windows ACCEPTED the launch, not when a window appeared — poll tool_list_windows and dedupe by pid before retrying, or a retry starts a second instance.',
+    tool_send_keys: 'Contract: success means the keys were injected into the FOREGROUND window, not that the app acted on them (this receipt has no effect_verified) — confirm with tool_capture_window or a tool_list_windows read-back before assuming it worked.',
+    tool_capture_window: 'Contract: an EMPTY save_path writes under %TEMP%\\win32_mcp_shots (that is the default, not a redirect); a non-empty save_path that cannot be written FAILS with PermissionError and does not fall back — use C:\\cua-work\\... inside the guest.'
+  }
+  const TARGET_NAME = 'winbox3'
+  /** `JSON.stringify(undefined)` is `undefined` — never call `.slice` on it. */
+  const brief = (value, n = 140) => String(JSON.stringify(value) ?? 'undefined').slice(0, n)
+  const guestDescriptionOf = (guest) => fake.GUEST_TOOLS.find((tool) => tool.name === guest)?.description ?? ''
+  const registeredDescription = (guest) => String(globalTools.get(`mcp__windows__${guest}`)?.description ?? '')
+
+  rows.set('winbox3', { kind: 'windows', state: 'ready', ssh: true, sshPort: 47103 })
+  rows.set('winbox4', { kind: 'windows', state: 'ready', ssh: true, sshPort: 47104 })
+  listRegistry = { winbox3: { kind: 'windows', state: 'ready' }, winbox4: { kind: 'windows', state: 'ready' } }
+  await post('/cua/state', {})
+  // Session B takes winbox4 and attaches there FIRST, so the mismatch below is
+  // a real one: two computers exist and the two sessions own different ones.
+  await globalTools.get('cua_vm_exec').execute({ name: 'winbox4', cmd: 'dir' }, { agent: agentB.agent })
+  const boundB = await waitFor(async () => (await doctor(agentB.agent)).target === 'winbox4', 8000)
+  check('(k) setup: session B is bound to winbox4 and the bridge is attached there',
+    boundB, `target=${(await doctor(agentB.agent)).target}`)
+  const attachGate = fake.holdConnect()
+  await globalTools.get('cua_vm_exec').execute({ name: 'winbox3', cmd: 'dir' }, { agent: agentA.agent })
+  let attachingSeen = false
+  for (let i = 0; i < 80 && !attachingSeen; i += 1) {
+    lastDoctor = await doctor(agentA.agent)
+    attachingSeen = lastDoctor.attach?.pendingName === TARGET_NAME && lastDoctor.attach?.pendingDead === false
+    if (!attachingSeen) await sleep(100)
+  }
+  check('(k) setup: the attach to winbox3 is in flight (the handshake is held open)',
+    attachingSeen && fake.connectHeld() && prefixed().length === 0,
+    `held=${fake.connectHeld()} pending=${JSON.stringify(lastDoctor.attach)} names=${prefixed().length}`)
+  // THE FIELD'S PRESENCE IS THE LANDED FLAG — never its value. WP-5.4 adds these
+  // two fields to `attach`; until they exist the checks below are PENDING, and
+  // the moment they exist with a wrong value they FAIL.
+  const ATTACH_LANDED = Object.hasOwn(lastDoctor.attach ?? {}, 'retryAfterMs')
+    || Object.hasOwn(lastDoctor.attach ?? {}, 'pendingSinceMs')
+  const heldDoctor = await freshDoctor()
+  const heldViewer = heldDoctor.viewer ?? {}
+  const heldAttach = heldDoctor.attach ?? {}
+  checkContract('(k) during a held attach the doctor says `attaching`, not `not-the-target`',
+    ATTACH_LANDED,
+    heldViewer.code === 'attaching'
+      && heldAttach.pendingName === TARGET_NAME
+      && Number.isFinite(heldAttach.retryAfterMs) && heldAttach.retryAfterMs >= 1000 && heldAttach.retryAfterMs <= 20000
+      && Number.isFinite(heldAttach.pendingSinceMs) && heldAttach.pendingSinceMs >= 0
+      && /attaching to winbox3/u.test(String(heldDoctor.verdict ?? '')),
+    `viewer=${JSON.stringify(heldViewer)} attach=${JSON.stringify(heldAttach)} verdict=${String(heldDoctor.verdict ?? '').slice(0, 140)}`)
+  // ONE STORY, NOT TWO (JURY co-juror-1 defect 2): the attaching sentence must
+  // REPLACE the "nothing is attached; start the computer" base, not follow it —
+  // a verdict that says both is how a model reads "permanent failure, and also
+  // wait". `attaching.text` is still allowed to repeat the name; the BASE is what
+  // this asserts.
+  checkContract('(k) ...and the verdict is ONE story: `attaching` replaces the "not attached" base',
+    ATTACH_LANDED,
+    String(heldDoctor.verdict ?? '').startsWith('attaching:')
+    && /dialling winbox3/u.test(String(heldDoctor.verdict ?? ''))
+    && !/ok: not attached and no prefixed schema is leaked/u.test(String(heldDoctor.verdict ?? '')),
+    String(heldDoctor.verdict ?? '').slice(0, 160))
+  // (l) THE GUARD, and its SCOPING. The attaching branch must be reachable from
+  // the dispatch veto (the model calls the tool, not the doctor) and must NOT
+  // swallow a session that is bound somewhere else: that session's refusal is
+  // the pre-existing `vm-offline` here (the bridge is down during the hold) and
+  // the exact `not-the-target` sentence once attached (asserted after release).
+  const attachingGuard = agentA.guards[0]({ name: 'mcp__windows__tool_click_at', agent: agentA.agent })
+  checkContract('(l) the guard answers `attaching` for the session bound to the pending name',
+    ATTACH_LANDED,
+    attachingGuard?.info?.code === 'attaching'
+      && /attaching to winbox3/u.test(String(attachingGuard?.reason ?? ''))
+      && /retry in ~\d+s/u.test(String(attachingGuard?.reason ?? '')),
+    `code=${attachingGuard?.info?.code} why=${String(attachingGuard?.reason ?? '').split('\n')[1] ?? ''}`)
+  const otherGuard = agentB.guards[0]({ name: 'mcp__windows__tool_click_at', agent: agentB.agent })
+  checkContract('(l) ...and a session bound to ANOTHER computer is not told "attaching" (its refusal is unchanged)',
+    ATTACH_LANDED,
+    otherGuard?.info?.code === 'vm-offline',
+    `code=${otherGuard?.info?.code} why=${String(otherGuard?.reason ?? '').split('\n')[1] ?? ''}`)
+  // (m) THE REVEAL. A hidden inventory plus a code is the honest answer; 19
+  // names that refuse one by one is not.
+  const heldReveal = await desktop(agentA.agent)
+  checkContract('(m) windows_desktop during the hold answers `attaching` with an EMPTY inventory',
+    ATTACH_LANDED,
+    heldReveal.code === 'attaching' && heldReveal.revealed === false
+      && Array.isArray(heldReveal.tools) && heldReveal.tools.length === 0
+      && /attaching|in flight|handshake/iu.test(String(heldReveal.note ?? '')),
+    JSON.stringify({ code: heldReveal.code, revealed: heldReveal.revealed, tools: heldReveal.tools?.length, note: String(heldReveal.note ?? '').slice(0, 120) }))
+  // (n) THE RELEASE: the state is temporary by construction, and the mismatch
+  // that really exists keeps the byte-exact sentence from today.
+  attachGate.release()
+  const attachedAgain = await waitFor(() => prefixed().length === 19, 10000)
+  const settledDoctor = await freshDoctor()
+  checkContract('(n) releasing the handshake clears `attaching` (the attach completes with 19 names)',
+    ATTACH_LANDED,
+    attachedAgain && (settledDoctor.viewer?.code ?? null) !== 'attaching'
+      && settledDoctor.viewer?.match === true
+      && (settledDoctor.attach?.pendingName ?? null) === null,
+    `names=${prefixed().length} viewer=${JSON.stringify(settledDoctor.viewer)} attach=${JSON.stringify(settledDoctor.attach)}`)
+  const crossAfter = agentB.guards[0]({ name: 'mcp__windows__tool_click_at', agent: agentB.agent })
+  check('(n) ...and the mismatch that really exists still gets the EXACT `not-the-target` sentence',
+    crossAfter?.info?.code === 'not-the-target'
+      && /this session is bound to winbox4; the Windows bridge is attached to winbox3; bind this session first/u.test(String(crossAfter?.reason ?? '')),
+    `code=${crossAfter?.info?.code} why=${String(crossAfter?.reason ?? '').split('\n')[2] ?? ''}`)
+  // (o) THE THREE CONTRACT NOTES (Appendix C, frozen), plus the CONTROL: every
+  // other description must stay byte-identical to the shipped sentence, which is
+  // what proves the change is scoped to three tools.
+  // WP-5.7 APPENDS the notes; WP-4.4 owns the table. The landed flag is the
+  // WP-5 surface (`attach.retryAfterMs`), so a tree where only the TABLE has
+  // landed is PENDING rather than a red for a file that has not been edited yet.
+  const CONTRACT_LANDED = ATTACH_LANDED
+  checkContract('(o) the three Appendix C notes are appended verbatim, before the "(dsh-cua, Windows computer …)" suffix',
+    CONTRACT_LANDED,
+    Object.keys(CONTRACT_NOTES).every((guest) => registeredDescription(guest)
+      === `${guestDescriptionOf(guest)} ${CONTRACT_NOTES[guest]} (dsh-cua, Windows computer ${TARGET_NAME})`),
+    Object.keys(CONTRACT_NOTES).filter((guest) => registeredDescription(guest)
+      !== `${guestDescriptionOf(guest)} ${CONTRACT_NOTES[guest]} (dsh-cua, Windows computer ${TARGET_NAME})`).join(',') || 'all three exact')
+  checkContract('(o) ...and every OTHER description is byte-identical to `<guest description> (dsh-cua, Windows computer <name>)`',
+    CONTRACT_LANDED,
+    fake.GUEST_TOOLS.filter((tool) => !Object.hasOwn(CONTRACT_NOTES, tool.name))
+      .every((tool) => registeredDescription(tool.name) === `${tool.description} (dsh-cua, Windows computer ${TARGET_NAME})`),
+    `${fake.GUEST_TOOLS.length - Object.keys(CONTRACT_NOTES).length} control description(s)`)
+  checkContract('(o) ...and the module table IS those three sentences (a divergent string is a red, not a new baseline)',
+    CONTRACT_LANDED,
+    Object.keys(realWinMcp.WINDOWS_TOOL_CONTRACT ?? {}).length === 3
+      && Object.keys(CONTRACT_NOTES).every((guest) => realWinMcp.WINDOWS_TOOL_CONTRACT?.[guest] === CONTRACT_NOTES[guest]),
+    JSON.stringify(Object.keys(realWinMcp.WINDOWS_TOOL_CONTRACT ?? {})))
+  // (p) THE DESKTOP FACTS IN THE VERDICT. `measured:false` must never read as
+  // "false"; a measured dead lane and an unwritable work dir are sentences with
+  // a next action, not a silent `ok`.
+  const DESKTOP_LANDED = Object.hasOwn(settledDoctor, 'desktop')
+  fake.setDesktopFacts({ win32ui: false, elementLaneOk: false })
+  const deadDoctor = await freshDoctor()
+  checkContract('(p) a measured DEAD element lane is a verdict warning naming the fallback',
+    DESKTOP_LANDED,
+    deadDoctor.desktop?.measured === true && deadDoctor.desktop?.elementLaneOk === false
+      && /element lane is DEAD/iu.test(String(deadDoctor.verdict ?? ''))
+      && /tool_click_at/u.test(String(deadDoctor.verdict ?? '')),
+    `desktop=${brief(deadDoctor.desktop)} verdict=${String(deadDoctor.verdict ?? '').slice(0, 140)}`)
+  fake.setDesktopFacts({ workDirWritable: false })
+  const noWriteDoctor = await freshDoctor()
+  checkContract('(p) an unwritable work dir names the path to use (and the %TEMP% fallback) instead of pretending',
+    DESKTOP_LANDED,
+    noWriteDoctor.desktop?.workDirWritable === false
+      && /C:\\cua-work/u.test(String(noWriteDoctor.verdict ?? ''))
+      && /win32_mcp_shots|TEMP/iu.test(String(noWriteDoctor.verdict ?? '')),
+    `desktop=${brief(noWriteDoctor.desktop)} verdict=${String(noWriteDoctor.verdict ?? '').slice(0, 140)}`)
+  // THE ROLLBACK CASE IS NOT A SILENT PASS (writer A's shipped shape): a
+  // `skipped:<why>` scaleFix means the arithmetic is UNPATCHED — including when
+  // the patch was rolled back because the import/probe failed — so the scale
+  // warning must stay active and name the value.
+  fake.setDesktopFacts({ scaleFix: 'skipped:write-failed' })
+  const skippedDoctor = await freshDoctor()
+  checkContract('(p) a `skipped:<why>` scaleFix keeps the scale warning ACTIVE (a rolled-back patch is not applied)',
+    DESKTOP_LANDED,
+    skippedDoctor.desktop?.scaleFix === 'skipped:write-failed'
+    && /scaleFix:skipped:write-failed/u.test(String(skippedDoctor.verdict ?? ''))
+    && /do not click from image pixels/u.test(String(skippedDoctor.verdict ?? '')),
+    `scaleFix=${skippedDoctor.desktop?.scaleFix} verdict=${String(skippedDoctor.verdict ?? '').slice(-140)}`)
+  fake.resetDesktopFacts()
+  // THE BLOCK HANDS J20-4 A KNOWN BOARD: winbox4 (session B's) is deleted so its
+  // binding cannot resurrect an attach, and the bridge stays ATTACHED to winbox3
+  // — J20-4's own switch to winbox2 then has a live attach to tear down first,
+  // which is exactly the state its race is about.
+  await post('/cua', { name: 'winbox4' })
+  rows.delete('winbox4')
+  listRegistry = { winbox3: { kind: 'windows', state: 'ready' } }
+  await post('/cua/state', {})
+  const blockBoardOk = await waitFor(() => prefixed().length === 19, 5000)
+  check('(k)-(p) the block hands the suite back a live attach (winbox3, 19 names)',
+    blockBoardOk && (await freshDoctor()).target === 'winbox3',
+    `names=${prefixed().length} target=${lastDoctor.target}`)
+  // ---- THE TEARDOWN FORGETS THE FACTS (JURY co-juror-1 defect 3, plugin half) ----
+  //
+  // `desktop` was MEASURED for winbox3. Once that computer is destroyed its
+  // facts belong to nobody: a doctor that keeps serving them is how winbox3's
+  // `win32ui:false` (or its writable work dir) becomes a claim about the next
+  // computer that reuses the name and the port.
+  const beforeTeardown = await freshDoctor()
+  await post('/cua', { name: 'winbox3' })
+  rows.delete('winbox3')
+  // EITHER `null` (never measured in this process) OR the honest unmeasured
+  // shape — what must NOT survive is a MEASURED copy: `measured:true` with
+  // `win32ui`/`workDir` filled in is winbox3's truth wearing the next
+  // computer's name.
+  const factsForgotten = (desktop) => desktop === null
+    || (desktop?.measured === false && desktop?.win32ui === null && desktop?.workDir === null
+      && desktop?.elementLaneOk === null && desktop?.scaleFix === null)
+  const teardownCleared = await waitFor(async () => factsForgotten((await freshDoctor()).desktop), 8000)
+  checkContract('(k)-(p) destroying the computer forgets its desktop facts (no measured copy survives)',
+    DESKTOP_LANDED,
+    beforeTeardown.desktop?.measured === true && teardownCleared,
+    `before.measured=${beforeTeardown.desktop?.measured} after=${JSON.stringify((await freshDoctor()).desktop)?.slice(0, 120)}`)
 
   // ---- J20-4: THE DELETE THAT LANDS MID-HANDSHAKE ----
   //

@@ -1191,6 +1191,13 @@ names the harness itself uses:
 | `windows_desktop` | the **reveal**: no arguments; unhides this session's bridged tools and returns their names, descriptions and schemas |
 | `windows_mcp_doctor` | diagnostics: target, online state, registered names, the raw prefix surface, grants, keepalive and the last error |
 
+**`save_path` belongs under `C:\cua-work`.** The desktop token — the filtered,
+Medium-integrity one the relay runs as — cannot write `C:\Users\cua`, so
+`tool_capture_window(save_path)` should name `C:\cua-work\…`: an EMPTY
+`save_path` writes under `%TEMP%\win32_mcp_shots` (the tool's own documented
+default, not a redirect), and a non-empty path that cannot be written fails with
+`PermissionError` instead of being relocated.
+
 **Nothing is attached unless a session named the computer.** The bridge binds to
 a Windows computer a session asked for (`cua_vm_create`, `cua_vm_ensure`,
 `cua_vm_start`, `cua_vm_exec`, `cua_vm_gui`) — it never adopts "the first ready

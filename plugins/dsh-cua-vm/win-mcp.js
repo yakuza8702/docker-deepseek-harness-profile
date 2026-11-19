@@ -121,6 +121,45 @@ export function windowsGuestToolName(tool) {
 }
 
 /**
+ * WHAT THE THREE RECEIPTS MEAN — FROZEN STRINGS (WP-4.4, SOL Appendix C).
+ *
+ * The plugin publishes upstream's tool descriptions VERBATIM (index.js appends
+ * only `" (dsh-cua, Windows computer <name>)"`), so the model reads a contract
+ * nobody verifies: `open_application` returns when `os.startfile` was accepted,
+ * `send_keys` has no `effect_verified`, and `capture_window` has no redirect
+ * path at all (an empty `save_path` is a DOCUMENTED DEFAULT, not a silent
+ * relocation). Three defects, one class: the receipt is fine, the description
+ * implied more than the receipt proves. Nothing upstream changes — the plugin
+ * appends the honest sentence and the same text is returned by
+ * `windows_desktop`'s `tools[]`, so the registry and the reveal cannot
+ * disagree.
+ *
+ * FROZEN: byte-identical to Appendix C. Keyed by GUEST tool name; every other
+ * tool gets `''` and its description stays exactly
+ * `<guest description> (dsh-cua, Windows computer <name>)` — that is how the
+ * scope of this change is proved (P5: 3 notes, 16 byte-identical controls).
+ */
+export const WINDOWS_TOOL_CONTRACT = Object.freeze({
+  tool_open_application: 'Contract: returns when Windows ACCEPTED the launch, not when a window appeared — poll tool_list_windows and dedupe by pid before retrying, or a retry starts a second instance.',
+  tool_send_keys: 'Contract: success means the keys were injected into the FOREGROUND window, not that the app acted on them (this receipt has no effect_verified) — confirm with tool_capture_window or a tool_list_windows read-back before assuming it worked.',
+  tool_capture_window: 'Contract: an EMPTY save_path writes under %TEMP%\\win32_mcp_shots (that is the default, not a redirect); a non-empty save_path that cannot be written FAILS with PermissionError and does not fall back — use C:\\cua-work\\... inside the guest.'
+})
+
+/**
+ * The note for ONE guest tool: `''` for the other sixteen (WP-4.4/C5).
+ *
+ * Accepts either the bare guest name (`tool_send_keys`) or the harness name
+ * (`mcp__windows__tool_send_keys`), because index.js has both in scope and a
+ * caller that has to remember which one this wants is how a note silently
+ * stops being appended.
+ */
+export function windowsToolContract(guestName) {
+  const bare = windowsGuestToolName(guestName)
+  const note = WINDOWS_TOOL_CONTRACT[bare]
+  return typeof note === 'string' ? note : ''
+}
+
+/**
  * Keepalive options for every SSH attach.
  *
  * ServerAliveInterval=15 alone is too slow for a suspended QEMU guest: the
@@ -479,8 +518,24 @@ export const PAYLOAD_SKEW_SEMANTICS = 'payload.skew is true only when the guest 
  * and ABSENT (not `false`) when none does — read absence as "unknown", never as
  * "an interpreter was found". Writer G's README text should quote this
  * constant's set.
+ *
+ * WP-4.3 / WP-4.5 — THE TWO NEW CLIENT FIELDS, ADDED TO THIS ONE LIST SO THE
+ * HELPER/CLIENT CONTRACT CANNOT DRIFT:
+ *
+ *   * `lastFailureKind` — on the FACTS (`doctorFacts()` only; the module-level
+ *     `relayDoctorFacts()` has no session, so it cannot know). One of
+ *     `'ssh-closed' | 'auth' | 'handshake' | 'unknown'` or `null`, beside the
+ *     byte-identical `lastError` text: `ssh-closed` is the boot race (retry),
+ *     `auth` is a key/account problem (retrying changes nothing), `handshake`
+ *     means the session existed and the MCP exchange did not complete.
+ *   * `desktop` — on the DOCTOR (`windowsMcpDoctor()`), the guest's own
+ *     measurement read by `desktopFacts()`: `{ measured, at, stale, source,
+ *     schema, user, session, python, dshCuaVersion, pywin32Version, win32ui,
+ *     uiaLane, uiaLaneOk, elementLaneOk, scaleFix, workDir, workDirWritable,
+ *     profileRootWritable, error }`. `measured !== true` means EVERY field is
+ *     unknown — never `false` (a `false` is a measurement).
  */
-export const DOCTOR_FACTS_FIELDS = 'canonical: transport, relayPort, relayOk, relayStatus, transportCommand, transportReason, interpreter, probeMode, relayDetail, repair, payload (all top-level); interpreterMissing rides along in the transport facts and passes through via the doctor spread when a client exists (absent, not false, when none does); aliases kept for existing consumers: command (= transportCommand), reason (= transportReason). payload as windows_mcp_doctor emits it: { measured, relayHash, expectedRelayHash, skew, port, portMeasured, relayPresent, portMismatch }; relayPresent is true (hash read) / false (measured, no script) / null (not measured), and a MEASURED empty hash= is normalized on the wire to relayHash: null + relayPresent: false, never relayHash: ""; portMismatch is true only when both the guest-measured port and the harness port are known and differ; skew is the relay-answered-but-unreadable evidence flag, not a hash comparison.'
+export const DOCTOR_FACTS_FIELDS = 'canonical: transport, relayPort, relayOk, relayStatus, transportCommand, transportReason, interpreter, probeMode, relayDetail, repair, payload (all top-level); interpreterMissing rides along in the transport facts and passes through via the doctor spread when a client exists (absent, not false, when none does); aliases kept for existing consumers: command (= transportCommand), reason (= transportReason). payload as windows_mcp_doctor emits it: { measured, relayHash, expectedRelayHash, skew, port, portMeasured, relayPresent, portMismatch }; relayPresent is true (hash read) / false (measured, no script) / null (not measured), and a MEASURED empty hash= is normalized on the wire to relayHash: null + relayPresent: false, never relayHash: ""; portMismatch is true only when both the guest-measured port and the harness port are known and differ; skew is the relay-answered-but-unreadable evidence flag, not a hash comparison. Client-only facts (WP-4.3/4.5): lastFailureKind on the client facts — ssh-closed | auth | handshake | unknown | null, beside the byte-identical lastError text (ssh-closed is the boot race, auth is a key/account problem, handshake means the session existed and the MCP exchange did not complete); desktop on windowsMcpDoctor — the guest-measured desktop facts { measured, at, stale, source, schema, user, session, python, dshCuaVersion, pywin32Version, win32ui, uiaLane, uiaLaneOk, elementLaneOk, scaleFix, workDir, workDirWritable, profileRootWritable, error }, where measured !== true means every field is unknown and never false.'
 
 /** The env override, VERBATIM (no trim, no re-quoting), or null when unset. */
 function winMcpCommandOverride() {
@@ -648,10 +703,72 @@ export function resetRelayProbeCache() {
 }
 
 /**
+ * WP-4.2: WAS THIS CAPTURE A CONNECTION-LEVEL FAILURE, OR DID SSH ACTUALLY RUN?
+ *
+ * The distinction the boot wait (WP-2.2) is built on: `exit 255` is ssh's own
+ * "I never got a session" code, and the three messages below are the transport
+ * saying the same thing in words (`sshd` not up yet, the banner not read, the
+ * socket reset). Anything else — including exit 1 from a remote `type` that
+ * found no file — means the SSH SESSION worked and the answer is the guest's.
+ *
+ * ONE OWNER, shared by `runSshCapture` (as the `connectionLevel` field) and
+ * `classifySshFailureKind` (the `ssh-closed` failure kind), so the capture flag
+ * and the doctor's vocabulary can never disagree. The pattern is the SOL's
+ * WP-2.2 regex verbatim: `/Connection (closed|refused|reset)|
+ * kex_exchange_identification|Connection timed out/iu`.
+ *
+ * PURE DATA (WP-4.2): adding the field changes no caller's behaviour. The boot
+ * wait that CONSUMES it lives in the supervisor; this file only reports it.
+ */
+const SSH_CONNECTION_FAILURE_RE = /Connection (closed|refused|reset)|kex_exchange_identification|Connection timed out/iu
+
+export function sshConnectionLevel({ exitCode = null, stderr = '' } = {}) {
+  if (Number(exitCode) === 255) return true
+  return SSH_CONNECTION_FAILURE_RE.test(String(stderr ?? ''))
+}
+
+/**
+ * WP-4.3: WHAT KIND OF FAILURE WAS IT — without touching the sentence that
+ * already reported it.
+ *
+ * `state.lastError` is a TEXT (the last stderr line, ≤400 chars) and every
+ * consumer of it has to regex it to decide what to do next. This is the same
+ * evidence, classified ONCE, into the four kinds the boot/attach race needs
+ * (`SOL §4.7`, WP-5.1's `attaching` sentence and the doctor's `lastFailureKind`):
+ *
+ *   ssh-closed  the transport never had a session: exit 255, the connection
+ *               messages, or a write that hit a dead pipe (EPIPE/ECONNRESET).
+ *               "Retry" is the right next move — the guest is booting.
+ *   auth        the transport worked and the KEY was refused (`Permission
+ *               denied (publickey)`, too many authentication failures). Retrying
+ *               changes nothing; the key or the account is wrong.
+ *   handshake   a session existed and the MCP exchange did not complete
+ *               (`initialize`, a protocol/JSON-RPC complaint). The guest is up;
+ *               the server behind the lane is the problem.
+ *   unknown     anything else — an exit code with no message, a spawn error.
+ *               Honest: "something failed and this file cannot name it".
+ *
+ * The LAST ERROR TEXT IS NOT REWRITTEN (WP-4.3): the classification is an
+ * additive field beside it, so a byte-identical `lastError` stays true.
+ */
+const SSH_AUTH_FAILURE_RE = /permission denied|publickey|authentication failed|too many authentication failures|no supported authentication|host key verification failed/iu
+const SSH_HANDSHAKE_FAILURE_RE = /handshake|initialize|protocol version|json-?rpc|not an mcp|unexpected token|invalid response/iu
+const SSH_LINK_DEAD_RE = /EPIPE|ECONNRESET|ECONNREFUSED|socket hang up|broken pipe/iu
+
+export function classifySshFailureKind({ text = '', exitCode = null } = {}) {
+  const body = String(text ?? '')
+  if (sshConnectionLevel({ exitCode, stderr: body }) === true) return 'ssh-closed'
+  if (SSH_LINK_DEAD_RE.test(body) === true) return 'ssh-closed'
+  if (SSH_AUTH_FAILURE_RE.test(body) === true) return 'auth'
+  if (SSH_HANDSHAKE_FAILURE_RE.test(body) === true) return 'handshake'
+  return 'unknown'
+}
+
+/**
  * ONE ssh child, bounded, with the drain-safe settle every probe in this file
- * needs. Returns `{ stdout, stderr, exitCode, detail, timedOut, ms }` and never
- * rejects: a spawn that throws, an 'error' event, a timeout and a clean exit are
- * all just a capture with empty output.
+ * needs. Returns `{ stdout, stderr, exitCode, detail, timedOut, ms,
+ * connectionLevel }` and never rejects: a spawn that throws, an 'error' event, a
+ * timeout and a clean exit are all just a capture with empty output.
  *
  * 'exit' means the PROCESS is gone, not that its pipes are drained: stdout data
  * already written can still be sitting in the stream when 'exit' fires. Settling
@@ -662,7 +779,7 @@ export function resetRelayProbeCache() {
  * that never emits 'close' cannot hold the probe to its full timeout; a real
  * child always reaches 'close' first.
  */
-function runSshCapture({ argv, spawnImpl, timeoutMs, now, onStdout }) {
+export function runSshCapture({ argv, spawnImpl, timeoutMs, now, onStdout }) {
   return new Promise((resolve) => {
     const startedAt = now()
     const budget = Math.max(1, Math.round(Number(timeoutMs)))
@@ -686,7 +803,7 @@ function runSshCapture({ argv, spawnImpl, timeoutMs, now, onStdout }) {
       if (exited !== true) {
         try { child?.kill('SIGTERM') } catch {}
       }
-      resolve({ stdout, stderr, exitCode, detail, timedOut, ms: Math.max(0, now() - startedAt) })
+      resolve({ stdout, stderr, exitCode, detail, timedOut, ms: Math.max(0, now() - startedAt), connectionLevel: sshConnectionLevel({ exitCode, stderr }) })
     }
     try {
       child = spawnImpl('/usr/bin/ssh', argv, { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -1122,6 +1239,396 @@ export async function relayDoctorFacts(options = {}) {
       // and a differing hash is reported as relayHash vs expectedRelayHash.
       skew: relayEvidenceSkew(facts.relayStatus, record)
     }
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * THE DESKTOP FACTS (WP-4.1): what the guest measured about ITSELF
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHERE THE RELAY PUBLISHES, and how we read it (WP-4.1, SOL §4.3).
+ *
+ * The relay's `--serve` entry measures the DESKTOP SESSION's own interpreter
+ * (does `win32ui` import? does the desktop token own a writable directory?) and
+ * writes one JSON object (Appendix B). This side never assumes any of it: it
+ * READS the file, and `measured:false` is a first-class answer — a guest
+ * provisioned before this change has no file at all, and saying "unknown" is
+ * the only honest report for it (risk R10).
+ *
+ * ONE ssh, two candidate paths, exactly as the SOL freezes it: the work
+ * directory the desktop token can write, then `%TEMP%` for a guest whose
+ * work-dir ACL did not take. `||` is cmd.exe's "run the second only when the
+ * first failed", which is why this is one bounded read and not two.
+ */
+export const DESKTOP_FACTS_PATH = 'C:\\cua-work\\cua-desktop-facts.json'
+export const DESKTOP_FACTS_FALLBACK_PATH = 'C:\\Users\\cua\\AppData\\Local\\Temp\\cua-desktop-facts.json'
+export const DESKTOP_FACTS_COMMAND = `type "${DESKTOP_FACTS_PATH}" || type "${DESKTOP_FACTS_FALLBACK_PATH}"`
+
+/** The read's own wall: 8 s (SOL §4.3). A doctor read must never outlive the doctor. */
+export const DESKTOP_FACTS_TIMEOUT_MS = 8000
+
+/**
+ * 60 s TTL (SOL §4.3): the facts are republished on every relay start, not on
+ * every call, so a fresh read every doctor would be an SSH child per poll for a
+ * number that cannot have changed. `stale:true` says the FILE is older than
+ * this — the relay has not republished — which is a different fact from "we
+ * cached it".
+ */
+export const DESKTOP_FACTS_TTL_MS = 60000
+
+/**
+ * A FAILURE IS NOT CACHED FOR THE FULL TTL — the probe cache's lesson, applied.
+ *
+ * `relayProbeCache` is 10 s precisely because a cached "down" that outlived boot
+ * pinned every attach to the blind lane. The same trap exists here: the first
+ * doctor call during boot legitimately finds no facts file, the relay publishes
+ * one a few seconds later, and a 60 s failure cache would make the doctor report
+ * `measured:false` for a minute after the guest became honest — and would defeat
+ * WP-5.9's promise that the FIRST `windows_desktop` after an attach carries the
+ * facts. So an unmeasured answer is remembered only long enough that a burst of
+ * calls shares one child (C3's "two calls inside the TTL → one spawn" holds for
+ * a failure too), never long enough to outlive a boot.
+ */
+export const DESKTOP_FACTS_FAILURE_TTL_MS = 5000
+
+/** The schema this side understands; a newer one is still read, field by field. */
+export const DESKTOP_FACTS_SCHEMA = 1
+
+/**
+ * THE CACHE KEY — AND WHY THE NAME IS PART OF IT (JURY-CO1 defect 3).
+ *
+ * `user@host:port` alone is NOT a computer identity: the supervisor hands out
+ * the lowest free SSH port and FREES it on destroy, so a destroyed guest and
+ * the guest that replaces it routinely share a port. A key of the SSH triple
+ * therefore let a NEW computer inherit the OLD one's measured facts for a full
+ * TTL — `measured:true, win32ui:false` for a guest that has no facts file at
+ * all, which is the exact class of lie this release exists to delete.
+ *
+ * The harness's own name for the computer IS an identity: `index.js` passes
+ * `target.name` to both the client and this reader, and the supervisor never
+ * has two rows of the same name. So the key is the triple PLUS `#name` when the
+ * caller knows it — and `forgetDesktopFacts()` closes the remaining hole (the
+ * same name re-created on the same port) at teardown, where the destroy
+ * actually happens.
+ */
+function desktopFactsKey({ user = 'cua', host = '127.0.0.1', port, name = '' } = {}) {
+  const identity = String(name ?? '')
+  return `${user}@${host}:${port}${identity === '' ? '' : `#${identity}`}`
+}
+
+/** One entry per computer — two computers must never inherit each other's facts. */
+const desktopFactsCache = new Map()
+
+/**
+ * ONE READ IN FLIGHT PER COMPUTER (JURY-CO1 defect 2). The attach path fires
+ * `refreshDesktopFacts()` and `scheduleDesktopFacts()` in the SAME tick, and the
+ * entry is only written after `runSshCapture` resolves — so without this latch
+ * the second caller saw an empty cache and spent a second ssh child. The latch
+ * is the read's own promise: concurrent callers await it and get the same
+ * answer, and it is removed the moment it settles (the TTL cache, not the
+ * latch, is what makes the NEXT call cheap).
+ */
+const desktopFactsInFlight = new Map()
+
+/**
+ * A GENERATION PER KEY, so a read that was in flight across a teardown cannot
+ * repopulate the cache with the dead computer's answer. `forgetDesktopFacts()`
+ * bumps it; a read only writes the entry if the generation it started in is
+ * still current.
+ */
+const desktopFactsEpoch = new Map()
+
+function desktopFactsEpochOf(key) {
+  return desktopFactsEpoch.get(key) ?? 0
+}
+
+/** Drop EVERY cached answer and every latch (tests; a full reset). */
+export function resetDesktopFactsCache() {
+  desktopFactsCache.clear()
+  desktopFactsInFlight.clear()
+  desktopFactsEpoch.clear()
+}
+
+/**
+ * FORGET ONE COMPUTER (JURY-CO1 defect 3). Called by the client's `close()` —
+ * which `index.js`'s `teardown()` calls on destroy — so the invariant "a
+ * destroyed computer's facts never serve a new computer" holds even when the
+ * replacement reuses the SAME name and the SAME port.
+ *
+ * It also bumps the key's generation, so a read that is still in flight for the
+ * old guest cannot write its answer back after the teardown. Returns the key it
+ * dropped (a log/test convenience, not a contract).
+ */
+export function forgetDesktopFacts(options = {}) {
+  const { host = '127.0.0.1', port, user = 'cua', name = '' } = options ?? {}
+  const key = desktopFactsKey({ user, host, port, name })
+  desktopFactsCache.delete(key)
+  desktopFactsInFlight.delete(key)
+  desktopFactsEpoch.set(key, desktopFactsEpochOf(key) + 1)
+  return key
+}
+
+/** A boolean fact, or `null` when the guest did not measure it. Never a guess. */
+function factBool(value) {
+  return value === true ? true : (value === false ? false : null)
+}
+
+/** A string fact, or `null`. Empty strings read as unknown. */
+function factString(value) {
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+/** A numeric fact, or `null`. */
+function factNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * IS THE FACTS FILE OLDER THAN THE TTL? — the FILE's age, never the cache's.
+ *
+ * `stale` used to be computed once, inside `normalizeDesktopFacts`, and then
+ * returned verbatim on every cache hit: a file that was 59 s old when it was
+ * read still reported `stale:false` at 118 s (JURY-CO1 defect 5). The verdict
+ * belongs to the moment of the ANSWER, so it is derived here and re-derived on
+ * every cache hit / shared read from the stored `at` and the caller's clock.
+ */
+function desktopFactsStale(at, nowMs, ttlMs) {
+  const measuredAt = at === null || at === undefined ? Number.NaN : Date.parse(String(at))
+  if (Number.isFinite(measuredAt) === false) return false
+  return Math.max(0, Number(nowMs) - measuredAt) > Math.max(0, Number(ttlMs))
+}
+
+/**
+ * THE ANSWER A CALLER GETS: `stale` re-derived at read time, and `cached`
+ * saying whether this call spent an ssh child of its own (a TTL hit and a
+ * shared in-flight read both answer `true` — neither one spawned).
+ */
+function desktopFactsAnswer(facts, { nowMs, ttlMs, cached }) {
+  const answer = facts.measured === true
+    ? { ...facts, stale: desktopFactsStale(facts.at, nowMs, ttlMs) }
+    : facts
+  return { ...answer, cached: cached === true }
+}
+
+/**
+ * THE LAST COMPLETE JSON OBJECT in a capture. The guest path is cmd.exe, and
+ * cmd.exe prints its own `The system cannot find the file specified.` noise
+ * around whatever `type` produced, so `JSON.parse(stdout)` would fail on a file
+ * that is perfectly good. Scanning backwards from the final `}` and trying each
+ * `{` keeps a leading banner harmless without a lenient parser (no trailing
+ * commas, no comments — the relay writes `json.dumps`).
+ */
+function parseLastJsonObject(text) {
+  const source = String(text ?? '')
+  const end = source.lastIndexOf('}')
+  if (end === -1) return null
+  for (let start = source.lastIndexOf('{', end); start !== -1; start = source.lastIndexOf('{', start - 1)) {
+    try {
+      const parsed = JSON.parse(source.slice(start, end + 1))
+      if (parsed !== null && typeof parsed === 'object' && Array.isArray(parsed) === false) return parsed
+    } catch {
+      // Not this one: an earlier `{` may be the real object.
+    }
+    if (start === 0) break
+  }
+  return null
+}
+
+/**
+ * Appendix B → the shape this file hands to the doctor. THE CONSUMER CONTRACT
+ * (§Appendix B, frozen): unknown keys are KEPT, missing keys read as `null`,
+ * and `measured !== true` means **every field is unknown** — never "false". A
+ * `false` here is a measurement; a `null` is the absence of one, and conflating
+ * them is how "the lane is dead" gets reported on a guest nobody measured.
+ */
+function normalizeDesktopFacts(parsed, { error = '', now = () => Date.now(), ttlMs = DESKTOP_FACTS_TTL_MS } = {}) {
+  const unknown = {
+    schema: null,
+    user: null,
+    session: null,
+    python: null,
+    dshCuaVersion: null,
+    pywin32Version: null,
+    win32ui: null,
+    uiaLane: null,
+    uiaLaneOk: null,
+    elementLaneOk: null,
+    scaleFix: null,
+    workDir: null,
+    workDirWritable: null,
+    profileRootWritable: null,
+    // WP-4.2: false unless the CAPTURE that produced this answer was a
+    // connection-level failure (desktopFacts() overwrites it from the capture).
+    connectionLevel: false
+  }
+  if (parsed === null || parsed === undefined) {
+    return {
+      measured: false,
+      at: null,
+      stale: false,
+      source: 'none',
+      cached: false,
+      ...unknown,
+      error: error === '' ? 'no desktop facts file was readable in the guest' : error
+    }
+  }
+  const measured = parsed.measured === true
+  if (measured !== true) {
+    return {
+      // Unknown keys are kept (§Appendix B), but nothing measured is claimed.
+      ...parsed,
+      measured: false,
+      at: null,
+      stale: false,
+      source: factString(parsed.source) ?? 'none',
+      cached: false,
+      ...unknown,
+      error: factString(parsed.error) ?? (error === '' ? 'the guest wrote desktop facts but reported measured:false' : error)
+    }
+  }
+  const win32ui = factBool(parsed.win32ui)
+  const uiaLane = factBool(parsed.uiaLane)
+  // THE ONE DERIVED FACT the model branches on (SOL §4.3/§4.5): the focus-free
+  // element lane needs BOTH imports, because `_wrapper_for()` reaches
+  // `pywinauto.controls.uiawrapper`, which imports `win32ui` unguarded.
+  const elementLaneOk = win32ui === false || uiaLane === false
+    ? false
+    : (win32ui === true && uiaLane === true ? true : null)
+  const at = factString(parsed.at)
+  return {
+    ...parsed,
+    measured: true,
+    at,
+    // The FILE is old, not the cache — and it is re-derived on every cache hit
+    // (desktopFactsAnswer), never frozen into the entry.
+    stale: desktopFactsStale(at, now(), ttlMs),
+    source: factString(parsed.source) ?? 'unknown',
+    cached: false,
+    schema: factNumber(parsed.schema) ?? DESKTOP_FACTS_SCHEMA,
+    user: factString(parsed.user),
+    session: factNumber(parsed.session),
+    python: factString(parsed.python),
+    dshCuaVersion: factString(parsed.dshCuaVersion),
+    pywin32Version: factString(parsed.pywin32Version),
+    win32ui,
+    uiaLane,
+    uiaLaneOk: uiaLane,
+    elementLaneOk,
+    scaleFix: factString(parsed.scaleFix),
+    workDir: factString(parsed.workDir),
+    workDirWritable: factBool(parsed.workDirWritable),
+    profileRootWritable: factBool(parsed.profileRootWritable),
+    error: String(parsed.error ?? '')
+  }
+}
+
+/**
+ * READ THE DESKTOP SESSION'S OWN FACTS (WP-4.1). One bounded SSH read, cached
+ * for `ttlMs` (60 s), keyed `user@host:port`. **Never throws** — a rejected
+ * promise is the exact bug class this repo keeps fixing, and the doctor that
+ * awaits this must be able to say `measured:false` instead of going down.
+ *
+ * Returns `{ measured, at, stale, source, cached, schema, user, session,
+ * python, dshCuaVersion, pywin32Version, win32ui, uiaLane, uiaLaneOk,
+ * elementLaneOk, scaleFix, workDir, workDirWritable, profileRootWritable,
+ * error }` — plus every unknown key the guest wrote (§Appendix B).
+ *
+ * `measured:false` + `error` is the answer for: no file (a pre-change guest),
+ * an SSH that never answered, a timeout, a file that is not JSON. The caller
+ * must treat every other field as UNKNOWN then, never as `false`.
+ *
+ * `options` accepts the same seams as every other read in this file:
+ * `spawnImpl` (so a test can answer without an ssh binary), `now` (the TTL and
+ * the `stale` verdict), `force` (bypass the cache AND the latch), `name` (the
+ * computer's identity — part of the cache key, so a reused SSH port is never
+ * mistaken for the same machine) and `sshArgsFactory` (an alternate transport).
+ *
+ * ONE READ IN FLIGHT PER COMPUTER: a second caller inside the same tick awaits
+ * the first caller's promise instead of spending a second ssh child, and gets
+ * `cached:true` (neither caller's answer is stale — one child measured it).
+ * `forgetDesktopFacts()` is the teardown half: the client calls it from
+ * `close()`, so a destroyed computer's facts can never serve its replacement.
+ */
+export async function desktopFacts(options = {}) {
+  const normalized = typeof options === 'function' ? { sshArgsFactory: options } : (options ?? {})
+  const {
+    host = '127.0.0.1',
+    port: sshPort,
+    user = 'cua',
+    // The computer's own name, when the caller knows it (index.js always does).
+    // Part of the cache key: a reused SSH port must not be a computer identity
+    // (see desktopFactsKey).
+    name = '',
+    keyPath,
+    timeoutMs = DESKTOP_FACTS_TIMEOUT_MS,
+    ttlMs = DESKTOP_FACTS_TTL_MS,
+    force = false,
+    sshArgsFactory,
+    spawnImpl = spawn,
+    now = () => Date.now(),
+    log = () => {}
+  } = normalized
+  const key = desktopFactsKey({ user, host, port: sshPort, name })
+  try {
+    // A TTL HIT. `stale` is re-derived from the stored `at` against THIS call's
+    // clock (defect 5): the entry is a cached MEASUREMENT, not a cached verdict.
+    const cached = desktopFactsCache.get(key)
+    if (force !== true && cached !== undefined && (now() - cached.at) < cached.ttl) {
+      return desktopFactsAnswer(cached.facts, { nowMs: now(), ttlMs, cached: true })
+    }
+    // A READ ALREADY IN FLIGHT FOR THIS COMPUTER (defect 2): share its child
+    // instead of spending a second one. `force` is the caller saying "read now".
+    const shared = force === true ? undefined : desktopFactsInFlight.get(key)
+    if (shared !== undefined) {
+      return desktopFactsAnswer(await shared, { nowMs: now(), ttlMs, cached: true })
+    }
+    // The generation this read belongs to: a teardown bumps it, and the entry is
+    // then NOT written — the dead computer's answer must not come back.
+    const epoch = desktopFactsEpochOf(key)
+    const run = (async () => {
+      try {
+        const argv = typeof sshArgsFactory === 'function'
+          ? sshArgsFactory({ remoteCommand: DESKTOP_FACTS_COMMAND })
+          : sshArgv({ host, port: sshPort, user, keyPath, remoteCommand: DESKTOP_FACTS_COMMAND })
+        const capture = await runSshCapture({ argv, spawnImpl, timeoutMs, now })
+        const parsed = parseLastJsonObject(capture.stdout)
+        const failure = parsed === null
+          ? String(capture.stderr || capture.stdout || capture.detail || '').trim().slice(0, 240)
+          : ''
+        const facts = normalizeDesktopFacts(parsed, { error: failure, now, ttlMs })
+        // WP-4.2's flag, carried on the answer so a caller can tell "the guest has
+        // no facts file" from "the transport never got a session" — both are
+        // `measured:false`, and only one of them is worth retrying.
+        facts.connectionLevel = capture.connectionLevel === true
+        // A MEASUREMENT is cached for the caller's TTL; a FAILURE only for the
+        // short failure window (see DESKTOP_FACTS_FAILURE_TTL_MS).
+        const entryTtl = facts.measured === true
+          ? Math.max(0, Number(ttlMs))
+          : Math.min(DESKTOP_FACTS_FAILURE_TTL_MS, Math.max(0, Number(ttlMs)))
+        if (desktopFactsEpochOf(key) === epoch) desktopFactsCache.set(key, { at: now(), ttl: entryTtl, facts })
+        if (facts.measured === true) {
+          log(`mcp-win: desktop facts measured (${facts.source}${facts.elementLaneOk === false ? ', element lane DEAD' : ''})`)
+        } else {
+          log(`mcp-win: desktop facts unreadable (${facts.source}): ${facts.error}`)
+        }
+        return facts
+      } catch (error) {
+        // Belt and braces: nothing above is supposed to throw, and a doctor read
+        // that CAN throw is a doctor that takes the panel down with it.
+        return normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}`, now, ttlMs })
+      }
+    })()
+    if (force !== true) desktopFactsInFlight.set(key, run)
+    try {
+      return await run
+    } finally {
+      if (desktopFactsInFlight.get(key) === run) desktopFactsInFlight.delete(key)
+    }
+  } catch (error) {
+    // A shared read that rejected, or an argv builder that threw before the
+    // latch existed: still an answer, still never a rejection.
+    return normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}`, now, ttlMs })
   }
 }
 
@@ -2022,6 +2529,17 @@ export function createDshCuaClient({
     serverInfo: null,
     tools: [],
     lastError: '',
+    /**
+     * WP-4.3: the KIND of the last failure, beside its text — `'ssh-closed' |
+     * 'auth' | 'handshake' | 'unknown'`, `''` when nothing failed since the last
+     * successful call. Additive: `lastError` keeps its exact text and no caller
+     * that ignored this field changes behaviour. The FIRST classification wins
+     * (a later message is usually a consequence), and a successful JSON-RPC
+     * answer clears it.
+     */
+    lastFailureKind: '',
+    /** WP-4.1/5.9: the last desktop-facts read, or null until one ran. */
+    desktop: null,
     transport: null,
     relayPort: relayPort(),
     relayOk: null,
@@ -2138,7 +2656,37 @@ export function createDshCuaClient({
     pending.delete(message.id)
     clearTimeout(entry.timer)
     if (message.error) entry.reject(new Error(message.error.message || `MCP error ${message.error.code}`))
-    else entry.resolve(message.result)
+    else {
+      // WP-4.3: THE NEXT SUCCESSFUL CALL CLEARS THE KIND. An answer on the wire
+      // is the proof that the transport is healthy again; keeping the old kind
+      // would make the doctor report a failure that has already healed.
+      state.lastFailureKind = ''
+      entry.resolve(message.result)
+    }
+  }
+
+  /**
+   * Record a failure KIND once (WP-4.3). The first classification wins: ssh
+   * prints its cause first and then a cascade, and the cascade is not the
+   * diagnosis. Never rewrites `state.lastError`.
+   */
+  const recordFailureKind = (text, exitCode = null) => {
+    if (state.lastFailureKind !== '') return
+    const body = String(text ?? '')
+    if (body === '' && (exitCode === null || exitCode === 0)) return
+    state.lastFailureKind = classifySshFailureKind({ text: body, exitCode })
+  }
+
+  /**
+   * The same, for a stderr LINE: only a CONFIDENT kind is recorded from a
+   * message. The lane can print benign text (a relay line, a warning) and that
+   * must not become the diagnosis — the exit handler is where an unclassifiable
+   * failure becomes `'unknown'`, and it still wins over nothing.
+   */
+  const recordFailureKindIfKnown = (text) => {
+    if (state.lastFailureKind !== '') return
+    const kind = classifySshFailureKind({ text })
+    if (kind !== 'unknown') state.lastFailureKind = kind
   }
 
   function attach(process_) {
@@ -2157,6 +2705,10 @@ export function createDshCuaClient({
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk) => {
       state.lastError = String(chunk).trim().slice(-400)
+      // WP-4.3: the KIND beside the text. The first CONFIDENT classification
+      // wins — ssh's first line is the cause, the rest are consequences — and
+      // the text above stays byte-identical (C4 asserts it literally).
+      recordFailureKindIfKnown(state.lastError)
       log(`mcp-win: ${state.lastError}`)
     })
     // A dead/suspended link makes the next write fail with EPIPE. Without a
@@ -2165,10 +2717,15 @@ export function createDshCuaClient({
     // more often. Record it and let the pending requests fail on exit/timeout.
     child.stdin.on('error', (error) => {
       state.lastError = `stdin: ${error?.message ?? error}`.slice(-400)
+      recordFailureKindIfKnown(state.lastError)
       log(`mcp-win: ${state.lastError}`)
     })
     child.on('exit', (code) => {
       const wasConnected = state.connected
+      // WP-4.3: a session that ended non-zero with NO stderr still has a kind —
+      // ssh's own 255 is the boot race this whole change is about. The exit is
+      // the LAST chance to classify, so it only fills an empty slot.
+      if (code !== 0 && code !== null) recordFailureKind(state.lastError, code)
       stopUpgradeWatch()
       state.connected = false
       state.online = false
@@ -2361,6 +2918,30 @@ export function createDshCuaClient({
     upgradeTimer.unref?.()
   }
 
+  /**
+   * WP-4.1/5.9: ONE bounded read of the guest's own desktop facts, remembered on
+   * the client so `windows_desktop` can answer from the cache WITHOUT blocking.
+   *
+   * The module-level `desktopFacts()` owns the SSH child, the 8 s cap and the
+   * 60 s TTL; this only supplies the target the client was created with and
+   * keeps the last answer. It cannot throw — `desktopFacts()` never rejects, and
+   * the belt-and-braces catch keeps a future edit from making the reveal path
+   * fail on a read that is, by definition, optional.
+   */
+  const refreshDesktopFacts = async (options = {}) => {
+    try {
+      // `name` is part of the cache key (desktopFactsKey): this client's computer,
+      // not merely the SSH port the supervisor happened to hand it.
+      const facts = await desktopFacts({ name, host, port: sshPort, user, keyPath, spawnImpl, log, ...(options ?? {}) })
+      state.desktop = facts
+      return facts
+    } catch (error) {
+      const facts = normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}` })
+      state.desktop = facts
+      return facts
+    }
+  }
+
   return {
     name,
     state,
@@ -2467,6 +3048,10 @@ export function createDshCuaClient({
         interpreterMissing: (state.interpreterMissing ?? decided?.interpreterMissing ?? probe?.interpreterMissing) === true,
         probeMode,
         relayDetail: state.relayDetail ?? decided?.relayDetail ?? probe?.relayDetail ?? '',
+        // WP-4.3/4.5: THE KIND OF THE LAST FAILURE, beside the text. `null`
+        // means "nothing failed since the last successful call" — an empty
+        // string would read as a kind nobody defined.
+        lastFailureKind: state.lastFailureKind === '' ? null : state.lastFailureKind,
         repair: record,
         payload: {
           // DEFECT 1: the same marker `relayDoctorFacts()` carries — the two
@@ -2506,6 +3091,40 @@ export function createDshCuaClient({
       return maybeUpgradeTransport(now)
     },
     /**
+     * WP-4.1/5.6/5.9: THE GUEST'S OWN DESKTOP FACTS, from the cache.
+     *
+     * Synchronous and never blocking: `windows_desktop` returns this or `null`
+     * and must not wait for an SSH read while the model is watching a reveal.
+     * `null` means "nothing measured yet in this process" — the reveal path
+     * kicks `refreshDesktopFacts()` in the background instead (WP-5.9).
+     */
+    desktopFactsCached() {
+      const facts = state.desktop
+      if (facts === null || facts === undefined) return null
+      // JURY-CO1 defect 5, at the synchronous reader too: a copy taken minutes
+      // ago must not keep claiming `stale:false` about a file that has aged past
+      // the TTL. The verdict is re-derived from the file's own `at`.
+      return facts.measured === true
+        ? { ...facts, stale: desktopFactsStale(facts.at, Date.now(), DESKTOP_FACTS_TTL_MS) }
+        : facts
+    },
+    /**
+     * WP-4.1: refresh them — one bounded SSH read, TTL-guarded (60 s), never
+     * throws. This is the method WP-5.9 calls after a successful attach so the
+     * first `windows_desktop` after a start already carries the facts.
+     */
+    refreshDesktopFacts(options = {}) {
+      return refreshDesktopFacts(options)
+    },
+    /**
+     * The same read under the name index.js's doctor helper uses (WP-5.6:
+     * "a new client method delegating to `desktopFacts()`"). Two names, ONE
+     * implementation — an alias, never a second code path.
+     */
+    desktopFacts(options = {}) {
+      return refreshDesktopFacts(options)
+    },
+    /**
      * REPAIR, FROM THE CLIENT (P1). `syncWindowsMcp()` calls this when the bridge
      * is connected but blind; `windows_mcp_doctor({repair:true})` calls it with
      * `{force:true}` for one attempt on demand. Everything that makes a repair
@@ -2522,7 +3141,19 @@ export function createDshCuaClient({
       state.repair = record
       return record
     },
+    /**
+     * TEARDOWN, AND THE FACTS DIE WITH THE COMPUTER (JURY-CO1 defect 3).
+     *
+     * `index.js`'s `teardown()` calls this on destroy/unbind, and the supervisor
+     * frees the SSH port with the row — so the guest that replaces this one can
+     * land on the SAME port. Dropping this computer's cache entry here (and
+     * bumping its generation, so a read still in flight cannot write it back)
+     * is what makes "a destroyed computer's facts never serve a new computer"
+     * true even when the replacement reuses the same name and port.
+     */
     close() {
+      try { forgetDesktopFacts({ name, host, port: sshPort, user }) } catch { /* never measured */ }
+      state.desktop = null
       shutdown()
     }
   }

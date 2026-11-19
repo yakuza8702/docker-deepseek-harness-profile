@@ -9,7 +9,23 @@
                      agent surface; without it those tools refuse.
     python.org       the runtime for dsh-cua (there is no reliable winget in a
                      fresh eval image without the Store).
-    dsh-cua          the UI-automation server (pywinauto) the harness drives.
+    dsh-cua          the UI-automation server (pywinauto) the harness drives,
+                     installed at the PINNED build and with its python
+                     dependency VERIFIED BY IMPORT: a resolved wheel whose pywin32
+                     DLLs were never copied passes `find_spec` and dies at tool
+                     time, so the step asserts and repairs (see step `dsh-cua`).
+    C:\cua-work      the one directory the DESKTOP token can write. The desktop
+                     runs the user's filtered token at Medium integrity and the
+                     profile root inherits a DACL that refuses it - the reported
+                     PermissionError on a save path. Created with an explicit
+                     DACL and a Medium label, re-measured by the relay at every
+                     start (see step `cua-workdir`).
+    the scale fix    upstream computes `scale_x/scale_y` from the WINDOW while the
+                     image is a client-area CROP, so the two disagree with
+                     `scale` by construction. Corrected in place under a
+                     version + SHA-256 + anchor gate and proven by a probe with no
+                     window; a refused gate is reported, never faked (see step
+                     `dsh-cua-scale`).
     a scheduled task  dsh-cua-server in the INTERACTIVE session at logon.
                      SSH lands in Session 0 with no desktop; pywinauto can only
                      drive windows in the user's own session, so the SSH side
@@ -47,7 +63,7 @@ $marker = 'C:\cua-provision.json'
 # An empty hash is recorded as '' rather than omitted: a reader must be able to
 # tell "this script could not hash itself" from "this marker predates the field".
 # ---------------------------------------------------------------------------
-$scriptVersion = '1.1.0'
+$scriptVersion = '1.2.0'
 $scriptSha256 = ''
 try {
   if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -ErrorAction Stop)) {
@@ -133,6 +149,112 @@ function Get-RealPython {
     if ($candidate.Source -and $candidate.Source -notmatch '\\WindowsApps\\') { return $candidate.Source }
   }
   return $null
+}
+
+# ---------------------------------------------------------------------------
+# WP-1: THE PYTHON LANE'S TWO PRIMITIVES - RUN A STATEMENT, AND REPAIR pywin32.
+#
+# WHY THEY EXIST AT ALL: the only verification this script had for its payload was
+# `importlib.util.find_spec('dsh_cua')`, which is a submodule FINDER. It answers
+# "is the package directory importable" and never "can its submodules be
+# imported", so it cannot see a pywin32 whose DLLs were never copied: the import
+# succeeds in the finder's world and dies at tool time with
+#
+#     ImportError: DLL load failed while importing win32ui
+#
+# (upstream uia.py:452-463, on the path every element_action* takes through
+# _wrapper_for). pywin32 ships win32ui.pyd but keeps pywintypes3??.dll and
+# pythoncom3??.dll in pywin32_system32 until `pywin32_postinstall.py -install`
+# copies them beside the .pyd files, and `pip install` does not run that when the
+# wheel is already satisfied. The functions below are the ASSERTION (`import
+# win32ui, win32gui` really executed) and the REPAIR (run the post-install, then
+# assert again).
+# ---------------------------------------------------------------------------
+
+# ONE STATEMENT, ITS EXIT CODE, AND THE LINE THAT NAMES THE FAILURE. stderr is
+# merged into stdout because a Python traceback arrives there, and its LAST line is
+# the only one worth putting in the marker ("ImportError: DLL load failed while
+# importing win32ui: The specified module could not be found."). `error` is that
+# line; `lines` is everything, for a caller that wants a value.
+function Invoke-PythonCheck([string]$PythonPath, [string]$Statement) {
+  $exit = 1
+  $lines = @()
+  try {
+    $lines = @(& $PythonPath -c $Statement 2>&1)
+    $exit = $LASTEXITCODE
+  } catch {
+    $lines = @($_.Exception.Message)
+    $exit = 1
+  }
+  $text = @($lines | ForEach-Object { [string]$_ })
+  $errorLine = ''
+  for ($i = $text.Count - 1; $i -ge 0; $i--) {
+    $trimmed = $text[$i].Trim()
+    if ($trimmed) { $errorLine = $trimmed; break }
+  }
+  return @{ exit = $exit; lines = $text; error = $errorLine }
+}
+
+# THE LAST NON-EMPTY LINE OF A SUCCESSFUL STATEMENT - the shape a `print(...)`
+# answer has (a version, a path). '' when the statement failed, and every caller
+# reads that as "unknown" rather than as a value.
+function Get-PythonValue([string]$PythonPath, [string]$Statement) {
+  $check = Invoke-PythonCheck -PythonPath $PythonPath -Statement $Statement
+  if ($check.exit -ne 0) { return '' }
+  $last = ''
+  foreach ($line in @($check.lines)) {
+    $trimmed = ([string]$line).Trim()
+    if ($trimmed) { $last = $trimmed }
+  }
+  return $last
+}
+
+# WHERE pywin32_postinstall.py IS. Two documented layouts: the wheel drops it in
+# <purelib> (site-packages), and a legacy installer put it in the Scripts
+# directory beside the interpreter. A layout with neither returns $null, which the
+# repair reports instead of failing the step on a path error.
+function Find-PyWin32PostInstall([string]$PythonPath) {
+  $dirs = @()
+  $purelib = Get-PythonValue -PythonPath $PythonPath -Statement "import sysconfig;print(sysconfig.get_paths()['purelib'])"
+  if ($purelib) { $dirs += $purelib }
+  $pythonDir = Split-Path -Parent $PythonPath
+  if ($pythonDir) {
+    $dirs += (Join-Path $pythonDir 'Scripts')
+    $dirs += $pythonDir
+  }
+  foreach ($dir in $dirs) {
+    if (-not $dir) { continue }
+    $candidate = Join-Path $dir 'pywin32_postinstall.py'
+    if (Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue) { return $candidate }
+  }
+  return $null
+}
+
+# RUN IT: `-install -silent` first (the documented non-interactive form), then the
+# plain `-install` once, because a build that rejects -silent must not leave the
+# lane dead over an argument. Returns WHAT RAN and how it exited, so the caller's
+# message can say which attempt the DLL error survived.
+function Invoke-PyWin32PostInstall([string]$PythonPath) {
+  $script = Find-PyWin32PostInstall -PythonPath $PythonPath
+  if (-not $script) { return @{ ok = $false; detail = 'pywin32_postinstall.py not found under <purelib> or <Scripts>' } }
+  # THE DETAIL IS CUMULATIVE ON PURPOSE: when the retry is what worked, the guest
+  # log must say that the `-silent` form was REJECTED, or a reader cannot tell a
+  # clean install from a build that needed the fallback - and the marker is the
+  # first evidence in every report about this step.
+  $detail = ''
+  foreach ($extra in @(@('-install', '-silent'), @('-install'))) {
+    $exit = 1
+    try {
+      & $PythonPath $script @extra 2>&1 | Out-Null
+      $exit = $LASTEXITCODE
+    } catch {
+      $exit = -1
+    }
+    $attempt = "$script $($extra -join ' ') -> exit $exit"
+    if (-not $detail) { $detail = $attempt } else { $detail = "$detail; $attempt" }
+    if ($exit -eq 0) { return @{ ok = $true; detail = $detail } }
+  }
+  return @{ ok = $false; detail = $detail }
 }
 
 # J22-13: THE ONLY LOCAL PROOF THAT cua-clip-agent IS RUNNING. `schtasks /run`
@@ -333,6 +455,100 @@ Step 'openssh' {
   Say "sshd: $((Get-Service sshd).Status)"
 }
 
+# WP-1.3/D2 - ONE DIRECTORY THE DESKTOP TOKEN CAN ACTUALLY WRITE.
+#
+# THE REPORTED FAILURE IS A PERMISSION DIALOG, NOT A DOCUMENTATION GAP: a save
+# path under C:\Users\cua is refused, because the desktop process runs the user's
+# FILTERED token at Medium integrity while the profile root it inherits from Setup
+# does not grant that token a write (only the High-IL token an SSH login gets can
+# write there - see the ORACLE O5 contrast). No sentence in a README fixes that, so
+# a dedicated directory is created here with an EXPLICIT DACL and a Medium
+# integrity label, and the relay re-proves the write from the desktop token on
+# every start (published as desktop.workDirWritable).
+#
+# WHY THE ACL IS EXPLICIT RATHER THAN INHERITED: an inherited ACE is a promise
+# somebody else can revoke. `c:\` hands down whatever the image's profile policy
+# says, and the reported guest is exactly the case where that is not a write for
+# the filtered token. `/inheritance:r` replaces the inherited list with the three
+# grants below and nothing else: SYSTEM and Administrators for repair, `cua` for
+# the desktop - each with (OI)(CI)F so subdirectories (a screenshot folder) stay
+# writable without a second trip.
+#
+# WHY THE INTEGRITY LABEL: a Medium label with the default no-write-up policy is
+# what makes the directory writable by the desktop's filtered token AND keeps a
+# High-IL process from being the only one that can write. `(OI)(CI)M` propagates
+# Medium to new children, so a file a tool writes does not inherit a label that
+# would then refuse the next write.
+#
+# WHAT IS FATAL HERE AND WHAT IS NOT: only "the directory could not be created"
+# throws. An icacls failure is RECORDED (aclExit/ilExit in the marker) and left to
+# the relay's desktop-token measurement, because a guest whose ACL did not take is
+# a guest that must SAY SO, not one that must be removed from service.
+Step 'cua-workdir' {
+  $workDir = 'C:\cua-work'
+  $createError = ''
+  try {
+    New-Item -ItemType Directory -Force -Path $workDir -ErrorAction Stop | Out-Null
+  } catch {
+    $createError = $_.Exception.Message
+  }
+  if (-not (Test-Path -LiteralPath $workDir -ErrorAction SilentlyContinue)) {
+    throw "could not create $workDir ($createError)"
+  }
+
+  # `/grant` takes one principal per argument; the machine-qualified `cua` account
+  # is built as ONE token so the colon that introduces the rights list cannot be
+  # read as a variable qualifier.
+  $cuaGrant = "$($env:COMPUTERNAME)\cua:(OI)(CI)F"
+  $aclExit = 1
+  $aclDetail = ''
+  try {
+    $aclOut = @(& icacls.exe $workDir /inheritance:r /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' /grant $cuaGrant 2>&1)
+    $aclExit = $LASTEXITCODE
+    $aclDetail = ((@($aclOut | ForEach-Object { [string]$_ })) -join ' ').Trim()
+  } catch {
+    $aclExit = -1
+    $aclDetail = $_.Exception.Message
+  }
+
+  # The label is set in its own call: `/setintegritylevel` and `/grant` in one
+  # icacls line would make a failure of either indistinguishable from the other,
+  # and the marker records them separately.
+  $ilExit = 1
+  $ilDetail = ''
+  try {
+    $ilOut = @(& icacls.exe $workDir '/setintegritylevel' '(OI)(CI)M' 2>&1)
+    $ilExit = $LASTEXITCODE
+    $ilDetail = ((@($ilOut | ForEach-Object { [string]$_ })) -join ' ').Trim()
+  } catch {
+    $ilExit = -1
+    $ilDetail = $_.Exception.Message
+  }
+
+  # THE WRITE ASSERTION THIS PASS CAN RUN, AND WHAT IT IS NOT WORTH. This token is
+  # SYSTEM in the setup pass and the elevated user in the logon pass, so a success
+  # here does NOT prove the desktop's filtered token can write - that proof is the
+  # relay's probe (WP-3, desktop.workDirWritable) and this field is only "the
+  # directory is not read-only to everything". A failure here is still worth
+  # recording: it is the one case where every downstream write would fail.
+  $probePath = Join-Path $workDir '.firstboot-write'
+  $writeOk = $false
+  try {
+    Set-Content -Path $probePath -Value 'ok' -Encoding ASCII -ErrorAction Stop
+    $writeOk = (Test-Path -LiteralPath $probePath -ErrorAction SilentlyContinue)
+  } catch {
+    $writeOk = $false
+  }
+  if (Test-Path -LiteralPath $probePath -ErrorAction SilentlyContinue) {
+    Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+  }
+
+  if ($aclExit -ne 0) { Say "cua-workdir: icacls exited $($aclExit): $aclDetail" }
+  if ($ilExit -ne 0) { Say "cua-workdir: setintegritylevel exited $($ilExit): $ilDetail" }
+  Say "cua-workdir: $workDir ready (acl=$cuaGrant integrity=M writeProbe=$writeOk)"
+  return @{ workDir = 'C:\cua-work'; acl = 'cua:(OI)(CI)F'; integrity = 'M'; aclExit = $aclExit; ilExit = $ilExit; writeProbe = $writeOk }
+}
+
 Step 'python' {
   $py = Get-RealPython
   if (-not $py) {
@@ -349,9 +565,331 @@ Step 'python' {
 Step 'dsh-cua' {
   $py = Get-RealPython
   if (-not $py) { throw 'python is missing: the python step did not produce a real interpreter' }
-  & $py -m pip install --disable-pip-version-check --no-input '{{DSH_CUA_PIP}}'
+
+  # WP-1.1 - THE SPEC IS THE BACKEND'S PIN, NOT THIS SCRIPT'S CHOICE.
+  # This placeholder is substituted from cua-vm-supervisor.mjs, whose default is
+  # `dsh-cua==0.4.1` (WINDOWS_DSH_CUA_DEFAULT). That is deliberately the SAME
+  # build the D3 hash gate in the `dsh-cua-scale` step below is proven against: a
+  # floating spec would install a wheel whose arithmetic the patch must refuse,
+  # and "the fix was not staged" would read as "the fix does not work" - exactly
+  # the confusion the marker's scriptSha256 was added to end.
+  $spec = '{{DSH_CUA_PIP}}'
+  & $py -m pip install --disable-pip-version-check --no-input $spec
+  $pipExit = $LASTEXITCODE
+  # THE EXIT CODE IS THIS STEP'S RESULT. It used to be discarded, so a resolver
+  # failure ran on into the find_spec line and was reported as "dsh-cua did not
+  # import" - a false statement about the wheel, and a name for the defect that
+  # sends the next reader after the wrong problem (nothing was installed at all).
+  if ($pipExit -ne 0) { throw "pip install '$spec' exited $pipExit; the wheel was not installed" }
+
+  # A FINDER IS NOT PROOF, but it is the cheap "is the package there" answer and it
+  # keeps the old failure message for the case where pip said 0 and installed
+  # nothing. The two assertions below are what the element lane actually needs.
   $mod = & $py -c "import importlib.util,sys; print('yes' if importlib.util.find_spec('dsh_cua') else 'no')"
   if ($mod.Trim() -ne 'yes') { throw 'dsh-cua did not import after pip install' }
+
+  # WP-1.1/D1 - THE LANE IS ASSERTED, AND REPAIRED ONCE BEFORE IT IS ASSERTED
+  # AGAIN. This is the difference between "the wheel resolved" and "the element
+  # lane works": only an EXECUTED import can observe a pywin32 whose DLLs were
+  # never copied out of pywin32_system32.
+  $lane = Invoke-PythonCheck -PythonPath $py -Statement 'import win32ui, win32gui'
+  if ($lane.exit -ne 0) {
+    Say "dsh-cua: the element lane is missing ($($lane.error)); running pywin32_postinstall"
+    $repair = Invoke-PyWin32PostInstall -PythonPath $py
+    Say "dsh-cua: pywin32_postinstall: $($repair.detail)"
+    $lane = Invoke-PythonCheck -PythonPath $py -Statement 'import win32ui, win32gui'
+  }
+  if ($lane.exit -ne 0) {
+    # THROWING IS THE RETRY MECHANISM, NOT A GIVE-UP: `$done` only ever holds
+    # ok:true, so the next firstboot pass (the logon one, running as `cua`) runs
+    # this step again, and the marker's ok:false plus this message is the audit.
+    # Recording ok:true here would make a dead lane PERMANENT and invisible - the
+    # defect this package closes.
+    throw "the element lane is dead: import win32ui failed after pywin32_postinstall ($($lane.error))"
+  }
+
+  # WP-1.2 - THE PATTERN PATH IMPORTS ONE MODULE MORE. element_action* goes
+  # _wrapper_for -> pywinauto.controls.uiawrapper -> base_wrapper -> win32ui, so
+  # win32ui alone does not prove that chain is importable; the module the failure
+  # was actually observed in is imported too.
+  $uia = Invoke-PythonCheck -PythonPath $py -Statement "import pywinauto.controls.uiawrapper; print('UIA_OK')"
+  if ($uia.exit -ne 0) {
+    throw "the element lane is dead: import pywinauto.controls.uiawrapper failed ($($uia.error))"
+  }
+
+  # WP-1.2 - WHAT IS ACTUALLY INSTALLED, MEASURED. Returned as a hashtable so the
+  # Step helper merges it into the `dsh-cua` row (see the annotation handling at
+  # the top of this file): dshCua, pywin32 and uiaLane are FIELDS, not a log line
+  # a reader has to parse out of prose.
+  $dshCuaVersion = Get-PythonValue -PythonPath $py -Statement "import importlib.metadata as m;print(m.version('dsh-cua'))"
+  $pywin32Version = Get-PythonValue -PythonPath $py -Statement "import importlib.metadata as m;print(m.version('pywin32'))"
+  Say "dsh-cua: element lane OK (pywin32 $pywin32Version, dsh-cua $dshCuaVersion)"
+  return @{ dshCua = $dshCuaVersion; pywin32 = $pywin32Version; uiaLane = $true }
+}
+
+# THE FUNCTIONAL PROBE FOR THE SCALE ARITHMETIC - NO WINDOW, NO DESKTOP, NO
+# SESSION. Appendix A of the SOL fixes its shape: 64x48 of BGRA, a client-area
+# crop of (8,8,56,40) -> a 48x32 image, no downscale.
+#
+# WHAT IT PROVES: the UNPATCHED function divides the WINDOW (64/48 = 1.333333 and
+# 48/32 = 1.5) while `scale` stays 1.0 - three numbers that cannot all be right.
+# The patched one divides the IMAGE's own size (48/48, 32/32) and answers 1.0/1.0.
+#
+# Returns 'SCALE_OK', 'SCALE_BAD:<payload>' or 'unverified:<why>'. It NEVER throws:
+# a probe that cannot run is a fact to record, not a step to fail.
+function Invoke-ScaleProbe([string]$PythonPath) {
+  $statement = "import dsh_cua.bridge as b; d,s = b._pixels_to_image_bytes(bytes(64*48*4), 64, 48, (8, 8, 56, 40), image_format='jpeg', quality=80, max_dim=0); ok = (s['width'], s['height']) == (48, 32) and s['scale'] == s['scale_x'] == s['scale_y'] == 1.0; print('SCALE_OK' if ok else 'SCALE_BAD', s)"
+  $check = Invoke-PythonCheck -PythonPath $PythonPath -Statement $statement
+  if ($check.exit -ne 0) { return "unverified:$($check.error)" }
+  $line = ''
+  foreach ($text in @($check.lines)) {
+    $trimmed = ([string]$text).Trim()
+    if ($trimmed) { $line = $trimmed }
+  }
+  if ($line -like 'SCALE_OK*') { return 'SCALE_OK' }
+  if ($line -like 'SCALE_BAD*') { return ('SCALE_BAD:' + $line.Substring('SCALE_BAD'.Length).Trim()) }
+  return 'unverified:unexpected-probe-output'
+}
+
+# A STALE .pyc WOULD KEEP THE OLD CODE RUNNING: the interpreter's cache key is the
+# source's mtime and size, and this patch can land inside the same second with the
+# same size class. So the cache is dropped BEFORE the re-import, and again after any
+# rollback (an attempt that failed to import has already written a cache entry for
+# the patched source).
+function Clear-BridgePyc([string]$BridgePath) {
+  if (-not $BridgePath) { return }
+  $cacheDir = Join-Path (Split-Path -Parent $BridgePath) '__pycache__'
+  Get-ChildItem -LiteralPath $cacheDir -Filter 'bridge.*.pyc' -File -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+# PUT THE ORIGINAL BYTES BACK - AND SAY WHETHER IT WORKED.
+#
+# EVERY refusal that happens after the first byte of the patched file could have
+# been written goes through here, THE WRITE ITSELF INCLUDED:
+# [System.IO.File]::WriteAllText opens the file with Create (truncate) before it
+# writes a byte, so a throw in the middle - a full disk, an AV lock, a sandbox
+# denial - can leave bridge.py EMPTY or half-written. The bytes read at the top of
+# the step are the only copy, so the caller restores from them and reports the
+# MEASURED outcome.
+#
+# WHY THIS RETURNS A BOOLEAN INSTEAD OF JUST DOING IT: "reverted" is a claim about
+# the guest, and a restore that is claimed but not measured is the same class of
+# lie as a patch that is claimed but not applied. The caller records this value as
+# `restoreOk` in the marker row and never says "reverted" without it.
+function Restore-BridgeSource([string]$BridgePath, [byte[]]$OriginalBytes, [string]$ExpectedHash = '') {
+  if (-not $BridgePath) { return $false }
+  if ($null -eq $OriginalBytes) { return $false }
+  if ($OriginalBytes.Length -eq 0) { return $false }
+  try {
+    [System.IO.File]::WriteAllBytes($BridgePath, $OriginalBytes)
+  } catch {
+    return $false
+  }
+  # A restored source with a cache entry for the PATCHED source is still a guest
+  # running the wrong code, so the cache goes too - and a cache that cannot be
+  # cleared means the restore did not do its job.
+  Clear-BridgePyc -BridgePath $BridgePath
+  $cacheDir = Join-Path (Split-Path -Parent $BridgePath) '__pycache__'
+  if (@(Get-ChildItem -LiteralPath $cacheDir -Filter 'bridge.*.pyc' -File -ErrorAction SilentlyContinue).Count -gt 0) { return $false }
+  if (-not $ExpectedHash) { return $true }
+  # BYTES, NOT INTENT: the file on disk is compared with the hash the gate measured
+  # before the patch, so a partial write can never be reported as a restore.
+  try {
+    return ((Get-FileHash -LiteralPath $BridgePath -Algorithm SHA256).Hash.ToLowerInvariant() -eq $ExpectedHash)
+  } catch {
+    return $false
+  }
+}
+
+# WP-1.4/D3 - THE SCALE ARITHMETIC, CORRECTED UNDER A GATE AND PROVEN BY A PROBE.
+#
+# THE DEFECT (upstream bridge.py:474-489): `_pixels_to_image_bytes` receives the
+# RAW WINDOW dimensions (w2, h2) and the client-area crop, crops the image, and
+# then computes `scale_x = w2/ew`, `scale_y = h2/eh`. With a 640x480 window whose
+# client area is 624x441 that reports 1.025641 / 1.088435 beside `scale: 1.0` - the
+# three numbers the report found. Nothing was resized: the denominator is simply
+# the wrong rectangle. The correct base is the image's own size AFTER the crop (the
+# same rectangle `capture_window` already returns as `bounds`), which is what the
+# two literal replacements below install.
+#
+# WHY A HASH-GATED IN-PLACE PATCH AND NOT A WRAPPER OR A PROFILE LAYER: there is no
+# DSH profile loader row inside the guest to patch (the relay spawns
+# `python -m dsh_cua.server` itself), and the relay's `child_argv()` splits the
+# server command with a plain `.split()`, so a wrapper cannot carry a quoted
+# `-c "..."` program without moving the spawn path. Three literal edits in a file
+# whose version AND SHA-256 are pinned - refusing on any mismatch - is the smaller
+# and LOUDER change: a refusal is a sentence the doctor repeats.
+#
+# NEVER THROWS. Every refusal is a recorded fact (`scaleFix:'skipped:<why>'`),
+# because a patch that silently did not apply is worse than one that says so. A
+# refusal that had to UNDO a write also records `restoreOk` - the measured result of
+# the rollback - and the log says "reverted" only when that value is true.
+Step 'dsh-cua-scale' {
+  $expectedVersion = '0.4.1'
+  $expectedHash = '59280ee9079cc09aa94b3813fd7a7665cfebffe68fb7259b752e161abf1f9209'
+
+  $py = Get-RealPython
+  if (-not $py) {
+    Say 'dsh-cua-scale: skipped (no python interpreter)'
+    return @{ scaleFix = 'skipped:no-python'; scaleHash = ''; scaleProbe = 'unverified:no-python' }
+  }
+
+  # WHERE THE FILE IS, WITHOUT IMPORTING IT. `find_spec` resolves the origin path
+  # and executes nothing - bridge.py imports `windll` at module level, so importing
+  # it just to learn its filename would make this step depend on the lane it is
+  # meant to help.
+  $bridgePath = Get-PythonValue -PythonPath $py -Statement "import importlib.util;print(importlib.util.find_spec('dsh_cua.bridge').origin)"
+  if (-not $bridgePath -or -not (Test-Path -LiteralPath $bridgePath -ErrorAction SilentlyContinue)) {
+    Say "dsh-cua-scale: skipped (bridge.py not found: '$bridgePath')"
+    return @{ scaleFix = 'skipped:no-file'; scaleHash = ''; scaleProbe = 'unverified:no-file' }
+  }
+
+  $measureHash = ''
+  try { $measureHash = (Get-FileHash -LiteralPath $bridgePath -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $measureHash = '' }
+
+  # GATE 1 - THE VERSION. The arithmetic below is proven against this build only.
+  # `dsh-cua==0.4.1` is the backend's default spec, so a guest that got a
+  # different wheel is a guest whose patch would be guessed rather than verified.
+  $dshCuaVersion = Get-PythonValue -PythonPath $py -Statement "import importlib.metadata as m;print(m.version('dsh-cua'))"
+  if ($dshCuaVersion -ne $expectedVersion) {
+    Say "dsh-cua-scale: skipped (dsh-cua '$dshCuaVersion' is not the pinned '$expectedVersion')"
+    return @{ scaleFix = 'skipped:version-mismatch'; scaleHash = $measureHash; scaleProbe = 'unverified:version-mismatch' }
+  }
+
+  # CRLF -> LF BEFORE ANY MATCHING OR WRITING. The wheel may ship either ending and
+  # the anchors below are written once, in LF; the write below is LF too, so a
+  # patched file is one consistent shape instead of a mixed one.
+  $originalBytes = $null
+  $text = ''
+  try {
+    $originalBytes = [System.IO.File]::ReadAllBytes($bridgePath)
+    $text = [System.Text.Encoding]::UTF8.GetString($originalBytes).Replace("`r`n", "`n")
+  } catch {
+    Say "dsh-cua-scale: skipped (bridge.py unreadable: $($_.Exception.Message))"
+    return @{ scaleFix = 'skipped:no-file'; scaleHash = $measureHash; scaleProbe = 'unverified:unreadable' }
+  }
+
+  # ALREADY PATCHED IS A POSITIVE STATE, AND IT IS CHECKED BEFORE THE HASH GATE:
+  # the patch changes the file, so a second run can never hash-match the pinned
+  # value. This is gate 4 of Appendix A moved first, because it is the only order in
+  # which idempotence (A6: a second -Force run reports `already` and does not insert
+  # a second `base_w`) can be true at all.
+  if ($text.Contains('base_w, base_h = img.size')) {
+    $alreadyProbe = Invoke-ScaleProbe -PythonPath $py
+    Say "dsh-cua-scale: already patched (probe $alreadyProbe)"
+    return @{ scaleFix = 'already'; scaleHash = $measureHash; scaleProbe = $alreadyProbe }
+  }
+
+  # GATE 2 - THE HASH OF THE FILE THIS WAS PROVEN AGAINST.
+  if ($measureHash -ne $expectedHash) {
+    Say "dsh-cua-scale: skipped (sha256 $measureHash is not the pinned $expectedHash)"
+    return @{ scaleFix = 'skipped:hash-mismatch'; scaleHash = $measureHash; scaleProbe = 'unverified:hash-mismatch' }
+  }
+
+  # GATE 3 - BOTH ANCHORS, EXACTLY ONCE. `count == 1` on each is what makes a
+  # literal replacement safe: zero means the wheel drifted, more than one means the
+  # replacement would land in a place nobody verified.
+  $anchorA = @'
+    if crop is not None:
+        img = img.crop(crop)
+    scale = 1.0
+'@
+  $replacementA = @'
+    if crop is not None:
+        img = img.crop(crop)
+    # [cua-D3] the rectangle this image covers, AFTER the client-area crop and
+    # BEFORE any downscale. scale_x/scale_y must be measured against this, not
+    # against the full window the raw BGRA buffer was taken from.
+    base_w, base_h = img.size
+    scale = 1.0
+'@
+  $anchorB = @'
+              "scale_x": round(w2 / ew, 6) if ew else 1.0,
+              "scale_y": round(h2 / eh, 6) if eh else 1.0,
+'@
+  $replacementB = @'
+              "scale_x": round(base_w / ew, 6) if ew else 1.0,
+              "scale_y": round(base_h / eh, 6) if eh else 1.0,
+'@
+  # A file edited on a Windows host can carry CRLF inside the here-strings; the
+  # text they are matched against was normalised above, so they are normalised too.
+  $anchorA = $anchorA.Replace("`r`n", "`n")
+  $replacementA = $replacementA.Replace("`r`n", "`n")
+  $anchorB = $anchorB.Replace("`r`n", "`n")
+  $replacementB = $replacementB.Replace("`r`n", "`n")
+
+  $anchorACount = ([regex]::Matches($text, [regex]::Escape($anchorA))).Count
+  $anchorBCount = ([regex]::Matches($text, [regex]::Escape($anchorB))).Count
+  if ($anchorACount -eq 0 -or $anchorBCount -eq 0) {
+    Say "dsh-cua-scale: skipped (anchor missing: A=$anchorACount B=$anchorBCount)"
+    return @{ scaleFix = 'skipped:anchor-missing'; scaleHash = $measureHash; scaleProbe = 'unverified:anchor-missing' }
+  }
+  if ($anchorACount -ne 1 -or $anchorBCount -ne 1) {
+    Say "dsh-cua-scale: skipped (anchor ambiguous: A=$anchorACount B=$anchorBCount)"
+    return @{ scaleFix = 'skipped:anchor-ambiguous'; scaleHash = $measureHash; scaleProbe = 'unverified:anchor-ambiguous' }
+  }
+
+  $patched = $text.Replace($anchorA, $replacementA).Replace($anchorB, $replacementB)
+  if (($patched -eq $text) -or (-not $patched.Contains('base_w, base_h = img.size'))) {
+    Say 'dsh-cua-scale: skipped (the two replacements produced no change)'
+    return @{ scaleFix = 'skipped:anchor-missing'; scaleHash = $measureHash; scaleProbe = 'unverified:no-change' }
+  }
+
+  $writeError = ''
+  $restoreOk = $true
+  try {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($bridgePath, $patched, $utf8NoBom)
+  } catch {
+    $writeError = $_.Exception.Message
+    # THE WRITE MAY ALREADY HAVE TRUNCATED THE FILE (Create runs before the first
+    # byte). Nothing may be reported as "skipped, nothing happened" until the
+    # original bytes are MEASURED back in place.
+    $restoreOk = Restore-BridgeSource -BridgePath $bridgePath -OriginalBytes $originalBytes -ExpectedHash $measureHash
+  }
+  if ($writeError) {
+    if ($restoreOk) {
+      Say "dsh-cua-scale: skipped (bridge.py not writable: $writeError; the original bytes are back in place)"
+    } else {
+      Say "dsh-cua-scale: NOT RESTORED (bridge.py was not writable: $writeError, and the rollback failed too) - $bridgePath may be truncated or partly written; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ scaleFix = 'skipped:write-failed'; scaleHash = $measureHash; scaleProbe = 'unverified:write-failed'; restoreOk = $restoreOk }
+  }
+
+  Clear-BridgePyc -BridgePath $bridgePath
+
+  # THE PATCH IS NOT CALLED `applied` UNTIL THE MODULES STILL IMPORT. A bridge.py
+  # that no longer loads is worse than an unpatched one, so the original bytes (in
+  # hand since the read above) go back and the refusal is recorded.
+  $importCheck = Invoke-PythonCheck -PythonPath $py -Statement "import dsh_cua.bridge, dsh_cua.server; print('IMPORT_OK')"
+  if ($importCheck.exit -ne 0) {
+    $restoreOk = Restore-BridgeSource -BridgePath $bridgePath -OriginalBytes $originalBytes -ExpectedHash $measureHash
+    if ($restoreOk) {
+      Say "dsh-cua-scale: import failed after the patch, reverted ($($importCheck.error))"
+    } else {
+      Say "dsh-cua-scale: NOT RESTORED after a failed import ($($importCheck.error)) - $bridgePath is left patched; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ scaleFix = 'skipped:import-failed'; scaleHash = $measureHash; scaleProbe = 'unverified:import-failed'; restoreOk = $restoreOk }
+  }
+
+  # THE SECOND CHECK IS THE ARITHMETIC ITSELF, which is the whole point of the
+  # change. `SCALE_BAD` here means the numbers are still wrong, so the patch is
+  # rolled back and reported; `unverified:` means the probe could not run, and the
+  # patch stays with that fact recorded rather than being called a success.
+  $scaleProbe = Invoke-ScaleProbe -PythonPath $py
+  if ($scaleProbe -like 'SCALE_BAD*') {
+    $restoreOk = Restore-BridgeSource -BridgePath $bridgePath -OriginalBytes $originalBytes -ExpectedHash $measureHash
+    if ($restoreOk) {
+      Say "dsh-cua-scale: probe says $scaleProbe after the patch, reverted"
+    } else {
+      Say "dsh-cua-scale: NOT RESTORED after a bad probe ($scaleProbe) - $bridgePath is left patched; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ scaleFix = 'skipped:probe-failed'; scaleHash = $measureHash; scaleProbe = $scaleProbe; restoreOk = $restoreOk }
+  }
+
+  Say "dsh-cua-scale: applied + $scaleProbe"
+  return @{ scaleFix = 'applied'; scaleHash = $measureHash; scaleProbe = $scaleProbe }
 }
 
 Step 'clipboard-tasks' {

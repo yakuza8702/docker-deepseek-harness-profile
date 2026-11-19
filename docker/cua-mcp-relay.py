@@ -47,6 +47,21 @@ client sends `{"jsonrpc":...` first, so the two are unambiguous. The probe is
 handled OUTSIDE the single-session lock, so a health check cannot be blocked by
 (or block) a live MCP session.
 
+DESKTOP FACTS: THE ONE THING MEASURED, NOT BRIDGED
+---------------------------------------------------
+Every claim this repo makes about the desktop used to be an assumption formed on
+the host. The listener mode is the only process that holds the desktop token, so
+it is the only one that can answer: does `win32ui` import, does the pywinauto UIA
+wrapper import, does the installed `dsh_cua.bridge` carry the corrected scale
+arithmetic, and can THIS token write `C:\\cua-work` - and its own profile root
+(the measured contrast, never a "fix")? It answers once, in a daemon thread
+started AFTER the listener binds (never in front of accept), bounded at 20 s, and
+writes one JSON object to `C:\\cua-work\\cua-desktop-facts.json`, falling back to
+`%TEMP%` when the work directory is not writable. A failure writes the same file
+with `measured:false` and the reason. No pump, no file descriptor and no argument
+changes: `--ping` still answers while it runs, and no byte of the MCP stream is
+touched.
+
 MODES
 -----
   python cua-mcp-relay.py --serve     listen 127.0.0.1:<port>, one client at a
@@ -88,6 +103,7 @@ exercised on Linux (`DSH_CUA_MCP_SERVER=cat` is a byte-exact echo server).
 """
 
 import errno
+import json
 import os
 import queue
 import shlex
@@ -122,6 +138,49 @@ CHUNK = 65536
 # allocate one and leave the blank window on the user's desktop that the
 # windowless-autostart fix exists to prevent.
 CREATE_NO_WINDOW = 0x08000000
+
+# --------------------------------------------------------------------------- #
+# the desktop-facts contract (paths, the two probes, the one bound)
+# --------------------------------------------------------------------------- #
+# WHY IN THIS PROCESS: the guest tools run in the logged-on user's session and
+# this relay is the only process on the guest that shares that token. The host
+# can ask the question but cannot answer it, so the answer is measured here
+# once and left in a file the client reads (contract Appendix B).
+DESKTOP_FACTS_SCHEMA = 1
+DESKTOP_FACTS_NAME = 'cua-desktop-facts.json'
+# The directory cua-firstboot.ps1 creates with an explicit DACL and a Medium
+# integrity label. The relay never creates it: a directory THIS process made
+# would prove nothing about the token the tools run as.
+WORK_DIR = 'C:\\cua-work'
+WRITE_PROBE_NAME = '.cua-write-probe'
+# Every child spawned for a measurement is bounded, and the whole pass is one
+# shot. The listener never waits for any of it.
+FACTS_PROBE_TIMEOUT = 20
+# ONE subprocess for both versions, so the cheapest facts (what is installed)
+# are also the least intrusive: importlib.metadata reads no modules.
+VERSION_PROBE = (
+    'import json, importlib.metadata as md\n'
+    'def one(name):\n'
+    '    try:\n'
+    '        return md.version(name)\n'
+    '    except Exception:\n'
+    "        return ''\n"
+    'print(json.dumps({"dsh-cua": one("dsh-cua"), '
+    '"pywin32": one("pywin32")}))'
+)
+# WHERE the module lives, without executing it: bridge.py imports windll at
+# module level, so a diagnostic must never `import dsh_cua.bridge` (and even
+# find_spec would import the package's __init__). The distribution's own file
+# table answers the same question with no module code running at all.
+SCALE_PROBE = (
+    'import importlib.metadata as md\n'
+    'try:\n'
+    "    dist = md.distribution('dsh-cua')\n"
+    "    print(dist.locate_file('dsh_cua/bridge.py'))\n"
+    'except Exception:\n'
+    "    print('')\n"
+)
+
 
 _log_lock = threading.Lock()
 
@@ -301,6 +360,396 @@ def spawn_child(argv):
 
 
 # --------------------------------------------------------------------------- #
+# desktop facts: measured by the token that actually runs the tools
+# --------------------------------------------------------------------------- #
+def utc_now():
+    """Appendix B's `at`: UTC, whole seconds, one spelling."""
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def remaining(deadline):
+    """Seconds left in the measurement budget, or None when unbounded.
+
+    The contract bounds the WHOLE self-check at one 20 s window, not each of
+    its four children: a guest whose interpreter hangs must not hold the pass
+    for 4 x 20 s.
+    """
+    if deadline is None:
+        return None
+    left = deadline - time.time()
+    return left if left > 0 else 0.0
+
+
+def short_error(exc, limit=160):
+    """One-line form of an exception, for a JSON field that must stay small."""
+    text = str(exc)
+    name = type(exc).__name__
+    line = '%s: %s' % (name, text) if text else name
+    return line.replace('\r', ' ').replace('\n', ' ')[:limit]
+
+
+def probe_child(argv, timeout=FACTS_PROBE_TIMEOUT):
+    """Run ONE short-lived diagnostic child: captured, bounded, never raises.
+
+    Deliberately NOT spawn_child: the MCP child is a long-lived byte pipe whose
+    stdio IS the session, while a probe must inherit neither end of the bridge
+    (a probe that wrote to fd 1 would corrupt the JSON-RPC stream). So stdin is
+    NUL, both outputs are captured as text, and a timeout kills the child
+    instead of wedging the caller.
+
+    Returns (rc, out, err). rc == -1 means the child never started, which a
+    caller must not confuse with "started and failed".
+    """
+    if not argv:
+        return (-1, '', 'empty argv')
+    kwargs = {
+        'stdin': subprocess.DEVNULL,
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.PIPE,
+        'timeout': timeout,
+        'close_fds': True,
+        # Text with a replacement policy: a traceback full of the guest's ANSI
+        # code page must never raise a UnicodeDecodeError inside a probe.
+        'universal_newlines': True,
+        'errors': 'replace',
+    }
+    if os.name == 'nt':
+        kwargs['creationflags'] = CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run(list(argv), **kwargs)
+    except subprocess.TimeoutExpired:
+        return (-9, '', 'timeout after %s s' % (timeout,))
+    except Exception as exc:
+        return (-1, '', short_error(exc))
+    out = proc.stdout if isinstance(proc.stdout, str) else ''
+    err = proc.stderr if isinstance(proc.stderr, str) else ''
+    code = proc.returncode
+    return (-1 if code is None else code, out, err)
+
+
+def run_python_probe(python, code, errors, label, timeout=FACTS_PROBE_TIMEOUT,
+                     deadline=None):
+    """One bounded `python -c` in the interpreter that runs the server.
+
+    Returns (ok, ran, out, err). `ran` separates "this interpreter cannot be
+    started" (a host/payload problem) from "the import failed" (the measured
+    dead lane the tools hit), and the failure reason is appended to `errors` so
+    the facts file explains itself instead of reporting a bare boolean.
+    """
+    if not python:
+        errors.append('%s: no interpreter' % (label,))
+        return (False, False, '', 'no interpreter')
+    budget = remaining(deadline)
+    if budget is not None and budget <= 0:
+        errors.append('%s: the %d s budget was spent before this probe'
+                      % (label, FACTS_PROBE_TIMEOUT))
+        return (False, False, '', 'budget spent')
+    if budget is not None:
+        timeout = max(0.1, min(timeout, budget))
+    rc, out, err = probe_child([python, '-c', code], timeout=timeout)
+    if rc == -1:
+        errors.append('%s: cannot start %s (%s)' % (label, python, err))
+        return (False, False, out, err)
+    if rc != 0:
+        detail = [line.strip() for line in (err or out or '').splitlines() if line.strip()]
+        errors.append('%s: %s' % (label, detail[-1] if detail else 'exit %d' % (rc,)))
+    return (rc == 0, True, out, err)
+
+
+def last_json_object(text):
+    """The LAST JSON object in a captured stream, or None.
+
+    A probe's stdout can carry an interpreter banner before the one line that
+    matters; the file readers (host side) apply the same rule.
+    """
+    if not text:
+        return None
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith('{') and line.endswith('}'):
+            try:
+                return json.loads(line)
+            except ValueError:
+                return None
+    return None
+
+
+def current_user():
+    """The account the desktop token runs as; never empty when the OS knows it.
+
+    A scheduled task can be started with a trimmed environment, so the env vars
+    are a fast path and getpass is the floor - the field is what a JURY report
+    reads to prove WHICH token measured the rest.
+    """
+    for name in ('USERNAME', 'USER'):
+        value = (os.environ.get(name) or '').strip()
+        if value:
+            return value
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:
+        return ''
+
+
+def profile_root():
+    """The logged-on user's profile root: the measured contrast, not the fix.
+
+    A Medium-integrity desktop token cannot write here on the shipped guest,
+    which is exactly why the work directory exists; reporting it keeps that
+    fact visible instead of assumed.
+    """
+    if os.name == 'nt':
+        return (os.environ.get('USERPROFILE') or '').strip()
+    return (os.environ.get('HOME') or '').strip()
+
+
+def current_session_id():
+    """The Windows session this process lives in (2 is the desktop), or None.
+
+    ctypes only on Windows: this is a fact about the guest, and on a Linux host
+    (where the pump is exercised) there is nothing to report.
+    """
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        value = ctypes.c_ulong(0)
+        answered = ctypes.windll.kernel32.ProcessIdToSessionId(
+            ctypes.c_ulong(os.getpid()), ctypes.byref(value))
+        return int(value.value) if answered else None
+    except Exception:
+        return None
+
+
+def write_probe(directory, errors=None, label='write'):
+    """Write-then-delete one byte file as THIS token. Both halves must work.
+
+    A create that cannot be removed is not writability: the next probe would
+    meet a file it did not make. Anything left behind is cleaned up quietly so
+    a failed measurement never becomes the next measurement's false positive.
+    """
+    if not directory:
+        if errors is not None:
+            errors.append('%s: no directory' % (label,))
+        return False
+    path = os.path.join(directory, WRITE_PROBE_NAME)
+    try:
+        handle = open(path, 'wb')
+        try:
+            handle.write(b'ok')
+        finally:
+            handle.close()
+    except Exception as exc:
+        if errors is not None:
+            errors.append('%s: %s' % (label, short_error(exc)))
+        return False
+    try:
+        os.remove(path)
+    except Exception as exc:
+        if errors is not None:
+            errors.append('%s: wrote but cannot delete (%s)' % (label, short_error(exc)))
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def measure_scale_fix(python, errors, deadline=None):
+    """'applied' when the INSTALLED bridge.py carries the corrected ratios.
+
+    A source read, exactly as Appendix B asks: the D3 patch names its own crop
+    size (`base_w`), so its presence in the module the server imports IS the
+    fact. Nothing here re-runs the patch or trusts the firstboot marker - an
+    unpatched or absent module is reported as `skipped:<why>`, never as
+    `applied`.
+    """
+    ok, ran, out, _err = run_python_probe(python, SCALE_PROBE, errors, 'scaleFix',
+                                           deadline=deadline)
+    if not ran:
+        return 'unverified:no interpreter'
+    if not ok:
+        # The distribution is not importable in this interpreter (or not
+        # installed at all): the patched file cannot be checked.
+        return 'skipped:no-file'
+    lines = [line.strip() for line in (out or '').splitlines() if line.strip()]
+    origin = lines[-1] if lines else ''
+    if not origin or not origin.lower().endswith('.py') or not os.path.isfile(origin):
+        # Nothing installed, or nothing that is a source file: the patched
+        # function cannot be checked, so claiming any state would be a guess.
+        return 'skipped:no-file'
+    try:
+        handle = open(origin, 'rb')
+        try:
+            source = handle.read(2 * 1024 * 1024).decode('utf-8', 'replace')
+        finally:
+            handle.close()
+    except Exception as exc:
+        errors.append('scaleFix: %s' % (short_error(exc),))
+        return 'unverified:unreadable source'
+    return 'applied' if 'base_w' in source else 'skipped:anchor'
+
+
+def facts_temp_dir():
+    """`%TEMP%` (the documented fallback), else the platform temp directory."""
+    for name in ('TEMP', 'TMP'):
+        value = (os.environ.get(name) or '').strip().strip('"')
+        if value and os.path.isdir(value):
+            return value
+    try:
+        directory = tempfile.gettempdir()
+    except Exception:
+        return ''
+    return directory if directory and os.path.isdir(directory) else ''
+
+
+def empty_facts():
+    """Every Appendix B key, with unknown values (measured stays false)."""
+    return {
+        'schema': DESKTOP_FACTS_SCHEMA,
+        'measured': False,
+        'at': utc_now(),
+        'user': current_user(),
+        'session': current_session_id(),
+        'python': '',
+        'dshCuaVersion': '',
+        'pywin32Version': '',
+        'win32ui': False,
+        'uiaLane': False,
+        'scaleFix': 'unverified:not measured',
+        'workDir': WORK_DIR,
+        'workDirWritable': False,
+        'profileRootWritable': False,
+        'source': '',
+        'error': '',
+    }
+
+
+def write_desktop_facts(facts):
+    """Write the one JSON object where the client looks. Returns (path, source).
+
+    The work directory is the documented home; `%TEMP%` is the fallback that
+    must work precisely when the work-dir probe just failed - a guest whose
+    DACL is wrong still has to be able to SAY so. Never raises: a measurement
+    that cannot be published is logged by the caller, not thrown at a thread.
+    """
+    candidates = (
+        (os.path.join(WORK_DIR, DESKTOP_FACTS_NAME) if WORK_DIR else '', 'cua-work'),
+        (os.path.join(facts_temp_dir(), DESKTOP_FACTS_NAME), 'temp'),
+    )
+    for path, source in candidates:
+        parent = os.path.dirname(path) if path else ''
+        if not path or not parent or not os.path.isdir(parent):
+            continue
+        facts['source'] = source
+        try:
+            payload = json.dumps(facts, ensure_ascii=True, sort_keys=True)
+        except Exception:
+            facts['source'] = 'none'
+            return ('', 'none')
+        try:
+            handle = open(path, 'w')
+            try:
+                handle.write(payload + '\n')
+            finally:
+                handle.close()
+        except Exception:
+            continue
+        return (path, source)
+    facts['source'] = 'none'
+    return ('', 'none')
+
+
+def collect_desktop_facts(deadline=None):
+    """Measure Appendix B in ONE pass bounded by a single 20 s budget.
+
+    Callers must be ready for a raise (publish_desktop_facts turns one into a
+    written failure file): a measurement that cannot even start must still be
+    a file the host can read, because "the guest said nothing" and "the guest
+    said it is blind" are different diagnoses.
+    """
+    if deadline is None:
+        deadline = time.time() + FACTS_PROBE_TIMEOUT
+    errors = []
+    facts = empty_facts()
+    python = resolve_python()
+    facts['python'] = python or ''
+
+    ok, version_ran, out, _err = run_python_probe(
+        python, VERSION_PROBE, errors, 'versions', deadline=deadline)
+    if ok:
+        parsed = last_json_object(out)
+        if isinstance(parsed, dict):
+            facts['dshCuaVersion'] = str(parsed.get('dsh-cua') or '')
+            facts['pywin32Version'] = str(parsed.get('pywin32') or '')
+        else:
+            errors.append('versions: unparseable answer')
+
+    facts['win32ui'], ui_ran, _ui_out, _ui_err = run_python_probe(
+        python, 'import win32ui', errors, 'win32ui', deadline=deadline)
+    facts['uiaLane'], uia_ran, _uia_out, _uia_err = run_python_probe(
+        python, 'import pywinauto.controls.uiawrapper', errors, 'uiaLane',
+        deadline=deadline)
+    facts['scaleFix'] = measure_scale_fix(python, errors, deadline=deadline)
+    facts['workDirWritable'] = write_probe(WORK_DIR, errors, 'workDir')
+    facts['profileRootWritable'] = write_probe(profile_root(), errors, 'profileRoot')
+
+    # measured is TRUE only when the interpreter answered all three lane
+    # questions. A probe that never ran (no interpreter, budget spent) means the
+    # lane is UNKNOWN, and the consumer contract reads measured:false as "every
+    # field unknown" - reporting it as a measured dead lane instead would be the
+    # same class of lie this contract removes.
+    lane = (('versions', version_ran), ('win32ui', ui_ran), ('uiaLane', uia_ran))
+    facts['measured'] = all(ran for _label, ran in lane)
+    if not facts['measured']:
+        silent = ', '.join(label for label, ran in lane if not ran)
+        errors.append('not measured (%s did not run in %s)'
+                      % (silent, python or 'no interpreter'))
+    facts['error'] = '; '.join(errors)[:600]
+    return facts
+
+
+def publish_desktop_facts():
+    """Measure once, write once, log once. Never raises, never blocks a pump.
+
+    Runs in its own daemon thread, started AFTER the listener binds, so the
+    bridge is already accepting sessions while this measures. Local to the
+    guest, bounded by FACTS_PROBE_TIMEOUT, sharing no state with the pumps.
+    """
+    started = time.time()
+    try:
+        facts = collect_desktop_facts()
+    except Exception as exc:
+        facts = empty_facts()
+        facts['error'] = 'collect: %s' % (short_error(exc),)
+    try:
+        path, source = write_desktop_facts(facts)
+    except Exception as exc:
+        path, source = ('', 'none')
+        facts['source'] = 'none'
+        facts['error'] = ('%s; write: %s' % (facts.get('error', ''),
+                                             short_error(exc))).strip('; ')[:600]
+    elapsed = time.time() - started
+    event('desktop-facts', 'measured=%s source=%s win32ui=%s uiaLane=%s '
+          'scaleFix=%s workDirWritable=%s profileRootWritable=%s '
+          'elapsed=%.2fs path="%s" error="%s"' % (
+              'true' if facts.get('measured') else 'false',
+              source or 'none',
+              'true' if facts.get('win32ui') else 'false',
+              'true' if facts.get('uiaLane') else 'false',
+              facts.get('scaleFix') or '',
+              'true' if facts.get('workDirWritable') else 'false',
+              'true' if facts.get('profileRootWritable') else 'false',
+              elapsed,
+              path,
+              (facts.get('error') or '')[:200],
+          ))
+    return facts
+
+
+# --------------------------------------------------------------------------- #
 # --serve
 # --------------------------------------------------------------------------- #
 class Relay(object):
@@ -409,6 +858,20 @@ class Relay(object):
                 proc.kill()
             except Exception:
                 pass
+
+    # -- desktop facts ------------------------------------------------------ #
+    def publish_desktop_facts(self):
+        """Thread target for the ONE background self-check.
+
+        Deliberately thin: the module-level publish_desktop_facts() does the
+        measuring and the logging, and this wrapper exists so that a raise
+        inside it lands in the event log instead of killing the thread with a
+        traceback nobody can read (pythonw.exe has no stderr).
+        """
+        try:
+            publish_desktop_facts()
+        except Exception as exc:
+            event('desktop-facts-failed', repr(exc))
 
     # -- classification ----------------------------------------------------- #
     def classify(self, conn):
@@ -541,6 +1004,14 @@ class Relay(object):
             return 1
         event('listen', '%s:%d child="%s"' % (LOOPBACK, self.port, ' '.join(child_argv())))
         note('listening on %s:%d' % (LOOPBACK, self.port))
+        # ONE background self-check, and only AFTER the listener exists: a
+        # measurement in front of accept() would be an outage, and the listener
+        # is what makes a client wait. Daemon, never joined, and wrapped, so a
+        # raise inside it cannot take the listener down with it.
+        facts_thread = threading.Thread(target=self.publish_desktop_facts,
+                                        name='desktop-facts')
+        facts_thread.daemon = True
+        facts_thread.start()
         try:
             while True:
                 try:

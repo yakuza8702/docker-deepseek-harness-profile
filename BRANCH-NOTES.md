@@ -2940,3 +2940,265 @@ helper tools while offline (D3) — `windows_desktop`/`windows_mcp_doctor` must 
 callable to explain an offline bridge. A repair is one SSH child and one PowerShell
 start per window, so on a guest whose PowerShell is itself broken the record is a
 failure with a `detail`, not an exception and not a retry storm (60 s → 5 min).
+
+## 28. Branch `cua-vm-improve` — 2026-11-19: what the guest installed, what the receipt meant, and a boot race that was called a failure
+
+A Windows guest reported "the element tools fail and the desktop tools disagree
+with each other". Seven defects came out of it, and only four were code this
+repository owns: an unpinned `pip install` whose only gate never imported a
+submodule (`win32ui` dead, `ImportError` at the first pattern action), an
+unwritable `C:\Users\cua` for the token the relay actually runs as, a scale
+arithmetic that measured the *window* while the image was the *client-area crop*,
+and a boot/attach race reported as a permanent `not-the-target` / `exit 255`. The
+other three were **truth-telling** defects: `open_application` is
+`os.startfile`, `send_keys` has no `effect_verified`, and `capture_window` has no
+redirect path at all — the plugin published upstream's descriptions verbatim, so
+the model read a contract nobody verified.
+
+The locked plan is `tooldefects-sol.md` (v1.0, §4 WP-1…WP-8, §Appendix A/B/C);
+this section is the implementation record for **WP-8** and the record of the
+branch as a whole. The gates are **ORACLE → PRE → JURY**; no merge before G2.
+
+### The ORACLE table (gate G0 — SOL §7.1)
+
+Read-only on the guest that produced the report; every row is one command from
+Appendix D. The `evidence` column says what a Linux-only PRE can already see and
+what is JURY's to measure.
+
+| # | question | PASS looks like | evidence |
+|---|---|---|---|
+| O1 | is the element lane dead? | `py -3 -c "import win32ui"` → `ImportError: DLL load failed while importing win32ui` | guest (JURY) — the upstream chain is offline-verified: `uia.py`'s `_wrapper_for()` imports `pywinauto.controls.uiawrapper`, which imports `win32ui` unguarded |
+| O2 | is pywin32 half-installed? | `pip show pywin32` prints a version **and** `dir` shows `win32ui.pyd` with **no** `pywintypes3??.dll` beside it | guest (JURY) |
+| O3 | which build did the guest get? | `importlib.metadata.version('dsh-cua')` → `0.4.1`; `C:\cua-provision.json` has **no** `scaleFix`/`workDir` keys | guest (JURY) — the wheel captured in `tooldefects-evidence/` is `0.4.1` (`bridge.py` sha256 `59280ee9…f9209`) |
+| O4 | is `C:\cua-work` absent? | `if exist C:\cua-work echo yes` → nothing | guest (JURY) |
+| O5 | one account, two tokens? | `whoami /groups \| findstr /i Mandatory` → `High Mandatory Level` over SSH, while the relay runs `/rl LIMITED`; `echo x > C:\Users\cua\o.txt` **succeeds** over SSH | guest (JURY) — the contrast is the point: the profile is writable by the high-IL token and not by the desktop token |
+| O6 | does the D3 arithmetic reproduce with no window? | `SCALE_BAD {'scale': 1.0, 'scale_x': 1.333333, 'scale_y': 1.5, 'width': 48, 'height': 32}` | **PRE, measured here** (below): `bridge.py` imports `windll` at module level, so the function is extracted with `ast` and executed alone — the SOL's §7.2.7 harness |
+| O7 | is F4's premise false? | `server.py:153-173` → `with open(save_path,'wb')` with **no** `try/except` and no redirect branch | **PRE, measured here**: the evidence copy (`sha256 29668590…d8713`) chooses `%TEMP%\win32_mcp_shots` only when `not save_path and not include_data_uri`, then opens the caller's path unguarded — so a non-empty path that cannot be written raises, and nothing is relocated |
+
+**FAIL handling (unchanged from the SOL).** If O1 imports cleanly, D1's proximate
+cause is wrong but the fix is still correct (verify what you install), and JURY's
+D1 assertion moves to "the lane is measured, not assumed". If O6 returns
+`SCALE_OK` **before** the patch, the arithmetic section is wrong and D3 is
+re-derived from the guest's actual `bridge.py` with its hash recorded.
+
+### The defect chain
+
+| # | class | the one-line cause |
+|---|---|---|
+| **D1** | repo payload gap | `pip install 'dsh-cua'` floats; the only gate is `find_spec('dsh_cua')` — a submodule finder that never imports — so a pywin32 whose DLLs were never copied passes and dies at tool time |
+| **D2** | guest configuration (token + IL) | `cua` is in Administrators, so SSH lands on the high-IL token while the relay runs the filtered one; `C:\Users\cua` and `C:\ProgramData\cua` are unwritable to it, and no writable directory was ever published |
+| **D3** | repo bug by dependency | `_pixels_to_image_bytes` computes `scale_x/scale_y` from the **window** (`w2/ew`) while the image is the **client crop**; `scale` stays `1.0` because `max_dim=0`, so the three numbers disagree by construction |
+| **F1** | report vs receipt | `os.startfile` returns when the shell accepted the association — `success: true` never meant a window appeared, and a retry starts a second instance |
+| **F2** | report vs receipt | the success branch of `send_keys` returns `hwnd/keys/arbiter/time_ms` and no `effect_verified` (unlike `tool_type_text`) |
+| **F4** | report premise false | there is no redirect: an empty `save_path` is a documented default, and a non-empty one has no `try/except` — the report merged two calls into one story |
+| **F3** | plugin vocabulary + supervisor exec | `targetMatchFor()` answered `not-the-target` + "no Windows computer is attached" for both "nothing attached" and "an attach is in flight", and `exec` folded a boot-time sshd failure into a bare `exit 255` |
+
+### The fixes, per file
+
+| file | WP (writer) | change |
+|---|---|---|
+| `docker/windows-oem/cua-firstboot.ps1` | WP-1 (A) | the `dsh-cua` step asserts pip's exit code, installs `pywin32`, runs `pywin32_postinstall -install -silent` when `import win32ui` fails, and then **executes** `import win32ui, win32gui` and `import pywinauto.controls.uiawrapper` before `ok: true` (a failure throws, so the logon pass retries and the marker says `ok:false` with the DLL error); new `Step 'cua-workdir'` creates `C:\cua-work` with `/inheritance:r`, `SYSTEM`/`Administrators`/`<COMPUTER>\cua` full control and `/setintegritylevel (OI)(CI)M`, and asserts a write from the SYSTEM token; new `Step 'dsh-cua-scale'` applies the Appendix A patch under the version + SHA-256 + `count==1` gate and records `scaleFix`/`scaleProbe`; one `Say` line per outcome |
+| `docker/cua-vm-supervisor.mjs` | WP-2 (B) | `WINDOWS_DSH_CUA_DEFAULT = 'dsh-cua==0.4.1'` (exported; `DSH_CUA_WINDOWS_DSH_CUA` still overrides); `windowsSshBootWait()` + `WINDOWS_SSH_BOOT_WAIT_MS` (default 60 000) / `WINDOWS_SSH_BOOT_RETRY_MS` (3 000) — state `installing` answers with **zero** spawns, `booting`/`ready` retries on connection-level failures only; `exec` gives up with `exit 125` + `stderr` starting `code: booting` (no `available:false`, so the plugin still binds), `put`/`get` with `available:false, code:'booting'` + `message`; one log line per wait |
+| `docker/cua-mcp-relay.py` | WP-3 (C) | one daemon `desktop-facts` thread started **after** the listener binds; `probe_child()` (bounded 20 s, captured, never raises) and `publish_desktop_facts()` writing Appendix B — `win32ui`/`uiaLane` as executed imports, `scaleFix` read from the installed source, `workDir` + `workDirWritable` and `profileRootWritable` as write-and-delete probes from the desktop token, `user`, `session`, `at` — to `C:\cua-work` then `%TEMP%` (`source` records which); a failure is `measured:false` + `error` in a file that is still written; `--serve`/`--connect`/`--ping` unchanged |
+| `plugins/dsh-cua-vm/win-mcp.js` | WP-4 (D) | `desktopFacts()` — one bounded SSH (`type C:\cua-work\… \|\| type %TEMP%\…`), 8 s cap, 60 s TTL keyed `user@host:port`, **never throws**, `measured:false` + `error` for an unreadable file, `elementLaneOk` derived from the two measured imports; `connectionLevel` added to `runSshCapture` (pure data); `lastFailureKind` (`ssh-closed\|auth\|handshake\|unknown`) beside a **byte-identical** `lastError`; `WINDOWS_TOOL_CONTRACT` + `windowsToolContract()` — the three frozen sentences, `''` for the other sixteen |
+| `plugins/dsh-cua-vm/index.js` | WP-5 (E) | `attachingFor()` + `code:'attaching'` in `targetMatchFor()` (ticket alive, bound to that name or the only known computer), in the guard **before** `vm-offline`, in `revealWindowsTools()`, and in the doctor's `viewer`/`verdict` (`attach.pendingSinceMs`, `retryAfterMs`, `state`); `desktop` facts in both public tools with the dead-lane / work-dir / scale / attaching sentences; the three notes appended at registration and in `windows_desktop.tools[]` from the same function; `refreshDesktopFacts()` after an attach; `PLUGIN_VERSION = '0.2.1'` |
+| `tests/windows-mcp-gate.mjs`, `tests/modules-unit.mjs`, `tests/supervisor-smoke.mjs` | WP-6 (F) | checks (k)–(n) for `attaching` (doctor, guard, `windows_desktop`, clears after release), (o) the three descriptions + a byte-identical control, (p) the facts warnings; `desktopFacts()` C1–C5 units; source assertions for the D3 anchors / `pywin32_postinstall` / `import win32ui` / `C:\cua-work`; S2–S6 through `DSH_CUA_SSH_BIN` stubs; budget invariants |
+| `tests/fixtures/fake-win-mcp.mjs` | WP-6 (F) | `desktopFacts()`/`refreshDesktopFacts()`/`state.lastFailureKind` + `setDesktopFacts()`/`desktopFactCalls` knobs |
+| `tools/check-cua-vm.mjs` | WP-7 (G) | the four needle blocks (`oemBoot`, `winMcp`, `index`, `supervisor`) that make a one-word revert visible without PowerShell; no needle deleted |
+| `plugins/dsh-cua-vm/package.json` | WP-8 (H) | `"version": "0.2.1"` — the string the cross-file WP-6.6 assertion compares against `PLUGIN_VERSION` |
+| `plugins/dsh-cua-vm/README.md` | WP-8 (H) | `#### What the receipts mean` (the three frozen sentences + what each receipt really is), `#### The element lane` (`win32ui`, the `desktop` facts field by field, the `elementLaneOk:false` fallback), `#### Where to save` (`C:\cua-work`, the DACL/IL, the empty-`save_path` default, "the profile root is not a save target"), `#### Attaching is not not-the-target` (the five codes) and the agent-surface paragraph (pinned build, executed imports, hash-gated patch, the boot wait); `pluginVersion 0.2.1` |
+| `BRANCH-NOTES.md` | WP-8 (H) | this section |
+| `.env.example` | WP-8 (H) | `DSH_CUA_WINDOWS_DSH_CUA=dsh-cua==0.4.1` and `DSH_CUA_WINDOWS_SSH_WAIT_MS=60000`, each with the one line that says why |
+| `README.md` (repo root) | WP-8 (H) | the Windows section gains the `save_path` sentence: screenshots belong under `C:\cua-work`, and the `%TEMP%` default is a default rather than a redirect |
+
+**Nothing else moved**, and the invariants are the proof: 19 guest tools under
+`mcp__windows__*`, `TOOL_TIMEOUTS` byte-identical (the largest, `cua_vm_exec`,
+is 3 660 000 ms — a 60 s boot wait cannot approach it), `PLUGIN_VERSION` and
+`package.json` both `0.2.1`, the relay still a byte bridge, no new MCP server
+package and no second transport, `Autounattend.xml`/`client.js`/`compose.*`
+untouched, and `DSH_CUA_VM_WIN_MCP=0` still disables everything.
+
+### The measured numbers (PRE, no Windows host)
+
+**The D3 arithmetic, proved without a guest.** `bridge.py` imports `windll` at
+module level, so it cannot be imported on Linux. The harness (scratch, not
+committed) reads the wheel's file, `ast.parse` + `ast.get_source_segment`s
+`_pixels_to_image_bytes`, execs that one function in a namespace holding
+`BytesIO` (PIL is imported inside it), and runs the Appendix A probe against the
+original and against the patched source:
+
+```
+file: tooldefects-evidence/bridge.py
+sha256: 59280ee9079cc09aa94b3813fd7a7665cfebffe68fb7259b752e161abf1f9209 (pinned 59280ee9…f9209)
+hash_match: True
+anchor A (_pixels_to_image_bytes tail) occurrences: 1
+anchor B (w2/ew + h2/eh ratios) occurrences: 1
+anchors_matched_exactly_once: True
+already_patched (base_w, base_h = img.size): False
+BEFORE (original): SCALE_BAD {'scale': 1.0, 'scale_x': 1.333333, 'scale_y': 1.5, 'width': 48, 'height': 32} bytes=293
+AFTER  (patched) : SCALE_OK {'scale': 1.0, 'scale_x': 1.0, 'scale_y': 1.0, 'width': 48, 'height': 32} bytes=293
+VERDICT: SCALE_BAD -> SCALE_OK, anchors unique
+```
+
+Three consequences are pinned by that run, and they are the facts the docs
+state: the wheel the pin installs is the wheel the arithmetic was proved on
+(one hash, one version); both anchors occur **exactly once**, so the gate can
+demand `count == 1`; and the patched file, while `base_w` appears on **two**
+lines (the assignment and the `scale_x` ratio — `grep -c base_w` → `2`), the
+idempotence key of Appendix A gate 4 (`base_w, base_h = img.size`) occurs
+**exactly once** (`grep -c 'base_w, base_h = img.size'` → `1`). A second `-Force`
+run therefore reports `scaleFix:"already"` in the marker (the relay's published
+fact reads `applied`) and writes nothing.
+
+**The gate, at this package's landing.** `node tools/check-cua-vm.mjs` →
+**1 237 assertions across 24 files**, and WP-8 adds **no red of its own**:
+`.env.example` keeps all 16 of its assertions, and
+`WP-6.6 plugins/dsh-cua-vm/package.json version 0.2.1 === index.js PLUGIN_VERSION`
+is **ok**. While this package was landing the gate was briefly red on WP-5's third
+contract sentence (`dedupe by pid`) and on the two-file identity — the same gate
+that went red in §27 — and it went green the moment the description landed. The
+only outstanding red at the last run is the **pair of supervisor `scpRun(...)`
+needles**, whose literal has to follow WP-2's new caller budget
+(`{ direction: 'to-guest', timeoutMs }`): that literal lives in
+`tools/check-cua-vm.mjs` (WP-7), so WP-8 reports the update instead of making it —
+the gate is `exit 0` once it lands. The identity assertion exists precisely so a
+half-landed bump cannot pass: a package version that moves without
+`PLUGIN_VERSION` (or the reverse) is a doctor that names a build nobody installed.
+
+**The doc numbers that a reader can check without a guest:** 19 tools (unchanged
+`TOOL_TIMEOUTS` diff: zero lines); `pluginVersion` `0.2.1` in both identities;
+`DSH_CUA_WINDOWS_SSH_WAIT_MS` default 60 000 with a 3 000 ms retry (worst case far
+inside the 3 660 000 ms `cua_vm_exec` ceiling); the facts file bound at 20 s in the
+guest, 8 s on the read, 60 s TTL in the cache.
+
+**`scaleFix` has two producers, and the docs name both.** The first version of
+this section (and of the plugin README) advertised one vocabulary —
+`applied | already | skipped:<version|hash|anchor|no-file>` — that **no producer
+emits**, which a JURY review caught; a first correction then invented a separate
+rollback-failure code, which the shipped design does not use either. The relay's
+fact is a **source read** of the installed `bridge.py`:
+`applied` / `skipped:no-file` / `skipped:anchor` (no `base_w` ⇒ not patched) /
+`unverified:no interpreter` / `unverified:unreadable source` /
+`unverified:not measured`. The firstboot **marker**
+(`C:\cua-provision.json`, step `dsh-cua-scale`) records the gate's own decision:
+`applied` / `already` / `skipped:no-python` / `skipped:no-file` /
+`skipped:version-mismatch` / `skipped:hash-mismatch` / `skipped:anchor-missing` /
+`skipped:anchor-ambiguous` / `skipped:write-failed` / `skipped:import-failed` /
+`skipped:probe-failed`. **The rollback is an additive `restoreOk` boolean on the
+three rows that attempt one** (`skipped:write-failed`, `skipped:import-failed`,
+`skipped:probe-failed`): `true` = the original bytes are measured back (SHA-256
+re-checked against the pre-patch hash, stale `pyc` cleared), `false` = the file may
+be truncated or left **patched** and the log says
+`NOT RESTORED … reinstall dsh-cua==0.4.1`. There is deliberately **no separate
+rollback-failure code**, and the reason is the doctor: `windowsDesktopWarnings()`
+warns only when `scaleFix` **starts with `skipped:`**, so a code with a new prefix
+would silence exactly the "do not click from image pixels" sentence a half-restored
+guest needs. The marker carries the rollback fact (`restoreOk`); `scaleFix` keeps
+the frozen `skipped:` family and the warning keeps firing. The README labels
+which field comes from which producer and states the one rule that matters:
+**`applied` is patched,
+`already` is patched from an earlier pass, and every `skipped:*` / `unverified:*`
+is NOT patched** — plus the one disagreement by design: a failed rollback leaves
+the patch on disk, so the relay can read `applied` while the marker says
+`skipped:probe-failed` (trust the marker). `tests/modules-unit.mjs`'s WP-6.3/C6
+block parses **both** producers and fails any test that pins a literal neither can
+emit, and WP-6.3/A7 asserts the three measured rollbacks and their `NOT RESTORED`
+texts, so the impossible vocabulary cannot come back. The same correction reaches
+`windows_mcp_doctor`'s own description (WP-5.8, writer E):
+`index.js` is not this package's file, so WP-8 reports the exact replacement
+string instead of editing it.
+
+### Verify
+
+From the repo root. These are the commands that gate this section; the guest-only
+numbers are JURY's (see below) and are not claimed here.
+
+```bash
+# 1. syntax (PowerShell is not on the Linux host — the guest payload is gated by
+#    needles and source assertions, never by a claim that it parsed here)
+node --check docker/cua-vm-supervisor.mjs
+node --check plugins/dsh-cua-vm/win-mcp.js
+node --check plugins/dsh-cua-vm/index.js
+node --check tests/windows-mcp-gate.mjs
+node --check tests/modules-unit.mjs
+node --check tests/supervisor-smoke.mjs
+node --check tests/fixtures/fake-win-mcp.mjs
+node --check tools/check-cua-vm.mjs
+python3 -m py_compile docker/cua-mcp-relay.py
+
+# 2. the needles + the cross-file identity (the one WP-8 can turn red)
+node tools/check-cua-vm.mjs
+
+# 3. the three suites the SOL's PRE names. The counts are the run on this tree at
+#    the WP-8 landing (they move with every new check — a number, not a target)
+node tests/windows-mcp-gate.mjs      # PASS — 96 checks, 0 pending
+node tests/modules-unit.mjs          # PASS — 414 assertions (405 when this section was
+                                     # first written; the C6 scaleFix-vocabulary checks landed
+                                     # after that measurement — a number, not a target)
+node tests/supervisor-smoke.mjs      # PASS — 271 assertions (incl. S2-S6 through the ssh stub)
+node tests/windows-boot.mjs
+node tests/qmp-shutdown.mjs
+
+# 4. the D3 proof, offline (the SOL's §7.2.7 harness; scratch, not committed)
+python3 .td-wh/d3-probe.py           # SCALE_BAD before, SCALE_OK after, anchors ×1
+
+# 5. the docs must not drift from the code they describe
+git diff --stat                      # §5's files only
+grep -c 'export const PLUGIN_VERSION' plugins/dsh-cua-vm/index.js
+grep -n '"version"' plugins/dsh-cua-vm/package.json
+```
+
+**Cross-writer sync this package forces.** The identity is a **two-file** fact
+(WP-5.10's `PLUGIN_VERSION` + WP-8.1's `package.json`), so the `index` needle block
+must read `export const PLUGIN_VERSION = '0.2.1'` — with the old `0.2.0` literal
+still in `tools/check-cua-vm.mjs` the gate is red on a tree that is correct, which
+is the one needle update this section hands to WP-7. Nothing else in the needles or
+the tests changes because of WP-8: the docs quote the frozen strings, they do not
+define them.
+
+### JURY (gate G2) — the plan this section hands over
+
+`tooldefects-sol.md` §7.3, J1–J12, on two guests: **A** = a fresh create from this
+tree (`windows`, `tiny10`, 2 vCPU / 4 GB / 20 GB — the report's spec) and **B** = a
+guest created before the change, which must **say** it is stale. The rows that
+decide this work:
+
+| step | action | pass |
+|---|---|---|
+| J1/J2 | create + start, then `cua_vm_exec` within 5 s of `ready` | `exit 0`, or `exit 125` + `code: booting` + `retry in ~Ns` — never `255`, never `126` |
+| J3 | `windows_mcp_doctor` right after the start | the window is legible: `attach.pendingName` + `viewer.code:'attaching'` + `retryAfterMs`, then `online:true`, `viewer.code:null`, 19 tools |
+| J4 | `windows_desktop` | 19 tools, `desktop.measured:true`, `elementLaneOk:true`, `workDir:'C:\cua-work'`, `workDirWritable:true`, `scaleFix:'applied'` |
+| J5 | `tool_element_action_at(…, action:'set_value')` on a Save-As dialog | `success:true, action_sent:true` — the report's D1 |
+| J6 | `tool_capture_window(client_only:true)` | `scale_x == scale_y == scale`, `width == bounds.width`, no `scale_note` unless `max_dim > 0` |
+| J7 | `capture_window(save_path:'C:\cua-work\shot.jpg')`, then `'C:\Users\cua\shot.jpg'` | the first succeeds and the file exists; the second is `isError` with `Errno 13`, **no silent relocation** |
+| J8/J9 | `tool_open_application('notepad')` twice; `tool_send_keys(['ctrl','s'])` on a background window | two instances are *expected and documented* (pid dedupe works); the send either refuses or the description's warning holds |
+| J10 | `cua_vm_shutdown` → doctor | `online:false`, `leaks:[]`, `status:ok`, `state:powered-off` |
+| J11 | guest **B** | the doctor still works; `desktop.measured:false` (no facts file at all), and if that guest's marker has a `dsh-cua-scale` row its `scaleFix` says why it was not applied (`skipped:*`) — the staleness is **stated**, not faked |
+| J12 | negative: `icacls C:\cua-work /inheritance:r /grant Everyone:R` + restart the relay | `workDirWritable:false`, `source:'temp'`, and the tool still answers |
+
+Artifacts for the record: the doctor JSON before and after the attach, the facts
+JSON, `icacls C:\cua-work`, `C:\cua-provision.json`, the D3 probe output before
+and after, and the relay log tail (`listen` → `desktop-facts`). A J5/J6 failure on
+guest **A** blocks the merge; any J-failure reopens the package that owns it.
+
+### What this section does not claim
+
+* **No guest measurement is claimed as done.** O1–O5 and J1–J12 are JURY's; the
+  only numbers in this section measured on this branch are the D3 arithmetic and
+  the repo-side gates.
+* **PowerShell was never executed here.** The firstboot changes are gated by the
+  WP-6.3 source assertions and the WP-7 needles only; the semantic proof (the ACL
+  taking, the postinstall repairing the DLLs, the patch applying in the guest) is
+  JURY's, exactly as §7.2.6 of the SOL requires.
+* **The profile root is measured, not fixed** (SOL §8 X5). `profileRootWritable` is
+  published as a fact; changing the profile's DACL/IL is a security-boundary change
+  with no evidence it is *the* cause, while `C:\cua-work` closes every reported
+  symptom.
+* **The patch is refused, never guessed** on another build (X8): a version or hash
+  mismatch is `skipped:version-mismatch` / `skipped:hash-mismatch` in the marker
+  and `skipped:anchor` (or `unverified:*`) in the published fact, and the verdict
+  warns that the axes are expected to disagree — an operator override is reported,
+  not silently applied.
+* **A stale guest is stated, not healed** (X7): nothing re-stages the relay or
+  re-runs pip on start, so `desktop.measured:false` is the honest answer and a
+  re-create is the documented upgrade.
