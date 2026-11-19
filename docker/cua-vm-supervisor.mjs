@@ -4837,6 +4837,13 @@ function watchWindowsInstall(name) {
               delete row.installStage
               delete row.bootedAt
             }, { reason: 'windows-install-ready' })
+            // SOL §5 WP-4.2: THIS IS THE TRANSITION A CHECKPOINT BOOT TAKES.
+            // The row is `ready` on disk now (the registry hook has already
+            // announced it), and the bridge is about to dial — fire the
+            // re-assert here, before the media detach and before this tick
+            // answers, so `schtasks /run` is in flight while SSH is still
+            // connecting instead of after the first probe has failed.
+            void windowsRelayReassert(name)
             // WP-4.4: the ready transition is the one the bridge MUST hear, even
             // if it joined the stream mid-install.
             emitVmState(name, 'ready', 'windows-install-ready')
@@ -5392,6 +5399,80 @@ function sshRun(meta, command, { timeoutMs = 330000 } = {}) {
   })
 }
 
+/* ------------------------------------------------------------------ *
+ * SOL §5 WP-4.1: RE-ASSERT THE RELAY TASK WHEN THE ROW BECOMES READY
+ *
+ * A checkpoint boot restores a DISK, not a logged-on desktop. If autologon has
+ * expired, or the logon trigger lost its race with the SSH banner, the relay
+ * task is registered and bound but never runs — the supervisor then reports
+ * `ready` while the desktop is blind. WP-1's guard covers the boot from inside
+ * the guest; this is the host half: one `schtasks /run` issued at the moment the
+ * SUPERVISOR decides the computer is ready, so the relay is already coming up
+ * while the bridge is still dialing instead of being discovered dead by the
+ * first probe.
+ *
+ * THE CONTRACT IS DELIBERATELY SMALL (risk R7 — it must never race a shutdown):
+ *   * only a row that is `kind: 'windows'`, has SSH enabled (`ssh !== false`)
+ *     and is `ready` ON DISK may cost an ssh child; a suspended/powered-off row
+ *     — or one whose shutdown landed between the transition and this call — is
+ *     a no-op and spawns nothing (S2);
+ *   * ONE `schtasks /run /tn cua-mcp-host` with a 20 s cap. No probe, no task
+ *     re-creation, no second command: repairing a payload is WP-1/WP-2's job,
+ *     and a supervisor that "helped" there would duplicate the repair's
+ *     handshake-before-run ordering;
+ *   * never awaited by its callers and never throws. The call sites use `void`,
+ *     so a rejection would be an unhandled rejection in a long-lived server; a
+ *     failed re-assert must not turn a successful Start into an error either;
+ *   * at most one attempt per computer per 15 s (S3, `WINDOWS_RELAY_REASSERT_AT`),
+ *     so an agent that retries Start three times in ten seconds costs one ssh
+ *     child instead of three.
+ * ------------------------------------------------------------------ */
+const WINDOWS_RELAY_REASSERT_COMMAND = 'schtasks /run /tn cua-mcp-host'
+const WINDOWS_RELAY_REASSERT_TIMEOUT_MS = 20000
+const WINDOWS_RELAY_REASSERT_INTERVAL_MS = 15000
+/** name → Date.now() of the last re-assert that actually spawned ssh. */
+const WINDOWS_RELAY_REASSERT_AT = new Map()
+
+/** Fire one relay re-assert for a ready Windows computer; resolves, never throws. */
+async function windowsRelayReassert(name) {
+  const key = String(name ?? '')
+  try {
+    if (key === '') return
+    // THE THROTTLE IS CHECKED, AND STAMPED, BEFORE THE FIRST `await`. Two Starts
+    // in the same tick both reach this line; the first stamps it synchronously,
+    // so the second leaves without spawning (the async functions are not
+    // interleaved until an await is actually reached).
+    const now = Date.now()
+    if (now - (WINDOWS_RELAY_REASSERT_AT.get(key) ?? 0) < WINDOWS_RELAY_REASSERT_INTERVAL_MS) return
+    // THE ROW IS RE-READ HERE, not passed in: the caller fires this after a
+    // transition, and the file on disk is the authority on whether the computer
+    // is still ready. Passing the pre-transition meta would let a row that was
+    // shut down mid-call still get an ssh child.
+    const meta = readRegistry().vms[key]
+    if (!meta || meta.kind !== 'windows') return
+    if (meta.ssh === false) return
+    if (meta.state !== 'ready') return
+    // Stamp BEFORE the ssh child exists: this is what makes the throttle hold
+    // for concurrent callers, not just for sequential ones.
+    WINDOWS_RELAY_REASSERT_AT.set(key, now)
+    const result = await sshRun(meta, WINDOWS_RELAY_REASSERT_COMMAND, { timeoutMs: WINDOWS_RELAY_REASSERT_TIMEOUT_MS })
+    // The exit code is the whole diagnostic the SOL asks for (S1: `exit 0` on a
+    // healthy guest). It is logged even when the task does not exist, which is
+    // exactly the case a human needs to see.
+    log(`windows: ${key} relay re-assert: cua-mcp-host exit ${result.code}${result.timedOut === true ? ' (timed out)' : ''}`)
+    if (result.code !== 0) {
+      const detail = String(result.stderr ?? '').split(/\r?\n/u).map((line) => line.trim()).find((line) => line !== '')
+      if (detail !== undefined) log(`windows: ${key} relay re-assert detail: ${detail.slice(0, 300)}`)
+    }
+  } catch (error) {
+    // NEVER RETHROW: the call sites discard the promise. An unreadable registry,
+    // a missing ssh binary or a spawn that throws must stay a log line.
+    try {
+      log(`windows: ${key === '' ? '(unnamed)' : key} relay re-assert failed: ${error?.message ?? error}`)
+    } catch {}
+  }
+}
+
 /**
  * THE scp BINARY — overridable ONLY so a test can point it at a stub that
  * records its argv. The default is the real one; nothing in production sets
@@ -5792,6 +5873,11 @@ async function windowsStart(name, meta) {
           row.lastUsed = new Date().toISOString()
           delete row.startedAt
         })
+        // SOL §5 WP-4.2: an unpause is a ready transition too. A suspended guest
+        // kept its relay process, but `schtasks /run` is idempotent and cheap,
+        // and the throttle makes a repeated Start free — so the row that says
+        // `ready` again always gets its one re-assert.
+        void windowsRelayReassert(name)
         // M6: a suspended computer lost its live view with the relay; rebuild it.
         await ensureWindowsConsoleRelay(name)
         // WP-4.5: the QMP hook travels with the process it watches.
@@ -5810,6 +5896,10 @@ async function windowsStart(name, meta) {
           delete row.error
           row.installDetail = `ready (${ready.endpoint} accepting, QMP running)`
         })
+        // SOL §5 WP-4.2: Start found a live, already-ready computer. The task
+        // may still have missed its logon trigger (autologon expiry is the case
+        // WP-1 cannot see from the host), so ask for it once — throttled inside.
+        void windowsRelayReassert(name)
         await ensureWindowsConsoleRelay(name)
         installQmpStateWatcher(name)
         return ok({ name, state: 'ready', kind: 'windows', console: `/vm/port/${name}/`, detail: ready.endpoint })

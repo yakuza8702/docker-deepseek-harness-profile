@@ -13,6 +13,21 @@ import {
   mcpError
 } from './win-mcp.js'
 
+/**
+ * THE PLUGIN'S OWN IDENTITY (WP-3.7, SOL §4.8 "identity travels").
+ *
+ * Both doctors report this string (`cua_vm_doctor.pluginVersion` here, and the
+ * same field on `windows_mcp_doctor`), so a report can never again say "fixed"
+ * about a plugin whose file on the host predates the fix.
+ *
+ * IT MUST EQUAL `plugins/dsh-cua-vm/package.json`'s `version`. That is not a
+ * comment-level promise: `tools/check-cua-vm.mjs` asserts the two agree (WP-6.6),
+ * so bumping one place and not the other fails the gate instead of shipping two
+ * identities for one file tree. The relay/blind-verdict release is 0.2.0 on both
+ * sides (WP-7.1 owns the package.json bump; this file owns this constant).
+ */
+export const PLUGIN_VERSION = '0.2.0'
+
 export const name = 'cua-vm'
 export const inject = ['tools', 'systemPrompt', 'webServer']
 
@@ -413,6 +428,18 @@ const WIN_MCP_AUX = {
    */
   inflightTicket: null,
   /**
+   * THE IN-FLIGHT CLIENTS (`Set<client>`), registered BEFORE `connect()` is
+   * awaited and removed when that attach settles.
+   *
+   * `WIN_MCP.client` is assigned only AFTER the handshake answers, so a teardown
+   * that lands inside the 45 s handshake used to have nothing to close: the
+   * ticket stopped the registrations, but the SSH child lived until its own
+   * request timer expired (a bounded zombie, but a zombie). `teardown()` closes
+   * every client parked here, so the mid-handshake child dies with the bridge.
+   * The generation guard is untouched — this only shortens the child's life.
+   */
+  inflightClients: new Set(),
+  /**
    * Every Windows computer the supervisor's registry has shown us, refreshed by
    * the same 30 s `vmList` that keeps the REA cache warm. It exists for ONE
    * honest relaxation: "exactly one Windows computer exists and this session
@@ -531,10 +558,37 @@ function grantFor(agent) {
   return WIN_MCP_AUX.grantDefault === true
 }
 
-/** Whether this agent has asked for the desktop (the reveal gate). */
+/**
+ * Record the reveal for ONE agent AND its session (WP-3.4, memory only).
+ *
+ * Two keys on purpose. The WeakMap is the fast path and the object identity the
+ * gate reads most often; the session id is the DURABLE key, because the harness
+ * may hand this plugin a new agent object for the same conversation (a resume, a
+ * later turn). `revealedFor()` accepts either, so a reveal can no longer be
+ * forgotten halfway through a session.
+ */
+function markRevealed(agent) {
+  if (agent === undefined || agent === null) return false
+  WIN_MCP.reveals.set(agent, true)
+  const key = sessionKeyOf(agent)
+  if (key !== '') WIN_MCP_AUX.revealedSessions.add(key)
+  return true
+}
+
+/**
+ * Whether this agent — or the SESSION it belongs to — has asked for the desktop
+ * (the reveal gate).
+ *
+ * WP-3.4: the WeakMap alone made a human reveal vanish whenever the harness
+ * replaced the agent object for the same conversation, and `reveal-required`
+ * came back for ever. The session id is therefore honoured as well; the WeakMap
+ * stays as the cheap object-identity fast path.
+ */
 function revealedFor(agent) {
   if (agent === undefined || agent === null) return false
-  return WIN_MCP.reveals.get(agent) === true
+  if (WIN_MCP.reveals.get(agent) === true) return true
+  const key = sessionKeyOf(agent)
+  return key !== '' && WIN_MCP_AUX.revealedSessions.has(key)
 }
 
 /**
@@ -854,6 +908,15 @@ function teardown(reason) {
   // so nothing it does after this line can put a name back on the registry.
   WIN_MCP.generation += 1
   if (WIN_MCP_AUX.inflightTicket !== null) WIN_MCP_AUX.inflightTicket.dead = true
+  // DEFECT 8: AND CLOSE THE HANDSHAKES THE TICKET CANNOT REACH. A client that is
+  // still inside `connect()` is not `WIN_MCP.client` yet, so the close below
+  // missed it and its SSH child survived until the 45 s request timer. Closing
+  // it here kills that child now; the attach's generation guard still refuses
+  // every write it might attempt afterwards.
+  for (const pending of WIN_MCP_AUX.inflightClients) {
+    try { pending?.close() } catch { /* the child may already be dead */ }
+  }
+  WIN_MCP_AUX.inflightClients.clear()
   const client = WIN_MCP.client
   WIN_MCP.client = null
   WIN_MCP.online = false
@@ -1002,6 +1065,9 @@ async function attachWindowsMcp(target) {
   const ctx = WIN_MCP_AUX.ctx
   if (ctx === undefined) return undefined
   let ownTicket = null
+  /** DEFECT 8: the client whose handshake is in flight, in the OUTER scope so
+   * the `.finally` below can unregister it whichever way the attach settles. */
+  let ownClient = null
   WIN_MCP.inflight = (async () => {
     if (WIN_MCP_AUX.retryAt > Date.now()) return
     teardown('switching computers')
@@ -1046,6 +1112,13 @@ async function attachWindowsMcp(target) {
           teardown(`client-closed:${code}`)
         }
       })
+      // DEFECT 8: REGISTER THE CLIENT BEFORE THE AWAIT. `WIN_MCP.client` is only
+      // assigned once the handshake answers, so a teardown landing inside the
+      // 45 s `connect()` had no handle to close and the SSH child outlived the
+      // bridge (until its own request timer). The registry is what `teardown()`
+      // walks; the ticket below still refuses every late registration.
+      ownClient = client
+      WIN_MCP_AUX.inflightClients.add(client)
       if (isDead()) { abort('the bridge was torn down while the handshake was in flight'); return }
       const session = await client.connect()
       // THE RACE J20-4 NAMES: a row deleted, or a shutdown observed, during the
@@ -1083,7 +1156,15 @@ async function attachWindowsMcp(target) {
           // keepalive (10s × 2) decides a dead link long before this.
           timeoutMs: WIN_MCP_ATTACH_TIMEOUT_MS,
           output: textOutput('The guest tool result as JSON, or a `code:` line when it failed.'),
-          async execute(args = {}) {
+          // DEFECT 6: THE INNER JSON-RPC TIMER IS THE SAME 45 s, SO THE INNER
+          // `timeout` CODE USED TO LOSE BY CONSTRUCTION — the harness guard and
+          // the client's per-request timer expire together, and the generic
+          // "tool call timed out" is what the model reads. Racing the body
+          // `TIMEOUT_LEAD_MS` earlier (the same 250 ms lead every other tool
+          // registration uses) makes the branchable `tool-timeout` code win.
+          // Behaviour is otherwise identical: the same call, the same catch,
+          // the same structured `code:` line for a non-timeout failure.
+          execute: boundedExecute(publicName, WIN_MCP_ATTACH_TIMEOUT_MS, undefined, async (args = {}) => {
             try {
               const result = await client.callTool(windowsGuestToolName(tool.name), args ?? {})
               return { text: JSON.stringify(result) }
@@ -1093,7 +1174,7 @@ async function attachWindowsMcp(target) {
               const code = error?.code ?? 'tool-failed'
               return { text: `${error?.message ?? error}\ncode: ${code}` }
             }
-          }
+          })
         }
         try {
           const dispose = ctx.tools.register(definition)
@@ -1123,6 +1204,9 @@ async function attachWindowsMcp(target) {
     // Only clear OUR ticket: a newer attach (or a teardown that already killed
     // it) must keep whatever it put there.
     if (WIN_MCP_AUX.inflightTicket === ownTicket) WIN_MCP_AUX.inflightTicket = null
+    // DEFECT 8: and drop OUR client from the in-flight registry — a teardown
+    // already cleared it, and a later attach must never close this one.
+    if (ownClient !== null) WIN_MCP_AUX.inflightClients.delete(ownClient)
   })
   return WIN_MCP.inflight
 }
@@ -1174,6 +1258,57 @@ function nudgeRelayUpgrade(reason = 'poll') {
 }
 
 /**
+ * `DSH_CUA_VM_WIN_MCP_REPAIR=0` — THE REPAIR KILL SWITCH, READ THE SAME WAY THE
+ * CLIENT READS IT.
+ *
+ * `repairRelay()` in win-mcp.js honours this env var itself, and this mirror is
+ * not a second implementation of the switch: it exists so (a) the plugin never
+ * asks for an attempt the client would refuse, and (b) the blind verdict can
+ * SAY `repair-disabled` instead of "something is wrong and nothing will happen".
+ */
+function relayRepairEnabled() {
+  return String(process.env.DSH_CUA_VM_WIN_MCP_REPAIR ?? '1') !== '0'
+}
+
+/**
+ * WP-3.5 — A BLIND, CONNECTED ATTACH ASKS FOR THE REPAIR, HERE.
+ *
+ * The observed defect was that every heal path re-ran the *probe*: a relay that
+ * was alive but unreadable (payload skew) stayed unreadable for ever, because
+ * nothing in the harness could re-assert, re-create or re-run the guest task.
+ * `client.repairRelay()` is that verb (WP-2.5), and the throttling, the
+ * three-failure backoff, the in-flight guard and the kill switch all live INSIDE
+ * the client — deliberately not re-implemented here, or there would be two
+ * repair policies. This function only decides WHEN to ask:
+ *
+ *   • the bridge must be connected on the decided blind lane (`session-0-direct`),
+ *     so a healthy relay attach and a not-yet-attached bridge ask for nothing;
+ *   • the kill switch must be on, so `DSH_CUA_VM_WIN_MCP_REPAIR=0` spawns no SSH
+ *     child at all (P4 counts that at the seam);
+ *   • the call is never awaited and never throws — it runs from the poll, and a
+ *     health check must not take the process down over a repair it wanted.
+ *
+ * Returns whether an attempt was asked for (the call sites read it, the client
+ * decides whether this one is inside its throttle window). `nudgeRelayUpgrade()`
+ * stays the second half: once the relay answers again, the forced re-probe is
+ * what moves the live session onto the relay.
+ */
+function nudgeRelayRepair(reason = 'poll') {
+  if (WIN_MCP.client?.state?.transport !== 'session-0-direct') return false
+  if (relayRepairEnabled() !== true) return false
+  if (typeof WIN_MCP.client?.repairRelay !== 'function') return false
+  try {
+    // `force: false` = "respect your own throttle/backoff", which is the whole
+    // point of keeping the policy in the client.
+    void Promise.resolve(WIN_MCP.client.repairRelay({ force: false })).catch(() => {})
+  } catch (error) {
+    WIN_MCP.lastError = `relay repair nudge (${reason}): ${error?.message ?? error}`
+    return false
+  }
+  return true
+}
+
+/**
  * THE STATE PATH. Since J20-3 this is the BELT, not the only brace: the
  * supervisor's `subscribe` stream (see `handleVmEvent`) delivers a transition
  * inside a turn, and this poll still runs behind it — a slower cadence on a
@@ -1183,10 +1318,12 @@ function nudgeRelayUpgrade(reason = 'poll') {
  * it down (the row is gone: `vm-removed`; the row is not ready: `vm-state:*`)
  * or dials SSH on the transition into online. Nothing here guesses a target.
  *
- * Every tick that leaves the bridge CONNECTED on the blind lane also nudges the
- * client's relay upgrade (`nudgeRelayUpgrade` above): the attach is re-validated
- * here for the life of the session, so this is the one loop that can heal a
- * relay which started after the client's 15 s watch closed.
+ * Every tick that leaves the bridge CONNECTED on the blind lane REPAIRS and then
+ * nudges the client's relay upgrade: a probe cannot heal a task that is not
+ * running or a launcher that names the wrong port, so the order is
+ * `nudgeRelayRepair()` (the verb, WP-3.5) then `nudgeRelayUpgrade()` (the lane
+ * move) — both fire-and-forget, both throttled inside the client, so a tick
+ * costs no SSH child of its own.
  */
 async function syncWindowsMcp(reason = 'poll') {
   if (windowsMcpEnabled() !== true) {
@@ -1201,14 +1338,24 @@ async function syncWindowsMcp(reason = 'poll') {
   }
   if (WIN_MCP.online === true && WIN_MCP.name === target.name && WIN_MCP.client?.state?.connected === true) {
     WIN_MCP.reason = `attached (${WIN_MCP.registrations.size} tool(s))`
-    // THE HEAL. The assign is already live and valid; the only outstanding
-    // question is whether it is blind and no longer has to be.
+    // THE HEAL, IN TWO STEPS. The assign is already live and valid; the only
+    // outstanding question is whether it is blind and no longer has to be.
+    //   1. WP-3.5: a decided blind lane ASKS FOR THE REPAIR (one throttled SSH
+    //      attempt inside the client) — a probe can never bring a stopped task
+    //      back, and re-probing was the whole defect;
+    //   2. the upgrade nudge then re-probes and, when the relay answers, moves
+    //      this live session onto it.
+    // Both are fire-and-forget and both are throttled by the client, so a tick
+    // of the health timer costs nothing when the lane is healthy or the window
+    // has not opened.
+    nudgeRelayRepair(reason)
     nudgeRelayUpgrade(reason)
     return
   }
   await attachWindowsMcp(target)
   // A fresh attach can land blind too (the probe said RELAY_DOWN and the relay
-  // answered a moment later). The same nudge covers it until the next tick.
+  // answered a moment later). The same two nudges cover it until the next tick.
+  nudgeRelayRepair(reason)
   nudgeRelayUpgrade(reason)
 }
 
@@ -1481,6 +1628,17 @@ function selfHealWindowsMcp(agent) {
  * BIND THE COMPUTER A SESSION ASKED FOR. Called by cua_vm_create/ensure and by
  * cua_vm_exec/cua_vm_gui/cua_vm_start, i.e. only on the model's own explicit
  * statement of which computer it means.
+ *
+ * WP-3.4 / SOL §4.7 — THE BIND IS THE REVEAL, AND THE GRANT STAYS THE VETO.
+ * A session that binds a computer while `grantFor(agent) === true` is revealed
+ * here, so the first desktop call after a bind does not need a manual
+ * `windows_desktop` round trip (the shipped first-boot test failed on exactly
+ * that step). Nothing about the safety story changes: the grant is still the
+ * one veto (`grant-off` at the guard), a session that binds NOTHING is still
+ * `reveal-required`, and `revealWindowsTools()` still re-checks online + grant +
+ * target before a single name becomes visible. A bind of a Linux computer is
+ * harmless: the gate also requires the Windows target to match, so no name
+ * appears for a computer that does not speak dsh-cua.
  */
 function rememberSessionTarget(exec, name) {
   const agent = exec?.agent
@@ -1490,6 +1648,10 @@ function rememberSessionTarget(exec, name) {
   if (name === undefined || name === null || String(name) === '') return
   const bound = String(name)
   WIN_MCP_AUX.targets.set(key, { name: bound, at: Date.now() })
+  // Auto-reveal BEFORE the gate pass below, so the bind that makes a session
+  // eligible also opens its names in the same beat (online + target are checked
+  // by `gateDenyList`, so this is eligibility, never visibility).
+  if (grantFor(agent) === true) markRevealed(agent)
   applyAgentGate(agent, 'bound target')
   // Bound, but do not turn every exec into a probe: one bind-triggered sync per
   // 5 s is enough to pick a new computer up, and the 10 s poll covers the rest.
@@ -1516,6 +1678,22 @@ function forgetSessionTarget(name) {
     if (row.name !== gone) continue
     WIN_MCP_AUX.targets.delete(key)
     WIN_MCP_AUX.revealedSessions.delete(key)
+    // NIT-8 / THE ASYMMETRY: `markRevealed()` writes the reveal under TWO keys —
+    // the agent OBJECT (the WeakMap fast path) and the session id (the durable
+    // Set). Forgetting only the session key left the object entry behind, so
+    // `revealedFor()` still answered yes for an agent whose pairing with the
+    // deleted computer had just been dropped. Close both: every live agent whose
+    // session is the one being forgotten loses the WeakMap entry too.
+    //
+    // A reveal recorded for a session that is NOT in `WIN_MCP.agents` needs no
+    // handling here: that set is the registry's list of live, gated agents, and
+    // an agent outside it has no installed guard and no visible names, so a
+    // stale WeakMap entry for it can never be read as visibility. The scan
+    // allocates nothing and runs only on a delete.
+    for (const agent of WIN_MCP.agents) {
+      if (sessionKeyOf(agent) !== key) continue
+      WIN_MCP.reveals.delete(agent)
+    }
   }
   const inflightName = WIN_MCP_AUX.inflightTicket === null ? '' : String(WIN_MCP_AUX.inflightTicket.name ?? '')
   if (WIN_MCP.name === gone || inflightName === gone) teardown(`vm-removed:${gone}`)
@@ -1524,11 +1702,7 @@ function forgetSessionTarget(name) {
 /** The reveal: unhide the bridged tools for one agent, then re-gate. */
 function revealWindowsTools(agent) {
   const tools = Array.isArray(WIN_MCP_AUX.tools) ? WIN_MCP_AUX.tools : []
-  if (agent !== undefined && agent !== null) {
-    WIN_MCP.reveals.set(agent, true)
-    const key = sessionKeyOf(agent)
-    if (key !== '') WIN_MCP_AUX.revealedSessions.add(key)
-  }
+  markRevealed(agent)
   const online = WIN_MCP.online === true
   const granted = agent === undefined || agent === null ? WIN_MCP_AUX.grantDefault === true : grantFor(agent)
   // J20-5: revealing is not a way around the target rule. A session that bound
@@ -1536,6 +1710,11 @@ function revealWindowsTools(agent) {
   // it makes, instead of 19 visible names that refuse one by one.
   const match = targetMatchFor(agent)
   const revealed = online && granted && match.ok === true
+  // WP-3.3 / WP-3.4: the reveal is also where a model finds out that the desktop
+  // it just unhid is BLIND — one sentence here is cheaper than 19 calls that come
+  // back empty because the lane has no interactive desktop.
+  const laneFacts = windowsLaneFacts()
+  const lane = windowsLaneVerdict(online, laneFacts)
   reapplyWindowsGates('reveal')
   const code = revealed
     ? ''
@@ -1546,20 +1725,453 @@ function revealWindowsTools(agent) {
         : (match.code ?? 'not-the-target')
   return {
     revealed,
-    tools: tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
+    // WP-3.4 / C4 — A HIDDEN BRIDGE INVENTORIES NOTHING. The 19 names used to be
+    // returned even when the bridge was offline or the session was not allowed to
+    // use them, which is how a doctor report could show a full tool list for a
+    // computer that had no schema registered at all. The list now exists only
+    // when `revealed` is true; otherwise it is an empty array and `code` says why.
+    tools: revealed === true
+      ? tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))
+      : [],
     online,
     granted,
     target: WIN_MCP.name === '' ? null : WIN_MCP.name,
     bound: boundTargetOf(agent)?.name ?? null,
     code,
-    note: revealed
-      ? `${tools.length} dsh-cua tool(s) are now visible for this session.`
-      : online !== true
+    // The lane, in the same words the doctor uses (`blindReason` is a §4.6 value
+    // or null): a reveal on the blind lane succeeds — the names are real — but the
+    // note below refuses to pretend they can see a desktop.
+    blind: lane.blind,
+    blindReason: lane.blindReason,
+    note: revealed !== true
+      ? online !== true
         ? `The Windows computer is not online yet (${WIN_MCP.reason}); start it and call windows_desktop again.`
         : granted !== true
           ? 'The Computer Use grant is OFF for this session (turned off explicitly), so the tools stay hidden: the user turns it back on in the Personal VM panel (or POST /dsh-cua-vm/cua-grant with {"grant":true}); it is ON by default.'
           : `${match.text}. The tools went back to hidden for this session.`
+      : lane.blind === true
+        ? `${tools.length} dsh-cua tool(s) are now visible for this session, but the desktop is BLIND (${lane.blindReason}): the bridge is attached on ${String(laneFacts?.transport ?? 'no decided lane')}, which has no interactive desktop, so list_windows and screenshots will come back empty. ${windowsBlindAction(lane.blindReason)}`
+        : lane.laneUpgrading === true
+          // DEFECT 1/2: the same window the doctor calls "upgrading" — the relay
+          // has answered but the child has not moved yet. Saying only "visible"
+          // would promise an element-level lane that is not there for one beat.
+          ? `${tools.length} dsh-cua tool(s) are now visible for this session; the relay ANSWERED and the lane upgrade to the interactive relay is in motion — it completes within one poll cycle.`
+          : `${tools.length} dsh-cua tool(s) are now visible for this session.`
   }
+}
+
+/* ==================================================================== *
+ * THE BLIND VERDICT (WP-3.1-3.3; SOL §4.6 and §4.10)
+ * ==================================================================== *
+ *
+ * THE DEFECT THIS EXISTS FOR. `status` used to be `leaking | ok` only: it asked
+ * "are prefixed schemas still on the global registry while offline", which is
+ * the LEAK question, and it answered `ok` for a bridge that was attached on the
+ * blind `session-0-direct` lane. The report then read "auto-start PASS,
+ * blindness separate" — a verdict that could not say the one thing that was
+ * wrong. §4.6 makes blindness a FIRST-CLASS verdict, and §4.10 is the table a
+ * test can assert:
+ *
+ *   attached through the relay        → ok      transport interactive-relay
+ *   attached, relay probe failed      → blind   blindReason probe-skew | relay-stopped
+ *   attached, no Active console session → blind blindReason no-interactive-session
+ *   attached, lane never decided      → blind   blindReason lane-unknown
+ *   not attached, computer ready      → ok (online: false)
+ *   not attached, prefixed schemas    → leaking (unchanged)
+ *
+ * PRECEDENCE: `leaking` first (it is the offline lie and its check is unchanged),
+ * then `blind` (online but not on the relay), then `ok`. An offline-but-clean
+ * bridge stays `ok` exactly as before: `online` / `onlineSource` / `state` already
+ * carry that fact, and inventing an `offline` value would break every existing
+ * consumer for no verdict gain (SOL D9).
+ *
+ * THE REASONS ARE A CLOSED SET. Every value below has exactly one producer in
+ * this file, and nothing else may be written into `blindReason`:
+ *   probe-skew            the guest answered the probe but the harness could not
+ *                         read it (payload mismatch) — the P0 signature;
+ *   relay-missing         the guest has no relay script at all;
+ *   relay-stopped         the probe said DOWN/BAD, or the blind lane has no
+ *                         better explanation — a relay that is not serving;
+ *   no-interactive-session the repair record measured session=0 (no Active
+ *                         console session for the guest user);
+ *   lane-unknown          a client exists but no lane was ever decided;
+ *   repair-disabled       `DSH_CUA_VM_WIN_MCP_REPAIR=0` and nothing else is known.
+ */
+const BLIND_REASONS = Object.freeze([
+  'probe-skew',
+  'relay-missing',
+  'relay-stopped',
+  'no-interactive-session',
+  'lane-unknown',
+  'repair-disabled'
+])
+const BLIND_REASON_SET = new Set(BLIND_REASONS)
+
+/**
+ * WHAT TO DO ABOUT EACH REASON, in the doctor's and the reveal's own words.
+ * A verdict without a next action is a complaint, and the observed defect was a
+ * report that said everything was fine while nothing worked — so every sentence
+ * that names a reason also names the verb that fixes it.
+ */
+const BLIND_ACTIONS = Object.freeze({
+  'probe-skew': 'next: call windows_mcp_doctor with {"repair":true} to re-assert the relay, or re-create the computer so the guest payload matches this plugin.',
+  'relay-missing': 'next: call windows_mcp_doctor with {"repair":true} to stage and start the relay.',
+  'relay-stopped': 'next: call windows_mcp_doctor with {"repair":true} to start the relay, or restart the computer.',
+  'no-interactive-session': 'next: restart the computer (it re-asserts autologon and the logon task, and the relay needs an Active console session to run in).',
+  'lane-unknown': 'next: retry once the attach settles, or restart the computer.',
+  'repair-disabled': 'next: unset DSH_CUA_VM_WIN_MCP_REPAIR (repair is disabled) and call windows_mcp_doctor with {"repair":true}.'
+})
+
+/** The next action for one closed-set reason; never empty, never throws. */
+function windowsBlindAction(reason) {
+  const stated = typeof reason === 'string' ? reason : ''
+  return BLIND_ACTIONS[stated] ?? 'next: restart the computer and call windows_mcp_doctor again.'
+}
+
+/** One closed-set reason from a repair record's own `reason` field, or null. */
+function recordBlindReason(repair) {
+  const stated = String(repair?.reason ?? '').trim().toLowerCase()
+  return BLIND_REASON_SET.has(stated) ? stated : null
+}
+
+/** The client's lane facts — synchronous, side-effect free, or null (no client). */
+function windowsLaneFacts() {
+  try {
+    return WIN_MCP.client?.doctorFacts?.() ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * CLASSIFY A BLIND LANE. First match wins, and the order is the evidence order:
+ * the facts a repair MEASURED on the guest, then the probe's own token, then the
+ * record's sentence, then the relay-answered evidence, then the plain fallback.
+ * Never returns a value outside the closed set. `null` means "not blind": the
+ * relay lane, or a lane whose relay has just answered and is upgrading.
+ */
+function classifyBlindReason({ transportFacts, repairEnabled }) {
+  // THE MEASURED MARKER (the repair-record contract). A repair attempt that never
+  // reached the guest still yields a RECORD — it just carries `measured: false`
+  // and null `session` / `hash` / `probe` instead of the old base defaults
+  // (`session: 0`, `hash: ''`, `probe: 'RELAY_DOWN'`). Those nulls mean "not
+  // measured", NOT "measured zero" / "measured absent": rules 3, 4 and 6 below
+  // are the paths where a default (or a borrowed sentence) used to masquerade as
+  // evidence, so all three now require `measured === true` on a record that is
+  // actually present.
+  const repair = transportFacts?.repair ?? null
+  const measured = repair !== null && repair.measured === true
+  const recorded = recordBlindReason(repair)
+  const payload = transportFacts?.payload ?? null
+  const transport = transportFacts?.transport ?? null
+  // 1. A CLIENT WITHOUT A LANE: the attach never got as far as a decision.
+  if (transport === null) {
+    return recorded ?? (repairEnabled === false ? 'repair-disabled' : 'lane-unknown')
+  }
+  // 2. The relay lane is not blind (the caller only asks when online).
+  if (transport === 'interactive-relay') return null
+  const status = String(transportFacts?.relayStatus ?? '')
+  // 3. A repair MEASURED that no console session exists: the relay has nowhere
+  //    to run, which no amount of re-probing will change. `session: null` (an
+  //    unmeasured or in-flight attempt), and a record whose OWN `sessionMeasured`
+  //    flag is false, are NOT this fact and must fall through.
+  //    DEFECT 3: this MEASURED fact now ranks ABOVE the probe token. A probe
+  //    cannot see a console, and a stale `RELAY_SKEW` must not relabel a measured
+  //    session=0 as `probe-skew` — the operator would go re-assert a payload on a
+  //    computer with no console to run it in.
+  const rawSession = repair?.session
+  const sessionMeasured = repair?.sessionMeasured !== false
+  const measuredSession = measured && sessionMeasured
+    && rawSession !== null && rawSession !== undefined && rawSession !== ''
+    && Number.isFinite(Number(rawSession))
+    ? Math.floor(Number(rawSession))
+    : null
+  if (measuredSession === 0) return 'no-interactive-session'
+  // 4. A MEASURED attempt read the relay script's hash and it was the EMPTY
+  //    string: the guest answered "there is no relay script here". A record with
+  //    no measurement (hash null, or `hashMeasured: false`) is silent on the
+  //    question, and so is a client without a payload — neither may claim
+  //    `relay-missing`. The record's own per-field flags (`sessionMeasured` /
+  //    `hashMeasured`) narrow the record-level `measured`; absent = not
+  //    contradicted, so a client that ships only `measured` still classifies.
+  //    Like rule 3, a measured hash OUTRANKS the SKEW token below.
+  const hashMeasured = repair?.hashMeasured !== false
+  const rawHash = measured && hashMeasured
+    ? (typeof repair?.hash === 'string' ? repair.hash : (typeof payload?.relayHash === 'string' ? payload.relayHash : null))
+    : null
+  if (rawHash === '') return 'relay-missing'
+  // 5. THE P0 SIGNATURE: the guest answered, the harness could not read it. The
+  //    SKEW token (and the payload's own proven `skew` flag) is the whole rule:
+  //    `probeMode` only ever answers handshake | legacy | none, so there is no
+  //    'skew' mode to compare against. It sits BELOW the measured console/hash
+  //    evidence (defect 3) and ABOVE the record's sentence: with writer B's
+  //    classification an interpreter-missing guest arrives as `RELAY_DOWN`, so a
+  //    remaining SKEW really is "the relay answered and we could not read it".
+  if (status === 'RELAY_SKEW' || payload?.skew === true) return 'probe-skew'
+  // 6. The repair's own sentence (it writes this vocabulary in Appendix B) — but
+  //    only when that attempt MEASURED something. `reason` is the guest's own
+  //    verdict, and an unmeasured record has none to give (`reason: ''` on every
+  //    unmeasured path today); keying off it WITHOUT the marker would let any
+  //    future unmeasured producer that borrows the vocabulary (`reason:
+  //    'no-interactive-session'`) short-circuit this ladder with a sentence
+  //    nothing measured. Same gate as rules 3/4: measured records keep their
+  //    reasons, unmeasured ones fall through to rules 8-10.
+  if (measured && recorded !== null) return recorded
+  // 7. THE RELAY ANSWERED (defect 1/2): a measured successful repair, or the
+  //    client's coherent up pair while the lane move is still in flight. The
+  //    relay is SERVING; classifying this as `relay-stopped` made the doctor say
+  //    "up" and "blind" in the same payload and told the model to repeat the
+  //    repair that had just worked. Not blind — the upgrade is in motion.
+  if (windowsRelayAnswered(transportFacts) === true) return null
+  // 8. A probe that answered at all.
+  if (status === 'RELAY_DOWN' || status === 'RELAY_BAD') return 'relay-stopped'
+  // 9. Nothing known, and the one verb that could find out is switched off.
+  if (repairEnabled === false) return 'repair-disabled'
+  // 10. The lane is known (session-0-direct) and the relay is not on it.
+  return 'relay-stopped'
+}
+
+/**
+ * HOW LONG A SUCCESSFUL REPAIR IS EVIDENCE. Two repair throttle windows: long
+ * enough for the lane move the repair triggered to happen (it rides the next
+ * poll, seconds), short enough that an ancient `ok=1` cannot excuse a lane that
+ * never moved. A record that carries no `at`/`lastAt` (the pre-timestamp shape,
+ * and every fixture) is still accepted — the value is evidence, only its AGE is
+ * bounded here.
+ */
+const RELAY_ANSWERED_FRESH_MS = 120_000
+
+/**
+ * THE RELAY ANSWERED — the ONE predicate both the ladder and the verdict share.
+ *
+ * Two shapes of the same fact, and they must agree or the doctor contradicts
+ * itself again:
+ *
+ *   • the client's coherent up pair: `relayOk === true` AND
+ *     `relayStatus === 'RELAY_OK'`. This is the UPGRADE WINDOW — the probe
+ *     answered, the client recorded the answer, and the SSH child has not been
+ *     replaced yet (`transport` is still `session-0-direct`).
+ *   • a MEASURED, SUCCESSFUL, FRESH repair: `measured && ok && probe ===
+ *     'RELAY_OK'`, stamped no more than RELAY_ANSWERED_FRESH_MS ago.
+ *     `{"repair": true}` re-asserted the relay and the guest's own Appendix-B
+ *     record says the handshake answered. The lane move is the only thing left,
+ *     and it rides the next poll (`nudgeRelayUpgrade()`).
+ *
+ * Either way the relay is SERVING, so the lane is not "blind" — it is upgrading.
+ */
+function windowsRelayAnswered(facts) {
+  if (facts === undefined || facts === null) return false
+  if (facts.transport === 'interactive-relay') return true
+  if (facts.relayOk === true && String(facts.relayStatus ?? '') === 'RELAY_OK') return true
+  const repair = facts.repair ?? null
+  if (repair === null || repair.measured !== true || repair.ok !== true) return false
+  if (String(repair.probe ?? '') !== 'RELAY_OK') return false
+  const repairedAt = Number(repair.at ?? repair.lastAt)
+  return !(Number.isFinite(repairedAt) && repairedAt > 0)
+    || (Date.now() - repairedAt) <= RELAY_ANSWERED_FRESH_MS
+}
+
+/** The lane is still `session-0-direct` but the relay has answered: the move to
+ * the interactive relay is IN MOTION and completes within one poll cycle. */
+function windowsLaneUpgrading(facts) {
+  return facts !== undefined && facts !== null
+    && facts.transport === 'session-0-direct'
+    && windowsRelayAnswered(facts) === true
+}
+
+/**
+ * THE PAYLOAD FACTS (WP-3.2): the relay script's identity on both sides, the
+ * port the guest was measured answering on, and the skew flag.
+ *
+ * THE KEYS ARE THE DOCUMENTED SET (`DOCTOR_FACTS_FIELDS`, win-mcp.js):
+ * `measured`, `expectedRelayHash`, `relayHash`, `relayPresent`, `skew`, `port`,
+ * `portMeasured`, `portMismatch`. `measured` is re-emitted here on purpose: it is
+ * the marker that makes the rest readable — without it, `relayHash: null` cannot
+ * be told apart from "nobody looked", and `port: null` cannot be told apart from
+ * "the guest could not say".
+ *
+ *   • `measured` — the client payload's own marker, or the repair record's when
+ *     the client predates it. `false` means NOBODY LOOKED, not "nothing is there".
+ *   • `expectedRelayHash` — the relay script THIS plugin ships. `null` means
+ *     "this build cannot say" (no payload source on the harness side): UNKNOWN,
+ *     which is neither "the guest has no relay" nor "the hashes differ".
+ *   • `relayHash` — the hash the guest last reported. A MEASURED record whose
+ *     Appendix-B `hash=` was literally empty arrives from the client as `''` and
+ *     is normalized HERE to `relayHash: null` — the `''` never reaches the wire
+ *     as a hash. `relayPresent` is what carries the "no relay script" fact.
+ *   • `relayPresent` — `true` (a hash was read), `false` (measured and absent:
+ *     the fact behind `relay-missing`), `null` (not measured).
+ *   • `port` / `portMeasured` — the port the guest relay was measured answering
+ *     on. `port` is reported only with `portMeasured: true`; otherwise it is
+ *     `null` / `false` ("the guest could not say"), so a port is never a guess.
+ *   • `portMismatch` — compares that guest-MEASURED port with the port the
+ *     harness probes (`transportFacts.relayPort`); `true` means the two sides are
+ *     talking about different listeners. Either side unknown ⇒ `false`, because
+ *     an unknown pair is not a mismatch.
+ *   • `skew` — passed through from the client's own flag (`relayEvidenceSkew` in
+ *     win-mcp.js): the guest relay ANSWERED and the probe could not READ the
+ *     answer (the `RELAY_SKEW` token, a `RELAY_BAD` answer, or a repair record
+ *     whose reason is `probe-skew`). It is NOT a hash comparison — a differing
+ *     hash is reported by `relayHash` vs `expectedRelayHash`, and a missing
+ *     interpreter is `RELAY_DOWN` + `interpreterMissing`, never skew.
+ *
+ * A missing/old client yields nulls, never invented values.
+ */
+function windowsPayloadFacts(transportFacts) {
+  const reported = transportFacts?.payload ?? null
+  const repair = transportFacts?.repair ?? null
+  const harnessRaw = Number(transportFacts?.relayPort)
+  const harnessPort = Number.isFinite(harnessRaw) && harnessRaw > 0 ? Math.floor(harnessRaw) : null
+  const repairRaw = Number(repair?.port ?? reported?.port)
+  const recordPort = Number.isFinite(repairRaw) && repairRaw > 0 ? Math.floor(repairRaw) : null
+  // THE MARKERS FIRST — the two flags the documented set promises, read from the
+  // client payload and falling back to the repair record (the same measurement,
+  // one level down) so a client that predates the payload flags still classifies.
+  const measured = reported?.measured === true || repair?.measured === true
+  const portMeasured = typeof reported?.portMeasured === 'boolean'
+    ? reported.portMeasured === true
+    : (typeof repair?.portMeasured === 'boolean' ? repair.portMeasured === true : recordPort !== null)
+  // THE WIRE SHAPE OF `hash=` (the claim this comment used to get wrong): a
+  // measured empty hash is `relayPresent: false` with `relayHash: null`, NOT a
+  // `''` on the wire — `''` only ever exists INSIDE the client/repair record.
+  const rawHash = typeof reported?.relayHash === 'string'
+    ? reported.relayHash
+    : (measured && typeof repair?.hash === 'string' ? repair.hash : null)
+  const relayHash = rawHash === null || rawHash === '' ? null : rawHash
+  return {
+    measured,
+    expectedRelayHash: typeof reported?.expectedRelayHash === 'string' && reported.expectedRelayHash !== ''
+      ? reported.expectedRelayHash
+      : null,
+    relayHash,
+    // THE HONEST FLAG, verbatim from the client (`relayEvidenceSkew`): `true`
+    // only when the guest relay ANSWERED and the probe could not READ it — the
+    // `RELAY_SKEW` token, a `RELAY_BAD` answer, or a repair record whose own
+    // reason is `probe-skew`. NOT a hash comparison: a differing hash is
+    // reported as `relayHash` vs `expectedRelayHash`, and a missing interpreter
+    // is `RELAY_DOWN` (+ `interpreterMissing`), never skew.
+    skew: reported?.skew === true,
+    // `true` (hash read) / `false` (measured, absent) / `null` (not measured):
+    // "no hash yet" and "the guest has no relay" are different facts.
+    relayPresent: rawHash === null ? null : rawHash !== '',
+    // Both halves move together: a MEASURED port is the only one reported, and
+    // `portMeasured: true` never stands next to `port: null` ("the guest could
+    // not say" is `null` / `false`, never a measured nothing).
+    port: portMeasured === true && recordPort !== null ? recordPort : null,
+    portMeasured: portMeasured === true && recordPort !== null,
+    portMismatch: portMeasured === true && recordPort !== null && harnessPort !== null && recordPort !== harnessPort
+  }
+}
+
+/**
+ * THE REPAIR FACTS (WP-3.2): `{ attempts, lastAt, ok, reason, backoffMs }` from
+ * the client's last record, plus the parts of Appendix B that explain a blind
+ * verdict (`session`, `probe`) and the switch's own state. `enabled` is this
+ * plugin's read of `DSH_CUA_VM_WIN_MCP_REPAIR`, so a report can tell "nothing to
+ * repair with" from "the repair ran and failed".
+ */
+function windowsRepairFacts(transportFacts) {
+  const reported = transportFacts?.repair ?? null
+  const attempts = Number(reported?.attempts)
+  const backoff = Number(reported?.backoffMs)
+  // NOT `Number(reported?.session)`: `Number(null)` is 0, and that coercion is
+  // exactly how an UNMEASURED record used to be reported as "session 0" — the
+  // fact behind `no-interactive-session`. A value is reported only when the
+  // record says it was MEASURED; null means "nobody measured it", and the
+  // reader can tell that apart from a measured 0.
+  const isMeasured = reported?.measured === true
+  const rawSession = reported?.session
+  const sessionMeasured = isMeasured && reported?.sessionMeasured !== false
+  const session = !sessionMeasured || rawSession === null || rawSession === undefined || rawSession === ''
+    ? null
+    : (Number.isFinite(Number(rawSession)) && Number(rawSession) >= 0 ? Math.floor(Number(rawSession)) : null)
+  const rawLastAt = reported?.lastAt
+  const lastAt = typeof rawLastAt === 'number' && rawLastAt > 0
+    ? Math.floor(rawLastAt)
+    : (typeof rawLastAt === 'string' && rawLastAt !== '' ? rawLastAt : null)
+  return {
+    enabled: relayRepairEnabled(),
+    attempts: Number.isFinite(attempts) && attempts > 0 ? Math.floor(attempts) : 0,
+    lastAt,
+    ok: reported?.ok === true ? true : (reported?.ok === false ? false : null),
+    reason: typeof reported?.reason === 'string' ? reported.reason : '',
+    backoffMs: Number.isFinite(backoff) && backoff > 0 ? Math.floor(backoff) : 0,
+    // THE MARKER, verbatim: true/false when the record carries one, null when
+    // the client predates it. `measured: false` is what keeps the nulls below
+    // from being read as evidence.
+    measured: isMeasured ? true : (reported?.measured === false ? false : null),
+    // The console session id the repair measured: 0 is the fact behind
+    // `no-interactive-session`, and null means "no measurement yet".
+    session,
+    sessionMeasured: sessionMeasured && session !== null,
+    // The probe token the record carries, or null when it carries none: an
+    // empty string would be a fourth value pretending to be "the probe said
+    // nothing".
+    probe: isMeasured && typeof reported?.probe === 'string' ? reported.probe : null,
+    // The relay script hash the record carries — `''` means the guest HAS no
+    // relay script (measured), null means nobody measured it.
+    hash: isMeasured && reported?.hashMeasured !== false && typeof reported?.hash === 'string' ? reported.hash : null,
+    hashMeasured: isMeasured && reported?.hashMeasured !== false && typeof reported?.hash === 'string'
+  }
+}
+
+/**
+ * THE VERDICT, ONCE, FOR BOTH READERS (the doctor's JSON and the reveal's note).
+ * `blind` is true only when the bridge is ONLINE and the lane is not the relay —
+ * exactly the §4.10 rows that are not already covered by `leaking`.
+ */
+function windowsLaneVerdict(online, transportFacts) {
+  const transport = transportFacts?.transport ?? null
+  // DEFECT 2: THE COHERENT PAIR. A probe that answered RELAY_OK while the child
+  // is still the session-0 one is the UPGRADE WINDOW, not a blind lane. The old
+  // expression (`transport !== 'interactive-relay'`) called that window blind,
+  // so the payload said `relayOk: true` AND `status: blind` — "up" and "blind"
+  // in one object, with a next action ("start the relay") for a running relay.
+  // The relay-answered predicate is the SAME one the ladder uses, so the two
+  // readers cannot drift apart again.
+  const upgrading = online === true && transport !== 'interactive-relay'
+    && windowsRelayAnswered(transportFacts) === true
+  const blind = online === true && transport !== 'interactive-relay' && upgrading !== true
+  return {
+    blind,
+    blindReason: blind === true ? classifyBlindReason({ transportFacts, repairEnabled: relayRepairEnabled() }) : null,
+    // The explicit note the verdict text carries: the lane is moving, not stuck.
+    laneUpgrading: upgrading,
+    payload: windowsPayloadFacts(transportFacts),
+    repair: windowsRepairFacts(transportFacts)
+  }
+}
+
+/**
+ * ONE SENTENCE FOR THE HUMAN READING THE DOCTOR: what the verdict IS, why, and
+ * what to do next. Built from the same fields the JSON carries, so the sentence
+ * and the payload cannot disagree.
+ */
+function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts }) {
+  if (leaking === true) {
+    return `leaking: ${leaks.length} mcp__windows__* schema(s) are still on the global registry while the bridge is offline; next: wait for the teardown (or remove the computer with cua_vm_destroy) and call windows_mcp_doctor again.`
+  }
+  if (blind === true) {
+    const lane = transportFacts?.transport === undefined || transportFacts?.transport === null
+      ? 'no decided lane'
+      : String(transportFacts.transport)
+    return `blind (${String(blindReason)}): the bridge is attached on ${lane}, so the desktop has no interactive lane and element-level tools cannot see windows. ${windowsBlindAction(blindReason)}`
+  }
+  if (online === true) {
+    // DEFECT 1/2: THE LANE IS MOVING, NOT BLIND. When the relay has answered
+    // (a successful measured repair, or the client's own up pair) but the child
+    // is still the session-0 one, the truth is "up, upgrading" — and the ONE
+    // thing the sentence must never do is send the model back to repeat the
+    // repair that just succeeded. It names the evidence and the wait instead.
+    if (windowsLaneUpgrading(transportFacts) === true) {
+      const evidence = transportFacts?.relayOk === true && String(transportFacts?.relayStatus ?? '') === 'RELAY_OK'
+        ? 'the probe answered RELAY_OK'
+        : 'the repair measured RELAY_OK'
+      return `ok: the relay ANSWERED (${evidence}), so the lane upgrade from session-0-direct to the interactive relay is in motion and completes within one poll cycle — no repair is needed; desktop tools work now and the element-level lane follows on the next beat.`
+    }
+    return `ok: attached through the interactive relay (port ${transportFacts?.relayPort ?? '?'}).`
+  }
+  return 'ok: not attached and no prefixed schema is leaked (online: false; start the computer to attach).'
 }
 
 /**
@@ -1568,23 +2180,138 @@ function revealWindowsTools(agent) {
  * It is built from the client's own `doctorFacts()` — the SAME object spread
  * into the JSON — so the sentence and the fields can never disagree. It dials
  * nothing: "never attached" is a fact, not a reason to open an SSH session.
+ *
+ * WP-3.3: WHEN THE VERDICT IS `blind` the SAME LINE also names the closed-set
+ * reason and the next action. The two halves are deliberately one string: a
+ * report that prints the lane but not the verdict is exactly how "session-0
+ * fallback" read as a pass for a whole session.
  */
-function windowsTransportLine(facts) {
-  if (facts.transport === 'interactive-relay') {
-    const relay = facts.relayOk === true ? 'up' : facts.relayOk === false ? 'down' : 'unknown'
-    return `windows mcp transport: interactive-relay (port ${facts.relayPort}, relay ${relay})`
+function windowsTransportLine(facts, blindReason = null) {
+  const line = (() => {
+    if (facts === null || facts === undefined) return 'windows mcp transport: not attached yet (no lane decided in this process)'
+    if (facts.transport === 'interactive-relay') {
+      const relay = facts.relayOk === true ? 'up' : facts.relayOk === false ? 'down' : 'unknown'
+      return `windows mcp transport: interactive-relay (port ${facts.relayPort}, relay ${relay})`
+    }
+    if (facts.transport === 'session-0-direct') {
+      // DEFECT 1/2: THE RELAY ANSWERED BUT THE CHILD HAS NOT MOVED YET. The line
+      // must not repeat the DOWN sentence from the attach-time probe: the lane
+      // upgrade is IN MOTION, and one poll cycle is how long it takes.
+      if (windowsLaneUpgrading(facts) === true) {
+        return `windows mcp transport: session-0-direct, relay ANSWERED; the lane upgrade to the interactive relay is in motion and completes within one poll cycle`
+      }
+      // A fallback attach records a SENTENCE ("session-0 fallback (…)"); the line
+      // needs only the part that says WHY, not a second copy of the label.
+      const recorded = String(facts.transportReason ?? '').trim()
+        .replace(/^session-0 fallback\s*[:\-]?\s*/i, '')
+        .replace(/^\(/, '')
+        .replace(/\)$/, '')
+      const detail = recorded !== '' ? recorded : (facts.relayStatus || 'interactive relay not running')
+      return `windows mcp transport: session-0 fallback: ${detail}`
+    }
+    return 'windows mcp transport: not attached yet (no lane decided in this process)'
+  })()
+  if (blindReason === null || blindReason === undefined) return line
+  return `${line}. BLIND (${String(blindReason)}): ${windowsBlindAction(blindReason)}`
+}
+
+/**
+ * HOW LONG ONE FORCED REPAIR MAY TAKE INSIDE A TOOL CALL (WP-3.6).
+ *
+ * The tool's declared envelope is 60 s (`TOOL_TIMEOUTS.windows_mcp_doctor`), and
+ * the client's own repair timeout is 25 s (WP-2.5). 30 s is therefore a ceiling
+ * ABOVE the client's budget and BELOW the tool's: a stuck SSH child can never eat
+ * the whole envelope, and the doctor still answers with whatever the attempt saw.
+ * The sentinel makes "the timer won" distinguishable from a record that happens
+ * to look empty.
+ */
+const WIN_MCP_FORCE_REPAIR_MS = 30_000
+const WIN_MCP_FORCE_REPAIR_TIMED_OUT = Symbol('cua-vm: force repair timed out')
+
+/**
+ * WP-3.6 — ONE REPAIR ATTEMPT, ON DEMAND, FROM `windows_mcp_doctor {"repair":true}`.
+ *
+ * The poll asks for repairs on its own (WP-3.5), but a human or a model staring at
+ * a blind verdict should not have to wait for the next throttle window. This runs
+ * the client's own `repairRelay({ force: true })` — the verb, the record grammar
+ * and every safety rule stay in win-mcp.js; nothing is re-implemented here:
+ *
+ *   • the kill switch is honoured BEFORE the client is touched, so
+ *     `DSH_CUA_VM_WIN_MCP_REPAIR=0` spawns no SSH child at all (P4);
+ *   • not attached means nothing to repair over SSH — `attempted: false` says so
+ *     instead of pretending an attempt happened;
+ *   • the race is bounded (see above) and the call never throws, so the doctor
+ *     always produces a payload;
+ *   • `requested` is always true (this runs only when the argument asked).
+ *
+ * The returned object is what `forcedRepair` in the doctor payload carries:
+ * `{ requested, attempted, ok, reason, port, at }`, where `ok` is boolean or null
+ * (null = the attempt could not be judged, never "success" by omission).
+ */
+async function forceRelayRepair(reason = 'windows_mcp_doctor') {
+  const at = Date.now()
+  if (relayRepairEnabled() !== true) {
+    return {
+      requested: true,
+      attempted: false,
+      ok: null,
+      reason: 'repair-disabled: DSH_CUA_VM_WIN_MCP_REPAIR=0',
+      port: null,
+      at
+    }
   }
-  if (facts.transport === 'session-0-direct') {
-    // A fallback attach records a SENTENCE ("session-0 fallback (…)"); the line
-    // needs only the part that says WHY, not a second copy of the label.
-    const recorded = String(facts.transportReason ?? '').trim()
-      .replace(/^session-0 fallback\s*[:\-]?\s*/i, '')
-      .replace(/^\(/, '')
-      .replace(/\)$/, '')
-    const detail = recorded !== '' ? recorded : (facts.relayStatus || 'interactive relay not running')
-    return `windows mcp transport: session-0 fallback: ${detail}`
+  const client = WIN_MCP.client
+  if (client === null || typeof client?.repairRelay !== 'function') {
+    return {
+      requested: true,
+      attempted: false,
+      ok: null,
+      reason: `${reason}: the bridge is not attached, so there is no SSH session to repair through (start the computer and attach first)`,
+      port: null,
+      at
+    }
   }
-  return 'windows mcp transport: not attached yet (no lane decided in this process)'
+  let timer = null
+  try {
+    const expiry = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(WIN_MCP_FORCE_REPAIR_TIMED_OUT), WIN_MCP_FORCE_REPAIR_MS)
+      timer.unref?.()
+    })
+    const answer = await Promise.race([Promise.resolve(client.repairRelay({ force: true })), expiry])
+    if (answer === WIN_MCP_FORCE_REPAIR_TIMED_OUT) {
+      return {
+        requested: true,
+        attempted: true,
+        ok: null,
+        reason: `no answer within ${WIN_MCP_FORCE_REPAIR_MS} ms`,
+        port: null,
+        at
+      }
+    }
+    // The record may be the value itself or nested under `record`; both shapes
+    // are accepted so a later client return shape cannot silently lose `ok`.
+    const record = answer?.record ?? answer ?? null
+    const port = Number(record?.port)
+    return {
+      requested: true,
+      attempted: true,
+      ok: record?.ok === true ? true : (record?.ok === false ? false : null),
+      reason: String(answer?.reason ?? record?.reason ?? ''),
+      port: Number.isFinite(port) && port > 0 ? Math.floor(port) : null,
+      at
+    }
+  } catch (error) {
+    return {
+      requested: true,
+      attempted: true,
+      ok: false,
+      reason: `${error?.message ?? error}`,
+      port: null,
+      at
+    }
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
 }
 
 /**
@@ -1597,8 +2324,13 @@ function windowsTransportLine(facts) {
  * `probeAgeMs` / `probe.*`, and may only add detail — never overrule a
  * not-online verdict, which is how `online: true / state: ready / 19 tools`
  * outlived a power-off by seconds.
+ *
+ * WP-3 adds the third question the first two could not answer: WHEN ONLINE, IS
+ * THE DESKTOP REAL? `status: blind` + a closed-set `blindReason` + a `verdict`
+ * sentence is the answer, and `options.forcedRepair` carries what an on-demand
+ * `{"repair": true}` did on this very call.
  */
-async function windowsMcpDoctor(execAgent) {
+async function windowsMcpDoctor(execAgent, options = {}) {
   try {
     if (windowsMcpEnabled() === true && typeof WIN_MCP_AUX.supervisorCall === 'function') {
       // A fast probe, not a handshake: the doctor must answer in one socket
@@ -1685,21 +2417,71 @@ async function windowsMcpDoctor(execAgent) {
   // guest to ask (a probe here would race the attach and cost a session).
   // No client means no lane was ever decided, so the keys are simply absent.
   const transportFacts = WIN_MCP.client?.doctorFacts?.() ?? null
-  const transportText = transportFacts === null ? null : windowsTransportLine(transportFacts)
+  // ---- WP-3.1/3.2: THE VERDICT, AND THE FACTS IT RESTS ON ----
+  // `leaking` is the same expression the `status` line below uses (the offline
+  // lie, unchanged since the leak fix). `blind` is the NEW value: online, but not
+  // through the relay, which is the state that used to report `ok`.
+  const leaking = online !== true && leaks.length > 0
+  const lane = windowsLaneVerdict(online, transportFacts)
+  const blind = lane.blind
+  const blindReason = lane.blindReason
+  const verdict = windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts })
+  // A blind verdict REPLACES the bare lane line with lane + reason + next action;
+  // a healthy one keeps the original sentence byte for byte.
+  const transportText = transportFacts === null
+    ? (blind === true ? windowsTransportLine(null, blindReason) : null)
+    : windowsTransportLine(transportFacts, blindReason)
+  // WP-3.6: what `{"repair": true}` did on THIS call (null when not requested).
+  // The doctor's own budget stays 60 s; the attempt is bounded below that.
+  const forcedRepair = options?.forcedRepair ?? null
   // ONE LINE FOR THE HUMAN READING THE DOCTOR (and cheap enough to always send):
   // the two desktop lanes are not interchangeable, and a noVNC screenshot is a
   // stream, not the guest framebuffer — the MCP tools are the element-level lane.
   const guiNote = 'desktop automation uses the MCP windows tools; cua_vm_gui screenshots are the noVNC stream, not a framebuffer'
   return {
-    status: online !== true && leaks.length > 0 ? 'leaking' : 'ok',
+    // SOL §4.6/§4.10. PRECEDENCE: leaking → blind → ok. The literal keeps the
+    // leak test's own expression in front (a leak while offline still wins), and
+    // the second branch is the value this release adds: an ONLINE bridge that is
+    // not on the interactive relay is `blind`, never `ok`.
+    status: online !== true && leaks.length > 0 ? 'leaking' : (blind === true ? 'blind' : 'ok'),
+    // SOL §4.8 / WP-3.7: which build answered. Equal to package.json's version
+    // (gate-enforced), so "the fix is not in your plugin" is now a fact, not a guess.
+    pluginVersion: PLUGIN_VERSION,
     enabled: windowsMcpEnabled() === true,
     target: WIN_MCP.name === '' ? null : WIN_MCP.name,
+    // SOL §4.10 names `transport: null` for "never attached" and "lane never
+    // decided", so those keys are PRESENT with a null value instead of being
+    // omitted — a consumer (or a test) can then say `transport === null` without
+    // guessing whether the field is missing. The spread right after overrides
+    // every one of them when a client exists (a client with a lane always wins).
+    transport: null,
+    relayPort: null,
+    relayOk: null,
+    relayStatus: null,
+    probeMode: null,
+    relayDetail: '',
+    interpreter: null,
+    transportCommand: null,
+    transportReason: '',
     // THE TRANSPORT FACTS, from the zero-SSH client method — transport /
     // relayPort / relayOk / relayStatus / transportCommand / transportReason.
-    // Spread FIRST, before the verdict: a client fact may add detail, never
-    // suppress `online`/`state`/`onlineSource` (see the verdict block above).
-    // Absent when no client exists — the doctor never dials to fill them in.
+    // Spread AFTER the nulls and BEFORE the verdict: a client fact may add
+    // detail, never suppress `online`/`state`/`onlineSource` (see the verdict
+    // block above). Absent when no client exists — the doctor never dials to
+    // fill them in.
     ...(transportFacts ?? {}),
+    // The verdict, split so a caller can branch without parsing the sentence:
+    // `blind` is boolean and `blindReason` is one of the six closed-set values
+    // (null whenever `blind` is false). AFTER the spread on purpose: the client's
+    // facts may describe a lane, never this plugin's verdict.
+    blind,
+    blindReason,
+    verdict,
+    // DEFECT 1/2: WHEN THE RELAY HAS ANSWERED AND THE LANE MOVE IS IN FLIGHT.
+    // `blind` is false and `blindReason` null in this window; this boolean is
+    // what says "ok because the upgrade is moving", so a caller can tell it from
+    // "attached through the relay" without parsing the sentence.
+    laneUpgrading: lane.laneUpgrading === true,
     // THE VERDICT, from the plugin's own state (see the block above) — a probe
     // may never raise it back to true during a power-off.
     online,
@@ -1732,10 +2514,47 @@ async function windowsMcpDoctor(execAgent) {
       on: [...WIN_MCP_AUX.grants.entries()].filter(([, value]) => value === true).map(([key]) => key)
     },
     revealed: [...WIN_MCP_AUX.revealedSessions],
+    // WP-3.2 / SOL §4.8: THE IDENTITY OF THE GUEST PAYLOAD — the FULL documented
+    // set (`measured`, `expectedRelayHash`, `relayHash`, `relayPresent`, `skew`,
+    // `port`, `portMeasured`, `portMismatch`), not a subset. `expectedRelayHash`
+    // is the relay script this plugin ships (`null` = this build cannot say —
+    // unknown, neither "no relay" nor "different"), `relayHash` the one the guest
+    // last reported; `measured` is what makes them readable, and a measured
+    // `hash=` arrives as `relayPresent: false` + `relayHash: null` (never `''` on
+    // the wire). `skew` keeps the client's own definition — the relay ANSWERED
+    // and the probe could not read the answer, never a hash mismatch.
+    payload: lane.payload,
+    // WP-3.2 / SOL §4.4: the repair's own last record — `attempts`, `lastAt`,
+    // `ok`, `reason`, `backoffMs` — plus the two facts that explain a blind
+    // verdict (`session`, `probe`) and whether the switch is even on (`enabled`).
+    repair: lane.repair,
+    // WP-3.6: the result of `{"repair": true}` on THIS call, or null. Never
+    // omitted (a caller can assert null), and never awaited past its budget.
+    forcedRepair,
     lastError: WIN_MCP.lastError,
-    reason: WIN_MCP.reason,
+    // THE DOCUMENTED KINDS, EACH UNDER ITS OWN NAME (DEFECT 2, co-juror J2).
+    // `DOCTOR_FACTS_FIELDS` (win-mcp.js) keeps `command` / `reason` as ALIASES of
+    // `transportCommand` / `transportReason`, and the module-level
+    // `relayDoctorFacts()` emits both spellings — so the doctor emits both too,
+    // or a consumer reading the alias gets `undefined`.
+    //
+    // `reason` used to carry `WIN_MCP.reason` (this PLUGIN's own state sentence,
+    // e.g. "attached (2 tool(s))") here. That is a DIFFERENT FACT wearing the
+    // alias's name: a consumer that read `reason` as documented got "attached"
+    // where the lane sentence was promised. The plugin sentence now travels under
+    // its own unambiguous key, `stateReason`, and `reason` is the alias it is
+    // documented to be. Nothing is lost, and no field means two things.
+    command: transportFacts?.transportCommand ?? null,
+    reason: transportFacts?.transportReason ?? '',
+    stateReason: WIN_MCP.reason,
     keepalive: { interval: WIN_MCP_KEEPALIVE.interval, countMax: WIN_MCP_KEEPALIVE.countMax },
-    gate: 'restrict+guard',
+    // J20-3/WP-3.7: what the tool gate ACTUALLY installed. `restrict+guard` used
+    // to be a constant — a STRING, not a measurement — so a failed install
+    // (`gateError` carried the failure) still reported a fully armed gate. The
+    // answer is now derived from the install's own record: both halves armed
+    // only when nothing failed, `partial` (with the reason) otherwise.
+    gate: WIN_MCP_AUX.gateError === '' ? 'restrict+guard' : 'partial',
+    gateDetail: WIN_MCP_AUX.gateError === '' ? '' : WIN_MCP_AUX.gateError,
     keepaliveMs: windowsMcpPollMs(),
     bound: [...WIN_MCP_AUX.targets.entries()].map(([session, row]) => ({ session, name: row.name, at: row.at })),
     agents: WIN_MCP.agents.size,
@@ -2155,14 +2974,21 @@ export function apply(ctx, config = {}) {
   /**
    * The two tools that are NEVER gated (they do not start with TOOL_PREFIX):
    *   * `windows_desktop` reveals the bridged tools for the calling session;
-   *   * `windows_mcp_doctor` reports the leak surface and the keepalive.
+   *   * `windows_mcp_doctor` reports the leak surface, the verdict and the repair.
+   *
+   * WP-3.6: `windows_desktop` STAYS ARGUMENT-FREE. It is the reveal, and the only
+   * thing it could usefully take (`repair`) is the doctor's job — keeping this
+   * schema empty is what lets an agent call it blind, before it knows anything
+   * about lanes. `windows_mcp_doctor` gains exactly one optional boolean, with
+   * `additionalProperties: false`, so `{"repair":true}` is a real, schema-checked
+   * request instead of a convention.
    */
   ctx.effect(() => registerCuaTool({
     name: REVEAL_TOOL_NAME,
     timeoutMs: TOOL_TIMEOUTS.windows_desktop,
-    description: 'Reveal the Windows desktop: unhides this session\u2019s dsh-cua tools (element-level click/type/find over SSH) and returns their names, descriptions and parameters. No arguments.',
+    description: 'Reveal the Windows desktop: unhides this session\u2019s dsh-cua tools (element-level click/type/find over SSH) and returns their names, descriptions and parameters. No arguments. Also says `blind: true` with a `blindReason` when the bridge is attached on the session-0 fallback lane, so a hidden desktop is never pretended to work.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
-    output: textOutput('Whether the tools are now visible, and their schemas.'),
+    output: textOutput('Whether the tools are now visible, and their schemas (an EMPTY list unless revealed), plus the lane verdict (blind/blindReason).'),
     async execute(_args = {}, exec) {
       return { text: JSON.stringify(revealWindowsTools(exec?.agent)) }
     }
@@ -2171,11 +2997,27 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => registerCuaTool({
     name: DOCTOR_TOOL_NAME,
     timeoutMs: TOOL_TIMEOUTS.windows_mcp_doctor,
-    description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation, the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error.',
-    parameters: { type: 'object', additionalProperties: false, properties: {} },
-    output: textOutput('One JSON object: status, target, online, registered, schemas, leaks, grants, keepalive, gate.'),
-    async execute(_args = {}, exec) {
-      return { text: JSON.stringify(await windowsMcpDoctor(exec?.agent)) }
+    description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation, the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error — plus the VERDICT (status ok|blind|leaking, blindReason, verdict sentence), pluginVersion, the payload identity (expectedRelayHash/relayHash/skew/portMismatch) and the repair record. Pass {"repair":true} to force ONE relay repair attempt before the report (throttled: it bypasses the poll window, not the client\u2019s safety rules).',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        repair: {
+          type: 'boolean',
+          description: 'Force ONE relay repair attempt (schtasks re-assert + handshake) before answering, then report what it did in `forcedRepair`. Default false: read-only diagnosis. The client still applies its kill switch (DSH_CUA_VM_WIN_MCP_REPAIR=0), in-flight guard and timeout.'
+        }
+      }
+    },
+    output: textOutput('One JSON object: status (ok|blind|leaking), blind, blindReason, verdict, laneUpgrading, pluginVersion, target, online, transport (+ the documented `command`/`reason` aliases of transportCommand/transportReason; the plugin\'s own sentence is `stateReason`), registered, schemas, leaks, grants, payload (measured, expectedRelayHash, relayHash, relayPresent, skew, port, portMeasured, portMismatch), repair, forcedRepair, keepalive, gate (+ gateDetail when only part of the gate is armed).'),
+    async execute(args = {}, exec) {
+      // WP-3.6: forcing ONE attempt is a doctor argument, not a second tool. The
+      // attempt is bounded (WIN_MCP_FORCE_REPAIR_MS) and never throws; a success
+      // also nudges the lane upgrade, because re-asserting the relay is only half
+      // the fix — this process still has to move onto it. The report is produced
+      // AFTER the attempt, so `repair`/`forcedRepair` describe the state it left.
+      const forcedRepair = args?.repair === true ? await forceRelayRepair('windows_mcp_doctor') : null
+      if (forcedRepair !== null && forcedRepair.ok === true) nudgeRelayUpgrade('doctor repair')
+      return { text: JSON.stringify(await windowsMcpDoctor(exec?.agent, { forcedRepair })) }
     }
   }), 'cua-vm: windows mcp doctor')
 
@@ -2706,6 +3548,9 @@ export function apply(ctx, config = {}) {
       const versions = Array.isArray(windows.versions) ? windows.versions.map((code) => String(code)) : []
       return {
         text: [
+          // WP-3.2 / SOL §4.8: the FIRST line is the identity, because every
+          // later line is only as good as "which build said it".
+          `plugin: dsh-cua-vm ${PLUGIN_VERSION}`,
           // The device and its ACCESS are two facts: "present but DENIED" is
           // the group/gid bug (uid 1000 is not in the device's group), and it
           // used to read as "NOT usable" with no way to tell it from a missing
@@ -2724,6 +3569,10 @@ export function apply(ctx, config = {}) {
           `store: ${(store.usedBytes / 1024 ** 3).toFixed(1)} GB of ${(store.quotaBytes / 1024 ** 3).toFixed(0)} GB`,
           `policy: shutdownTimeoutSec=${answer.shutdownTimeoutSec} checkpointPolicy=${answer.checkpointPolicy} computers=${answer.vms}`
         ].join('\n'),
+        // WP-3.2: the host-level doctor carries the plugin's identity too. The
+        // LANE verdict is deliberately NOT here (SOL D8): a host doctor has no
+        // guest facts, and the lane belongs to `windows_mcp_doctor`.
+        pluginVersion: PLUGIN_VERSION,
         // The structured half: `text` is what the model reads, this is what a
         // caller (or a test) can branch on without parsing prose.
         windows: {

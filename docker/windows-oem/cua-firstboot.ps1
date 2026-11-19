@@ -33,13 +33,38 @@ function Say([string]$m) { "$(Get-Date -Format o) $m" | Tee-Object -FilePath $lo
 
 $marker = 'C:\cua-provision.json'
 
+# ---------------------------------------------------------------------------
+# P3 - IDENTITY. The marker below records what ran; without these two keys it
+# cannot say WHICH firstboot ran. On a guest that has been through two passes and
+# a reboot, "the fix did not work" and "the fix was never staged" look identical
+# (the live guest carried a 46,955-byte script where the repository had 46,830),
+# and every stale-payload fix reads as a non-fix. scriptSha256 is the hash of the
+# file being executed right now - $PSCommandPath, not a guessed path - so the
+# marker, `Get-FileHash` on the payload, and the repository's own copy can be
+# compared byte for byte. scriptVersion is bumped by hand when the provisioning
+# contract changes; the hash is what proves identity, the number is for humans.
+#
+# An empty hash is recorded as '' rather than omitted: a reader must be able to
+# tell "this script could not hash itself" from "this marker predates the field".
+# ---------------------------------------------------------------------------
+$scriptVersion = '1.1.0'
+$scriptSha256 = ''
+try {
+  if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -ErrorAction Stop)) {
+    $scriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  }
+} catch {
+  Say "identity: could not hash $PSCommandPath : $($_.Exception.Message)"
+  $scriptSha256 = ''
+}
+
 # THIS SCRIPT RUNS TWICE: once as SYSTEM from setupcomplete.cmd (the end of
 # Setup) and once as `cua` from FirstLogonCommands. Installing OpenSSH, python
 # and the scheduled task twice is wasteful at best and fights itself at worst
 # (a second `pip install` while the first holds the wheel cache, a second
 # Register-ScheduledTask on a running one). The marker makes it idempotent: a
 # stage that already succeeded is SKIPPED, and -Force re-runs everything.
-$state = @{ started = (Get-Date).ToString('o'); steps = @() }
+$state = @{ started = (Get-Date).ToString('o'); scriptVersion = $scriptVersion; scriptSha256 = $scriptSha256; steps = @() }
 if (Test-Path $marker) {
   try {
     $previous = Get-Content $marker -Raw | ConvertFrom-Json
@@ -53,17 +78,30 @@ $done = @{}
 foreach ($step in $state.steps) { if ($step.ok -eq $true -and $step.skipped -ne $true) { $done[$step.step] = $true } }
 if ($Force) { $done = @{}; $state.steps = @() }
 
-function Step([string]$name, [scriptblock]$body) {
-  if ($done.ContainsKey($name)) { Say "== $name (already done, skipped)"; return }
+function Step([string]$name, [scriptblock]$body, [switch]$Always) {
+  # -Always: THE ONE STEP THAT IS NEVER SKIPPED (mcp-relay-reassert). Every other
+  # step is idempotent-by-marker - right for installing OpenSSH, wrong for the
+  # relay lane, which can be dead (killed, crashed, an onlogon task that never
+  # fired) while the marker still reads ok:true from the pass that installed it.
+  if (-not $Always -and $done.ContainsKey($name)) { Say "== $name (already done, skipped)"; return }
   Say "== $name"
+  # ATTEMPTS, NOT HISTORY. The marker keeps ONE row per step (the state now) plus
+  # how many times it has actually EXECUTED, so "was this step tried twice" is a
+  # field instead of an inference from duplicate rows. A row written by an older
+  # firstboot has no `attempts`, and that reads as 1 - the count restarts here
+  # rather than being invented from entries that were never counted.
+  $previous = @($state.steps | Where-Object { $_.step -eq $name } | Select-Object -Last 1)
+  $attempts = 1
+  if ($previous.Count -gt 0 -and $previous[0].attempts) { $attempts = ([int]$previous[0].attempts) + 1 }
   try {
     $result = & $body
-    $entry = @{ step = $name; ok = $true }
+    $entry = @{ step = $name; ok = $true; attempts = $attempts }
     # A BODY MAY ANNOTATE ITS OWN MARKER ENTRY by returning a hashtable. The
     # clip-agent step uses it to record `skipped = $true; reason =
     # 'clip-agent-disabled'` when the privacy off-switch sentinel exists: a bare
     # ok:true there would read as "the task was registered", which is the exact
-    # lie the switch exists to prevent.
+    # lie the switch exists to prevent. The relay steps use the same mechanism for
+    # "registered, but this pass cannot own an interactive session".
     #
     # SEARCHED, NOT TESTED ON $result: a body that logged with Say before
     # returning its hashtable hands back an ARRAY of strings and hashtables, and
@@ -73,11 +111,16 @@ function Step([string]$name, [scriptblock]$body) {
     if ($annotation.Count -gt 0) {
       foreach ($key in $annotation[0].Keys) { $entry[$key] = $annotation[0][$key] }
     }
-    $state.steps += $entry
   } catch {
     Say "FAILED $name : $($_.Exception.Message)"
-    $state.steps += @{ step = $name; ok = $false; error = $_.Exception.Message }
+    $entry = @{ step = $name; ok = $false; error = $_.Exception.Message; attempts = $attempts }
   }
+  # REPLACE, DO NOT APPEND: two rows for one step made the marker read as a log
+  # and left a reader guessing which one was current. @(...) on both sides keeps
+  # `steps` an ARRAY even with a single entry - ConvertTo-Json would otherwise
+  # serialise it as an OBJECT and every reader of steps[] would break.
+  $kept = @($state.steps | Where-Object { $_.step -ne $name })
+  $state.steps = @($kept + @($entry))
   $state | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $marker
 }
 
@@ -105,66 +148,156 @@ function Get-ClipStateStamps([string]$dir) {
   return $map
 }
 
-# THE ONLY LOCAL PROOF THAT THE MCP RELAY IS LISTENING (same idea as J22-13
-# above, for a process that publishes no file). The relay answers a connection
-# whose first bytes are RELAY_PING with RELAY_OK and closes it, BEFORE it touches
-# a child, so this probe is safe to run against a relay that is mid-session.
+# THE RELAY PROBE DOES NOT LIVE HERE ANY MORE - AND THAT IS THE FIX.
 #
-# TcpClient has no connect timeout of its own: BeginConnect + WaitOne is the
-# documented way to bound it, otherwise a host where the port is filtered (rather
-# than refused) makes firstboot hang instead of failing the step.
-function Test-RelayPing([int]$Port, [int]$TimeoutMs = 800) {
-  $client = $null
-  # ONE DEADLINE FOR THE WHOLE PROBE, tracked by a stopwatch instead of handed to
-  # each Read: a stream timeout is per-read, so N late bytes would otherwise buy
-  # N x $TimeoutMs of stall inside a check whose contract is 800 ms total.
-  $clock = [System.Diagnostics.Stopwatch]::StartNew()
+# This file used to carry its own TcpClient probe (Test-RelayPing) and its own
+# 20 x 500 ms wait around it. That copy is the one that twice read NINE bytes for
+# an EIGHT-byte answer, answered "down" against a healthy relay, and made every
+# firstboot run start a SECOND listener whose loser died with WinError 10048.
+#
+# "Is the relay up" is now answered in exactly one place: cua-relay-guard.ps1,
+# which this script calls with -Ensure and the boot task calls with -Boot. The
+# wait, the eight-byte assertion and the accumulate loop moved there verbatim, so
+# there is one copy of the defect history instead of two that can drift.
+
+# THE ACCOUNT, RESOLVED AND ASSERTED - NEVER %USERNAME%.
+#
+# `schtasks /create ... /it` WITHOUT `/ru` binds the task to the CALLER, and in the
+# SYSTEM pass the caller is the computer account (NAME$): `/it` is meaningless for
+# a machine principal and Task Scheduler refuses the create with exit 1. That is
+# the reproduced failure (C:\cua-provision.json: mcp-relay-task ok:false "schtasks
+# could not register cua-mcp-host (exit 1)" at 12:33:06, ok:true only on the retry
+# from the logon pass at 12:35:41).
+#
+# WHY NOT %USERNAME%: it is the COMPUTER account in the SYSTEM pass, and it is
+# merely "whatever happens to be right" in the logon pass - the exact reason the
+# defect stayed invisible for so long. The name comes from the guest instead: the
+# account the answer file provisions ('cua'), then Winlogon's DefaultUserName (the
+# account the automatic logon will use), and every candidate is ASSERTED to be a
+# real, enabled local account before it can reach a command line.
+function Test-LocalAccount([string]$Name) {
+  if (-not $Name) { return $false }
+  if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+    $user = Get-LocalUser -Name $Name -ErrorAction SilentlyContinue
+    if (-not $user) { return $false }
+    return [bool]$user.Enabled
+  }
+  # STRIPPED IMAGES CAN LACK Microsoft.PowerShell.LocalAccounts (the module is
+  # part of Windows PowerShell 5.1 on a full install; a reduced image may drop
+  # it). `net user <name>` exists on every Windows and its exit code is the
+  # assertion - 0 means the account is there.
   try {
-    $client = New-Object System.Net.Sockets.TcpClient
-    $pending = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
-    if (-not $pending.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
-    $client.EndConnect($pending)
-    $client.ReceiveTimeout = $TimeoutMs
-    $stream = $client.GetStream()
-    $probe = [System.Text.Encoding]::ASCII.GetBytes('RELAY_PING')
-    $stream.Write($probe, 0, $probe.Length)
-    $stream.Flush()
-    # RELAY_OK IS EIGHT BYTES ("R","E","L","A","Y","_","O","K"). A 9-byte
-    # buffer here read one byte too many and compared a short read against the
-    # wrong length - which made this probe answer $false EVERY time, i.e. the
-    # idempotency check below would never fire and every run would start a
-    # second listener. The length is asserted, not assumed.
-    #
-    # AND ONE Read IS NOT THE ANSWER. RELAY_OK is "eight bytes" on the WIRE, not
-    # "eight bytes in one syscall": TCP is a byte stream, so a legal short read
-    # (the relay's sendall landing in two segments, a loopback/NIC oddity, a
-    # Winsock buffer that has 3 of 8 bytes when the read is issued) is NOT a
-    # failure - and treating it as one made this probe answer $false against a
-    # relay that was perfectly healthy. That false negative lands on the same
-    # /run path as a real outage: the next firstboot starts a SECOND relay, which
-    # loses the bind with WinError 10048 (the two-relays-on-one-port defect this
-    # whole function exists to prevent). So ACCUMULATE until 8 bytes or EOF, and
-    # let the shared stopwatch bound the loop.
-    $answer = New-Object byte[] 8
-    $read = 0
-    while ($read -lt $answer.Length) {
-      $remaining = $TimeoutMs - [int]$clock.ElapsedMilliseconds
-      if ($remaining -le 0) { return $false }
-      $client.ReceiveTimeout = $remaining
-      $got = $stream.Read($answer, $read, $answer.Length - $read)
-      # 0 means the peer closed: EOF before 8 bytes is a truncated answer, and a
-      # truncated answer is not RELAY_OK. Stop here rather than spin.
-      if ($got -le 0) { break }
-      $read += $got
-    }
-    if ($read -ne 8) { return $false }
-    return ([System.Text.Encoding]::ASCII.GetString($answer) -ceq 'RELAY_OK')
+    & net.exe user $Name 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
   } catch {
     return $false
-  } finally {
-    if ($client) { $client.Close() }
   }
 }
+
+function Resolve-ProvisionedAccount {
+  $candidates = @('cua')
+  try {
+    $default = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name DefaultUserName -ErrorAction Stop).DefaultUserName
+    if ($default) { $candidates += [string]$default }
+  } catch { }
+  foreach ($name in $candidates) {
+    if (Test-LocalAccount -Name $name) { return [string]$name }
+  }
+  # A renamed account is still fixed by asking which local accounts exist: the
+  # single enabled non-builtin one is the account Setup created. More than one
+  # candidate stays unresolved on purpose - guessing the wrong account would
+  # register a task that never runs in the session the harness can see.
+  if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+    $local = @(Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -and $_.Name -ne 'Administrator' -and $_.Name -ne 'Guest' })
+    if ($local.Count -eq 1) { return [string]$local[0].Name }
+  }
+  return $null
+}
+
+# THE OEM PAYLOAD SEARCH, for the files firstboot stages but does not own. The
+# list is the SAME one the relay uses further down: $PSScriptRoot (Setup\Scripts),
+# the setup.img ROOT (the removable roots the fallback boot path walks) and a copy
+# an operator already put in place. -ErrorAction SilentlyContinue on every probe
+# because a drive letter this guest does not have must read as "not there", never
+# as "the step failed".
+function Find-OemPayloadFile([string]$Name) {
+  $dirs = @($PSScriptRoot, 'C:\Windows\Setup\Scripts', 'C:\', 'D:\', 'E:\', 'F:\', 'G:\', 'H:\')
+  foreach ($dir in $dirs) {
+    if (-not $dir) { continue }
+    $candidate = Join-Path $dir $Name
+    if (Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue) { return $candidate }
+  }
+  return $null
+}
+
+# WHERE THE GUARD IS. ProgramData first (the staged, canonical copy the boot task
+# names), then the payload (a firstboot pass that runs before the staging step, or
+# a guest whose staged copy was deleted).
+function Find-RelayGuardPath {
+  $staged = 'C:\ProgramData\cua\cua-relay-guard.ps1'
+  if (Test-Path -LiteralPath $staged -ErrorAction SilentlyContinue) { return $staged }
+  return (Find-OemPayloadFile -Name 'cua-relay-guard.ps1')
+}
+
+# ONE CALL PATH INTO THE GUARD. Windows PowerShell is named BY PATH, not by the
+# `powershell` on PATH: firstboot can run from a cmd.exe whose PATH predates the
+# OpenSSH/python steps, and the check must not depend on that. The guard prints one
+# record line; it is captured and returned so this script's own log carries the
+# verdict (the exit code alone cannot say WHY a relay is down).
+function Invoke-RelayGuard([string]$GuardPath, [string]$Mode, [int]$Port, [string]$Account, [int]$WaitSeconds) {
+  if (@('Ensure', 'Autologon', 'Boot') -notcontains $Mode) { throw "unknown relay-guard mode '$Mode'" }
+  # NAMED BY PATH when the system root is known (a firstboot that runs from a
+  # cmd.exe whose PATH predates the OpenSSH/python steps must not depend on
+  # `powershell` being resolvable); the bare name is the fallback, never a guess.
+  $ps = 'powershell.exe'
+  if ($env:SystemRoot) {
+    $candidate = $env:SystemRoot + '\System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue) { $ps = $candidate }
+  }
+  $arguments = @(
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+    '-File', $GuardPath, ('-' + $Mode), '-Port', [string]$Port, '-WaitSeconds', [string]$WaitSeconds
+  )
+  if ($Account) { $arguments += @('-User', $Account) }
+  $lines = @()
+  $code = 1
+  try {
+    $lines = @(& $ps @arguments)
+    $code = $LASTEXITCODE
+  } catch {
+    $code = -1
+  }
+  $record = (@($lines | ForEach-Object { [string]$_ }) -join ' ').Trim()
+  return @{ exit = $code; record = $record }
+}
+
+# WHICH PASS AM I? The SYSTEM pass of setupcomplete.cmd cannot own an interactive
+# session, so a relay that is not listening there is EXPECTED - while the same
+# answer in the logon pass is a real failure. `IsSystem` is the window's own
+# answer and does not touch %USERNAME% (see Resolve-ProvisionedAccount).
+function Test-SystemPass {
+  try {
+    return ([System.Security.Principal.WindowsIdentity]::GetCurrent()).IsSystem
+  } catch {
+    return $false
+  }
+}
+
+# The relay port, resolved ONCE for every consumer in this script (the launcher,
+# the guard task's -Port, the -Ensure calls). DSH_CUA_MCP_RELAY_PORT is the same
+# override the relay itself honours; anything unparsable falls back to 47999
+# rather than registering a task that listens somewhere nobody probes.
+function Resolve-RelayPort {
+  if ($env:DSH_CUA_MCP_RELAY_PORT) {
+    $parsedPort = 0
+    if ([int]::TryParse($env:DSH_CUA_MCP_RELAY_PORT, [ref]$parsedPort) -and $parsedPort -gt 0 -and $parsedPort -lt 65536) { return $parsedPort }
+  }
+  return 47999
+}
+
+$relayPort = Resolve-RelayPort
+$relayAccount = Resolve-ProvisionedAccount
+Say "mcp relay: port $relayPort; interactive account '$relayAccount' (resolved from the guest, never %USERNAME%)"
 
 Step 'openssh' {
   # The capability is in the image; no internet needed for this step.
@@ -752,6 +885,72 @@ Step 'autostart-windowless' {
   Say 'dsh-cua-server task registered (interactive, windowless)'
 }
 
+# THE BOOT GUARD - STEP 1 OF THE LANE, AND THE ONLY THING THAT RUNS AFTER OOBE.
+#
+# WHY IT HAS TO EXIST: the relay is started by an `onlogon` task, and nothing
+# re-asserts the lane after OOBE - cua-firstboot.ps1 never runs again (the
+# supervisor has no re-provision path). So a boot that produces no logon (an
+# autologon that expired, a restore that resumes before Winlogon, a task that was
+# refused in the SYSTEM pass and never re-registered) leaves the harness attached
+# to a blind Session 0 with a perfectly healthy relay that simply is not running.
+# The guard task makes "the lane is up" a BOOT property instead of a logon-time
+# accident, and it is also the repair path a failed mcp-relay-task leaves behind.
+#
+# /sc onstart + /ru SYSTEM: it must run BEFORE - and without - any logon, and
+# SYSTEM is the only principal that exists at that point. /rl HIGHEST is what
+# lets it write the Winlogon autologon values. -Boot is the mode that does the
+# whole job: autologon re-assert, wait up to 90 s for an Active console session,
+# handshake first, then register/run only what is missing and only when silent.
+#
+# THE TASK NAMES A FILE THAT EXISTS: the guard is staged to C:\ProgramData\cua
+# first, and a missing guard fails this step instead of registering a task that
+# "starts" and does nothing - the failure mode this repository keeps naming.
+Step 'relay-guard-task' {
+  New-Item -ItemType Directory -Force -Path 'C:\ProgramData\cua' | Out-Null
+  $guardScript = 'C:\ProgramData\cua\cua-relay-guard.ps1'
+  $guardSource = Find-OemPayloadFile -Name 'cua-relay-guard.ps1'
+  if ($guardSource) {
+    Copy-Item -LiteralPath $guardSource -Destination $guardScript -Force
+    Say "relay guard: $guardSource -> $guardScript"
+  } elseif (Test-Path -LiteralPath $guardScript -ErrorAction SilentlyContinue) {
+    # A re-run after the payload directory is gone: the staged copy is the same
+    # bytes and is what the boot task already names, so keep it.
+    Say "relay guard: no staged copy found; keeping the existing $guardScript"
+  } else {
+    throw 'cua-relay-guard.ps1 is in neither the OEM payload nor C:\ProgramData\cua; the boot guard would be a task that does nothing'
+  }
+
+  # NO NESTED QUOTES IN /tr: C:\ProgramData\cua is a path with no spaces, so the
+  # -File argument needs none - and avoiding them is the entire reason the relay's
+  # command lives in a .vbs instead of in /tr (a nested quote there silently
+  # truncates the action). -Port is written into the action so the FIRST run after
+  # provisioning probes the port this pass used (a task has no environment).
+  #
+  # -Port IS A FALLBACK, NOT THE TRUTH. The guard prefers the port it reads out of
+  # C:\ProgramData\cua\mcp-relay-host.vbs, because that file is the one the harness
+  # can still repair after provisioning (`--serve --port <port>`) and the port a
+  # relay actually listens on is whatever its launcher starts it with. This value
+  # covers the first pass (no launcher yet, or a launcher from an older payload
+  # that says bare `--serve`); from then on the launcher is self-correcting, so a
+  # later harness repair cannot leave this baked number probing a dead port.
+  $guardTr = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File $guardScript -Boot -Port $relayPort"
+  $guardCmd = Join-Path $env:TEMP 'cua-relay-guard-task.cmd'
+  @("schtasks /create /tn `"cua-mcp-host-guard`" /sc onstart /ru SYSTEM /rl HIGHEST /f /tr `"$guardTr`"") |
+    Set-Content -Path $guardCmd -Encoding ASCII
+  & cmd /c $guardCmd
+  $guardExit = $LASTEXITCODE
+  Remove-Item -Force $guardCmd -ErrorAction SilentlyContinue
+  if ($guardExit -ne 0) { throw "schtasks could not register cua-mcp-host-guard (exit $guardExit)" }
+
+  # IDENTITY (P3): the guest records WHICH guard it registered. The boot guard is
+  # the one component that repairs the lane when nobody is watching, so "the guard
+  # is stale" must be visible from the marker rather than inferred from behaviour.
+  $guardHash = ''
+  try { $guardHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $guardHash = '' }
+  Say "relay guard registered (cua-mcp-host-guard: onstart, SYSTEM, /rl HIGHEST) -> $guardScript sha256=$guardHash"
+  return @{ guardSha256 = $guardHash }
+}
+
 # THE SESSION-0 DEFECT, FIXED AT ITS ROOT.
 #
 # THE OBSERVED FAILURE: the MCP server the harness starts over SSH runs in the
@@ -834,16 +1033,23 @@ Step 'mcp-relay-task' {
   $relayPyw = Join-Path (Split-Path -Parent $py) 'pythonw.exe'
   if (Test-Path -LiteralPath $relayPyw) { $relayPy = $relayPyw }
 
-  $relayPort = 47999
-  if ($env:DSH_CUA_MCP_RELAY_PORT) {
-    $parsedPort = 0
-    if ([int]::TryParse($env:DSH_CUA_MCP_RELAY_PORT, [ref]$parsedPort) -and $parsedPort -gt 0 -and $parsedPort -lt 65536) { $relayPort = $parsedPort }
-  }
+  # THE PORT IS RESOLVED ONCE, AT THE TOP OF THIS SCRIPT (Resolve-RelayPort), and
+  # every consumer reads that one value: the launcher here, the guard task's -Port,
+  # and the -Ensure calls. A second resolution in this step is how the launcher and
+  # the probe could end up naming different ports.
+  #
+  # AND THE LAUNCHER IS A CONSUMER IN FACT, NOT ONLY IN THIS COMMENT: the command
+  # below carries `--port $relayPort`. A bare `--serve` lets the relay fall back to
+  # its own default (47999) or to whatever a logon session happens to carry, while
+  # the guard probes the resolved number - the two agree only by luck, and this
+  # step rewrites the launcher on EVERY run, so a bare command here would undo the
+  # harness's repair (`--serve --port <harness port>`) and re-open the port split
+  # at the next provisioning pass.
 
   # THE COMMAND THE TASK MUST RUN (quoted, because python.org installs to
   # "C:\Program Files\Python3xx\..."). This is the line that ends up in the
   # launcher below, and the launcher is what /tr names.
-  $relayCommand = "`"$relayPy`" `"$relayScript`" --serve"
+  $relayCommand = "`"$relayPy`" `"$relayScript`" --serve --port $relayPort"
 
   # WHY A LAUNCHER AND NOT THE COMMAND IN /tr DIRECTLY:
   #   `schtasks /tr` is ONE command line that Windows RE-PARSES, and the repo
@@ -860,7 +1066,12 @@ Step 'mcp-relay-task' {
   # is GUI-subsystem and `Run ..., 0, False` starts the relay hidden. Same
   # trick as Unattend.vbs, the image's existing hidden launcher.
   $relayLauncher = 'C:\ProgramData\cua\mcp-relay-host.vbs'
-  $relayRunLine = 'shell.Run """' + $relayPy + '"" ""' + $relayScript + '"" --serve", 0, False'
+  # `--port <n>` STAYS IMMEDIATELY BEFORE THE CLOSING QUOTE, exactly as the guard's
+  # New-RelayLauncher and the harness's repair (`win-mcp.js`, which recognises its
+  # own work by `'--port ' + $port + '"'`) write it: anything else is a launcher
+  # the host will rewrite on the next attach, and a repair loop is a worse defect
+  # than the divergence it was meant to close.
+  $relayRunLine = 'shell.Run """' + $relayPy + '"" ""' + $relayScript + '"" --serve --port ' + [string]$relayPort + '", 0, False'
   Set-Content -Path $relayLauncher -Encoding ASCII -Value @(
     "' cua-mcp-host: start the interactive-session MCP relay, hidden, no console.",
     "' Written by cua-firstboot.ps1 (step mcp-relay-task); regenerated on every run.",
@@ -883,36 +1094,94 @@ Step 'mcp-relay-task' {
   # /sc onlogon + /it: AT LOGON, IN THE INTERACTIVE SESSION - the one session
   # whose desktop UIA can see. /rl LIMITED: the user's own token, same desktop,
   # same integrity level as the windows the MCP server will drive.
+  #
+  # /ru "<account>" IS THE FIX, AND IT IS NOT A DETAIL. WITHOUT it the task binds
+  # to the CALLER - the computer account in the SYSTEM pass - and `/it` is
+  # meaningless for a machine principal, so Task Scheduler refuses the create with
+  # exit 1 (reproduced: the marker's mcp-relay-task ok:false "exit 1" at 12:33:06,
+  # then ok:true at 12:35:41 from the logon pass, where /ru was implicitly the
+  # logged-on user). With /ru the SAME command succeeds from Session 0 - measured
+  # over SSH: SUCCESS, "Run As User: cua", "Logon Mode: Interactive only", exit 0.
+  # $relayAccount was resolved once, above, and asserted with Get-LocalUser.
+  if (-not $relayAccount) {
+    throw 'no local account could be resolved for /ru (Get-LocalUser/net user found none); /it without /ru is refused from Session 0'
+  }
   $relayTr = "wscript.exe //B //NoLogo $relayLauncher"
   $relayCmd = Join-Path $env:TEMP 'cua-mcp-relay-task.cmd'
-  @("schtasks /create /tn `"cua-mcp-host`" /sc onlogon /it /rl LIMITED /f /tr `"$relayTr`"") |
+  @("schtasks /create /tn `"cua-mcp-host`" /sc onlogon /ru `"$relayAccount`" /it /rl LIMITED /f /tr `"$relayTr`"") |
     Set-Content -Path $relayCmd -Encoding ASCII
   & cmd /c $relayCmd
   $relayExit = $LASTEXITCODE
   Remove-Item -Force $relayCmd -ErrorAction SilentlyContinue
-  if ($relayExit -ne 0) { throw "schtasks could not register cua-mcp-host (exit $relayExit)" }
-
-  # IDEMPOTENT: THE PORT IS THE EVIDENCE. If it already answers RELAY_PING the
-  # relay is up (started at logon, or by an earlier firstboot) and a /run here
-  # would race it for the bind - the loser dies with WinError 10048 while the
-  # marker still reads ok:true. Starting nothing is the correct outcome.
-  if (Test-RelayPing $relayPort) {
-    Say "mcp relay: already answering RELAY_PING on 127.0.0.1:$relayPort; not started again"
-  } else {
-    & schtasks /run /tn 'cua-mcp-host' | Out-Null
-    $relayRun = $LASTEXITCODE
-    if ($relayRun -ne 0) { throw "schtasks could not start cua-mcp-host (exit $relayRun)" }
-    # schtasks /run proves ACCEPTANCE, not a listener (J22-13's lesson). Poll the
-    # probe: 20 x 500 ms covers a cold pythonw.exe plus the import of dsh_cua.
-    $relayUp = $false
-    for ($attempt = 0; $attempt -lt 20; $attempt++) {
-      Start-Sleep -Milliseconds 500
-      if (Test-RelayPing $relayPort) { $relayUp = $true; break }
-    }
-    if (-not $relayUp) { throw 'task-started-but-relay-not-listening' }
+  if ($relayExit -ne 0) {
+    # A FAILURE HERE MUST STAY SELF-HEALING, NOT TERMINAL. It throws, so the step
+    # records ok:false - and $done only ever holds ok:true, so the NEXT firstboot
+    # pass retries it. It also leaves the cua-mcp-host-guard task registered (the
+    # step above runs first and does not depend on this one), so a guest that
+    # failed in BOTH passes is repaired at the next boot instead of staying blind
+    # until somebody notices.
+    throw "schtasks could not register cua-mcp-host (exit $relayExit); the cua-mcp-host-guard task will retry at boot"
   }
-  Say "mcp relay registered (cua-mcp-host: onlogon, INTERACTIVE, /rl LIMITED) and answering on 127.0.0.1:$relayPort as $relayPy"
+
+  # "IS IT UP" HAS EXACTLY ONE IMPLEMENTATION, AND IT IS NOT IN THIS FILE.
+  #
+  # This used to carry a TcpClient probe plus a 20 x 500 ms wait of its own - the
+  # copy that twice read nine bytes for an eight-byte answer, said "down" against a
+  # healthy relay, and made every run start a SECOND listener (WinError 10048).
+  # The guard owns the probe and the wait now: -Ensure probes first, starts the
+  # task only when the port is silent, and waits up to the budget below. The boot
+  # guard runs the same file with -Boot, so firstboot and boot time cannot
+  # disagree about what "up" means.
+  $guardPath = Find-RelayGuardPath
+  if (-not $guardPath) {
+    throw 'relay-guard-missing: cua-relay-guard.ps1 is in neither the OEM payload nor C:\ProgramData\cua, so the relay cannot be verified'
+  }
+  $guardResult = Invoke-RelayGuard -GuardPath $guardPath -Mode 'Ensure' -Port $relayPort -Account $relayAccount -WaitSeconds 10
+  Say "mcp relay: guard -Ensure exit $($guardResult.exit): $($guardResult.record)"
+  if ($guardResult.exit -eq 0) {
+    Say "mcp relay registered (cua-mcp-host: onlogon, INTERACTIVE, /rl LIMITED) and answering on 127.0.0.1:$relayPort as $relayPy"
+  } elseif (Test-SystemPass) {
+    # THE SYSTEM PASS CANNOT PROVE A LISTENER, AND MUST NOT PRETEND IT DID.
+    # An InteractiveToken task cannot run before anyone logs on, so a negative
+    # probe in setupcomplete.cmd is EXPECTED: what this pass can prove - and does -
+    # is that the task is registered against the right account with the right
+    # trigger. The interactive pass re-asserts the lane (mcp-relay-reassert), and
+    # the boot guard repairs it from then on. Reported as an annotation so the
+    # marker says which of the two failures this is.
+    Say "mcp relay: registered for '$relayAccount'; no interactive session exists in the SYSTEM pass, so the listener is proven at logon"
+    return @{ relay = 'registered-session-0'; guardExit = $guardResult.exit }
+  } else {
+    throw 'task-started-but-relay-not-listening'
+  }
 }
+
+# THE STEP THAT IS NEVER SKIPPED.
+#
+# Every other step is gated by `$done`, which only holds ok:true - correct for
+# installing OpenSSH, wrong for the lane: the relay can be dead (killed, crashed,
+# an onlogon task that never fired) while the marker still reads ok:true from the
+# pass that installed it, and nothing else runs firstboot twice. This step runs on
+# EVERY invocation and asks the same guard the boot task runs to make the relay
+# answer, so any later firstboot pass repairs the lane instead of reporting a
+# stale success.
+#
+# WHICH ANSWER IS A REAL FAILURE: in the SYSTEM pass an InteractiveToken task
+# cannot start at all, so "not answering" there is expected and recorded as an
+# annotation - a step that is permanently ok:false would hide a real failure. In
+# the interactive pass the same answer throws, which keeps the step retryable.
+Step 'mcp-relay-reassert' {
+  $guardPath = Find-RelayGuardPath
+  if (-not $guardPath) {
+    throw 'relay-guard-missing: cua-relay-guard.ps1 is in neither the OEM payload nor C:\ProgramData\cua, so the relay cannot be re-asserted'
+  }
+  $guardResult = Invoke-RelayGuard -GuardPath $guardPath -Mode 'Ensure' -Port $relayPort -Account $relayAccount -WaitSeconds 10
+  Say "mcp relay re-assert: guard -Ensure exit $($guardResult.exit): $($guardResult.record)"
+  if ($guardResult.exit -eq 0) { return @{ reassert = 'up' } }
+  if (Test-SystemPass) {
+    return @{ reassert = 'skipped'; reason = 'no-interactive-session' }
+  }
+  throw "mcp-relay-reassert: the relay is still not answering after -Ensure (exit $($guardResult.exit))"
+} -Always
 
 $state.finished = (Get-Date).ToString('o')
 $state | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $marker

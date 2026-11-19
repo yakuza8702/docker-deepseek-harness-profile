@@ -82,6 +82,14 @@ const FILES = {
   oemAnswer: { label: 'docker/windows-oem/Autounattend.xml', name: 'Autounattend.xml' },
   oemSetup: { label: 'docker/windows-oem/setupcomplete.cmd', name: 'setupcomplete.cmd' },
   oemBoot: { label: 'docker/windows-oem/cua-firstboot.ps1', name: 'cua-firstboot.ps1' },
+  // WP-1: THE RELAY GUARD — its OWN entry, because the probe and the autologon
+  // re-assert MOVED here. `cua-firstboot.ps1` no longer carries a TcpClient
+  // probe at all (its old `Test-RelayPing` is what two separate short-read
+  // defects lived in), so the needle list that keeps looking for it in the
+  // firstboot file would either fail forever or, worse, pass on a stub copy. One
+  // owner, one gate block: the firstboot block asserts that the STAGING and the
+  // two tasks exist, this block asserts that the ONE probe is still correct.
+  oemGuard: { label: 'docker/windows-oem/cua-relay-guard.ps1', name: 'cua-relay-guard.ps1' },
   clipAgent: { label: 'docker/cua-clip-agent.ps1', name: 'cua-clip-agent.ps1' },
   // J22-14: the two-mode python relay. Guest-side, so it gets its own section
   // instead of being folded into the Windows backend's 400 needles: `--serve`
@@ -634,7 +642,46 @@ const NEEDLES = {
     ['const SSH_BIN = process.env.DSH_CUA_SSH_BIN', 1],
     ['const SCP_BIN = process.env.DSH_CUA_SCP_BIN', 1],
     ['scpRun(putMeta, source, assertWindowsGuestPath(guest), { direction: \'to-guest\' })', 1],
-    ['scpRun(getMeta, absolute, assertWindowsGuestPath(guest), { direction: \'from-guest\' })', 1]
+    ['scpRun(getMeta, absolute, assertWindowsGuestPath(guest), { direction: \'from-guest\' })', 1],
+    // WP-4 / SOL §7: THE SUPERVISOR'S RELAY RE-ASSERT.
+    //
+    // The SYNC MATRIX promised this needle and the gate did not have it: WP-4
+    // shipped `windowsRelayReassert()` and a fire-and-forget call at each ready
+    // transition, and NOTHING here would have noticed if it were deleted — the
+    // bridge would simply be blind again after a checkpoint boot while every
+    // other assertion stayed green. Three facts, each a revert's target:
+    //
+    //   * the ONE command: `schtasks /run /tn cua-mcp-host`. No probe, no task
+    //     re-creation — repairing the payload is WP-1/WP-2's job, and a
+    //     supervisor that "helped" would duplicate the handshake-before-/run
+    //     ordering (the 10048 lesson);
+    //   * the 15 s throttle (`S3`): three Starts in ten seconds cost ONE ssh
+    //     child. Removing the interval turns every retry into a guest command;
+    //   * the log line the JURY reads (`S1`): `relay re-assert: cua-mcp-host
+    //     exit <code>`. Without it the re-assert is unobservable, which is the
+    //     "auto-start PASS" that started this whole SOL.
+    //
+    // TEST COVERAGE (landed — this needle no longer waits for it):
+    // `tests/modules-unit.mjs` drives the REAL function through a loader-appended
+    // export line (no production byte changes) and asserts S1 (one ssh child, the
+    // exact `schtasks /run /tn cua-mcp-host` argv, the `exit 0` log sentence, the
+    // 20 s/15 s constants), S2 (paused / off / booting / installing / ssh:false /
+    // non-Windows / missing rows spawn nothing, and a row powered off BETWEEN the
+    // transition and the call is a no-op because the row is re-read), S3 (three
+    // same-tick calls cost one child; the next call after the window costs one
+    // more) and S4 (non-zero exit, ENOENT and a hung child never throw). This gate
+    // proves the facts are PRESENT; the suite proves the behaviour above them.
+    ["const WINDOWS_RELAY_REASSERT_COMMAND = 'schtasks /run /tn cua-mcp-host'", 1],
+    ['const WINDOWS_RELAY_REASSERT_INTERVAL_MS = 15000', 1],
+    ['relay re-assert: cua-mcp-host exit ${result.code}', 1],
+    ['async function windowsRelayReassert(name)', 1],
+    // S2: the row is RE-READ and gated (`kind`, `ssh`, `state`) before a child
+    // exists; a suspended/powered-off row must spawn nothing.
+    ['if (meta.ssh === false) return', 1],
+    ['if (meta.state !== \'ready\') return', 1],
+    // ...and every ready transition fires it UN-AWAITED (3 call sites), so a
+    // failed re-assert can never turn a successful Start into an error.
+    ['void windowsRelayReassert(name)', 3]
   ],
   space: [
     ['export const CAPTURE_MAX_PIXELS = 900_000', 1],
@@ -1154,18 +1201,45 @@ const NEEDLES = {
     // `$OEM$/$$/Setup/Scripts` copy and the byte-compare all read — a fifth file
     // added without its COPY is exactly the drift that constant prevents.
     ["export const OEM_MCP_RELAY_FILE = 'cua-mcp-relay.py'", 1],
-    ['OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]', 1],
+    // WP-1/6.5: THE RELAY GUARD IS THE THIRD PAYLOAD SCRIPT, and the list needle
+    // now names all three. It is the one a checkout keeps INSIDE
+    // docker/windows-oem/, so its resolver probe is `<payload-dir>/<name>` — and
+    // it is NOT in OEM_PAYLOAD_REQUIRED (a payload directory is identified by the
+    // four answer-file members; a fifth identity test un-recognises a checkout's
+    // own directory). A revert that drops it from the frozen set leaves a guest
+    // whose firstboot has a task to register and no script to name.
+    ["export const OEM_GUARD_FILE = 'cua-relay-guard.ps1'", 1],
+    ['OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE, OEM_GUARD_FILE])', 1],
     // staged into $STORE/windows/<name>/oem/ from the resolver (checkout: beside
     // docker/windows-oem/; image: inside it)
     ["stagePayloadFile(OEM_MCP_RELAY_FILE, 'MCP relay',", 1],
     ['a checkout keeps it beside it as docker/cua-mcp-relay.py', 1],
+    ["stagePayloadFile(OEM_GUARD_FILE, 'relay guard',", 1],
     // ...then copied into $OEM$/$$/Setup/Scripts, which Setup turns into
     // C:\Windows\Setup\Scripts — one of the four places firstboot searches.
-    ["for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE])", 1],
-    // ...and VERIFIED there, exactly like the other four (a listing that misses
-    // it means the guest runs firstboot's embedded floor instead — silently).
+    ["for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE, OEM_GUARD_FILE])", 1],
+    // ...and VERIFIED there. The base loop is still the FIVE answer/agent/relay
+    // names, and the guard is verified by its OWN check right below it — exactly
+    // how the sentinel is verified, and for the same reason: an entry that is
+    // conditional on another stage does not belong in a fixed list, but a missing
+    // verification does not either. (Earlier revision of this gate said the guard
+    // "is not verified there"; that was true when writer H's first pass widened
+    // only the copy. The dedicated `if (!oemScripts.includes(OEM_GUARD_FILE))`
+    // check landed with the copy fix, so both statements below are now pinned.)
     ["for (const script of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE])", 1],
-    ["const rootFiles = ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]", 1]
+    // WP-1: THE GUARD'S OWN VERIFICATION, and the sentence a guest would get
+    // without it ("the boot guard task firstboot registers would name a file that
+    // is not there"). One `if`, so deleting it leaves the guard copy unverified.
+    ['if (!oemScripts.includes(OEM_GUARD_FILE)) {', 1],
+    // The medium's ROOT byte-compare is the base set PLUS the guard: `rootFiles`
+    // is a `const` literal and the guard is APPENDED (`rootFiles.push`), the same
+    // shape the conditional sentinel uses. It has to be here because the guard
+    // really is copied to the medium's root (`SETUP_IMAGE_ENTRIES` + the
+    // `mcopy -s`), so a differing byte is a corrupt-medium defect, not a file
+    // that lives only under `$OEM$`. Dropping the push silently stops comparing
+    // the one payload script that repairs an unwatched boot.
+    ["const rootFiles = ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]", 1],
+    ['rootFiles.push(OEM_GUARD_FILE)', 1]
   ],
   /**
    * WP-2: THE CATALOG AND THE FIRMWARE SPLIT.
@@ -1323,21 +1397,155 @@ const NEEDLES = {
     // override naming the relay still runs through the relay
     ["transport: relayLane ? 'interactive-relay' : 'session-0-direct'", 1],
     ['const relayLane = /mcp-relay\\.py/iu.test(wanted)', 1],
-    ['facts.reason = SESSION0_FALLBACK_REASON', 1],
+    // WP-2.3/§4.3: TWO SENTENCES, TWO DIAGNOSES, ONE LANE. `RELAY_SKEW` means the
+    // guest ANSWERED and the harness could not read it (a payload/parse mismatch:
+    // fix the probe); `RELAY_DOWN` means nothing answered (fix the relay). The
+    // single `facts.reason = SESSION0_FALLBACK_REASON` assignment was exactly the
+    // conflation the doctor could not undo, so the two branches are asserted
+    // separately — the else branch keeps the DOWN sentence byte-identical for
+    // every existing consumer.
+    ['if (probe.status === RELAY_SKEW) facts.reason = SESSION0_SKEW_REASON', 1],
+    ['else facts.reason = SESSION0_FALLBACK_REASON', 1],
     ['DSH_CUA_MCP_RELAY_PORT', 1],
     ['const relayProbeCache = { key: ', 1],
-    // J22-14b: THE PROBE IS THE RELAY'S OWN `--ping`, AND ITS WALL IS 12 s.
-    // The old probe was a PowerShell one-liner: correct, and ~4.6 s cold because
-    // powershell.exe starts a CLR before its first socket call. Right after boot
-    // that start raced the then-8 s budget and answered RELAY_DOWN for a relay
-    // that was alive, so every attach fell back to the blind session-0 lane.
-    // `--ping` does the same handshake inside the interpreter that is already
-    // resolved (one socket, no child, no session lock), and 12 s covers a cold
-    // ssh plus a cold `py` launcher — a dead relay still costs only that, because
-    // the probe early-settles the instant an answer lands.
-    ['export const RELAY_PROBE_TIMEOUT_MS = 12000', 1],
+    // §4.1 — THE PROBE IS A HANDSHAKE, NOT A SUBCOMMAND, AND THE ORDER IS THE
+    // CONTRACT. The old probe was `py -3 <RELAY_SCRIPT> --ping <port>`: a mode of
+    // a payload that is STAGED AT MACHINE CREATE and never refreshed, so a guest
+    // whose relay predates the mode answers a usage line on stderr and exits 2
+    // (measured, Appendix A control) — and the harness read that as "down" on a
+    // relay that was healthy. The fix is a program carried INSIDE the command:
+    // base64, so `"`, `%`, `^`, `&`, `|` cannot be mangled by `ssh → cmd.exe →
+    // python`; sent as `RELAY_PING`, read as an 8-BYTE ACCUMULATE, printed as
+    // RELAY_OK/BAD/DOWN.
+    //
+    // `--ping` is KEPT, as the LAST candidate and in `legacyPingCommand()` — a
+    // fresh payload really implements it, so it stays a tested third chance
+    // instead of a string nobody can point at. What must never come back is
+    // `--ping` as the FIRST question, and the needle that used to bless
+    // `return \`py -3 ${RELAY_SCRIPT} --ping ${port}\`` as the probe is gone with
+    // it: it described a command the relay might refuse, not a handshake.
+    ['export function relayProbeCandidates(port = relayPort())', 1],
+    ['export function relayProbeCommands(port = relayPort())', 1],
+    ["{ id: 'py3-handshake', mode: 'handshake', interpreter: 'py -3'", 1],
+    ["{ id: 'legacy-ping', mode: 'legacy', interpreter: 'py -3'", 1],
+    // ...and the third candidate CALLS the builder instead of inlining a string:
+    // removing the builder (or the candidate) is the revert this pair catches.
+    ['command: legacyPingCommand(port) }', 1],
+    ["exec(__import__('base64').b64decode('${encoded}').decode())", 1],
+    ['const carrier = `exec(__import__(\'base64\').b64decode(', 1],
+    // the legacy builder is a REAL function, not an inline literal, so its
+    // existence is what says "third chance", not "the probe"
+    ['function legacyPingCommand(port = relayPort())', 1],
     ['export function relayProbeCommand(port = relayPort())', 1],
-    ['return `py -3 ${RELAY_SCRIPT} --ping ${port}`', 1],
+    // §4.3/§4.2 — CLASSIFICATION AND THE INTERPRETER THAT ANSWERED. A token-less
+    // answer is SKEW (the guest spoke), silence is DOWN; `probeMode` and
+    // `interpreter` travel so the session command is built from the carrier the
+    // probe proved exists (`py` vs `python`), instead of assuming `py`.
+    ["export const RELAY_SKEW = 'RELAY_SKEW'", 1],
+    ['export const SESSION0_SKEW_REASON = ', 1],
+    ['const status = answeredAny === true ? RELAY_SKEW : RELAY_DOWN', 1],
+    // THE INTERPRETER-MISSING CLASSIFICATION — DEFECT 3, IN ITS FINAL SHAPE.
+    // Two earlier readings were wrong in opposite directions, and both are now
+    // encoded as the thing that must not come back:
+    //   * "any guest text means the relay answered" made a guest with no `py`/no
+    //     `python` look like payload skew, so the doctor said "re-create the
+    //     computer" when the real answer was "this guest has no interpreter";
+    //   * "no token means DOWN" alone then hid that fact entirely.
+    // The shipped rule: SKEW requires the text to NAME the relay script
+    // (`mcp-relay` / `cua-mcp-relay`) AND to be unreadable (usage/option noise,
+    // or the payload's own exit 2); an interpreter/shell failure is RELAY_DOWN,
+    // and `interpreterMissing` carries the finer fact to the probe answer.
+    ['const RELAY_SCRIPT_REFERENCE_RE = /mcp-relay|cua-mcp-relay/iu', 1],
+    ['const RELAY_UNREADABLE_RE = /usage|invalid argument|unknown option|unrecognized argument|no such option|not recognized|cannot find/iu', 1],
+    ['const INTERPRETER_MISSING_RE = /is not recognized as an internal or external command|command not found|is not recognized|was not found|not found|no such file or directory|cannot find the (?:path|file)|cannot find the file/iu', 1],
+    // ONE OWNER FOR THE CLASSIFICATION, exported, and `answered` derived from it:
+    // the SKEW flag can no longer be set by a message about the interpreter.
+    ['export function classifyRelayProbeAnswer({ stderr = \'\', stdout = \'\', exitCode = null } = {})', 1],
+    ['if (RELAY_SCRIPT_REFERENCE_RE.test(text) === true', 1],
+    ['export function relayInterpreterMissing({ stderr = \'\', stdout = \'\' } = {})', 1],
+    ['answered: classification === RELAY_SKEW', 1],
+    ['interpreterMissing: relayInterpreterMissing({ stderr: capture.stderr, stdout: capture.stdout })', 1],
+    // ...and it rides BOTH probe paths: the answering candidate and the
+    // no-token one, so "no python here" survives to the doctor either way.
+    ['interpreterMissing: attempt.interpreterMissing === true', 1],
+    ['interpreterMissing: last?.interpreterMissing === true', 1],
+    // WRITER B'S FINAL CONTRACT: THE RANK, THE SKEW SEMANTICS, AND THE ONE PAYLOAD
+    // IDENTITY. Three exported facts that other files and docs now READ, so a
+    // rename or an inline substitution breaks them silently:
+    //   * `RELAY_ANSWER_RANK` / `relayAnswerRank()` — SKEW OUTRANKS DOWN. Two
+    //     candidates can answer differently in one probe; "the guest answered"
+    //     is the stronger fact, and a plain last-wins reducer loses it;
+    //   * `PAYLOAD_SKEW_SEMANTICS` — the sentence `windowsPayloadFacts()` and the
+    //     docs quote: skew is "the relay ANSWERED and the probe could not read
+    //     it", NOT a hash comparison, and a missing interpreter is DOWN;
+    //   * `expectedRelayHash()` — the harness-side payload identity index.js has
+    //     always read; nothing produced it before, so `payload.expectedRelayHash`
+    //     was structurally null.
+    // (`export function classifyRelayProbeAnswer(` is already pinned by the FULL
+    // signature needle above, so a second, shorter needle would only restate it.)
+    ['export const RELAY_ANSWER_RANK = Object.freeze({', 1],
+    ['export function relayAnswerRank(status)', 1],
+    ['export const PAYLOAD_SKEW_SEMANTICS', 1],
+    ['export const DOCTOR_FACTS_FIELDS', 1],
+    ['export function expectedRelayHash(sourcePath = null)', 1],
+    // THE BUDGET IS THE REMAINING BUDGET. One shared deadline covers every
+    // candidate (§4.1), so the per-child timer is the leftover milliseconds with
+    // a 1 ms floor — a 1 s floor here let a third candidate outlive the 12 s wall
+    // and made the LAST carrier's silence indistinguishable from a slow one.
+    ['const budget = Math.max(1, Math.round(Number(timeoutMs)))', 1],
+    ['interpreter: candidate.interpreter', 1],
+    ['probeMode: probe.probeMode ?? null', 1],
+    // THE DOCTOR'S FIELD ALIASES ARE A CONTRACT ACROSS TWO FILES. The client
+    // reports the lane's own words under `transportCommand` / `transportReason`
+    // (the module-level `relayDoctorFacts()` says `command` / `reason`), and
+    // index.js READS `transportReason` to build the fallback sentence. Renaming
+    // either side blanks the doctor's command and reason without any type error —
+    // `undefined` in a template is a string, not a failure — so the alias is
+    // pinned here and its consumer is pinned in the index block.
+    ['transportCommand: decided?.command ?? null', 1],
+    ['transportReason: state.reason', 1],
+    // §4.4 — REPAIR. One self-contained SSH attempt, bounded and throttled, with
+    // an Appendix-B record so the doctor can SAY what happened instead of asking
+    // the user to look at the guest. `spawnImpl` is the seam every child (probe,
+    // repair, session) goes through; without it the repair path is untestable.
+    ['export async function repairRelay(', 1],
+    ['export const RELAY_REPAIR_INTERVAL_MS = 60_000', 1],
+    ["export const RELAY_REPAIR_RECORD_PREFIX = 'CUA_RELAY'", 1],
+    ['spawnImpl = spawn', 3],
+    // ...and the launcher it REGENERATES names the harness's port: the
+    // interactive session has no DSH_CUA_MCP_RELAY_PORT, so a bare `--serve`
+    // would always listen on 47999 whatever the harness probes (direction E).
+    ["--serve --port ' + $port", 1],
+    ['export const RELAY_PROBE_TIMEOUT_MS = 12000', 1],
+    // WP-2.5/§4.4 — THE REPAIR RECORD SAYS WHETHER IT MEASURED ANYTHING.
+    // A repair that never reached the guest still returns a RECORD; before the
+    // marker, that record carried the base defaults (`session: 0`, `hash: ''`,
+    // `probe: 'RELAY_DOWN'`), which are indistinguishable from measurement — so
+    // index.js read "a repair measured that no console exists" and "the guest has
+    // no relay" on paths where NOTHING was measured (J7). Every consumer must
+    // gate on `measured` first, and the per-field `*Measured` flags narrow it:
+    // `session === 0` means "no console session" ONLY when `sessionMeasured`.
+    ['export function relayRepairMeasured(record)', 1],
+    ['export function relayRepairMeasurement(record)', 1],
+    ["export const RELAY_REPAIR_UNMEASURED = Object.freeze({", 1],
+    ['sessionMeasured: measured && record?.sessionMeasured === true', 1],
+    ['unmeasured: RELAY_REPAIR_UNMEASURED.THROTTLED', 1],
+    // BOTH DOCTORS CARRY IT (P2): the module-level relayDoctorFacts() and the
+    // client's doctorFacts() must agree field for field, so the payload marker
+    // and the measured-gated hash are asserted twice — a client that reports the
+    // guest's hash for an unmeasured attempt is the "blind bridge reported ok" bug
+    // wearing payload fields.
+    ['measured: record?.measured === true,', 2],
+    ['relayHash: record?.measured === true ? (record?.hash ?? null) : null,', 2],
+    // DEFECT 4(b): `port=` IS A MEASUREMENT, NOT AN ECHO OF THE HARNESS PORT.
+    // The guest now reports the port its handshake ACTUALLY answered on
+    // (`$answerPort`, discovered from the launcher or from the python listener),
+    // and an empty field parses to null with `portMeasured: false` — never to the
+    // harness's own port. That is what lets `portMismatch` finally mean "the relay
+    // answers somewhere else" instead of being unreachable by construction.
+    ['portMeasured: port !== null', 1],
+    ["' port=' + $answerPort", 1],
+    ['function Get-PythonListenPorts', 1],
     // J22-14b: A LATE RELAY MUST BE ABLE TO TAKE OVER A LIVE BLIND ATTACH. The
     // lane is decided per attach and the logon task can come up AFTER the SSH
     // attach that found it down; without an upgrade nothing re-decided and the
@@ -1485,28 +1693,98 @@ const NEEDLES = {
     ["$relayScript = 'C:\\ProgramData\\cua\\mcp-relay.py'", 1],
     ["Join-Path $relayDir 'cua-mcp-relay.py'", 1],
     ['the relay would be a task that does nothing', 1],
-    ["/tn `\"cua-mcp-host`\" /sc onlogon /it /rl LIMITED /f /tr", 1],
+    // WP-1.1/§1-fact-2: `/ru` IS THE FIX, NOT A TIDY-UP. `/it` without `/ru`
+    // binds the task to the CALLER — and the pass that registers this task runs
+    // as SYSTEM, so Windows refuses the create with exit 1 (reproduced). The
+    // account is resolved ONCE with Get-LocalUser (`$relayAccount`), never from
+    // `$env:USERNAME` (which IS "SYSTEM" in this pass), and the same value is
+    // what the guard and the re-assert hand to their own `schtasks /create`.
+    ["/tn `\"cua-mcp-host`\" /sc onlogon /ru `\"$relayAccount`\" /it /rl LIMITED /f /tr", 1],
     ["$relayLauncher = 'C:\\ProgramData\\cua\\mcp-relay-host.vbs'", 1],
     ['shell.Run', 1],
     ['", 0, False', 1],
     ['wscript.exe //B //NoLogo $relayLauncher', 1],
     ['cua-mcp-relay-task.cmd', 1],
-    // THE PROBE IS THE IDEMPOTENCY PROOF, and its LENGTH is the bug: a 9-byte
-    // buffer read one byte too many and compared a short read against the wrong
-    // length, so Test-RelayPing answered $false EVERY time — every firstboot then
-    // ran a second listener, and the loser died on WinError 10048 while the marker
-    // still read ok:true. The eight is asserted, not assumed.
-    ['function Test-RelayPing(', 1],
-    ["GetBytes('RELAY_PING')", 1],
-    ['New-Object byte[] 8', 1],
-    ["-ceq 'RELAY_OK'", 1],
-    ['if (Test-RelayPing $relayPort)', 1],
-    ['already answering RELAY_PING on 127.0.0.1:$relayPort', 1],
+    // WP-1.4/1.5/1.6 — THE GUARD TASK, THE NEVER-SKIPPED STEP, AND THE MARKER'S
+    // IDENTITY. Three separate promises, so three separate needles:
+    //
+    //   * `relay-guard-task` stages cua-relay-guard.ps1 to C:\ProgramData\cua and
+    //     registers it `/sc onstart /ru SYSTEM /rl HIGHEST`: it must exist for a
+    //     boot that produces NO logon (expired autologon, a resume before
+    //     Winlogon), which is the case an `onlogon` task cannot cover;
+    //   * `mcp-relay-reassert` is the ONE step declared `-Always`, so every
+    //     firstboot pass repairs a lane that died while its marker still said
+    //     ok:true (the `$done` skip is right for OpenSSH and wrong for a server);
+    //   * `attempts` and `scriptSha256` make the marker say HOW MANY TIMES and
+    //     WHICH script — without them "was this step tried twice" and "is the
+    //     stash stale" are inferences from duplicate rows and file sizes.
+    //
+    // The -File argument has no quotes on purpose: C:\ProgramData\cua is a path
+    // with no spaces, and a nested quote in /tr silently truncates the action.
+    ["Step 'relay-guard-task'", 1],
+    ['/sc onstart /ru SYSTEM /rl HIGHEST /f /tr', 1],
+    ['-WindowStyle Hidden -File $guardScript -Boot -Port $relayPort', 1],
+    ["Step 'mcp-relay-reassert'", 1],
+    ['} -Always', 1],
+    ['attempts = $attempts', 2],
+    ['scriptSha256 = $scriptSha256', 1],
     ["throw 'task-started-but-relay-not-listening'", 1],
     // the port is the same env override the relay and the client read
     ['DSH_CUA_MCP_RELAY_PORT', 1],
     // ...and the task is recorded as INTERACTIVE, like the clipboard tasks above
     ['mcp relay registered (cua-mcp-host: onlogon, INTERACTIVE, /rl LIMITED)', 1]
+  ],
+  /**
+   * WP-1.7: THE RELAY GUARD — ONE COPY OF "IS THE RELAY LISTENING", AND THE
+   * BOOT-TIME RE-ASSERT THAT USES IT.
+   *
+   * This file exists because the question had TWO copies: firstboot's inline
+   * `Test-RelayPing` and the client's probe both decided "down", and both got it
+   * wrong in the same way. The firstboot copy is GONE (the file's own header says
+   * so), and the guard is what firstboot `-Ensure`, the `/sc onstart` boot task
+   * and the logon path all call — so the needles that used to live in `oemBoot`
+   * are asserted HERE, against the file that actually carries them. That is a
+   * MOVE, not a deletion: a revert that puts an 8-byte-buffer probe back into
+   * `cua-firstboot.ps1` would leave this block red, because the guard would then
+   * be a task that does nothing.
+   */
+  oemGuard: [
+    // THE PROBE IS THE IDEMPOTENCY PROOF. The eight is asserted, not assumed: a
+    // 9-byte buffer read one byte too many, and comparing a short read against
+    // the wrong length made every "is it up?" answer $false — so every run
+    // started a SECOND listener and the loser died on WinError 10048 while the
+    // marker still read ok:true (the same defect, twice, in two copies).
+    ['function Test-RelayPing(', 1],
+    ["GetBytes('RELAY_PING')", 1],
+    ['New-Object byte[] 8', 1],
+    ["-ceq 'RELAY_OK'", 1],
+    // ONE Read IS NOT THE ANSWER either: a legal short read is a healthy relay,
+    // so the guard accumulates until 8 bytes or EOF. The loop's bound is the
+    // stopwatch, not one socket timeout per Read.
+    ['$read = 0', 1],
+    ['while ($read -lt $answer.Length) {', 1],
+    // THE PORT IS A PARAMETER, NEVER A CLOSURE. The boot task carries `-Port`,
+    // the firstboot `-Ensure` call passes the same number, and the harness
+    // probes that number — a literal 47999 in the probe is the port divergence
+    // (direction E) the launcher fix closes on the host side.
+    ['if (Test-RelayPing -Port $Port', 1],
+    // THE /run IS GATED BY THE PROBE, and the action records WHY it did not run:
+    // `already-up` is the 10048 lesson in one string (a /run against a live
+    // relay races it for the bind).
+    ["'already-up'", 1],
+    // THE AUTOLOGON RE-ASSERT is the direction-D half, and it writes ONLY the two
+    // values it must (an operator's DefaultPassword/DefaultUserName survives):
+    // the key is resolved once, and the write is the literal 1 — not a re-assert
+    // that rewrites whatever it read.
+    ['-Name AutoAdminLogon', 2],
+    ["-Value '1'", 1],
+    // ONE LINE PER RUN, at a path firstboot can copy into the marker. The
+    // ASSIGNMENT is asserted, not the word: the header comment also names the
+    // file, so a needle matching the bare name would stay green after the writer
+    // pointed $LogPath somewhere else (proven by mutation).
+    ["$LogPath = $Dir + '\\relay-guard.log'", 1],
+    // EXIT 0/1 AND NOTHING ELSE, so a caller can branch on the code.
+    ['if ($Ok) { exit 0 }', 1]
   ],
   /**
    * THE CLIP AGENT ITSELF (J22-1/2/4/5/11): a separate file, gated separately,
@@ -1680,7 +1958,15 @@ const NEEDLES = {
     // flat SET is proven semantically by J1-6b (adjacency needles broke the
     // clipboard agent's line once already).
     ['docker/cua-mcp-relay.py', 2],
-    ['cua-clip-agent.ps1 cua-mcp-relay.py; do', 1]
+    // WP-1/6.5: the permission loop reads the payload AS uid 1000, so a file the
+    // image ships but the loop does not name is a file nobody proved readable —
+    // and the guard is exactly the one a firstboot would then fail to stage. The
+    // order inside the loop follows the COPY line above it.
+    ['cua-clip-agent.ps1 cua-mcp-relay.py cua-relay-guard.ps1; do', 1],
+    // ...and the FLAT gate tree carries it, like every file the gate reads: this
+    // gate now resolves cua-relay-guard.ps1 by name (NEEDLES.oemGuard), so the
+    // in-image run would find "file not found" without this COPY member.
+    ['docker/windows-oem/cua-relay-guard.ps1 docker/cua-mcp-relay.py', 1]
   ],
   client: [
     // the four labels are a contract: automation reads them
@@ -1829,6 +2115,13 @@ const NEEDLES = {
     ['scoped.tools.guard((execution) => windowsGuardDecision(execution))', 1],
     ['tools.restrict({ deny })', 1],
     ['registrations: new Map()', 1],
+    // THE PER-TOOL ATTACH BUDGET IS A TIMEOUT THE MODEL CAN BRANCH ON. A tool
+    // called during the 45 s handshake used to wait on the client's own request
+    // timer and surface as "tool call timed out" — one string for every cause.
+    // Racing the body with `WIN_MCP_ATTACH_TIMEOUT_MS` (boundedExecute's 250 ms
+    // lead) makes `tool-timeout` the code that wins, so an attach in flight is
+    // distinguishable from a guest that answered too slowly.
+    ['execute: boundedExecute(publicName, WIN_MCP_ATTACH_TIMEOUT_MS, undefined,', 1],
     // the cheap state read, and the removal path that takes the names away
     ['vmWindowsMcpState', 1],
     ['vm-removed', 1],
@@ -1853,6 +2146,18 @@ const NEEDLES = {
     ['WIN_MCP.generation += 1', 1],
     ['const isDead = () => ticket.dead === true || WIN_MCP.generation !== generation', 1],
     ['if (isDead()) { abort(', 3],
+    // DEFECT 8: THE HANDSHAKE THE TICKET CANNOT REACH. `WIN_MCP.client` is only
+    // assigned AFTER `connect()` answers, so a teardown inside the 45 s handshake
+    // had no handle: the ticket blocked registrations but the SSH child lived
+    // until its request timer. Every client parked in `inflightClients` is closed
+    // by `teardown()`, and the attach deletes itself when it settles. The ORDER
+    // (`add` BEFORE `await client.connect()`) is asserted semantically (JURY-R2)
+    // — these needles can only prove the four call sites exist.
+    ['inflightClients: new Set(),', 1],
+    ['WIN_MCP_AUX.inflightClients.add(client)', 1],
+    ['for (const pending of WIN_MCP_AUX.inflightClients) {', 1],
+    ['WIN_MCP_AUX.inflightClients.clear()', 1],
+    ['if (ownClient !== null) WIN_MCP_AUX.inflightClients.delete(ownClient)', 1],
     ['function forgetSessionTarget(name)', 1],
     ['const inflightName = WIN_MCP_AUX.inflightTicket === null', 1],
     // J20-5: CROSS-SESSION TARGETING. One process, one attached computer, many
@@ -1880,12 +2185,89 @@ const NEEDLES = {
     // the text and the fields cannot disagree. `transportText` is null, never a
     // guess, when nothing was attached in this process.
     ['const transportFacts = WIN_MCP.client?.doctorFacts?.() ?? null', 1],
-    ['const transportText = transportFacts === null ? null : windowsTransportLine(transportFacts)', 1],
+    // WP-3.1/3.3 — THE THREE-VALUE VERDICT AND THE TWO-BRANCH SENTENCE.
+    // `leaking` keeps the leak test's own expression in front (offline + leaked
+    // schemas still wins, unchanged); `blind` is the NEW middle value: online but
+    // not through the relay, the state that used to report `ok`. The sentence
+    // follows the same split — an attached-but-blind bridge names the REASON and
+    // the next action instead of going silent, and an unattached one says
+    // "blind" only when there is a reason to.
+    ["status: online !== true && leaks.length > 0 ? 'leaking' : (blind === true ? 'blind' : 'ok')", 1],
+    ['const transportText = transportFacts === null', 1],
+    ['? (blind === true ? windowsTransportLine(null, blindReason) : null)', 1],
+    ['windowsTransportLine(transportFacts, blindReason)', 1],
+    // ...the closed set the reason comes from (`§4.6`): six values, one owner,
+    // and the doctor's `blindReason` is one of them or null.
+    ['const BLIND_REASONS = Object.freeze([', 1],
+    ['const BLIND_REASON_SET = new Set(BLIND_REASONS)', 1],
+    ['function classifyBlindReason({ transportFacts, repairEnabled })', 1],
+    ['const blindReason = lane.blindReason', 1],
+    // the PAYLOAD field, not any of the six local mentions: constructor key and
+    // verdict are adjacent there, so the pair is what says "the doctor sends it".
+    ['blind,\n    blindReason,', 1],
+    ['function windowsLaneVerdict(online, transportFacts)', 1],
+    ['function windowsBlindAction(reason)', 1],
+    // THE MEASURED GATE ON THE REPAIR RECORD (rules 4, 5 and 6). A record's
+    // `session`/`hash` are only evidence when the attempt MEASURED them; the
+    // base defaults (`session: 0`, `hash: ''`) used to answer "no console
+    // session" and "the guest has no relay" for attempts that never reached the
+    // guest. The four facts below are the fix, and rule 6 is the one a "helpful"
+    // refactor deletes first (it looks redundant next to the sentence it checks):
+    //   * `measured` is read from the record, never inferred from a value;
+    //   * `measuredSession` / `hashMeasured` narrow it per field, so a client
+    //     that ships only `measured` still classifies (absent = not contradicted);
+    //   * rule 6 keeps the guest's OWN sentence, but only when that attempt
+    //     measured something — otherwise any unmeasured producer borrowing the
+    //     vocabulary would short-circuit the ladder.
+    ['const measured = repair !== null && repair.measured === true', 1],
+    ['const measuredSession = measured && sessionMeasured', 1],
+    ['const hashMeasured = repair?.hashMeasured !== false', 1],
+    ['const rawHash = measured && hashMeasured', 1],
+    ['if (measured && recorded !== null) return recorded', 1],
+    ['recordBlindReason(repair)', 2],
+    // THE RELAY-ANSWERED PREDICATE, AND THE RULE THAT KEEPS THE DOCTOR FROM
+    // CONTRADICTING ITSELF. A measured successful repair (or the client's
+    // coherent up pair) means the relay is SERVING while the lane move is still
+    // in flight; without rule 7 the payload said "up" and "blind" at once and
+    // told the model to repeat the repair that had just worked.
+    ['function windowsRelayAnswered(facts)', 1],
+    ['function windowsLaneUpgrading(facts)', 1],
+    ['if (windowsRelayAnswered(transportFacts) === true) return null', 1],
+    // ...and the measured-session rule RANKS ABOVE the probe token: a probe
+    // cannot see a console, so a stale RELAY_SKEW must not relabel a measured
+    // session=0. That ORDER is asserted semantically (JURY-R1) — a needle can
+    // only prove both lines exist.
+    ["if (measuredSession === 0) return 'no-interactive-session'", 1],
+    // DEFECT 1/2, THE OTHER HALF: "UP, BUT THE CHILD HAS NOT MOVED YET" is its
+    // own verdict, not `blind`. When the relay ANSWERED (a measured repair, or the
+    // client's coherent up pair) but `transport` is still `session-0-direct`, the
+    // lane move is in flight for one poll; calling that blind makes the doctor say
+    // "up" and "blind" together and sends the model to repeat a repair that just
+    // worked. Three facts: the predicate input, the verdict field, and the two
+    // sentences that must say "ANSWERED" instead of the DOWN one.
+    ['const upgrading = online === true && transport !== \'interactive-relay\'', 1],
+    ['laneUpgrading: lane.laneUpgrading === true,', 1],
+    ['windows mcp transport: session-0-direct, relay ANSWERED;', 1],
+    // THE EVIDENCE ITSELF IS NAMED, and it is ONE of two measured facts — never a
+    // guess, because the sentence's whole job is to say WHY no repair is needed.
+    ['const evidence = transportFacts?.relayOk === true', 1],
+    // ...and a successful repair is evidence only while it is FRESH: two throttle
+    // windows long (the lane move rides the next poll), short enough that an
+    // ancient `ok=1` cannot excuse a lane that never moved. The trailing newline
+    // is part of the needle on purpose: `120_000` is a PREFIX of `120_000_000`,
+    // so a value that turns the window into "never expires" would satisfy the
+    // bare literal (proven by mutation). The boundary is the fact.
+    ['const RELAY_ANSWERED_FRESH_MS = 120_000\n', 1],
     ['...(transportFacts ?? {})', 1],
     ['    transportText,', 1],
     ['windows mcp transport: interactive-relay (port ${facts.relayPort}, relay ${relay})', 1],
     ["if (facts.transport === 'session-0-direct')", 1],
     ['windows mcp transport: session-0 fallback: ${detail}', 1],
+    // ...and the sentence's REASON comes from the client's alias, not from a
+    // re-derivation: this read is the other half of the `transportReason`
+    // contract above. Drop it and a blind attach loses WHY it is blind (the line
+    // falls back to "interactive relay not running", which is one cause of six).
+    ["const recorded = String(facts.transportReason ?? '').trim()", 1],
     ['not attached yet (no lane decided in this process)', 1],
     // J22-15: THE RELAY HEAL RIDES THE 10 s POLL. The client's own upgrade watch
     // is one 15 s window at connect time; a relay whose logon task starts AFTER
@@ -1923,6 +2305,33 @@ const NEEDLES = {
     ['const probeOverridden = online !== true && probeFacts.online === true', 1],
     ['probeAgeMs,', 1],
     ['overridden: probeOverridden', 1],
+    // THE GATE IS MEASURED, NOT ASSERTED (J20-3/WP-3.7). `gate: 'restrict+guard'`
+    // was a CONSTANT — a doctor claiming a fully armed gate on a process where
+    // `tools.restrict()` or `tools.guard()` had THROWN. The install's own failure
+    // record now decides: both halves armed only when nothing failed, `partial`
+    // otherwise, with the reason beside it. A revert to the constant is exactly
+    // the "verdict cannot lie" defect this release exists to end, so all three
+    // facts are pinned (the verdict, its detail, and the error it reads).
+    ["gate: WIN_MCP_AUX.gateError === '' ? 'restrict+guard' : 'partial'", 1],
+    ["gateDetail: WIN_MCP_AUX.gateError === '' ? '' : WIN_MCP_AUX.gateError", 1],
+    ['gateError: WIN_MCP_AUX.gateError', 1],
+    // WP-3.7/§4.8 — IDENTITY TRAVELS, and it is a GATE-ENFORCED equality, not a
+    // comment: `PLUGIN_VERSION` is the value the cross-file assertion at the end
+    // of this file compares against `plugins/dsh-cua-vm/package.json`. Both
+    // doctors report it, so "the fix is not in your plugin" stops being a guess.
+    ["export const PLUGIN_VERSION = '0.2.0'", 1],
+    ['pluginVersion: PLUGIN_VERSION', 1],
+    // WP-3.4/C4 — A HIDDEN BRIDGE INVENTORIES NOTHING. Nineteen names used to come
+    // back from a reveal that had FAILED (offline, grant off, wrong target), which
+    // is how a doctor could show a full tool list for a computer with no schema.
+    // `tools` exists only when the reveal really happened; otherwise `[]` + `code`.
+    ['tools: revealed === true', 1],
+    // WP-3.4/§4.7 — AUTO-REVEAL ON BIND, GRANT STILL THE VETO. A session that binds
+    // a computer is revealed in the same beat, so a first desktop call does not
+    // need a manual round trip; a session that binds NOTHING stays
+    // `reveal-required`, and a bind of a Linux guest reveals nothing (the gate
+    // still requires the Windows target to match).
+    ['if (grantFor(agent) === true) markRevealed(agent)', 1],
     ['const guiNote = \'desktop automation uses the MCP windows tools; cua_vm_gui screenshots are the noVNC stream, not a framebuffer\'', 1]
   ],
   proxy: [
@@ -2679,6 +3088,9 @@ function sourceOf(label, name) {
     // J22-14: this gate reads the relay by NAME (NEEDLES.relay), so the flat tree
     // must carry it or the image build fails on a file the checkout has.
     'cua-mcp-relay.py',
+    // WP-1/WP-6.1: and the relay GUARD, which the gate reads by name too
+    // (NEEDLES.oemGuard). Same rule, same failure if the COPY drops it.
+    'cua-relay-guard.ps1',
     'cua-guest-provision.sh', 'cua-guest-android.sh', 'proxy.mjs',
     'compose.yaml', 'compose.windows.yaml', '.env.example', 'Dockerfile',
     'windows-iso-sources.md'
@@ -2853,8 +3265,136 @@ function sourceOf(label, name) {
   }
 }
 
+/**
+ * WP-6.6 / §4.8 — ONE IDENTITY, TWO FILES. A SCRIPTED CROSS-FILE ASSERTION.
+ *
+ * `index.js` exports `PLUGIN_VERSION` and both doctors report it, while the
+ * package that a user installs carries `package.json`'s `version`. Nothing
+ * type-checks the pair: bump one, ship the other, and "the fix is not in your
+ * plugin" becomes a lie the doctor itself tells — the report says 0.2.0 while the
+ * installed package is 0.1.0, or the reverse. A needle cannot express equality
+ * between two files, so this READS BOTH and compares the strings.
+ *
+ * BOTH SIDES ARE FOUND THE WAY THE REST OF THE GATE FINDS THINGS: `index.js`
+ * through `pick()` (checkout or flat image tree), `package.json` beside it. The
+ * image's flat `/opt/seek-harness/cua-check` does not ship `package.json` (it
+ * ships the three JS files the plugin runs), so in THAT layout the assertion is
+ * out of scope and says so — never silently dropped, the same convention L5/N3
+ * use for checkout-only facts.
+ *
+ * THE FAILURE NAMES THE TWO VALUES AND THE FILE. `package.json 0.1.0 ≠
+ * PLUGIN_VERSION 0.2.0 (plugins/dsh-cua-vm/package.json)` is actionable; "the
+ * versions disagree" is not. This assertion was RED the moment it was written —
+ * index.js already exported 0.2.0 while the manifest still said 0.1.0 — and it is
+ * the gate, not a review note, that made WP-7.1's bump unmissable. It is green
+ * now that both say 0.2.0; a future bump in ONE file turns it red again.
+ */
+{
+  total += 1
+  const indexFile = pick('index.js')
+  const indexText = indexFile === null ? '' : readFileSync(indexFile, 'utf8')
+  const versionMatch = /export const PLUGIN_VERSION = '([^']+)'/u.exec(indexText)
+  const pluginVersion = versionMatch === null ? null : versionMatch[1]
+  // The package manifest is the plugin's own, so resolve it from index.js's
+  // directory first (a checkout keeps it there; the flat image tree does not have
+  // it at all), then fall back to the checkout path.
+  const packageCandidates = [
+    indexFile === null ? null : path.join(path.dirname(indexFile), 'package.json'),
+    path.join(ROOT, 'plugins', 'dsh-cua-vm', 'package.json')
+  ].filter((candidate) => candidate !== null)
+  const packageFile = packageCandidates.find((candidate) => existsSync(candidate)) ?? null
+  let packageVersion = null
+  if (packageFile !== null) {
+    try {
+      packageVersion = JSON.parse(readFileSync(packageFile, 'utf8')).version ?? null
+    } catch {
+      packageVersion = null
+    }
+  }
+  if (!REPO_LAYOUT && packageFile === null) {
+    if (!process.argv.includes('--quiet')) console.log('  n/a  WP-6.6 package.json vs PLUGIN_VERSION lives in the checkout, not in the flat image check tree')
+    total -= 1
+  } else if (pluginVersion === null || packageVersion === null) {
+    failures += 1
+    missing.push(`WP-6.6: both identities must be readable — index.js export const PLUGIN_VERSION = '<x>' (${pluginVersion === null ? 'MISSING' : `got ${JSON.stringify(pluginVersion)}`}) and package.json "version" (${packageVersion === null ? `MISSING or unparsable at ${packageFile === null ? 'no package.json found' : path.relative(ROOT, packageFile) || packageFile}` : `got ${JSON.stringify(packageVersion)}`})`)
+    console.log('  FAIL WP-6.6 plugin identity (PLUGIN_VERSION vs package.json)')
+  } else if (pluginVersion === packageVersion) {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   WP-6.6 plugins/dsh-cua-vm/package.json version ${packageVersion} === index.js PLUGIN_VERSION`)
+  } else {
+    failures += 1
+    missing.push(`WP-6.6: plugins/dsh-cua-vm/package.json version ${JSON.stringify(packageVersion)} ≠ index.js PLUGIN_VERSION ${JSON.stringify(pluginVersion)} — §4.8/WP-7.1: both must be the same release (0.2.0), so the doctor's pluginVersion names the build that is actually installed. OWNER: writer G (WP-7.1 bumps package.json).`)
+    console.log(`  FAIL WP-6.6 plugin identity: package.json ${packageVersion} ≠ PLUGIN_VERSION ${pluginVersion} (owner: WP-7.1 / writer G)`)
+  }
+}
+
+/**
+ * JURY-R1 — THE LADDER'S ORDER IS THE CONTRACT (index.js classifyBlindReason).
+ *
+ * A needle can prove both branches EXIST; only an ORDER assertion proves the
+ * measured console fact still outranks a stale probe token. The reproduced
+ * contradiction: a repair MEASURED `session=0` (no Active console session) while
+ * the cached probe still said `RELAY_SKEW`, so the doctor answered `probe-skew`
+ * and sent the operator to re-assert a payload — on a guest where the relay had
+ * nowhere to run. Defect 3 moved the measured branch above the token; this keeps
+ * it there. A reorder is invisible to every needle and to every "field present"
+ * check, which is exactly why it is asserted here.
+ */
+{
+  total += 1
+  const indexText = pick('index.js') === null ? '' : readFileSync(pick('index.js'), 'utf8')
+  const bodyStart = indexText.indexOf('function classifyBlindReason(')
+  const bodyEnd = bodyStart === -1 ? -1 : indexText.indexOf('\nfunction windowsRelayAnswered(', bodyStart)
+  const body = bodyStart === -1 ? '' : indexText.slice(bodyStart, bodyEnd === -1 ? indexText.length : bodyEnd)
+  const sessionAt = body.indexOf("return 'no-interactive-session'")
+  const skewAt = body.indexOf("return 'probe-skew'")
+  const measuredAt = body.indexOf('const measured = repair !== null && repair.measured === true')
+  const ok = body !== '' && measuredAt !== -1 && sessionAt !== -1 && skewAt !== -1 && sessionAt < skewAt
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   JURY-R1 a MEASURED console session outranks a stale RELAY_SKEW token in classifyBlindReason')
+  } else {
+    failures += 1
+    missing.push(`JURY-R1: plugins/dsh-cua-vm/index.js classifyBlindReason() must rank the MEASURED session fact (return 'no-interactive-session') ABOVE the stale probe token (return 'probe-skew'), and read the measured marker first — got measured=${measuredAt} session=${sessionAt} skew=${skewAt} (session<skew required)`)
+    console.log('  FAIL JURY-R1 blind-reason ladder order')
+  }
+}
+
+/**
+ * JURY-R2 — REGISTER THE CLIENT BEFORE THE AWAIT (index.js attach, DEFECT 8).
+ *
+ * `WIN_MCP.client` is assigned only AFTER the 45 s handshake answers, so a
+ * teardown that lands INSIDE `connect()` has nothing to close: the inflight
+ * ticket still refuses every late registration, but the SSH child lives until its
+ * own request timer — a bounded zombie. The fix parks the client in
+ * `WIN_MCP_AUX.inflightClients` BEFORE `await client.connect()` so `teardown()`
+ * can close it. Moving that one line below the await restores the defect and is
+ * invisible to every presence needle (both lines still exist), which is why the
+ * order is asserted here.
+ *
+ * The search for `await client.connect()` starts AT the add, so the doc comment
+ * that also spells the call (`index.js` header: "`await client.connect()` is 45 s
+ * wide") cannot satisfy the assertion on its own.
+ */
+{
+  total += 1
+  const indexText = pick('index.js') === null ? '' : readFileSync(pick('index.js'), 'utf8')
+  const addAt = indexText.indexOf('WIN_MCP_AUX.inflightClients.add(client)')
+  const connectAt = addAt === -1 ? -1 : indexText.indexOf('await client.connect()', addAt)
+  const ok = addAt !== -1 && connectAt !== -1 && addAt < connectAt
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   JURY-R2 the attach parks its client in inflightClients BEFORE awaiting the 45 s handshake (defect 8)')
+  } else {
+    failures += 1
+    missing.push(`JURY-R2: plugins/dsh-cua-vm/index.js must call WIN_MCP_AUX.inflightClients.add(client) BEFORE await client.connect() — a teardown inside the handshake can only close what is already parked (add=${addAt}, connect-after-add=${connectAt})`)
+    console.log('  FAIL JURY-R2 inflight client registered before the handshake')
+  }
+}
+
 if (failures > 0) {
-  console.error(`\n${failures} assertion(s) failed:`)
+  // THE COUNT IS PART OF THE FAILURE, not only of the success. A red gate that
+  // prints "3 assertion(s) failed" and nothing about the 1,100 that passed reads
+  // as "the gate is broken", and the reader cannot tell a one-needle regression
+  // from a truncated run. `total` is the same counter the green path prints.
+  console.error(`\n${failures} assertion(s) failed of ${total}:`)
   for (const line of missing) console.error(`  - ${line}`)
   console.error('\nThe personal VM is one chain: spec → supervisor → guest → plugin → proxy → compose.')
   console.error('A missing line is a hop that no longer exists, not a formatting nit.')

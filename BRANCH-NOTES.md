@@ -2709,3 +2709,234 @@ product decision about ergonomics, not about security: the guard, the reveal, th
 target binding and the offline teardown are what refuse a call, and a reviewer who
 disagrees with the default can flip one constant — `grantDefault` — without
 touching any of them.
+
+## 27. Branch `cua-vm-improve` — 2026-11-19: a probe that asked the payload a question it could not answer, and a verdict that could not say blind
+
+The reported symptom was "desktop automation is blind on a Windows computer that is
+otherwise fine". It was not an install failure and not a dead relay: the relay was
+running in the interactive session and answering `RELAY_PING`, and the harness was
+asking it a question — `py -3 C:\ProgramData\cua\mcp-relay.py --ping <port>` — that
+the copy of `mcp-relay.py` staged on that guest did not implement. The relay printed
+a usage line on stderr, nothing on stdout, exited 2, and the probe honestly settled
+`RELAY_DOWN`; every attach then took the Session-0 lane, and `status` stayed `ok`
+because it only knew `leaking | ok`. One defect, three enablers, and no way for the
+doctor to say the one thing that was wrong.
+
+The locked plan is `session0-sol.md` (v1.0, §5 WP-1…WP-7); this section is the
+implementation record. **ORACLE → PRE → JURY** are the three gates; no merge before
+JURY (§8.3).
+
+### The ORACLE evidence (gate G0, read-only on the stale `win-test` guest)
+
+| observation | measured |
+|---|---|
+| `C:\cua-provision.json`, `mcp-relay-task` | `ok:false` — `"schtasks could not register cua-mcp-host (exit 1)"` at 12:33:06, then `ok:true` at 12:35:41 |
+| `cua-firstboot.log` | `mcp relay registered (cua-mcp-host: onlogon, INTERACTIVE, /rl LIMITED) and answering on 127.0.0.1:47999 as C:\Program Files\Python312\pythonw.exe` |
+| `schtasks /query /tn cua-mcp-host /xml` | `LogonType=InteractiveToken`, `Author=CUA-WIN-TEST\cua`, one `LogonTrigger` |
+| `query session` | `console  cua  2  Active` |
+| `mcp-relay.log` | `listen 127.0.0.1:47999` at 12:35, 14:06, 14:44, 15:50, 22:06, 23:18, 23:57 — **and** `listen-failed port=47999 [WinError 10048]` at 15:53:07 |
+| guest `mcp-relay.py` | 26,573 B, **`--ping` occurrences: 0**, usage `--serve \| --connect [--port N]` |
+| repo `mcp-relay.py` | 31,640 B, `--ping` supported |
+| the old probe, stdout/stderr split | **exit 2, stdout 0 bytes**, stderr = `cua-mcp-relay: usage: …` |
+| the handshake on the same guest | `RELAY_OK`, **1,250 ms** end-to-end over SSH |
+| `--connect` + an `initialize` line | a full result, `serverInfo: {"name":"dsh-cua","version":"0.4.1"}` |
+
+The two rows that decide the cause are the payload's `--ping` count (**0**) and the
+handshake's (`RELAY_OK`, 1,250 ms): same guest, same moment, same port.
+
+### The defect chain
+
+```
+VM created (payload frozen at create time: relay WITHOUT --ping)
+  └─ setupcomplete.cmd → firstboot as SYSTEM, Session 0
+       └─ mcp-relay-task: schtasks /create … /it            ← no /ru → exit 1 → marker ok:false
+  └─ FirstLogonCommand → firstboot as cua, interactive
+       └─ mcp-relay-task retried → SUCCESS, task InteractiveToken, relay binds 47999, answers RELAY_PING
+HARNESS ATTACH
+  └─ relayProbe() → py -3 …mcp-relay.py --ping 47999
+       guest script has no --ping → usage on stderr, 0 bytes on stdout, exit 2
+       → RELAY_DOWN → lane session-0-direct → blind desktop
+  └─ doctor: transport/relayOk correct; status still `ok` (only leaking|ok existed)
+  └─ the poll nudge and the 15 s watch only RE-PROBED the same impossible command
+```
+
+| # | defect | evidence |
+|---|---|---|
+| **P0** | the probe depends on the guest payload's CLI surface — a script staged at machine-create and never refreshed | the payload's `--ping` count is 0; the same command exits 2 with 0 stdout bytes; the handshake answers on the same guest |
+| **P1** | nothing can repair, or even notice, a payload/lane mismatch: every heal path re-runs P0 | `grep schtasks` found no repair in `plugins/` or `docker/*.mjs`; `maybeUpgradeTransport`, the 15 s watch and `nudgeRelayUpgrade` all called the same probe |
+| **P2** | the verdict cannot say blind: `status ∈ {leaking, ok}`, and `transport`/`transportReason` were spread in *before* the verdict and never consulted | an online `session-0-direct` attach reported `status: ok` |
+| **P3** | identity is absent: no `pluginVersion` in any doctor, no script hash in the guest marker, no relay hash in the payload | `package.json` was `0.1.0`; `C:\cua-provision.json` recorded steps only |
+
+Hardening that ships with it (not P0, each with its own evidence): `/it` without
+`/ru` is refused (SYSTEM pass `exit 1`; the same create with `/ru cua` succeeded
+from Session 0), no boot-time re-assert of the relay, no AutoAdminLogon re-assert,
+`windows_desktop` returning 19 names for a hidden bridge, reveal keyed only on
+`WeakMap<agent>`, and a fixture that could not see any of the above.
+
+### The fixes, per file
+
+| file | WP | change |
+|---|---|---|
+| `docker/windows-oem/cua-firstboot.ps1` | WP-1 (A) | `schtasks … /it` gains `/ru "<account>"` (the account resolved once, never `$env:USERNAME`); a failed create stays `ok:false`/retryable and installs the guard anyway; the new `relay-guard-task` step stages `cua-relay-guard.ps1` and registers `cua-mcp-host-guard` (`/sc onstart /ru SYSTEM /rl HIGHEST`, hidden `powershell.exe -File … -Boot -Port <port>`); the new `mcp-relay-reassert` step is the only `-Always` step and calls the guard in `-Ensure` mode; the marker gains `scriptVersion`, `scriptSha256` and per-step `attempts` |
+| `docker/windows-oem/cua-relay-guard.ps1` | WP-1 (A) | **new**: one guest-side owner of "is the lane up" — `-Boot` (autologon re-assert, ≤90 s for an Active console session, handshake first, register/run only what is missing), `-Ensure` (10 s, the firstboot mode) and `-Autologon`; exit 0 iff the handshake answered, one line in `relay-guard.log` |
+| `plugins/dsh-cua-vm/win-mcp.js` | WP-2 (B) | the probe is a **handshake**: `relayProbeProgram()` (base64 carrier, `RELAY_PING`, 8-byte accumulate) behind `relayProbeCandidates()`/`relayProbeCommands()` in the order `py -3 -c` → `python -c` → legacy `--ping`; one 12 s budget across candidates; `RELAY_SKEW` classification + `SESSION0_SKEW_REASON`; the answering `interpreter` is carried into `--connect`; `spawnImpl` seam; `repairRelay()` (one base64 `-EncodedCommand`, handshake-first, `/ru` task re-create, launcher regenerated with `--serve --port <port>`, 60 s/25 s/5 min throttle+backoff, single-flight, kill switch, `resetRelayProbeCache()` on success); `maybeUpgradeTransport()` repairs once and re-probes; `doctorFacts()`/`relayDoctorFacts()` carry `probeMode`, `relayDetail`, `repair`, `payload { measured, relayHash, expectedRelayHash, skew, port, portMeasured }` (`expectedRelayHash()` is finally produced on the harness side, `port` is the guest's measurement, `skew` = the relay answered but the probe could not read it, and `DOCTOR_FACTS_FIELDS` names the canonical set plus the `command`/`reason` aliases); every repair record carries `measured`/`unmeasured` (`no-record`, `repair-disabled`, `bridge-disabled`, `throttled`, `exception`), so an attempt that never reached the guest reports null `session`/`hash` instead of the old `session: 0` / `hash: ''` defaults |
+| `plugins/dsh-cua-vm/index.js` | WP-3 (C) | `status ∈ {ok, blind, leaking}` with `leaking → blind → ok` precedence, `blind`/`blindReason` from the closed set, a `verdict` sentence built from the same fields; `pluginVersion`, `payload` (the canonical client set `{ measured, relayHash, expectedRelayHash, skew, port, portMeasured }`, plus the doctor's derived `relayPresent` / `portMismatch`): `skew` = the guest answered but the harness could not read it (not a hash comparison), `relayPresent` keeps "nobody measured" apart from "measured absent", and `portMismatch` compares the guest-measured port with the port the harness probes, `repair { attempts, lastAt, ok, reason, backoffMs, session, probe, enabled }` in both doctors; a blind sentence in `windowsTransportLine()`; auto-reveal on bind when granted (session-id-aware `revealedFor()`), `tools: []` unless `revealed === true`, `grant-off`/`reveal-required` unchanged; `windows_mcp_doctor` takes `{ repair?: boolean }` (`additionalProperties: false`), `windows_desktop` stays argument-free; `PLUGIN_VERSION = '0.2.0'` |
+| `docker/cua-vm-supervisor.mjs` | WP-4 (D) | `windowsRelayReassert(name)`: `ready` + `kind: windows` + `ssh !== false` only, one `schtasks /run /tn cua-mcp-host` (20 s timeout), 15 s per-name throttle, `void` call sites on the ready/unpause transitions and the install watcher, logged exit code, never throws |
+| `docker/cua-vm-windows-qemu.mjs` | WP-1 (A — **by the extension below**) | the guard becomes a payload file in the code that builds the medium: `OEM_GUARD_FILE = 'cua-relay-guard.ps1'`, added to `OEM_PAYLOAD_FILES` and `SETUP_IMAGE_ENTRIES`, staged onto the setup.img `$OEM$/$$/Setup/Scripts` **and** the medium's root (`rootFiles.push(OEM_GUARD_FILE)`), with `verifySetupImage()` throwing when the guard is not in either place — without it the boot task names a file that was never staged, the "starts and does nothing" failure this repository keeps naming. `stagePayloadFile()` and the `SETUP_IMAGE_ENTRIES` conditional list carry it too |
+| `Dockerfile` | WP-1 (A — **by the extension below**) | the guard joins both copies of the payload: `/opt/seek-harness/cua-check` (the flat tree the gate reads by name) and `/usr/local/share/cua-vm/windows-oem` (what the supervisor stages), and the **permission-proof loop** reads it as uid 1000 (`setpriv … test -r /usr/local/share/cua-vm/windows-oem/cua-relay-guard.ps1`), so an unreadable guard fails the image build instead of a boot |
+| `tests/fixtures/fake-win-mcp.mjs` | WP-5 (E) | lane/repair knobs (`setLane`, `setRepairResult`, `repairCalls`, `probeCalls`), `doctorFacts()`/`maybeUpgradeTransport()`/`repairRelay()`, `options.spawnImpl` honoured; default lane `interactive-relay` so the existing "online ⇒ ok" checks keep their meaning |
+| `tests/windows-mcp-gate.mjs` | WP-5 (E) | checks (f)–(j): lane `ok`, blind lane + closed-set reason, repair upgrades the lane and is throttled, power-off→ready re-probes instead of pinning, empty `tools` until revealed + auto-reveal + `pluginVersion`/`payload.relayHash`; check (d) rewritten for auto-reveal (bound session no longer `reveal-required`, unbound `implicit-single-target` still is) |
+| `tests/modules-unit.mjs` | WP-5 (E) | the old `--ping` literal assertion **rewritten, not deleted** (§5.4 — this is the test that would have caught P0): the first candidate decodes to a program containing `RELAY_PING`, the port and an 8-byte accumulate, contains no `powershell`, and `--ping` survives only as the last candidate; `SESSION0_SKEW_REASON` asserted distinct from the DOWN sentence; `shouldUpgradeToRelay` and `SESSION0_FALLBACK_REASON` untouched |
+| `tools/check-cua-vm.mjs` | WP-6 (F) | `oemGuard` in `FILES`; the winMcp needle block describes the handshake contract (`relayProbeCandidates`, `relayProbeCommands`, `RELAY_SKEW`, `SESSION0_SKEW_REASON`, `repairRelay`, `spawnImpl`, `interpreter`); the `/ru` form, `relay-guard-task`, `mcp-relay-reassert`, `scriptSha256`; `status`/`blindReason`/`PLUGIN_VERSION`/empty-tools/auto-reveal; the scripted cross-file invariant **`package.json.version === PLUGIN_VERSION`** (WP-6.6) |
+| `plugins/dsh-cua-vm/package.json` | WP-7 (G) | `"version": "0.2.0"` — the string the gate compares against `PLUGIN_VERSION` |
+| `plugins/dsh-cua-vm/README.md` | WP-7 (G) | the probe is a handshake (carrier, candidates, 8-byte accumulate, 1,250 ms / exit-2 measurements), `RELAY_SKEW`, the stale-payload story (`payload.skew`), the repair (record grammar, throttle/backoff, kill switch), the boot guard, the `ok\|blind\|leaking` table, auto-reveal, `pluginVersion 0.2.0` |
+| `.env.example` | WP-7 (G) | `DSH_CUA_VM_WIN_MCP_REPAIR=1` beside `DSH_CUA_VM_WIN_MCP` |
+| `BRANCH-NOTES.md` | WP-7 (G) | this section |
+
+**The ownership map was extended to 15 files (authorized).** SOL §6 froze thirteen
+files for the eight work packages and listed `Dockerfile` and
+`docker/cua-vm-windows-qemu.mjs` as **not touched**. Shipping the guard falsified
+both halves: a new OEM file that firstboot stages is only real if the image ships it
+(`Dockerfile`: the flat `/opt/seek-harness/cua-check` tree, the
+`/usr/local/share/cua-vm/windows-oem` payload and the uid-1000 permission proof)
+and the setup.img medium carries it (`SETUP_IMAGE_ENTRIES`, `verifySetupImage`,
+`stagePayloadFile`). The lead therefore authorized the map to **15 files** — the 14
+modified files plus the new `cua-relay-guard.ps1` — with both additions owned by
+**WP-1 (writer A)**, not WP-7. The two rows above are the record of that extension;
+SOL §6 is left byte-identical as the frozen plan it was, and this section is where
+the divergence is accounted for.
+
+**The frozen rule-1 residual (not changed by this package).** `classifyBlindReason`
+is a numbered ladder. Rules 4, 5 and 6 now require `measured === true`, which is the
+measurement-marker fix; **rule 1 is untouched**: when `transport === null` (no lane was ever
+decided) the classifier still returns the repair record's borrowed `reason` first —
+even on an unmeasured record — and only falls back to `lane-unknown` (or
+`repair-disabled` when the repair is switched off). `.fix3/repro-rule6.mjs` pins the
+behaviour deliberately, in both directions: `transport: null` + an unmeasured
+`reason: 'relay-missing'` → `relay-missing` (documented residual), `transport: null`
++ no record → `lane-unknown`. A reader who expects "a reason without a measurement
+is never a verdict" should know rule 1 is exempt, and why: a client that never
+decided a lane has no probe evidence at all, so the record's sentence is the only
+thing there is; narrowing it further would need a lane decision, which is exactly
+what `lane-unknown` reports.
+
+### Verify
+
+All of these run from the repo root. The numbers are the run recorded for this
+section (2026-11-19, checkout `cua-vm-improve`, working tree with WP-1…WP-7):
+
+```bash
+node --check plugins/dsh-cua-vm/index.js
+node --check plugins/dsh-cua-vm/win-mcp.js
+node --check docker/cua-vm-supervisor.mjs
+node --check docker/cua-vm-windows-qemu.mjs
+node --check tests/windows-mcp-gate.mjs
+node --check tests/modules-unit.mjs
+node --check tests/supervisor-smoke.mjs
+node --check tests/windows-boot.mjs
+node --check tests/qmp-shutdown.mjs
+node --check tests/fixtures/fake-win-mcp.mjs
+node --check tools/check-cua-vm.mjs              # all 11 exit 0
+
+node tools/check-cua-vm.mjs                      # exit 0 — 1,207 assertions across 24 files — the
+                                                 # final FROZEN gate after the JURY fix round (1,173
+                                                 # needles cumulative), including WP-6.6:
+                                                 # package.json 0.2.0 === PLUGIN_VERSION (1,143 at the
+                                                 # WP-7 landing)
+node tests/windows-mcp-gate.mjs                  # PASS — 82 checks (50 at the WP-5 contract freeze;
+                                                 # (d) rewritten, (f)-(j) added, +4 in the post-PRE
+                                                 # measurement block)
+node tests/modules-unit.mjs                      # PASS — 376 assertions (366 at the WP-5 landing, incl.
+                                                 # the 5.4 probe rewrite, + the 10 WP-4 supervisor checks)
+node tests/supervisor-smoke.mjs                  # PASS — 254 assertions
+node tests/windows-boot.mjs                      # PASS — 63 assertions
+node tests/qmp-shutdown.mjs                      # PASS — 7 assertions
+```
+
+The gate is the one that can go red on **my** half of the work: before the bump it
+printed `WP-6.6 … package.json 0.1.0 ≠ PLUGIN_VERSION 0.2.0 (owner: WP-7.1)`, and
+this section exists only once that line is `ok`.
+
+The **82** are not the freeze count. The post-PRE fix round added the block (h)
+measurement checks — what a repair record is allowed to PROVE — and the JURY re-ran
+them: a **measured** `session=0` selects `no-interactive-session`; a **measured**
+empty `hash=` selects `relay-missing`; an **unmeasured** record keeps `session` and
+`hash` null and falls through to `relay-stopped`; and `repair.measured` is exposed,
+so "nobody looked" cannot be read as "session 0" (4 contract checks, plus the
+kill-switch arm). The **rule-6** ladder those checks sit
+on — a *measured* record's own `reason` outranks the layered verdict, while rules
+4/5 still outrank rule 6, and an empty `reason` stays silent — is the
+`.fix3/repro-rule6.mjs` matrix below (15/15), because one gate check cannot
+enumerate a ladder.
+
+Workspace artifacts from the per-writer gates (they live next to the checkout, not
+in the repo, and they are not part of the image):
+
+```bash
+# GREEN — still the live WP-1 slice (guest scripts, no guest needed)
+node .wp1-verify/contract-check.mjs              # PASSED — 11/18 existing needles unchanged
+ps1 -File .wp1-verify/parse-check.ps1            # WP-1: the guest parser
+ps1 -File .wp1-verify/invoke-guard-test.ps1      # WP-1: `Invoke-RelayGuard -Ensure` through a fake SSH
+ps1 -File .wp1-verify/marker-step-test.ps1       # WP-1: the marker's attempts/scriptSha256 shape
+python3 .wp1-verify/guard-smoke.py               # PASSED — guard probe/wait/record/exit contract
+
+# LIVE REPROS of the FINAL contract (the replacement for the two superseded files below)
+node .fix3/repro.mjs                             # 44 passed / 0 failed
+node .fix3/repro-rule6.mjs                       # 15 passed / 0 failed (rule-6 ladder + rule-1 residual)
+node .pre2-verify/repro1-classify.mjs            # 32 passed / 0 failed
+node .pre2-verify/repro2-repair-record.mjs       # 55 passed / 0 failed
+node .pre2-verify/repro3-ports.mjs               # 29 passed / 0 failed
+```
+
+**Superseded, not green.** Two per-writer artifacts are still in the workspace and
+now exit 1, because they assert the contracts this fix REPLACED. They are recorded
+here with their final outputs instead of being listed as passing:
+
+```bash
+node w2-wp2/wp2-check.mjs   # exit 1 — 21 passed, 2 FAIL:
+                            #   §Appendix B: the record parses, and a missing `ok` is NEVER success
+                            #   P4: DSH_CUA_VM_WIN_MCP_REPAIR=0 spawns NOTHING and reports repair-disabled
+node wp3-verify/check.mjs   # exit 1 — 2 FAILURE(S):
+                            #   WP-3.2: the repair record reaches the doctor
+                            #   §4.10: repair measured session=0 → blind / no-interactive-session (got relay-stopped)
+```
+
+Both failures are the pre-fix model, and naming them is the point: the first asserts
+the old parser acceptance and the old `reason: 'repair-disabled'` kill-switch record
+(a `reason` that would preempt the probe evidence), the second feeds records without
+`measured`, where `session: 0` could still be read as a measurement. Neither is
+evidence against the shipped tree — the corrected behavior is asserted by
+`tests/windows-mcp-gate.mjs` block (h) and by the `.fix3` / `.pre2-verify` repros
+above. They are workspace scratch: not in the repo, not in the image, and not part
+of `git diff`.
+
+The live half of PRE (§8.2-6/-7) is read-only and re-runs the two measured facts:
+`relayProbeCommands(port)[0]`, executed verbatim through `cua_vm_exec`, must print
+`RELAY_OK` (baseline **1,250 ms**), and the legacy `--ping` command on the same
+stale guest must still produce **0 bytes on stdout, exit 2, usage on stderr**. The
+repair transport (`-EncodedCommand` as base64 UTF-16LE) is gated by one no-op
+command from Session 0 with exit 0.
+
+### JURY (gate G2) — the plan this section hands over
+
+`session0-sol.md` §8.3, J1–J10, on two guests: **A** = the stale `win-test` (upgrade
+path — no re-create, no firstboot re-run) and **B** = a fresh guest from the patched
+image (`tiny10`, 2 vCPU / 4 GB / 20 GB).  The checks that decide *this* work are
+J2 (`status: ok`, `transport: interactive-relay`, `relayOk: true`,
+`probeMode: handshake`, `pluginVersion: 0.2.0`), J4 (`tool_open_application` →
+`tool_list_windows` enumerates a Notepad title), J6 (`taskkill /im pythonw.exe /f`
+→ repaired within ≤90 s with `repair.ok: true`), J7 (`DSH_CUA_VM_WIN_MCP_REPAIR=0`
+→ `blind` / `relay-stopped`, never `ok`, and no repair ssh in the log) and J8
+(`cua_vm_shutdown` → `cua_vm_start` → `ok` within 30 s with no manual command). A
+J2/J4 failure on **A** is a P0 regression and blocks the merge; artifacts (doctor
+JSONs, `query session`, task XML, the provision marker, the relay log tail) are
+attached to the JURY record.
+
+**Residual risk, named honestly.** The stale-payload *class* is only detectable,
+not healed: nothing re-stages the relay on start (SOL D6), so a guest whose relay
+works but lacks a newer feature shows `payload.skew` and needs a re-create. The
+`ready()` half of direction C stays deferred (D1), and so does denying the two
+helper tools while offline (D3) — `windows_desktop`/`windows_mcp_doctor` must stay
+callable to explain an offline bridge. A repair is one SSH child and one PowerShell
+start per window, so on a guest whose PowerShell is itself broken the record is a
+failure with a `detail`, not an exception and not a retry storm (60 s → 5 min).

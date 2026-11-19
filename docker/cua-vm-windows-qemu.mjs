@@ -2727,6 +2727,33 @@ export const OEM_CLIP_AGENT_FILE = 'cua-clip-agent.ps1'
 export const OEM_MCP_RELAY_FILE = 'cua-mcp-relay.py'
 
 /**
+ * THE RELAY GUARD'S SCRIPT — payload, and it ships EXACTLY like the MCP relay.
+ *
+ * "Is the relay up?" used to be answered by `cua-firstboot.ps1` itself, in its own
+ * inline probe. WP-1 moved that judgement — and the autologon re-assert it depends
+ * on — into ONE script the guest runs from three places: firstboot (`-Ensure`),
+ * the `cua-mcp-host-guard` task on every boot (`-Boot`), and the logon task.
+ * firstboot stages it to `C:\ProgramData\cua\cua-relay-guard.ps1` and throws
+ * `relay-guard-missing` when it is in NEITHER the OEM payload NOR ProgramData —
+ * so a medium that carries everything EXCEPT this file produces a guest whose
+ * relay is never verified, with no way to fix it from the host afterwards.
+ *
+ * It rides the SAME THREE routes as `cua-clip-agent.ps1` and `cua-mcp-relay.py`,
+ * for the same reason (firstboot can only stage what the medium carries): the
+ * medium's ROOT — `Find-OemPayloadFile` walks the removable roots the fallback
+ * boot path boots from — the `$OEM$/$$/Setup/Scripts` tree Setup copies into
+ * `C:\Windows\Setup\Scripts`, and the flat image payload directory.
+ *
+ * It is the ONE payload script a checkout keeps INSIDE `docker/windows-oem/`
+ * rather than beside it (the other two are root-level host artifacts); the
+ * resolver's first probe — `<payload-dir>/<name>` — is what finds it, in both
+ * layouts. It is NOT in OEM_PAYLOAD_REQUIRED: a payload directory is identified
+ * by the four answer-file members, and adding a fifth to that identity test is
+ * how a checkout's own `docker/windows-oem/` stops being recognised.
+ */
+export const OEM_GUARD_FILE = 'cua-relay-guard.ps1'
+
+/**
  * J22-6: THE PRIVACY OFF-SWITCH, MATERIALIZED AS A FILE.
  *
  * `DSH_CUA_CLIP_AGENT=0` means "do not run the ambient clipboard loop", but the
@@ -2756,8 +2783,8 @@ export const OEM_MCP_RELAY_FILE = 'cua-mcp-relay.py'
  */
 export const CLIP_AGENT_SENTINEL_FILE = 'clip-agent-disabled'
 
-/** Every file the answer medium carries: the four answer-file members + the agent + the relay. */
-export const OEM_PAYLOAD_FILES = Object.freeze([...OEM_PAYLOAD_REQUIRED, OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE])
+/** Every file the answer medium carries: the four answer-file members + the agent + the relay + the guard. */
+export const OEM_PAYLOAD_FILES = Object.freeze([...OEM_PAYLOAD_REQUIRED, OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE, OEM_GUARD_FILE])
 
 /**
  * The first place `cua-clip-agent.ps1` can be read from, or null.
@@ -2815,6 +2842,13 @@ export function resolveOemPayloadSourceFile(candidates = [], fileName = OEM_CLIP
  * `cua-mcp-relay.py` sits beside it for the same reason and no other: it is a
  * guest-side script firstboot stages, so it must be on the medium it stages
  * from — root and `$OEM$` both — not merely inside the image payload directory.
+ *
+ * `cua-relay-guard.ps1` is the third such script and the newest reader of this
+ * list: firstboot's `Find-OemPayloadFile` searches `$PSScriptRoot`,
+ * `C:\Windows\Setup\Scripts` AND the removable roots, and the root copy is what
+ * a firstboot that ran from the EFI-Shell fallback path finds. Without it in
+ * this list the create still succeeds and the guest fails later with
+ * `relay-guard-missing` — the exact hop WP-1 exists to close.
  */
 export const SETUP_IMAGE_ENTRIES = Object.freeze([
   'Autounattend.xml',
@@ -2823,6 +2857,7 @@ export const SETUP_IMAGE_ENTRIES = Object.freeze([
   'Unattend.vbs',
   OEM_CLIP_AGENT_FILE,
   OEM_MCP_RELAY_FILE,
+  OEM_GUARD_FILE,
   // J22-6: present ONLY when DSH_CUA_CLIP_AGENT=0 at staging time. Listed here
   // because the medium's root is one of the places firstboot searches (and the
   // copy it makes is what reaches C:\ProgramData\cua\); it is optional in
@@ -3595,6 +3630,16 @@ export function verifySetupImage({ paths: p } = {}) {
       throw new Error(`setup.img's $OEM$/$$/Setup/Scripts is missing ${script} (listed: ${oemScripts.join(', ') || 'nothing'}) — Setup would never stage it into C:\\Windows\\Setup\\Scripts`)
     }
   }
+  // WP-1: AND THE RELAY GUARD IS VERIFIED THERE TOO, with its own sentence exactly
+  // like the sentinel below — because this is the asymmetry that reached a user:
+  // the medium carried the guard at its ROOT (so `Find-OemPayloadFile` found it
+  // when the stick was mounted) while Setup's copy into C:\Windows\Setup\Scripts
+  // silently did not, and that tree is the route a firstboot that runs BEFORE the
+  // removable root is reachable depends on. A listing that misses it means the
+  // `cua-mcp-host-guard` task firstboot registers names a path that is not there.
+  if (!oemScripts.includes(OEM_GUARD_FILE)) {
+    throw new Error(`setup.img's $OEM$/$$/Setup/Scripts is missing ${OEM_GUARD_FILE} (listed: ${oemScripts.join(', ') || 'nothing'}) — Setup would never stage the relay guard into C:\\Windows\\Setup\\Scripts, so the boot guard task firstboot registers would name a file that is not there`)
+  }
   // J22-6: AND THE SENTINEL, THE SAME WAY. `$OEM$\$$\Setup\Scripts` is the
   // second route into C:\Windows\Setup\Scripts, i.e. one of firstboot's search
   // locations; when the switch is on it must be listed here too.
@@ -3604,6 +3649,14 @@ export function verifySetupImage({ paths: p } = {}) {
   // BYTE COMPARE, exactly like dockur: the host copy and the image copy must be
   // indistinguishable. mtype emits the raw file.
   const rootFiles = ['Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]
+  // WP-1: the relay guard is byte-compared on the SAME terms as the files beside
+  // it. It DOES reach the medium's root — SETUP_IMAGE_ENTRIES carries it and the
+  // `mcopy -s` above copies every staged entry there — so a root copy whose bytes
+  // differ from the staged file is the corrupt-medium defect this loop exists to
+  // catch, not a file that legitimately lives only under $OEM$. Appended rather
+  // than listed inside the literal, the same way the conditional sentinel below
+  // is, so the two extra payload routes read as additions to one base set.
+  rootFiles.push(OEM_GUARD_FILE)
   if (existsSync(path.join(p.oemDir, CLIP_AGENT_SENTINEL_FILE))) rootFiles.push(CLIP_AGENT_SENTINEL_FILE)
   for (const name of rootFiles) {
     const staged = readFileSync(path.join(p.oemDir, name))
@@ -3933,6 +3986,14 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
   // from the removable-root fallback.
   stagePayloadFile(OEM_MCP_RELAY_FILE, 'MCP relay',
     '(the image copies it into windows-oem/, a checkout keeps it beside it as docker/cua-mcp-relay.py)')
+  // THE RELAY GUARD RIDES THE SAME ROUTES, and it is the one payload script the
+  // checkout keeps INSIDE windows-oem/ (WP-1 authored it there), so the
+  // resolver's first probe finds it in both layouts — no sibling copy exists and
+  // none is needed. Skipping this staging is what made a fresh guest record
+  // `relay-guard-missing`: firstboot had a task to register and no script to
+  // name, so the relay was never verified and never healed.
+  stagePayloadFile(OEM_GUARD_FILE, 'relay guard',
+    '(the image copies it into windows-oem/, a checkout keeps it there too as docker/windows-oem/cua-relay-guard.ps1)')
   // J22-6: THE PRIVACY OFF-SWITCH'S WRITER. `DSH_CUA_CLIP_AGENT=0` is a STAGING
   // variable; the guest can only see a file. This stages `clip-agent-disabled`
   // beside the payload, and buildSetupImage() carries it into both places
@@ -3977,8 +4038,11 @@ export function writeOemPayload({ paths: p, name, password, sshPubKey, sourceDir
   mkdirSync(setupDir, { recursive: true })
   // S4: the SAME scripts Setup copies into C:\Windows\Setup\Scripts.
   // SetupComplete.cmd is the SYSTEM pass and Unattend.vbs is the hidden
-  // first-logon launcher; both invoke cua-firstboot.ps1 idempotently.
-  for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE]) {
+  // first-logon launcher; both invoke cua-firstboot.ps1 idempotently. The relay
+  // guard rides along because THIS tree is one of the places firstboot's
+  // Find-OemPayloadFile searches for it — the route that survives a medium whose
+  // root the guest mounted somewhere other than a drive letter.
+  for (const file of ['setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', OEM_CLIP_AGENT_FILE, OEM_MCP_RELAY_FILE, OEM_GUARD_FILE]) {
     copyFileSync(path.join(p.oemDir, file), path.join(setupDir, file))
   }
   // J22-6: THE SENTINEL RIDES THE SAME COPY when the switch is on, so it lands

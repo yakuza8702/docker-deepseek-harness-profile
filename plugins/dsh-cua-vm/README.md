@@ -561,8 +561,8 @@ blind (see [the relay](#the-interactive-session--the-mcp-server-lives-there-now-
 | name | what it is |
 |---|---|
 | `mcp__windows__<guest tool>` | one per guest tool — `tool_click_at`, `find_elements`, `tool_type_text`, … The prefix is `TOOL_PREFIX = "mcp__windows__"` and `windowsToolName()` is the only place it is added (a name that arrives prefixed is not prefixed twice) |
-| `windows_desktop` | **reveal** — no arguments; unhides this session's bridged tools and returns their names, descriptions and parameters |
-| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` surface on the global registry (`leaks`), the grants, the keepalive and the last error |
+| `windows_desktop` | **reveal** — no arguments; unhides this session's bridged tools and returns their names, descriptions and parameters (an empty `tools` list with a `code` until they are really visible, and `blind` + `blindReason` when the lane cannot see a desktop) |
+| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` surface on the global registry (`leaks`), the grants, the keepalive and the last error — plus the **verdict** (`status: ok\|blind\|leaking`, `blindReason`, `verdict`), `pluginVersion`, the payload identity (`expectedRelayHash`/`relayHash`/`skew`/`portMismatch`) and the last `repair` record; `{"repair": true}` forces one attempt first |
 
 Why it is worth its cost: `find_elements` + `type_text` return a compact JSON
 receipt (`action_sent`, `effect_verified`) in a few hundred bytes, where the
@@ -589,7 +589,17 @@ one of them lives in the plugin's process (module-level state, not per-mount):
    stopped computer's tools visible.
 2. **the reveal** — with the grant on, the names are still hidden until
    `windows_desktop` is called for that session. `restrict({ deny })` is what
-   hides them, and the deny set is every name this bridge registered.
+   hides them, and the deny set is every name this bridge registered. **A bind
+   reveals, and the grant stays the veto**: a session that binds a computer
+   (`cua_vm_exec`, `cua_vm_gui`, `cua_vm_ensure`) while `grantFor(agent) === true`
+   is revealed in the same beat, so the first desktop call after a bind needs no
+   manual `windows_desktop` round trip. Nothing about the safety story changes —
+   a deny still comes back as `grant-off`, and a session that binds **nothing**
+   under `implicit-single-target` still gets `reveal-required` (the veto stays
+   reachable: the allowance covers *which* computer, never *whether* it may see
+   one). `windows_desktop` itself returns `tools: []` with `revealed: false` and
+   a `code` until the names are really visible, so a hidden bridge inventories
+   nothing.
 3. **the guard** — `tools.guard` vetoes the CALL at dispatch time, so a name that
    is still visible (a race, a step admission captured before a teardown) is
    **refused, never run**, with a structured `code:` line the model can branch on:
@@ -849,14 +859,48 @@ harness ──ssh stdio──▶ relay --connect ──127.0.0.1:47999──▶ 
   outside the session lock. firstboot's `Test-RelayPing` is the guest-side twin —
   its 8-byte buffer is what makes `mcp-relay-task` idempotent (the port is the
   evidence; a second listener would die on `WinError 10048`).
-* the **client's** probe: `py -3 C:\ProgramData\cua\mcp-relay.py --ping <port>`, one
-  SSH round trip that prints exactly one token (`RELAY_OK` / `RELAY_DOWN`). It
-  replaced a PowerShell one-liner that was correct and too slow — `powershell.exe`
-  starts a CLR before its first socket call (~4.6 s cold on a tiny10 guest), so
-  right after boot it raced the then-8 s budget and called a **live** relay DOWN,
-  which pinned the attach to the blind lane. The wall is now **12 s**
-  (`RELAY_PROBE_TIMEOUT_MS`): a cold ssh plus a cold `py`, with a dead relay still
-  costing only that because the probe settles the moment an answer arrives.
+* the **client's** probe is a HANDSHAKE, not a subcommand. The carrier is
+  `py -3 -c "exec(__import__('base64').b64decode('…').decode())"`, and the decoded
+  program connects `127.0.0.1:<port>` (1.5 s), sets a 2 s read timeout, sends
+  `RELAY_PING`, **accumulates exactly 8 bytes**, prints one of `RELAY_OK` /
+  `RELAY_BAD` / `RELAY_DOWN`, and exits 0. Nothing in it imports the relay or names
+  a mode of it — that independence is the fix, not a convenience. Base64 is the
+  carrier because the one-liner has to survive `ssh → cmd.exe → python`, and
+  cmd.exe is where a `"` splits, a `%` expands and a `^` is eaten; the base64
+  alphabet cannot smuggle any of them. The accumulate loop is the same lesson
+  firstboot's `Test-RelayPing` documents: `RELAY_OK` is eight bytes **on the
+  wire**, not eight bytes in one `recv()`, and a legal short read must never turn
+  a healthy relay into "down" (that false negative once started a second listener,
+  which died on `WinError 10048`).
+* **three candidates, one budget, first token wins** — `py -3 -c "<program>"` →
+  `python -c "<program>"` → the **legacy**
+  `py -3 C:\ProgramData\cua\mcp-relay.py --ping <port>`. The legacy form is a mode
+  of the guest payload, which is staged at machine-create and never refreshed, so
+  it is the last question instead of the first: on the measured guest the payload
+  was **26,573 B with zero `--ping` occurrences**, and that command answered
+  **exit 2, 0 bytes on stdout, a usage line on stderr** while the relay was
+  answering `RELAY_OK`. The handshake on the same guest answered `RELAY_OK` in
+  **1,250 ms** including the SSH round trip. The wall is **12 s**
+  (`RELAY_PROBE_TIMEOUT_MS`) shared by all three — one deadline, so the candidates
+  cannot triple it — and the interpreter that answered is the interpreter the
+  session command uses (`<interpreter> … --connect`), which closes the
+  `py`/`python` split.
+* **an answer without a token is `RELAY_SKEW` only when the PAYLOAD answered.**
+  `RELAY_SKEW` means the relay script replied with something the probe could not
+  read: a usage line, an unknown/invalid option, or a cannot-find that **names the
+  relay script** (`mcp-relay.py` / `cua-mcp-relay`). A carrier failure — `'py' is
+  not recognized`, `command not found`, `The system cannot find the path
+  specified`, or a bare exit code 2 that names no relay script — is `RELAY_DOWN`,
+  because the interpreter never ran and nothing about the payload was measured;
+  reading it as skew would diagnose a payload mismatch on a guest that has no
+  python at all, and (since SKEW outranks DOWN downstream) would hide a repair
+  that had measured `session=0` or `hash=` empty. `relayOk` stays boolean;
+  `relayStatus` / `probeMode` / `relayDetail` carry the truth, and the probe
+  answer keeps `interpreterMissing` so "this guest has no interpreter" can be
+  said without reading `RELAY_DOWN` as "the relay is stopped"; only a skew
+  record gets `SESSION0_SKEW_REASON` ("…the guest relay answered, but the harness
+  probe could not read it: payload mismatch; desktop automation will be blind")
+  instead of the `RELAY_DOWN` sentence.
 * the log: one line per event in `C:\ProgramData\cua\mcp-relay.log`
   (`DSH_CUA_MCP_RELAY_LOG`), which is the only diagnosis a `pythonw.exe` task has.
 
@@ -865,16 +909,169 @@ after the boot that made sshd reachable):
 
 | probe | command the SSH child runs | `transport` | `transportText` |
 |---|---|---|---|
-| `RELAY_OK` | `py -3 C:\ProgramData\cua\mcp-relay.py --connect` | `interactive-relay` | `windows mcp transport: interactive-relay (port 47999, relay up)` |
-| `RELAY_DOWN` / `RELAY_BAD` | `python -m dsh_cua.server --stdio` | `session-0-direct` | `windows mcp transport: session-0 fallback: … desktop automation will be blind` |
+| `RELAY_OK` | `<the interpreter that answered> C:\ProgramData\cua\mcp-relay.py --connect` | `interactive-relay` | `windows mcp transport: interactive-relay (port 47999, relay up)` |
+| `RELAY_SKEW` | `python -m dsh_cua.server --stdio` | `session-0-direct` | `windows mcp transport: session-0 fallback: the guest relay answered, but the harness probe could not read it: payload mismatch; desktop automation will be blind` |
+| `RELAY_DOWN` / `RELAY_BAD` | `python -m dsh_cua.server --stdio` | `session-0-direct` | `windows mcp transport: session-0 fallback: … interactive relay not running; desktop automation will be blind` |
 
 The fallback still speaks MCP and cannot see the desktop, so it is recorded, never
-hidden: `relayOk: false`, the `SESSION0_FALLBACK_REASON` sentence in
-`transportReason`, a log line per attach, and the same facts in
-`windows_mcp_doctor` (`transport`, `relayPort`, `relayOk`, `transportText`) — all
-from the client's synchronous, side-effect-free `doctorFacts()`, which never opens
-an SSH session of its own. Before an attach the fields are `null` and the text says
+hidden: `relayOk: false`, the `SESSION0_FALLBACK_REASON` (or `SESSION0_SKEW_REASON`)
+sentence in `transportReason`, a log line per attach, and the same facts in
+`windows_mcp_doctor` (`transport`, `relayPort`, `relayOk`, `relayStatus`,
+`probeMode`, `relayDetail`, `interpreter`, `interpreterMissing`,
+`transportCommand`, `transportReason`, `transportText`) — all from the client's
+synchronous, side-effect-free `doctorFacts()`, which never opens an SSH session of
+its own.
+**The lane fields have aliases, and they are the same facts, not two
+measurements:** the canonical names are `transportCommand` / `transportReason`
+(what the doctor emits, and what this page uses), while `command` / `reason` are
+kept as **aliases for existing consumers** — the module-level `relayDoctorFacts()`
+emits both spellings, and the client's own `state` uses `reason`.
+`DOCTOR_FACTS_FIELDS` spells the canonical set and the alias pairs; a consumer may
+read whichever spelling its surface offers, and reading them as two independent
+fields is the mistake.
+Before an attach the fields are `null` and the text says
 `not attached yet (no lane decided in this process)`.
+
+**A stale payload is visible, not fatal.** The guest's copies of
+`cua-firstboot.ps1` and `cua-mcp-relay.py` are frozen at machine-create, so an old
+computer is the normal case, not an accident. The doctor carries
+`payload { expectedRelayHash, relayHash, relayPresent, skew, port, portMismatch }`,
+derived from the client's canonical payload
+`{ measured, relayHash, expectedRelayHash, port, portMeasured, skew }` (the set
+`DOCTOR_FACTS_FIELDS` names). The identity fields mean different things:
+
+* `measured` is the marker that makes the rest readable: it lives on the client
+  payload and on the repair record (`repair.measured`), and the doctor states it
+  as `relayPresent`. `measured: false` + `relayHash: null` is **"nobody looked"** (no
+  repair ran, or the attempt never reached the guest); a measured record that read
+  the guest's relay file reports its SHA-256, and the same measured record reports
+  `relayHash: ''` when there is **no relay script at all**. So `relayPresent` is
+  `true` (hash read), `false` (measured and absent — the fact behind
+  `relay-missing`) or `null` (not measured): "no hash yet" and "the guest has no
+  relay" are not the same fact.
+* `expectedRelayHash` is the **SHA-256 of the relay script this build ships**
+  (lower-case hex — the same format the guest's `Get-FileHash` writes), produced
+  from the harness-side file the OEM payload stages. It is **null when this build
+  cannot say** (an installed bundle that carries no `docker/` tree): null means
+  **unknown** — never "no relay" and never "different". Compare it with
+  `relayHash` only when both are non-null; a differing pair is reported as
+  `relayHash` vs `expectedRelayHash`, and the comparison is never folded into
+  `skew`.
+* `skew` is **true only when the guest relay ANSWERED and the harness probe could
+  not read it** — the exported `PAYLOAD_SKEW_SEMANTICS` in one sentence: the
+  `RELAY_SKEW` token, a `RELAY_BAD` answer, or a guest repair record whose own
+  `reason` is `probe-skew`. It is **not** a hash comparison: a differing hash is
+  `relayHash` ≠ `expectedRelayHash`, and a **missing interpreter** is
+  `RELAY_DOWN` plus `interpreterMissing` — never skew.
+* `port` / `portMeasured` are the port the guest relay was **measured answering
+  on** — after the repair's ensure step the record emits `port=$answerPort`, so
+  this is the answer port, not the port the harness asked for; it is null with
+  `portMeasured: false` when the guest could not say. The harness port the attempt
+  targeted is the client repair record's `targetPort` (never reported as a
+  measurement), and `portMismatch` compares the guest's answer port with the
+  harness port **only when the guest measurement exists**. That is what makes the mismatch
+  meaningful: the record no longer echoes the harness's own number back at it.
+
+Nothing re-stages the payload on start — the handshake removed the *lane's*
+dependence on it, so a stale relay is a fact to report (`payload.relayHash`,
+`payload.portMismatch`) and re-create is the documented upgrade when a *feature*
+(not the lane) needs a newer relay.
+
+**The mismatch can be repaired from the harness.** When the forced probe is not
+`RELAY_OK` and the lane is `session-0-direct`, one SSH command may be issued: a
+self-contained base64 PowerShell script (`-EncodedCommand`, so cmd.exe quoting
+cannot mangle it) that is **generated in `win-mcp.js`, not read from the guest** —
+a script that depends on a guest file cannot repair a guest file — and does five
+things in order:
+
+1. **handshake first** — the port is the only truth, so a live relay is never
+   restarted (the `WinError 10048` race cannot start);
+2. **session** — the console session id for the account (`0` when there is none);
+3. **task** — `schtasks /query /tn cua-mcp-host /xml`, bound iff `InteractiveToken`
+   + the account + `mcp-relay-host.vbs`; re-created when missing or mis-bound as
+   `/sc onlogon /ru <user> /it /rl LIMITED` (`/it` **without** `/ru` binds to the
+   caller — SYSTEM — and is refused; the same create with `/ru <user>` succeeded
+   from Session 0, exit 0);
+4. **launcher** — regenerated when absent **or when it names another port**, with
+   `--serve --port <port>` written in: an interactive session has no
+   `DSH_CUA_MCP_RELAY_PORT`, so the port has to live in the launcher, which is what
+   closes the port-divergence split;
+5. **start + wait** — `schtasks /run` only when the port is silent, then ≤8 s for
+   the handshake.
+
+One record line comes back, space-separated, `CUA_RELAY` first —
+`CUA_RELAY ok=1 port=47999 task=1 running=1 session=2 probe=RELAY_OK hash=<sha256> mode=handshake reason=`
+— and the exit code is 0 iff `ok=1`. The parser tolerates a missing tail field but
+**never** treats a missing `ok` as success. `task`/`running` come from
+`schtasks /query` and a live check, not from `/run`; `session` is what decides
+`no-interactive-session`; `reason` is a `blindReason` value or empty.
+
+The attempt is throttled and single-flight: one per `RELAY_REPAIR_INTERVAL_MS`
+(**60 s**), a `RELAY_REPAIR_TIMEOUT_MS` (**25 s**) wall for the SSH child, and
+after `RELAY_REPAIR_FAILURES_BEFORE_BACKOFF` (**3**) consecutive failures the
+interval becomes `RELAY_REPAIR_BACKOFF_MS` (**5 min**) until one succeeds. A
+concurrent caller awaits the in-flight attempt instead of queueing a second one, it
+never throws, and a success drops the 10 s probe cache — the cached `DOWN` is
+exactly what would otherwise keep the next attach blind. **`DSH_CUA_VM_WIN_MCP_REPAIR=0`
+spawns nothing**, and the record says so without claiming to know anything about the
+guest: `skipped: true`, `disabled: true`, `measured: false`, `unmeasured: 'repair-disabled'`
+(`unmeasured: 'bridge-disabled'` when `DSH_CUA_VM_WIN_MCP=0` is the switch that
+fired), and **`reason: ''` — empty on purpose**. `reason` is the guest's
+`blindReason` vocabulary, so putting `repair-disabled` there would preempt the probe
+evidence and turn the verdict into `repair-disabled` when the measured answer is
+`relay-stopped`; the switch state travels in `disabled` + `unmeasured` instead, and
+`detail` names the variable (`DSH_CUA_VM_WIN_MCP_REPAIR=0`). Every record carries
+that measurement marker, so `unmeasured` also says `throttled`, `no-record`,
+`bridge-disabled` or `exception` when there was nothing to measure — and `reason`
+stays empty on all of those paths. The doctor keeps saying `blind` (its `repair`
+facts read `enabled: false`); `repair-disabled` becomes the `blindReason` itself
+only when nothing else is known, because a measured failure (`relay-stopped`,
+`no-interactive-session`) always wins.
+The doctor's `{"repair": true}` forces ONE attempt before
+the report — it bypasses the poll window, never the client's kill switch, timeout or
+in-flight guard.
+
+**The boot guard re-asserts the lane on every boot.** `relay-guard-task` stages
+`cua-relay-guard.ps1` to `C:\ProgramData\cua\` and registers it as
+`cua-mcp-host-guard` — `/sc onstart /ru SYSTEM /rl HIGHEST /f`, a hidden
+`powershell.exe -File … -Boot -Port <port>` action (no nested quotes in `/tr`, for
+the same reason the relay's command lives in a `.vbs`). In `-Boot` it re-asserts
+`HKLM\…\Winlogon\AutoAdminLogon` when missing or 0, waits **≤90 s** for an `Active`
+console session for the user, probes the handshake first, and registers/runs
+`cua-mcp-host` only when it is missing or silent — one line per run in
+`C:\ProgramData\cua\relay-guard.log`, exit 0 iff the handshake answered. firstboot
+shares the implementation instead of copying it: its `mcp-relay-reassert` step is
+the **one** step declared `-Always`, invokes the same guard in `-Ensure` mode
+(10 s) on every invocation, and `C:\cua-provision.json` now records
+`scriptVersion`, `scriptSha256` and a per-step `attempts` count, so "was this pass
+even the payload I think it is" is a fact in the marker. The supervisor adds the
+host-side half: on a `ready` Windows row (with `ssh` on) it fires one
+`schtasks /run /tn cua-mcp-host` (20 s timeout, at most one per computer per
+**15 s**), logs the exit code, and never waits for it.
+
+**The verdict: `ok` | `blind` | `leaking`.** `status` used to be `leaking | ok`
+only, so an online bridge on the blind lane reported `ok` — the report read as a
+pass. Precedence is `leaking` (offline + leaked schemas, unchanged) → `blind`
+(online, but not on the interactive relay) → `ok`:
+
+| situation | `status` | `transport` | `blindReason` |
+|---|---|---|---|
+| attached through the relay | `ok` | `interactive-relay` | `null` |
+| attached, probe failed, task/session fine | `blind` | `session-0-direct` | `relay-stopped` / `probe-skew` |
+| attached, no `Active` console session | `blind` | `session-0-direct` | `no-interactive-session` |
+| attached, lane never decided | `blind` | `null` | `lane-unknown` |
+| not attached, computer ready | `ok` (`online: false`) | `null` | `null` |
+| not attached, prefixed schemas alive | `leaking` | `null` | `null` |
+
+`blindReason` is a **closed set** — `probe-skew`, `relay-missing`,
+`relay-stopped`, `no-interactive-session`, `lane-unknown`, `repair-disabled` — and
+nothing else is ever written into it; the doctor also prints a `verdict` sentence
+built from the same fields, so the sentence and the JSON cannot disagree.
+`windows_desktop` says `blind` with the same reason in its note, and its `tools`
+list is empty until the names are really visible. Both doctors report
+**`pluginVersion: "0.2.0"`** — this README describes `dsh-cua-vm 0.2.0`, and
+`package.json` must equal `PLUGIN_VERSION` (the gate compares the two strings, so
+"the fix is not in your plugin" is a fact rather than a guess).
 
 **A late relay heals the live session.** Re-deciding per attach does not cover the
 case that actually bit: the `cua-mcp-host` logon task firing *after* the attach
@@ -896,13 +1093,26 @@ the session stayed blind. So every poll beat that still sees a CONNECTED
 guard and the same teardown of the client's child, because the plugin calls the
 client's method instead of re-implementing the decision. A late relay is therefore
 healed within **≤60 s** (one throttle window) on top of the 15 s fast path, and
-`DSH_CUA_VM_WIN_MCP_UPGRADE=0` silences this path too.
+`DSH_CUA_VM_WIN_MCP_UPGRADE=0` silences this path too. That one call is also where
+the repair lives: if the forced probe still fails on the blind lane, it issues ONE
+`repairRelay()` (throttled inside the client) and one forced re-probe before
+deciding, so the same ≤60 s bound covers a relay that **died** and not just one
+that started late.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DSH_CUA_MCP_RELAY_PORT` | `47999` | relay port on both sides of the wire; garbage falls back to the default rather than building a broken command |
+| `DSH_CUA_MCP_RELAY_PORT` | `47999` | relay port on both sides of the wire; the guest launcher gets `--serve --port <this>` written into it, because an interactive session has no environment variable of its own; garbage falls back to the default rather than building a broken command |
 | `DSH_CUA_MCP_RELAY_LOG` | `C:\ProgramData\cua\mcp-relay.log` | the relay's event log |
 | `DSH_CUA_VM_WIN_MCP_UPGRADE` | `1` | `0` disables the relay upgrade on both paths (the 15 s watch and the 10 s poll nudge), keeping a blind `session-0-direct` attach on that lane |
+| `DSH_CUA_VM_WIN_MCP_REPAIR` | `1` | `0` disables the repair: **no repair SSH child is ever spawned**, the record comes back `disabled: true`, `measured: false`, `unmeasured: 'repair-disabled'`, `reason: ''` (empty — `reason` speaks the guest's `blindReason` vocabulary, so the switch must not overwrite a measured `relay-stopped`), and `detail: 'DSH_CUA_VM_WIN_MCP_REPAIR=0'`; the doctor keeps saying `blind` instead of claiming a heal. The bridge and the reveal are unaffected |
+
+The repair's three budgets are **module constants, not environment variables** —
+`RELAY_REPAIR_INTERVAL_MS` (`60_000`), `RELAY_REPAIR_TIMEOUT_MS` (`25_000`) and
+`RELAY_REPAIR_BACKOFF_MS` (`300_000`, after
+`RELAY_REPAIR_FAILURES_BEFORE_BACKOFF` = `3` failures); a caller may narrow the
+wall per attempt, but the throttle is the client's own. `RELAY_REPAIR_COMMAND_MARKER`
+(`'-EncodedCommand'`) is the string that makes a repair child recognisable to a
+test, not an operator switch — no guest variable selects the repair transport.
 
 `DSH_CUA_WIN_MCP_COMMAND` still overrides the command verbatim (the doctor records
 that the relay was bypassed on purpose). The relay's limits are honest ones: it
