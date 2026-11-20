@@ -276,11 +276,163 @@ export const counters = {
   repairCalls: 0,
   probeCalls: 0,
   connects: 0,
-  spawnCalls: 0
+  spawnCalls: 0,
+  // WP-C (C12): how many functional probes the plugin really asked for. The
+  // cheap handshake probes only the accept loop, so "did the doctor ask the
+  // only question that can see the child" is a number, not a promise.
+  functionalCalls: 0
 }
 
 export function resetCounters() {
   for (const key of Object.keys(counters)) counters[key] = 0
+}
+
+/* ------------------------------------------------------------------ *
+ * WP-C / C12 — THE FUNCTIONAL PROBE'S ANSWER (the third token's seam)
+ *
+ * `RELAY_OK` proves only that the relay's accept loop answered; the child is
+ * proven by a real `initialize` + `tools/list` round trip, whose answer is
+ * `RELAY_OK` + `measured:true` or `RELAY_UNRESPONSIVE` + the C3 evidence. The
+ * fixture answers that question from a knob so the doctor's FOURTH status
+ * (`unresponsive`) and its precedence can be driven without a guest.
+ *
+ * THE DEFAULT IS HEALTHY (`RELAY_OK`, `measured:true`, 19 tools): the checks
+ * that predate WP-C are about the lane and the descriptions, and a default
+ * `unresponsive` would turn every unrelated verdict assertion into a failure.
+ * ------------------------------------------------------------------ */
+export const FUNCTIONAL_DEFAULT = Object.freeze({
+  mode: 'functional',
+  status: 'RELAY_OK',
+  measured: true,
+  reason: '',
+  budgetMs: 5000,
+  elapsedMs: 14,
+  initializeMs: 5,
+  toolsListMs: 6,
+  tools: 19,
+  port: 47999,
+  evidenceAt: '2026-11-20T00:00:00Z',
+  evidence: Object.freeze({
+    mode: 'functional',
+    at: '2026-11-20T00:00:00Z',
+    childPid: 4242,
+    childRestarts: 0,
+    lastSuccessfulCallAgeMs: 412,
+    outstandingRequestAgeMs: null,
+    lastWedgeAt: null,
+    wedgeDeadlineMs: 20000,
+    busy: false,
+    attached: true
+  })
+})
+
+let RELAY_FUNCTIONAL = null
+
+/** What the NEXT probe answers; `null` restores the healthy default. */
+export function setRelayFunctional(answer) {
+  RELAY_FUNCTIONAL = answer === null || answer === undefined ? null : { ...answer }
+  return RELAY_FUNCTIONAL
+}
+
+export function resetRelayFunctional() {
+  RELAY_FUNCTIONAL = null
+  counters.functionalCalls = 0
+}
+
+function functionalAnswer() {
+  if (RELAY_FUNCTIONAL === null) {
+    return { ...FUNCTIONAL_DEFAULT, evidence: { ...FUNCTIONAL_DEFAULT.evidence } }
+  }
+  return { ...RELAY_FUNCTIONAL }
+}
+
+/* ------------------------------------------------------------------ *
+ * WP-C / C2-C5 — A GUEST CALL THAT CAN HANG, AND A PER-CALL BUDGET
+ *
+ * The real client takes `callTool(name, args, { timeoutMs })` (WP-B, C5) and
+ * answers its own timer at that budget. The fixture honours the same option, so
+ * "two attempts inside 3 × 200 ms" is a wall clock the suite can measure
+ * instead of a promise about the transport.
+ * ------------------------------------------------------------------ */
+const CALL_TOOL_DEFAULT_MS = 60_000
+let CALL_TOOL_BEHAVIOR = null
+const CALL_TOOL_ATTEMPTS = new Map()
+/** name -> the `options` object each attempt carried (the budget R3 revision). */
+const CALL_TOOL_LOGGED = new Map()
+
+/**
+ * `setCallToolBehavior({ hangMs, times, code, message, rpcCode, ignoreBudget })`
+ * — the next `times` call(s) (default: every call) wait `hangMs` and then reject
+ * with `code` (default `timeout`). `hangMs` is CLAMPED to the per-call budget
+ * unless `ignoreBudget: true`, which models a transport that never answers on its
+ * own: the only thing that can end such a call is the plugin's own race, which is
+ * exactly the seam the per-call budget (R3 revision) has to prove. `null`
+ * clears it.
+ */
+export function setCallToolBehavior(behavior) {
+  CALL_TOOL_BEHAVIOR = behavior === null || behavior === undefined ? null : { ...behavior }
+  return CALL_TOOL_BEHAVIOR
+}
+
+/** How many times ONE guest tool was really called (the retry count). */
+export function attemptsFor(name) {
+  return CALL_TOOL_ATTEMPTS.get(String(name)) ?? 0
+}
+
+/** The per-attempt budgets ONE tool's last call carried (WP-C revision). */
+export function callOptionsFor(name) {
+  return [...(CALL_TOOL_LOGGED.get(String(name)) ?? [])]
+}
+
+/** Counters only — the BEHAVIOUR is a separate knob (`setCallToolBehavior(null)`). */
+export function resetCallToolAttempts() {
+  CALL_TOOL_ATTEMPTS.clear()
+  CALL_TOOL_LOGGED.clear()
+}
+
+function takeCallToolBehavior() {
+  if (CALL_TOOL_BEHAVIOR === null) return null
+  if (CALL_TOOL_BEHAVIOR.times !== undefined) {
+    if (!(CALL_TOOL_BEHAVIOR.times > 0)) return null
+    CALL_TOOL_BEHAVIOR.times -= 1
+  }
+  return CALL_TOOL_BEHAVIOR
+}
+
+const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(1, ms)))
+
+/* ------------------------------------------------------------------ *
+ * WP-C / C9-C10 — A FACTS READ THAT CAN STAY IN FLIGHT
+ *
+ * `holdDesktopFacts()` parks the next facts reads on a promise, which is the
+ * ONE state C9 must keep silent: `desktop === null` means "nothing has been read
+ * yet (a read is in flight)", and it must produce no warning. Without a seam for
+ * the PARKED read the suite could only ever observe a read that had answered,
+ * and `desktop: null` on a live bridge would be unreachable.
+ * ------------------------------------------------------------------ */
+let DESKTOP_READ_GATE = null
+
+export function holdDesktopFacts() {
+  let release = null
+  const promise = new Promise((resolve) => { release = resolve })
+  DESKTOP_READ_GATE = { promise, release }
+  return {
+    release() {
+      const gate = DESKTOP_READ_GATE
+      DESKTOP_READ_GATE = null
+      try { gate?.release() } catch {}
+    }
+  }
+}
+
+export function desktopFactsHeld() {
+  return DESKTOP_READ_GATE !== null
+}
+
+async function waitForDesktopRead() {
+  const gate = DESKTOP_READ_GATE
+  if (gate === null) return
+  try { await gate.promise } catch { /* released or abandoned */ }
 }
 
 /**
@@ -468,6 +620,10 @@ function desktopFactsAnswer() {
  */
 export async function desktopFacts() {
   desktopFactCalls.reads += 1
+  // WP-C / C9-C10: the PARKS that make `desktop: null` reachable on a live
+  // bridge (a read that has not answered yet), and the reason the reveal's
+  // "silent on null" branch is testable at all.
+  await waitForDesktopRead()
   return desktopFactsAnswer()
 }
 
@@ -643,14 +799,46 @@ export function createDshCuaClient(options = {}) {
     sshArgv() {
       return realSshArgv({ host: options.host ?? '127.0.0.1', port: options.sshPort, user: options.user ?? 'cua', keyPath: options.keyPath })
     },
-    async callTool(name, args = {}) {
+    async callTool(name, args = {}, options = {}) {
       if (state.connected !== true) {
         const error = new Error('the Windows MCP bridge is not connected')
         error.code = 'not-connected'
         throw error
       }
-      session.calls.push({ name, args })
+      session.calls.push({ name, args, options })
+      CALL_TOOL_ATTEMPTS.set(name, (CALL_TOOL_ATTEMPTS.get(name) ?? 0) + 1)
+      const logged = CALL_TOOL_LOGGED.get(name) ?? []
+      logged.push(options ?? {})
+      CALL_TOOL_LOGGED.set(name, logged)
+      const behavior = takeCallToolBehavior()
+      if (behavior !== null) {
+        // THE CLIENT'S OWN TIMER, AT THE PER-CALL BUDGET (C5). A budget that is
+        // absent falls back to the real client's 60 s default, which is exactly
+        // the value the old single 45 s constant made unreachable.
+        const budget = Number(options?.timeoutMs) > 0
+          ? Math.floor(Number(options.timeoutMs))
+          : CALL_TOOL_DEFAULT_MS
+        const hangMs = Number(behavior.hangMs) > 0 ? Number(behavior.hangMs) : budget
+        // `ignoreBudget` is a transport that never gives up by itself: the call
+        // can only end at the plugin's own deadline, which is the point.
+        await sleepFor(behavior.ignoreBudget === true ? hangMs : Math.min(hangMs, budget))
+        const error = new Error(behavior.message ?? `${name} did not answer within ${budget} ms`)
+        error.code = behavior.code ?? 'timeout'
+        error.budgetMs = budget
+        if (behavior.rpcCode !== undefined) error.rpcCode = behavior.rpcCode
+        throw error
+      }
       return { ok: true, tool: name, echoed: args }
+    },
+    /**
+     * THE FUNCTIONAL PROBE (C12), on the client because that is the ssh session
+     * the plugin already holds. The plugin resolves it through
+     * `client.relayFunctionalProbe` first, so a fixture that only had the
+     * module-level function would leave the doctor's fourth status untestable.
+     */
+    async relayFunctionalProbe(_options = {}) {
+      counters.functionalCalls += 1
+      return functionalAnswer()
     },
     /**
      * THE ZERO-SSH FACTS (WP-2.7): synchronous, side-effect free, and the SAME
@@ -686,10 +874,12 @@ export function createDshCuaClient(options = {}) {
      */
     async desktopFacts() {
       desktopFactCalls.reads += 1
+      await waitForDesktopRead()
       return desktopFactsAnswer()
     },
     async refreshDesktopFacts() {
       desktopFactCalls.refreshes += 1
+      await waitForDesktopRead()
       const facts = desktopFactsAnswer()
       state.desktop = facts
       return facts

@@ -594,12 +594,110 @@ blind (see [the relay](#the-interactive-session--the-mcp-server-lives-there-now-
 |---|---|
 | `mcp__windows__<guest tool>` | one per guest tool — `tool_click_at`, `find_elements`, `tool_type_text`, … The prefix is `TOOL_PREFIX = "mcp__windows__"` and `windowsToolName()` is the only place it is added (a name that arrives prefixed is not prefixed twice) |
 | `windows_desktop` | **reveal** — no arguments; unhides this session's bridged tools and returns their names, descriptions and parameters (an empty `tools` list with a `code` until they are really visible, and `blind` + `blindReason` when the lane cannot see a desktop) |
-| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` surface on the global registry (`leaks`), the grants, the keepalive and the last error — plus the **verdict** (`status: ok\|blind\|leaking`, `blindReason`, `verdict`), `pluginVersion`, the payload identity (`expectedRelayHash`/`relayHash`/`skew`/`portMismatch`), the last `repair` record and the guest's measured `desktop` facts (`measured`, `elementLaneOk`, `workDir`, `workDirWritable`, `scaleFix`); `{"repair": true}` forces one attempt first |
+| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` surface on the global registry (`leaks`), the grants, the keepalive and the last error — plus the **verdict** (`status: ok\|blind\|unresponsive\|leaking` — precedence `leaking → blind → unresponsive → ok`, `blindReason`, `verdict`), `desktopWarning`, the functional probe's own `relayFunctional` answer, `pluginVersion` (**0.2.2** in this release), the payload identity (`expectedRelayHash`/`relayHash`/`skew`/`portMismatch`), the last `repair` record and the guest's measured `desktop` facts (`measured`, `elementLaneOk`, `workDir`, `workDirWritable`, `scaleFix`); `{"repair": true}` forces one attempt first, `{"functional": false}` skips the 20 s functional probe |
 
 Why it is worth its cost: `find_elements` + `type_text` return a compact JSON
 receipt (`action_sent`, `effect_verified`) in a few hundred bytes, where the
 screenshot loop costs a PNG per attempt. The cost is the schema: **~3-8k tokens
 while attached**, zero when no Windows computer is active.
+
+#### The budget ladder: one 45 s constant was doing three jobs
+
+The **attach** handshake is 45 s wide on purpose (SSH + the guest's python coming
+up). It ALSO used to be the per-call `timeoutMs` and the body's race deadline,
+which meant two things at once: a slow-but-alive guest call was indistinguishable
+from a dead attach (it burned 45 s and then said `tool call timed out`), and the
+client's own 60 s request timer could never win — so the model never saw a
+transport timeout, and no call was ever retried.
+
+The per-call budget is now a **ladder**, and every rung above the first is
+*derived* from it (never an independent constant):
+
+| rung | value | what it is |
+|---|---|---|
+| guest `WEDGE_DEADLINE_MS` | 20 000 | the relay kills a wedged child and answers `child-wedged` |
+| host `WIN_MCP_CALL_TIMEOUT_MS` | 25 000 (`DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS`, call time, clamped 200..120 000) | one request inside `callTool` |
+| host `WIN_MCP_CALL_ENVELOPE_MS` | 26 000 = `call + 1 000` | the budget `boundedExecute` races the body against |
+| host `WIN_MCP_CALL_RETRY_BUDGET_MS` | 56 000 = `2 × envelope + 4 000` | a **retried** (read-only) tool's whole call |
+| host `WIN_MCP_CALL_GUARD_MS` | 30 000 = `envelope + 4 000` | the registered ceiling of a single-attempt tool |
+| attach `WIN_MCP_ATTACH_TIMEOUT_MS` | 45 000 | the handshake ONLY |
+
+**The ordering is structural, not cosmetic:** the guest's clock starts *after* the
+host's, so the host budget must be **larger** than the guest deadline — otherwise
+`child-wedged` could never reach the model, and a local `timeout` would replace it
+every time. The gate asserts the inequality across the two files (`S2`) and the
+three derivations, so `20 000` here and `25 000` there cannot drift apart.
+
+`boundedExecute` keeps its 250 ms lead (`TIMEOUT_LEAD_MS`) over the harness
+guard, so the *branchable* code wins instead of the generic "tool call timed out". The numbers are read **once per CALL**, not once per attach:
+`winMcpCallNumbers()` composes `call`/`envelope`/`attempts`/`total` from a single
+`winMcpCallTimeoutMs()` reading and every rung routes through it, so a session
+that changes `DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS` cannot get a body race cut at the
+old envelope while the transport waits on the new budget — the split that used to
+turn `code: relay-unresponsive` into a generic `tool-timeout`.
+
+#### The two tool sets: retry is for the read-only, `[DEGRADED]` is for the lane
+
+Two frozen, **disjoint** sets (both are guest names; every entry resolves through
+`windowsToolName()`):
+
+| set | members | what it drives |
+|---|---|---|
+| `WIN_MCP_ELEMENT_LANE_TOOLS` (5) | `find_elements`, `tool_invoke`, `tool_get_text`, `tool_set_value`, `tool_wait_for` | the tools that need **`win32ui`**. This is the set that carries `[DEGRADED]` when the desktop MEASURED the lane dead |
+| `WIN_MCP_CALL_RETRY_TOOLS` (3) | `tool_list_windows`, `tool_capture_window`, `tool_read_clipboard` | **read-only AND not element-lane**: the only calls that get ONE retry |
+
+**Disjointness is the point.** A retry exists for a *transient* timeout; an
+element call on a dead lane fails in **milliseconds** with `ImportError`, so
+retrying it is noise — and doubling the cost of the one class of call that cannot
+recover by waiting is exactly what the rule forbids. A mutating tool is never
+retried at all: the first attempt may have landed, and the guest's own
+`child-wedged` sentence says so ("the call did not return, so its effect is
+UNKNOWN"). The retry is a JSON-RPC request retry **on the same session** — the
+documented `reconnect {500 ms, 30 000 ms, 10 attempts}` policy is untouched.
+
+#### The three codes the model branches on
+
+| `code:` line | when | what the model should do |
+|---|---|---|
+| `relay-unresponsive` | no answer inside the per-call budget, or a transport `timeout` | the relay is listening, the child is not answering. The text carries a `hint:` naming `windows_mcp_doctor` (it runs the functional probe) and one retry |
+| `child-wedged` | the guest answered `{"code": -32000, "message": "child-wedged: …"}` | the guest's sentence travels **verbatim**: its effect is UNKNOWN — re-observe the screen before retrying |
+| `tool-failed` | everything else (with the client's own code when it has one) | unchanged from before |
+
+The `code:` line is repeated **in the text** because the harness error payload
+does not hand `code` to the model — the same reason `toolTimeoutError()` does.
+
+#### `[DEGRADED]`, and `desktopWarning`
+
+The five element tools advertised a focus-free lane on guests where `win32ui`
+cannot import, and they fail with `ImportError` in milliseconds — three calls
+spent discovering a lane that was never installed. So when the desktop facts
+**measured** a dead lane (`measured === true && elementLaneOk === false`), the
+five descriptions are prefixed with one frozen sentence, first in the string,
+before the guest's prose and before the contract note:
+
+> `[DEGRADED] the element lane is unavailable on this computer (win32ui missing):
+> this tool will fail with ImportError - use tool_click_at + tool_type_text, or
+> tool_list_windows, until the guest is rebuilt.`
+
+* **exactly five tools, exactly when measured.** `measured: false` produces **no**
+  prefix: unknown is not degraded, and claiming otherwise sends the model to a
+  fallback for a lane nobody measured.
+* the prefix is applied by **re-registering** those five once per generation,
+  after the attach's own facts read settles (`degradedAt` latches it; a healthy
+  guest re-registers nothing). The registration and `windows_desktop`'s `tools[]`
+  are rendered by the **same function**, at read time, so a reveal served seconds
+  later cannot hand back the pre-render sentence.
+* the other fourteen descriptions stay **byte-identical**.
+
+**`desktopWarning`** is the sibling field, and it exists because the state the
+tested image was actually in — `measured: false`, facts file unreadable — was
+**silent everywhere**: 19 tools handed over with no word that the desktop those
+tools drive had never been measured. It is `windowsDesktopWarnings({desktop}).join(' ') || null`
+computed **once** and published by both `windows_desktop` and
+`windows_mcp_doctor`, so the field and the sentence cannot disagree. `null` means
+"nothing measured yet / nothing to warn about" — a read is in flight or the
+desktop is healthy — and `measured: false` is a **warning** naming the guest's own
+error, because "nobody looked" is not "nothing is broken".
 
 #### The gate: grant → reveal → guard
 
@@ -662,8 +760,9 @@ The 19 guest tools are upstream `dsh-cua` tools, and the plugin publishes
 upstream's descriptions **verbatim** — before this change it appended only
 `" (dsh-cua, Windows computer <name>)"`. So the model was reading a contract
 nobody had checked, and three of those descriptions implied more than the receipt
-proves. The fix is the honest sentence in the description, not a wrapper around
-the result: the relay is a byte bridge and the plugin rewrites nothing
+proves — while a fourth receipt (`tool_type_text`) was not generous but **wrong**.
+The fix is the honest sentence in the description, not a wrapper around the
+result: the relay is a byte bridge and the plugin rewrites nothing
 (`open_application` has no polling surface to wrap, and inventing a
 `path_redirected` flag for a redirect that does not exist would be a second lie).
 
@@ -671,8 +770,14 @@ the result: the relay is a byte bridge and the plugin rewrites nothing
 |---|---|
 | `tool_open_application` | `os.startfile(target)` returns when the SHELL accepted the association. `success: true` does **not** mean a window appeared, and a retry launches a **second instance** — two Notepads is the expected, described outcome |
 | `tool_send_keys` | the success branch returns `hwnd/keys/arbiter/time_ms` and **no** `effect_verified` (unlike `tool_type_text`). Success means the keys were injected into the FOREGROUND window, not that the app acted on them |
-| `tool_capture_window` | there is **no redirect path** at all. An EMPTY `save_path` is a documented default (`%TEMP%\win32_mcp_shots`); a non-empty path that cannot be written raises `PermissionError` (Errno 13), and nothing relocates it |
+| `tool_type_text` | the receipt is an **exact** compare: `ok: true, effect_verified: true` only when the control's text is EXACTLY `before + text`. A truncated insert (a focus race drops the tail) is `effect_verified: false, reason: "short-insert", missing: "<the tail that never landed>"`, the tail is posted again up to `TYPE_TEXT_RETRY = 2` times, and a recovered insert reports `recovered: true, retries: n`. A terminal failure **restores** the control to `before` and reports the MEASURED `restoreOk` (a read-back, not an intention). The old `after != before` called a lost character a success |
+| `tool_capture_window` | an EMPTY `save_path` is a documented default (`%TEMP%\win32_mcp_shots`); a NON-empty one must be under the allow-list (`C:\cua-work` or `%TEMP%\win32_mcp_shots`, or below them), whose missing directory the tool **creates** and reports as `created_dir: true` (plus `saved_dir`). Outside those roots it fails closed with a sentence naming both roots (`success: false, created_dir: false`); it never raises and never relocates the path |
 
+`tool_type_text` is the one row that is not a description note at all: it is
+**guest-side behaviour**, patched into `bridge.py` by firstboot
+(`dsh-cua-typetext`, below), and its description still says what the tool does not
+promise. `tool_capture_window`'s row is both — the note is a description note,
+the allow-list and `created_dir` are the guest patch (`dsh-cua-savepath`, below).
 The three notes are frozen in `WINDOWS_TOOL_CONTRACT` (`win-mcp.js`), keyed by
 guest tool name and appended **before** the `(dsh-cua, Windows computer <name>)`
 suffix. `windowsToolContract()` returns `''` for every other tool, so the other
@@ -761,9 +866,50 @@ pair that does not need the wrapper — `tool_click_at` with the numbers a captu
 reports, and `tool_type_text` into the focused window — then verify with
 `tool_capture_window`. The doctor's `verdict` says that sentence with the same
 facts, and `windows_desktop`'s payload carries `desktop` too, so a dead lane is a
-sentence rather than 19 identical `ImportError`s. A guest provisioned before this
+sentence rather than 19 identical `ImportError`s. And since 0.2.2 the **five element tools say it themselves**: their registered
+descriptions start with the frozen `[DEGRADED]` sentence (see
+[`[DEGRADED]` and `desktopWarning`](#degraded-and-desktopwarning)), re-registered
+once per generation when the facts **measured** the lane dead. A guest provisioned before this
 change answers `measured: false`: the documented upgrade is a **re-create**
 (nothing re-stages the relay or re-runs pip on start).
+
+#### The three guest patch steps, and why they are patched instead of wrapped
+
+`dsh-cua==0.4.1` ships three behaviours this harness cannot live with, and the
+relay is a byte bridge — it rewrites nothing — so firstboot patches the installed
+wheel in place, one step per defect, in the same style as `dsh-cua-scale`:
+
+| step | file / anchors | gate before any write | what it fixes |
+|---|---|---|---|
+| `dsh-cua-typetext` | `dsh_cua/bridge.py` (the `type_text` signature, the effect-receipt block, the out-dict) | dsh-cua `0.4.1`, SHA-256 `59280ee9…`, `count == 1` per anchor | `effect_verified = after != before` called a **truncated** insert a success. The replacement is an exact compare, the `missing` tail, `TYPE_TEXT_RETRY = 2`, the `short-insert` receipt and a measured `restoreOk` |
+| `dsh-cua-savepath` | `dsh_cua/server.py` (the `save_path` open block, the `@mcp.tool(description="Capture a window screenshot and SAVE IT TO A FILE.` descriptor, the success payload) | dsh-cua `0.4.1`, SHA-256 `29668590…`, `count == 1` | a non-empty `save_path` whose directory did not exist raised `PermissionError`. `_ensure_save_dir()` creates it **inside the two-root allow-list** and reports `created_dir`; outside it fails closed, naming both roots |
+| `desktop-token-probe` | a generated, **hidden** `C:\ProgramData\cua\desktop-probe.ps1`, run as an `/it` `/rl LIMITED` task | the python interpreter and the provisioned account | nothing ever proved the **desktop token** could see an interactive session — the costliest blind lane in the report. The probe records `session`, `win32ui`, `uiaLane`, `workDirWritable` and its own `scriptSha256` into `C:\cua-work\cua-desktop-probe.json`, and the step **throws** on a missing or stale marker (that is the logon retry mechanism) |
+
+**The order is the contract:** `dsh-cua` → `dsh-cua-scale` → `dsh-cua-typetext`
+→ `dsh-cua-savepath` → `desktop-token-probe` → `clipboard-tasks`. The two patch
+steps edit the same two files, so a reorder makes the next step's `count == 1`
+anchor gate depend on luck — the gate asserts the order (`S6`).
+
+**The marker vocabulary is the `scale` step's family**, plus the probe's own
+value: `typeTextFix` / `savePathFix` are `applied` · `already` ·
+`skipped:no-python` · `skipped:no-file` · `skipped:version-mismatch` ·
+`skipped:hash-mismatch` · `skipped:anchor-missing` · `skipped:anchor-ambiguous` ·
+`skipped:no-change` · `skipped:write-failed` · `skipped:import-failed` ·
+`skipped:probe-failed`, with `typeTextProbe` / `savePathProbe`
+(`TYPE_TEXT_OK` / `TYPE_TEXT_BAD…`) as the **executed** proof that the patched
+module imports and behaves; `desktopProbe` is `ok` · `failed:<why>`, beside
+`desktopSession` and `desktopScriptSha256`. **A refusal that had to UNDO a write
+keeps its `skipped:<why>` and adds `restoreOk`** — the same rule the scale step
+documents: `restoreOk: true` means the original bytes are measured back,
+`false` means the rollback failed too and the guest needs
+`reinstall dsh-cua==0.4.1`. The idempotence sentinel (`if expected is not None:`,
+`_ensure_save_dir`) is checked **before** the hash gate, because a second pass
+cannot hash-match a file the first pass rewrote.
+
+`tests/guest-patch.mjs` (≥24 checks) applies the here-strings to the pinned 0.4.1
+evidence copies, AST-extracts the patched functions and runs them against stubs —
+including the **unpatched** copy, which still reports `effect_verified: true` for a
+dropped character. That is the proof the defect was real, not a story.
 
 #### Where to save
 
@@ -786,11 +932,22 @@ The relay then proves the write **from the desktop token** (create and delete
 `.cua-write-probe`) and publishes `workDir` + `workDirWritable`. The rule for
 `save_path` is therefore one line:
 
-| `save_path` | where the bytes go |
-|---|---|
-| `C:\cua-work\shot.jpg` | there, and `success: true` |
-| empty | `%TEMP%\win32_mcp_shots` (`os.path.join(os.environ.get("TEMP", "."), "win32_mcp_shots")`, with yesterday's shots pruned) — the documented DEFAULT (the tool's own choice), never a silent redirect of a path you gave; with `include_data_uri: true` no file is written and the bytes come back inline |
-| anything else it cannot write (e.g. `C:\Users\cua\shot.jpg`) | **fails** with `PermissionError` (Errno 13). No fallback, and no `path_redirected` field pretending one happened |
+| `save_path` | where the bytes go | `created_dir` |
+|---|---|---|
+| `C:\cua-work\shot.jpg` | there, and `success: true` (the directory already exists) | `false` |
+| `C:\cua-work\shots\today\shot.jpg` (directories missing) | there — the tool **creates** the levels and says so | `true` |
+| empty | `%TEMP%\win32_mcp_shots` (`os.path.join(os.environ.get("TEMP", "."), "win32_mcp_shots")`, with yesterday's shots pruned) — the documented DEFAULT (the tool's own choice), never a silent redirect of a path you gave; with `include_data_uri: true` no file is written and the bytes come back inline | `false` |
+| anything outside the allow-list (e.g. `C:\Users\cua\shot.jpg`) | **fails closed**, `success: false`, with a sentence naming `C:\cua-work` **and** `%TEMP%\win32_mcp_shots`; nothing is created and nothing is relocated | `false` |
+
+The allow-list is exactly two roots — `C:\cua-work` and `%TEMP%\win32_mcp_shots`,
+matched with **normalisation** (`\` vs `/`, case, a trailing separator), so the
+predicate is testable off Windows. `created_dir` is `true` only when *this* call
+made the directory (a caller can tell "it was already there" from "I created it"),
+and a save that fails to write after the directory was created reports
+`created_dir: true` with `error: "save_path could not be written: …"` — the
+directory stayed, the file did not. `saved_dir` names the directory on success.
+A write failure is a **receipt**, not an exception: `PermissionError` used to
+escape as a traceback, which the model could not branch on.
 
 `workDirWritable: false` means the ACL or the label did not take (a guest created
 before this change, or a hand-edited DACL): the verdict names `C:\cua-work` and
@@ -1138,6 +1295,152 @@ fields is the mistake.
 Before an attach the fields are `null` and the text says
 `not attached yet (no lane decided in this process)`.
 
+#### The cheap probe proves the accept loop; `RELAY_FN` proves the child
+
+`RELAY_OK` answers one question — **is a listener on this port** — and it is
+answered *before* the session lock, which is exactly what makes it cheap and
+exactly why it cannot answer the other one. A relay whose MCP child is **wedged**
+(a `PostMessage`/`WM_GETTEXT`/UIA call that will never return) or **gone** still
+answers `RELAY_OK`: the accept loop is fine, the thing behind it is not. During
+session 5 that was a seven-minute-per-call outage reported as a healthy lane.
+
+So there are two probes, and they answer different questions:
+
+| probe | what the client sends | what it proves | where it is used |
+|---|---|---|---|
+| **cheap** | `RELAY_PING` (10 bytes) | the accept loop is up — the *lane* question, in milliseconds | every attach, the lane-preference table above, the 10 s state poll |
+| **functional** | `RELAY_FN` (8 bytes in, one JSON line back) | the **child** answered a real `initialize` + `tools/list` round trip through the session | `windows_mcp_doctor` (default on, `{"functional": false}` to skip), after a `{"repair": true}` attempt |
+
+* `RELAY_FN` is its own token, **not** a `RELAY_PING` prefix: a token spelled
+  `RELAY_PING_FN` would be answered by the 10-byte cheap path the moment its
+  prefix had arrived, before its own trailing bytes were ever seen. The relay
+  compares against a **token set** (`PROBES`), not one prefix.
+* the answer is **one JSON line** carrying the relay's live counters —
+  `mode`, `at`, `childPid`, `childRestarts`, `lastSuccessfulCallAgeMs`,
+  `outstandingRequestAgeMs`, `lastWedgeAt`, `wedgeDeadlineMs`, `busy`, `attached`.
+  A `null` is a fact ("no successful call yet", "nothing outstanding"), never a
+  zero. Failing to serialise answers `{"mode": "functional", "error": …}`, not
+  silence.
+* the client's **functional** program is carried the same way the cheap one is —
+  `py -3 -c "exec(__import__('base64').b64decode('…').decode())"` — deliberately
+  with **no `--functional` flag**, so a stale guest payload cannot answer a probe
+  it does not implement (its `usage()` stays byte-identical). It writes an
+  `initialize` (id `900001`), `notifications/initialized` and `tools/list` (id
+  `900002`) — the same three frames `connect()` sends — and prints exactly two
+  lines: the token and the JSON answer. `RELAY_OK` is the token of the
+  **measured** success only when both ids answered and `tools >= 1`; the one
+  short-circuit below (`session-busy`) also prints it, with `measured: false`.
+
+**What the functional probe can actually answer.** This table is the PRODUCERS,
+not the intent: `win-mcp.js`'s program has exactly five exits, and a reader who
+learns the reasons anywhere else will invent a sixth:
+
+| branch | token | `measured` | `reason` | exit (the program's own) |
+|---|---|---|---|---|
+| no `RELAY_FN` line, or an unparsable one | `RELAY_UNRESPONSIVE` | `false` | `no-evidence` | 3 |
+| the relay's evidence says `busy === true` | **`RELAY_OK`** | **`false`** | **`session-busy`** | 4 |
+| both ids answered and `tools >= 1` | `RELAY_OK` | `true` | `''` | 0 |
+| the child closed the socket while waiting | `RELAY_UNRESPONSIVE` | `false` | `child-eof` | 3 |
+| the budget ended without both answers, or `tools == 0` | `RELAY_UNRESPONSIVE` | `false` | `child-silent` | 3 |
+
+**`session-busy` is not a health verdict, and it is not rank 3.** It is the one
+answer the probe gives about ITSELF rather than about the child: the relay's
+evidence says `busy === true`, meaning the attached session (a real `tools/call`
+in flight, or another probe) already holds the child — so the program returns
+**before** it opens a second socket and never runs the
+`initialize`/`tools/list` round trip. The token is `RELAY_OK` because the _lane_
+is demonstrably fine, `measured` is `false` because **nobody measured the child**,
+and `relayOk` is therefore **true on an answer that proves nothing about the
+child** — `relayAnswerRelayOk()` reads the status only, by design, because the
+lane really is usable.
+
+That is the trap this paragraph exists to close: a busy answer must never be
+allowed to conclude health. It still carries the relay's own evidence, so the
+verdict is decided from the numbers, not the token — `lastSuccessfulCallAgeMs`
+(how long since ANY call succeeded), `outstandingRequestAgeMs` (how long the id
+somebody else's session owns has been open) and `childRestarts` — which is
+exactly the evidence the doctor's `unresponsive` branch consumes and prints
+(`lastSuccessfulCallAgeMs=…, outstandingRequestAgeMs=…, childRestarts=…`). Read it
+as: **busy = "the lane is up, the child is somebody else's question right now"** —
+re-probe when the session frees, and until then a busy answer with an aged or
+absent `lastSuccessfulCallAgeMs` is evidence of an overdue child, not a clean
+bill of health.
+
+**A fourth token, and it is not a fifth failure mode:**
+
+| token | rank | meaning |
+|---|---|---|
+| `RELAY_OK` | 0 | the cheap probe answered; or the functional one answered and the child listed tools (`measured: true`); or it answered `session-busy` (`measured: false` — lane up, child unmeasured) |
+| `RELAY_SKEW` | 1 | the payload answered something unreadable — a payload mismatch, not a dead relay |
+| `RELAY_DOWN` | 2 | the transport never delivered a token: nothing ran |
+| `RELAY_UNRESPONSIVE` | 3 | **the relay answered and its child did not** — `reason` is `child-silent`, `child-eof` or `no-evidence`, and **never** `session-busy` |
+
+**The `reason` set is exactly the producers — five members, nothing surplus.**
+`RELAY_FN_REASONS` (`win-mcp.js`) is the frozen list `''`, `child-silent`,
+`child-eof`, `session-busy`, `no-evidence`: one member for each of the five exits
+above and nothing else. A value from OUTSIDE the set is normalized to
+`no-evidence` rather than forwarded — an unrecognised word means "the evidence
+did not arrive", not a sixth diagnosis.
+
+**The retired member.** `wedge` was once listed and never emitted: the relay's
+evidence object carries no `reason` field at all, and a wedge is `event('wedge', …)`
+in the log plus `lastWedgeAt` in the evidence. It is gone from the constant, and
+`tests/modules-unit.mjs` D-9 pins both halves — the exact five, frozen, and an
+answer that claims `wedge` arriving as `no-evidence`.
+
+`RELAY_UNRESPONSIVE` outranks every other token because it is the strongest
+statement available: the lane exists, the process behind it does not answer.
+`relayOk` stays **false** for it (rank-3 evidence is not a usable lane), and the
+doctor reports `status: "unresponsive"` with the evidence numbers — see
+*The three codes the model branches on* below — and the `status` precedence is
+`leaking → blind → unresponsive → ok`.
+
+#### The wedged child: the 20 s deadline, the kill, and `child-wedged`
+
+The relay pairs every outbound request id with an inbound answer **passively**,
+from the bytes it already forwards (`_observe_outbound` / `_observe_inbound` —
+they can only append to and pop from `pending`, and both are wrapped so the
+bridge stays raw). That pairing is what makes a wedge measurable at all.
+
+* **the trigger** is age, not a guess: one request outstanding longer than
+  `WEDGE_DEADLINE_MS` (20 000, or `DSH_CUA_MCP_WEDGE_DEADLINE_MS`) is a *wedged*
+  child — not slow, never coming back. `0` disables the watchdog (the old
+  behaviour: the call waits forever); anything else is clamped to
+  `200..600000`, read at **call time** so a test can scale it.
+* **the order is the contract**: log the wedge (`event('wedge', 'id=… age=…')`),
+  **kill** the child (`TerminateProcess`, `self.proc` cleared *before* the kill so
+  the dying child's own EOF is not read as "my client is gone"), **then** answer.
+  An answer before the kill lets the client retry into the same wedged process.
+* **every pending id is answered once, ascending, on the same socket** the client
+  is already reading — a re-connect would lose the session the wedge just saved.
+  The error is `{"id": n, "error": {"code": -32000, "message": "child-wedged: the
+  MCP server did not answer in <n> ms; killed pid <p> (restart #<r>); the call did
+  not return, so its effect is UNKNOWN - re-observe before retrying"}}`. The
+  `-32000` is the guest's own code; `win-mcp.js` rethrows it as
+  `code: 'child-wedged'` and the plugin publishes it to the model **verbatim**,
+  because that sentence is the only thing that says the effect is UNKNOWN.
+* **the lane heals without a reconnect**: the next client spawns a fresh child
+  (`childRestarts` increments, `childPid` changes) and the next request succeeds.
+  `_fn_evidence()` reports both, which is why the doctor can say "it restarted
+  twice" instead of "it is unresponsive".
+
+#### The facts file has a cadence, and it is not one number
+
+`publish_desktop_facts()` writes the file **atomically** (a temp file in the same
+directory + `os.replace`, so a reader never sees a torn JSON) and adds
+`refreshMs` — the interval the measurement just earned — plus the `relay` block
+(C3's counters). The interval is `facts_refresh_interval(facts)`:
+
+| facts | interval | why |
+|---|---|---|
+| every fact true (lane, work dir, scale) | `FACTS_FULL_REFRESH_MS` = 900 000 (15 min) | a healthy desktop does not change on its own |
+| any fact not true | `FACTS_REFRESH_MS` = 60 000 | a half-working guest is the one worth re-measuring |
+| 5 consecutive **identical** suspect passes | back to 900 000 | `FACTS_SUSPECT_MAX`: a permanently half-broken guest must not cost an SSH child every minute forever |
+
+Both cadences are overridable (`DSH_CUA_MCP_FACTS_REFRESH_MS`,
+`DSH_CUA_MCP_FACTS_FULL_REFRESH_MS`), and the loop sleeps in 250 ms slices so
+`stop.set()` is honoured promptly instead of after a 15-minute nap.
+
 **A stale payload is visible, not fatal.** The guest's copies of
 `cua-firstboot.ps1` and `cua-mcp-relay.py` are frozen at machine-create, so an old
 computer is the normal case, not an accident. The doctor carries
@@ -1255,14 +1558,18 @@ host-side half: on a `ready` Windows row (with `ssh` on) it fires one
 `schtasks /run /tn cua-mcp-host` (20 s timeout, at most one per computer per
 **15 s**), logs the exit code, and never waits for it.
 
-**The verdict: `ok` | `blind` | `leaking`.** `status` used to be `leaking | ok`
-only, so an online bridge on the blind lane reported `ok` — the report read as a
-pass. Precedence is `leaking` (offline + leaked schemas, unchanged) → `blind`
-(online, but not on the interactive relay) → `ok`:
+**The verdict: `ok` | `blind` | `unresponsive` | `leaking`.** `status` used to be
+`leaking | ok` only, so an online bridge on the blind lane reported `ok` — the
+report read as a pass. Precedence is `leaking` (offline + leaked schemas,
+unchanged) → `blind` (online, but not on the interactive relay) →
+`unresponsive` (on the relay, but its MCP child did not answer the functional
+probe) → `ok`. The last one is the session-5 addition: the cheap probe used to
+vouch for it, so a wedged child read `ok` through a seven-minute-per-call outage:
 
 | situation | `status` | `transport` | `blindReason` |
 |---|---|---|---|
-| attached through the relay | `ok` | `interactive-relay` | `null` |
+| attached through the relay, child answers | `ok` | `interactive-relay` | `null` |
+| attached through the relay, child silent | `unresponsive` | `interactive-relay` | `null` |
 | attached, probe failed, task/session fine | `blind` | `session-0-direct` | `relay-stopped` / `probe-skew` |
 | attached, no `Active` console session | `blind` | `session-0-direct` | `no-interactive-session` |
 | attached, lane never decided | `blind` | `null` | `lane-unknown` |
@@ -1275,9 +1582,13 @@ nothing else is ever written into it; the doctor also prints a `verdict` sentenc
 built from the same fields, so the sentence and the JSON cannot disagree.
 `windows_desktop` says `blind` with the same reason in its note, and its `tools`
 list is empty until the names are really visible. Both doctors report
-**`pluginVersion: "0.2.1"`** — this README describes `dsh-cua-vm 0.2.1`, and
+**`pluginVersion: "0.2.2"`** — this README describes `dsh-cua-vm 0.2.2`, and
 `package.json` must equal `PLUGIN_VERSION` (the gate compares the two strings, so
-"the fix is not in your plugin" is a fact rather than a guess).
+"the fix is not in your plugin" is a fact rather than a guess). 0.2.2 is the
+session-5 release: the functional probe and its fourth token, the wedge watchdog
+(`child-wedged`), the per-call budget ladder, the two tool sets with `[DEGRADED]`,
+`desktopWarning`, the fourth doctor status, and the three guest patch steps
+(`type_text`, `save_path`, `desktop-token-probe`).
 
 **A late relay heals the live session.** Re-deciding per attach does not cover the
 case that actually bit: the `cua-mcp-host` logon task firing *after* the attach

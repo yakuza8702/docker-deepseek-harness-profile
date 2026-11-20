@@ -29,35 +29,395 @@
  * -----
  *   node tools/check-cua-vm.mjs                 # repository layout
  *   node tools/check-cua-vm.mjs --root DIR      # flat image layout
+ *   node tools/check-cua-vm.mjs --mutations     # the revert-proof harness (§7.2 E-4)
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 
 const { values } = parseArgs({
   options: {
     root: { type: 'string', default: path.resolve(import.meta.dirname, '..') },
-    quiet: { type: 'boolean', default: false }
+    quiet: { type: 'boolean', default: false },
+    // E-4 (R10/C15): the mutation harness. A SEPARATE invocation, never part of
+    // the default run — it copies the tree and spawns this very file 22 times.
+    mutations: { type: 'boolean', default: false }
   }
 })
 const ROOT = path.resolve(values.root)
+/** This file. The mutation table is asserted against it (E1/E2) and it is the judge. */
+const SELF = fileURLToPath(import.meta.url)
 
 /** A file in either layout: flat (the image's check dir) or the repository's. */
 function pick(name) {
+  return pickIn(ROOT, name)
+}
+
+/** The same resolver against ANY tree — the mutation runner's throwaway copy. */
+function pickIn(rootDir, name) {
   const candidates = [
-    path.join(ROOT, name),
-    path.join(ROOT, 'docker', name),
-    path.join(ROOT, 'plugins', name),
-    path.join(ROOT, 'plugins', 'dsh-cua-vm', name),
-    path.join(ROOT, 'docker', 'windows-oem', name)
+    path.join(rootDir, name),
+    path.join(rootDir, 'docker', name),
+    path.join(rootDir, 'plugins', name),
+    path.join(rootDir, 'plugins', 'dsh-cua-vm', name),
+    path.join(rootDir, 'docker', 'windows-oem', name)
   ]
   for (const candidate of candidates) {
     if (existsSync(candidate) && statSync(candidate).isFile()) return candidate
   }
   return null
+}
+
+/* ====================================================================== *
+ * E-4 / C15 — THE MUTATION TABLE: TWENTY REVERTS, EACH ONE JUDGED.
+ * ====================================================================== *
+ *
+ * R10's second half. A needle proves a line is PRESENT; it does not prove the
+ * line is LOAD-BEARING — a needle whose `min` is met by a comment, a docstring
+ * or a second copy would stay green through the very revert it claims to catch.
+ * Each row below is one plausible revert, applied as a literal substitution to a
+ * COPY of the tree, and then judged by this very file:
+ *
+ *   red  + the failure text names the expected needle/assertion  => the row is PROVEN
+ *   red  + some other failure                                     => FALSE GREEN (fails the run)
+ *   exit 0                                                        => FALSE GREEN (fails the run)
+ *
+ * THE TABLE IS FROZEN IN SIZE (22 rows: §7.3's 20 plus JE1's M-21/M-22, which
+ * cover the two guest markers that had neither a needle nor a pair).
+ *
+ * THIRTEEN ROWS CARRY `all: true` (replace every occurrence, require at least
+ * one). Eleven of them replace a *word* that is also documentation in its file —
+ * M-02 `child-wedged`, M-04 `lastSuccessfulCallAgeMs`, M-05 `refreshMs`, M-07
+ * `relayFunctionalProbeProgram(`, M-08 `describeRepairRecord(`, M-09
+ * `perCallTimeoutMs`, M-12 `relay-unresponsive`, M-13 `desktopWarning`, M-15
+ * `typeTextFix`, M-16 `created_dir`, M-17 `desktop-token-probe` — so a
+ * single-occurrence substitution would leave a second hit (a docstring, a
+ * test-facing field, a log line) and the needle would stay green. Risk (b) from
+ * WP-A's report, absorbed here instead of rediscovered later.
+ *
+ * The other two, M-21/M-22, are `all: true` for MULTIPLICITY rather than for
+ * documentation: `savePathFix` occurs 13 times and `desktopProbe` 8 times in
+ * `cua-firstboot.ps1`, so no single occurrence is THE marker — a marker is the
+ * whole family of rows the doctor reads, and a rename has to take all of them.
+ * Their `replace` values deliberately do NOT contain the needle as a substring
+ * (`savePathPatch`, `desktopRun`): `desktopProbeMarker` would have left
+ * `desktopProbe` matching and the pair would have been a false green.
+ *
+ * Where a unique literal exists, the row spells the LONGEST one the file offers
+ * (`pid = self._kill_wedged_child(proc, age_ms)`, `'RELAY_FN'`,
+ * `'tool_capture_window',`, `const WIN_MCP_CALL_RETRY_BUDGET_MS`) so the drift
+ * check has one answer, not a choice between a line and its echo.
+ *
+ * THE RUNNER IS NEVER A MUTATION TARGET. A mutated runner would be the process
+ * judging its own mutation, so every one of the twenty-two rows mutates a
+ * PACKAGE file and spawns an UNMUTATED judge from the copy: each verdict comes
+ * from the same gate CI runs, and no pair can pass by breaking its own judge.
+ */
+const MUTATIONS = Object.freeze([
+  /* ---- WP-A: the relay's wedge watchdog, evidence, facts cadence (S1) ---- */
+  {
+    // A COMMENT-OUT, not a rename — exactly the revert WP-A's report called a
+    // false-green risk: an index-only order check still finds the literal inside
+    // the comment. S1 strips comments first, so this row is what PROVES the
+    // stripping works (risk (a), absorbed).
+    id: 'M-01',
+    file: 'cua-mcp-relay.py',
+    find: 'pid = self._kill_wedged_child(proc, age_ms)',
+    replace: '# pid = self._kill_wedged_child(proc, age_ms)',
+    expect: 'S1:',
+    why: 'kill-then-answer order (C4.6) is invisible to every presence needle'
+  },
+  {
+    id: 'M-02',
+    file: 'cua-mcp-relay.py',
+    find: 'child-wedged',
+    replace: 'child-stuck',
+    all: true,
+    expect: '× child-wedged',
+    why: 'the model branches on this exact code; a rename is the silent break'
+  },
+  {
+    id: 'M-03',
+    file: 'cua-mcp-relay.py',
+    find: "'RELAY_FN'",
+    replace: "'RELAY_X'",
+    expect: "× PROBE_FN = b'RELAY_FN'",
+    why: 'the functional token is what the host base64 probe sends'
+  },
+  {
+    id: 'M-04',
+    file: 'cua-mcp-relay.py',
+    find: 'lastSuccessfulCallAgeMs',
+    replace: 'lastCallAgeMs',
+    all: true,
+    expect: '× lastSuccessfulCallAgeMs',
+    why: 'C3 evidence key; a renamed field is a null the doctor renders as unknown'
+  },
+  {
+    id: 'M-05',
+    file: 'cua-mcp-relay.py',
+    find: 'refreshMs',
+    replace: 'refreshInterval',
+    all: true,
+    expect: '× refreshMs',
+    why: 'the facts reader (and the host) read this exact key for the cadence'
+  },
+  /* ---- WP-B: the client's truth (functional probe, evidence, repair) ---- */
+  {
+    id: 'M-06',
+    file: 'win-mcp.js',
+    find: "RELAY_UNRESPONSIVE = 'RELAY_UNRESPONSIVE'",
+    replace: "RELAY_UNRESPONSIVE = 'RELAY_DOWN'",
+    expect: '× export const RELAY_UNRESPONSIVE',
+    why: 'three tokens become two: a wedged child reads as a dead transport'
+  },
+  {
+    id: 'M-07',
+    file: 'win-mcp.js',
+    find: 'relayFunctionalProbeProgram(',
+    replace: 'relayFnProbeProgram(',
+    all: true,
+    expect: '× export function relayFunctionalProbeProgram(',
+    why: 'the base64-carried program is the only functional prover'
+  },
+  {
+    id: 'M-08',
+    file: 'win-mcp.js',
+    find: 'describeRepairRecord(',
+    replace: 'repairSentence(',
+    all: true,
+    expect: '× export function describeRepairRecord(',
+    why: 'C6 one-owner sentence; losing it brings back `reason:""`'
+  },
+  {
+    id: 'M-09',
+    file: 'win-mcp.js',
+    find: 'perCallTimeoutMs',
+    replace: 'timeout',
+    all: true,
+    expect: '× perCallTimeoutMs',
+    why: 'the per-call budget is what lets 200 ms beat the 60 s default'
+  },
+  /* ---- WP-C: the plugin surface (budgets, codes, DEGRADED, attach truth) ---- */
+  {
+    id: 'M-10',
+    file: 'index.js',
+    find: 'const WIN_MCP_CALL_TIMEOUT_MS = 25_000',
+    replace: 'const WIN_MCP_CALL_TIMEOUT_MS = 20_000',
+    expect: 'S2:',
+    why: 'host budget must exceed the guest wedge deadline, or child-wedged can never arrive'
+  },
+  {
+    id: 'M-11',
+    file: 'index.js',
+    find: "const prefix = winMcpElementLaneDegraded(guestName, snapshot) === true ? `${DEGRADED_ELEMENT_LANE_SENTENCE} ` : ''",
+    replace: "const prefix = ''",
+    expect: 'S4:',
+    why: 'the [DEGRADED] prefix is the only warning a dead element lane gets'
+  },
+  {
+    id: 'M-12',
+    file: 'index.js',
+    find: 'relay-unresponsive',
+    replace: 'tool-timeout',
+    all: true,
+    expect: '× relay-unresponsive',
+    why: 'C6 routing: one code for "the child did not answer" collapsed back into a generic timeout'
+  },
+  {
+    id: 'M-13',
+    file: 'index.js',
+    find: 'desktopWarning',
+    replace: 'desktopNote',
+    all: true,
+    expect: '× desktopWarning',
+    why: 'C9: the reveal and the doctor publish this field; a rename is an unmeasured desktop going silent'
+  },
+  {
+    id: 'M-14',
+    file: 'index.js',
+    find: "'tool_capture_window',",
+    replace: "'find_elements',",
+    expect: 'S3:',
+    why: 'a retried tool on a dead element lane doubles the cost of the one call that cannot recover'
+  },
+  /* ---- WP-D: the guest payload (type_text, save_path, desktop token) ---- */
+  {
+    id: 'M-15',
+    file: 'cua-firstboot.ps1',
+    find: 'typeTextFix',
+    replace: 'typeTextPatch',
+    all: true,
+    expect: '× typeTextFix',
+    why: 'the idempotency key AND the marker: a rename re-patches on every boot'
+  },
+  {
+    id: 'M-16',
+    file: 'cua-firstboot.ps1',
+    find: 'created_dir',
+    replace: 'made_dir',
+    all: true,
+    expect: '× created_dir',
+    why: 'the receipt that says the directory was created is what makes a silent save honest'
+  },
+  {
+    id: 'M-17',
+    file: 'cua-firstboot.ps1',
+    find: "Step 'desktop-token-probe'",
+    replace: "Step 'desktop-probe'",
+    expect: '× Step \'desktop-token-probe\'',
+    why: 'the only proof the desktop token can see a real session'
+  },
+  /* ---- cross-file rows: the ladder's derived budget, C3's owner, identity ---- */
+  {
+    id: 'M-18',
+    file: 'index.js',
+    find: 'const WIN_MCP_CALL_RETRY_BUDGET_MS',
+    replace: 'const WIN_MCP_RETRY_TOTAL_MS',
+    expect: '× const WIN_MCP_CALL_RETRY_BUDGET_MS',
+    why: 'the retry budget is DERIVED (2 envelopes + 4 s); an independent constant drifts'
+  },
+  {
+    id: 'M-19',
+    file: 'cua-mcp-relay.py',
+    find: 'def _fn_evidence(',
+    replace: 'def _fn_facts(',
+    expect: '× def _fn_evidence(',
+    why: 'the single owner of the C3 evidence object'
+  },
+  {
+    id: 'M-20',
+    file: 'index.js',
+    find: "PLUGIN_VERSION = '0.2.2'",
+    // THE REPLACEMENT IS DELIBERATELY THE PREVIOUS RELEASE, not the current one:
+    // M-20 has to make the two files DISAGREE, so this `0.2.1` is the mutation's
+    // payload, not a claim about this build. A "stale version" sweep that
+    // rewrote it to 0.2.2 would disarm the pair silently — do not.
+    replace: "PLUGIN_VERSION = '0.2.1'",
+    expect: 'WP-6.6',
+    why: 'one identity, two files: half a bump makes "the fix is not in your plugin" a guess'
+  },
+  /* ---- JE1 (JURY chief + co-juror 2): the two markers a rename could erase ---- */
+  {
+    // `typeTextFix` had a needle AND M-15; these two had NEITHER, so a rename
+    // passed every gate while the doctor read a marker that no longer existed.
+    // `replace` deliberately does NOT contain the needle as a substring
+    // (`savePathPatch` vs `savePathFix`) — `desktopProbeMarker` would have left
+    // `desktopProbe` matching and the pair would have been a false green.
+    id: 'M-21',
+    file: 'cua-firstboot.ps1',
+    find: 'savePathFix',
+    replace: 'savePathPatch',
+    all: true,
+    expect: '× savePathFix',
+    why: 'the save-path step is silent without its marker: "not attempted" and "attempted and refused" become one state'
+  },
+  {
+    id: 'M-22',
+    file: 'cua-firstboot.ps1',
+    find: 'desktopProbe',
+    replace: 'desktopRun',
+    all: true,
+    expect: '× desktopProbe',
+    why: 'the desktop-token probe is the only proof the desktop can see a session; an orphaned marker key reports it as never run'
+  }
+])
+
+/**
+ * E-4's runner. Copies ROOT (never `.git`/`node_modules`), then applies each row
+ * to the COPY, spawns this file as an unmutated judge against the copy, and
+ * requires BOTH a non-zero exit AND the row's expected failure text.
+ *
+ * The expected text is what separates a red from a FALSE GREEN: a mutation that
+ * breaks the tree in some unrelated way (a syntax error, a missing file) also
+ * exits non-zero, and counting that as proof is how a mutation table rots into
+ * 20 decorative rows.
+ */
+async function runMutations() {
+  const startedAt = Date.now()
+  const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'cua-vm-mutations-'))
+  const copy = path.join(tmpRoot, 'tree')
+  const results = []
+  try {
+    cpSync(ROOT, copy, {
+      recursive: true,
+      filter: (src) => {
+        const base = path.basename(src)
+        return base !== '.git' && base !== 'node_modules'
+      }
+    })
+    for (const mutation of MUTATIONS) {
+      const target = pickIn(copy, mutation.file)
+      if (target === null) {
+        results.push({ id: mutation.id, proved: false, detail: `the target ${mutation.file} is missing from the copied tree` })
+        continue
+      }
+      const original = readFileSync(target, 'utf8')
+      const hits = original.split(mutation.find).length - 1
+      if (hits < 1 || (mutation.all !== true && hits !== 1)) {
+        results.push({
+          id: mutation.id,
+          proved: false,
+          detail: hits === 0
+            ? `the mutation target drifted: ${JSON.stringify(mutation.find)} no longer occurs in ${mutation.file}`
+            : `the mutation target is ambiguous: ${hits} occurrences of ${JSON.stringify(mutation.find)} in ${mutation.file} — use all: true or a longer literal`
+        })
+        continue
+      }
+      const mutated = mutation.all === true
+        ? original.split(mutation.find).join(mutation.replace)
+        : original.replace(mutation.find, mutation.replace)
+      let judged = null
+      try {
+        writeFileSync(target, mutated)
+        judged = spawnSync(process.execPath, [SELF, '--root', copy, '--quiet'], {
+          cwd: copy,
+          encoding: 'utf8',
+          timeout: 300_000
+        })
+      } finally {
+        // ALWAYS restore, even when the judge could not be spawned: the next row
+        // may target the same file, and a half-mutated copy judges nothing.
+        writeFileSync(target, original)
+      }
+      const stderr = `${judged?.stderr ?? ''}`
+      const red = judged !== null && judged.status !== 0
+      const named = stderr.includes(mutation.expect)
+      results.push({
+        id: mutation.id,
+        proved: red && named,
+        detail: red === false
+          ? `exit 0 — the gate stayed GREEN with ${mutation.id} applied (${mutation.why})`
+          : named === false
+            ? `exit ${judged.status} but the failure never names ${JSON.stringify(mutation.expect)} — a false red proves nothing (${mutation.why})`
+            : `red, expected message present (${mutation.why})`
+      })
+    }
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true })
+  }
+  const proved = results.filter((row) => row.proved === true).length
+  for (const row of results) {
+    console.log(`  ${row.proved === true ? 'red ' : 'GREEN'} ${row.id} — ${row.detail}`)
+  }
+  const seconds = ((Date.now() - startedAt) / 1000).toFixed(1)
+  if (proved === MUTATIONS.length) {
+    console.log(`\nmutations: ${proved}/${MUTATIONS.length} red, ${results.length - proved} false-green (${seconds}s, judge = ${path.relative(ROOT, SELF) || SELF})`)
+    process.exit(0)
+  }
+  console.error(`\nmutations: ${proved}/${MUTATIONS.length} red, ${results.length - proved} FALSE-GREEN (${seconds}s)`)
+  console.error('A false-green pair is worse than no pair: it claims a line is load-bearing while proving nothing.')
+  process.exit(1)
+}
+
+// THE MODE. Placed before the default run so `--mutations` never pays for the
+// gate's own assertions first: the judge runs inside the loop, twenty times.
+if (values.mutations) {
+  await runMutations()
 }
 
 /** Whitespace drifts when a line is rewrapped; everything else is literal. */
@@ -1624,7 +1984,50 @@ const NEEDLES = {
     // the upgrade FORCES a fresh probe: the cached answer may be the DOWN that
     // put the attach on this lane, and the whole point is that a relay started
     // since then is now seen
-    ['force: true, timeoutMs: RELAY_PROBE_TIMEOUT_MS', 1]
+    ['force: true, timeoutMs: RELAY_PROBE_TIMEOUT_MS', 1],
+    // =====================================================================
+    // WP-B (SOL §4.4) — CLIENT TRUTH: the fourth token, the functional probe,
+    // the repair sentence and the PER-CALL budget.
+    //
+    // The cheap probe can only ever answer "the accept loop is alive": it is
+    // answered before the session lock, so a wedged child reads OK. These rows
+    // keep the three things that turn that into a diagnosis: a THIRD status
+    // (`RELAY_UNRESPONSIVE`), the base64-carried program that actually drives
+    // `initialize` + `tools/list` through the child, and the evidence object
+    // whose numbers are printed verbatim by the doctor's `unresponsive` verdict.
+    // `tests/modules-unit.mjs` drives the behaviour (B-1..B-14); these are the
+    // revert-proof half.
+    // ---------------------------------------------------------------------
+    // B1/B2 — the token, and its rank ABOVE skew. Rank 3 exists because
+    // "the child did not answer" is stronger evidence than "the payload hash
+    // did not match"; collapsing it into DOWN would send the operator to the
+    // wrong repair.
+    ['export const RELAY_UNRESPONSIVE = \'RELAY_UNRESPONSIVE\'', 1],
+    ['[RELAY_UNRESPONSIVE]: 3', 1],
+    // B3 — ONE token matcher for both probes. The group is explicit, not `.`:
+    // `RELAY_OKAY` must not parse, and `RELAY_OK` must not need a boundary.
+    ['RELAY_(OK|BAD|DOWN|UNRESPONSIVE)', 1],
+    // B4/B5/B6 — program, command, runner. The base64 CARRIER is the §27
+    // rule: no `--functional` flag, so a stale guest payload cannot answer a
+    // probe it does not implement (its `usage()` stays byte-identical).
+    ['export function relayFunctionalProbeProgram(', 1],
+    ['export function relayFunctionalProbeCommand(', 1],
+    ['export async function relayFunctionalProbe(', 1],
+    // B7/B8 — the token the program SENDS, and the doctor field it publishes.
+    ['RELAY_FN', 1],
+    ['relayFunctional', 1],
+    // B9/B10/B11 — C3's three evidence numbers, typed through `evidenceInt`:
+    // `null` stays `null` (never 0), because "no successful call yet" and
+    // "0 ms ago" are different diagnoses and C12 prints both.
+    ['lastSuccessfulCallAgeMs', 1],
+    ['outstandingRequestAgeMs', 1],
+    ['childRestarts', 1],
+    // B12 — C6's ONE owner for the repair sentence: an unmeasured attempt must
+    // name WHY, so `ok:false, reason:""` can never be the answer again.
+    ['export function describeRepairRecord(', 1],
+    // B13 — the per-call budget: the only reason a 200 ms test beats the 60 s
+    // default, and the reason a slow call is not reported as a dead attach.
+    ['perCallTimeoutMs', 1]
   ],
   oemAnswer: [
     ['<unattend xmlns="urn:schemas-microsoft-com:unattend">', 1],
@@ -1840,7 +2243,51 @@ const NEEDLES = {
     // the port is the same env override the relay and the client read
     ['DSH_CUA_MCP_RELAY_PORT', 1],
     // ...and the task is recorded as INTERACTIVE, like the clipboard tasks above
-    ['mcp relay registered (cua-mcp-host: onlogon, INTERACTIVE, /rl LIMITED)', 1]
+    ['mcp relay registered (cua-mcp-host: onlogon, INTERACTIVE, /rl LIMITED)', 1],
+    // =====================================================================
+    // WP-D (SOL §6.4) — THE GUEST PAYLOAD: type_text's receipt, save_path's
+    // allow-list, and the desktop-token proof.
+    //
+    // Three defects, one shape: the guest reported success for work it had not
+    // verified. `type_text` posted the text and trusted it (a focus race drops
+    // the tail, and the old code still answered `effect_verified: true`);
+    // `tool_capture_window` wrote to a path nobody could have written to and
+    // raised; and nothing ever proved the DESKTOP token could see an interactive
+    // session at all — the costliest blind lane in the report. Each is a NEW
+    // here-string-patched step, so the anchors, the SHA pin, the `count == 1`
+    // gate and the marker are all part of the contract. `tests/guest-patch.mjs`
+    // applies them to the pinned 0.4.1 evidence copies and runs the patched code
+    // (D-1..D-20); these rows are the revert-proof half.
+    // ---------------------------------------------------------------------
+    // D1/D2/D3 — the three steps exist, in the order S6 asserts.
+    ['Step \'dsh-cua-typetext\'', 1],
+    ['Step \'dsh-cua-savepath\'', 1],
+    ['Step \'desktop-token-probe\'', 1],
+    // D4 — the idempotency key AND the patch marker: a second boot must say
+    // `already`, and the marker is the only witness that the step ran.
+    ['typeTextFix', 1],
+    // D9 (WP-E / JE1) — THE OTHER TWO MARKERS, which had a MUTATION-less hole:
+    // `typeTextFix` had a needle and M-15, while `savePathFix` (13 occurrences)
+    // and `desktopProbe` were pinned by NOTHING — renaming either marker passed
+    // every gate, and a renamed marker is a marker the doctor reads as absent
+    // (`savePathFix` absent = "the save-path patch was never attempted";
+    // `desktopProbe` absent = "the desktop token was never proven"). One row
+    // each, in the same one-word-revert style as D4; the pairs are M-21/M-22.
+    ['savePathFix', 1],
+    // D10 (WP-E / JE1) — the probe's own marker key. NOTE: unrelated to the
+    // `D-9` that `tests/modules-unit.mjs` uses for the probe REASON SET; this is
+    // the guest marker row, numbered after D8 in this block.
+    ['desktopProbe', 1],
+    // D5 — the receipt that makes an auto-created directory honest instead of
+    // silent (a save into `%TEMP%\win32_mcp_shots\...` used to fail).
+    ['created_dir', 1],
+    // D6 — the proof that the exact-compare receipt is real: `short-insert` is
+    // the reason a dropped tail is REPORTED instead of claimed as verified.
+    ['short-insert', 1],
+    // D7 — the probe's task name, and D8 the retry marker on its character
+    // post: the two halves a revert would drop independently.
+    ['cua-desktop-probe', 1],
+    ['TYPE_TEXT_RETRY', 1]
   ],
   /**
    * WP-1.7: THE RELAY GUARD — ONE COPY OF "IS THE RELAY LISTENING", AND THE
@@ -1983,7 +2430,68 @@ const NEEDLES = {
     // RAW BYTES AT EVERY HOP: a pty would rewrite CR/LF and mangle the JSON.
     ['def write_all(fd, data)', 1],
     ['os.read(fd, size)', 1],
-    ['no encoding decision', 1]
+    ['no encoding decision', 1],
+    // =====================================================================
+    // WP-A (SOL §3.4) — THE RELAY'S WEDGE WATCHDOG, THE FUNCTIONAL PROBE, THE
+    // EVIDENCE OBJECT AND THE FACTS CADENCE.
+    //
+    // One defect, five hops, and every hop used to be absent: `RELAY_OK` was
+    // answered by the ACCEPT LOOP before the session lock, so a relay whose MCP
+    // child was wedged — a PostMessage/UIA call that never returns — still said
+    // OK; the call waited on the host's timer; and the facts file said nothing
+    // about the child at all. `tests/relay-wedge.mjs` drives the behaviour
+    // (18 checks); these rows are what a revert breaks. Position in the list is
+    // the contract's order (A1..A24 as the SOL numbers them), so a reader can
+    // map a red row back to §3.4 without guessing.
+    // ---------------------------------------------------------------------
+    // A1/A2 — THE TOKEN SET. `RELAY_FN` is deliberately not a `RELAY_PING`
+    // prefix: a token spelled RELAY_PING_FN would be answered by the 10-byte
+    // cheap path as soon as its prefix arrived, i.e. on bytes that never
+    // completed a token.
+    ['PROBE_FN = b\'RELAY_FN\'', 1],
+    ['PROBES = ((PROBE_PING, \'ping\'), (PROBE_FN, \'functional\'))', 1],
+    // A3 — one classifier, two kinds. A second comparison would drift from the
+    // token set above on the first added probe.
+    ['def _probe_kind(', 1],
+    // A4/A5 — PASSIVE accounting. These are the only writers of `pending`; they
+    // run AFTER a successful forward, so a byte that was never written can
+    // never age into a wedge.
+    ['def _observe_outbound(', 1],
+    ['def _observe_inbound(', 1],
+    // A6/A7 — 20 s, read at CALL time (`wedge_deadline_ms()`), never a module
+    // constant captured once: the suite scales the deadline with an env var.
+    ['WEDGE_DEADLINE_MS = 20000', 1],
+    ['def wedge_deadline_ms(', 1],
+    ['DSH_CUA_MCP_WEDGE_DEADLINE_MS', 1],
+    // A9/A10/A11/A12 — the thread, its tick, the kill, the answer. All four
+    // names are asserted because the ORDER assertion (S1) can only compare
+    // calls that exist.
+    ['def _wedge_watch(', 1],
+    ['WEDGE_TICK_MS = 250', 1],
+    ['def _kill_wedged_child(', 1],
+    ['def _answer_wedged(', 1],
+    // A13/A14/A15 — THE MODEL-FACING CONTRACT: one code string, one JSON-RPC
+    // code, one log event. `child-wedged` is what the plugin maps to
+    // `code: child-wedged` (index.js) and what says "its effect is UNKNOWN".
+    ['child-wedged', 1],
+    ['-32000', 1],
+    ['event(\'wedge\'', 1],
+    // A16..A19 — C3's evidence object: ONE owner (`_fn_evidence`) and the three
+    // numbers the unresponsive verdict prints. A `null` stays a null.
+    ['def _fn_evidence(', 1],
+    ['lastSuccessfulCallAgeMs', 1],
+    ['outstandingRequestAgeMs', 1],
+    ['childRestarts', 1],
+    // A20..A23 — the CADENCE, pure and testable in isolation: one interval for a
+    // suspect guest, another for a healthy one, and a back-off after five
+    // identical suspect passes (a permanently half-broken desktop must not cost
+    // an SSH child every minute forever).
+    ['def facts_refresh_interval(', 1],
+    ['FACTS_REFRESH_MS = 60000', 1],
+    ['FACTS_FULL_REFRESH_MS = 900000', 1],
+    ['FACTS_SUSPECT_MAX = 5', 1],
+    // A24 — the published interval, under the name the host reads.
+    ['refreshMs', 1]
   ],
   provision: [
     ['MARKER=/var/lib/cua-provision', 1],
@@ -2161,7 +2669,8 @@ const NEEDLES = {
     // U4: the MEASURED free space joins the spec line, with the warning visible.
     ["api('windowsFreeSpace'", 1],
     ['${space.line}', 1],
-    ['space.belowFloor === true', 1]
+    ['space.belowFloor === true', 1],
+
   ],
   index: [
     // =====================================================================
@@ -2271,13 +2780,21 @@ const NEEDLES = {
     ['scoped.tools.guard((execution) => windowsGuardDecision(execution))', 1],
     ['tools.restrict({ deny })', 1],
     ['registrations: new Map()', 1],
-    // THE PER-TOOL ATTACH BUDGET IS A TIMEOUT THE MODEL CAN BRANCH ON. A tool
-    // called during the 45 s handshake used to wait on the client's own request
-    // timer and surface as "tool call timed out" — one string for every cause.
-    // Racing the body with `WIN_MCP_ATTACH_TIMEOUT_MS` (boundedExecute's 250 ms
-    // lead) makes `tool-timeout` the code that wins, so an attach in flight is
-    // distinguishable from a guest that answered too slowly.
-    ['execute: boundedExecute(publicName, WIN_MCP_ATTACH_TIMEOUT_MS, undefined,', 1],
+    // THE PER-TOOL BUDGET IS A TIMEOUT THE MODEL CAN BRANCH ON (R3, C5).
+    //
+    // RETIRED BY WP-E: this row used to pin
+    // `execute: boundedExecute(publicName, WIN_MCP_ATTACH_TIMEOUT_MS, undefined,`
+    // — the 45 s constant doing the handshake AND every per-call budget. WP-C
+    // deleted that line, and the row only stayed green because WP-C left the old
+    // literal spelled out inside a doc comment ("the line this replaces is kept
+    // verbatim on ONE line because the repository gate pins it"). A needle that a
+    // comment can satisfy pins documentation, not wiring: reverting the budget
+    // while keeping the comment would have been green. It is replaced by the line
+    // that actually executes, whose `declaredMs` comes from the ladder (C5) and
+    // whose 250 ms lead keeps `code: relay-unresponsive` in front of the harness
+    // guard. Mutation coverage: M-10 scales the ladder's input; M-18 names the
+    // derived retry budget.
+    ['const execute = boundedExecute(publicName, declaredMs, undefined,', 1],
     // the cheap state read, and the removal path that takes the names away
     ['vmWindowsMcpState', 1],
     ['vm-removed', 1],
@@ -2341,14 +2858,21 @@ const NEEDLES = {
     // the text and the fields cannot disagree. `transportText` is null, never a
     // guess, when nothing was attached in this process.
     ['const transportFacts = WIN_MCP.client?.doctorFacts?.() ?? null', 1],
-    // WP-3.1/3.3 — THE THREE-VALUE VERDICT AND THE TWO-BRANCH SENTENCE.
-    // `leaking` keeps the leak test's own expression in front (offline + leaked
-    // schemas still wins, unchanged); `blind` is the NEW middle value: online but
-    // not through the relay, the state that used to report `ok`. The sentence
-    // follows the same split — an attached-but-blind bridge names the REASON and
-    // the next action instead of going silent, and an unattached one says
-    // "blind" only when there is a reason to.
-    ["status: online !== true && leaks.length > 0 ? 'leaking' : (blind === true ? 'blind' : 'ok')", 1],
+    // WP-3.1/3.3 — THE VERDICT LADDER, NOW FOUR VALUES (C12).
+    //
+    // RETIRED BY WP-E: this row used to pin the three-way expression
+    // `... (blind === true ? 'blind' : 'ok')`. WP-C replaced it with the
+    // four-way ladder and kept the OLD expression verbatim inside a comment
+    // ("The revert-proof needle the repository gate pins for this field still
+    // spells the OLD three-way expression, verbatim, on the next line"), so the
+    // row was satisfied by documentation while the field could have been
+    // reverted to `ok` for a wedged child. The replacement pins the real
+    // expression: `leaking → blind → unresponsive → ok`, with the leak test's own
+    // expression still in front (a leak while offline outranks everything).
+    // `unresponsive` is the fourth status — "attached through the relay, but its
+    // MCP child did not answer an initialize/tools/list round trip" — and it is
+    // the value that used to read `ok` through a seven-minute outage.
+    ["status: online !== true && leaks.length > 0 ? 'leaking' : (blind === true ? 'blind' : (unresponsive === true ? 'unresponsive' : 'ok')),", 1],
     ['const transportText = transportFacts === null', 1],
     ['? (blind === true ? windowsTransportLine(null, blindReason) : null)', 1],
     ['windowsTransportLine(transportFacts, blindReason)', 1],
@@ -2478,8 +3002,11 @@ const NEEDLES = {
     // WP-7.1/WP-8.1: the RELEASE LITERAL tracks the identity — this is the one
     // pre-existing needle whose payload changes with a version bump (the pair
     // still has to agree: the cross-file assertion below compares both files, so
-    // a bump in one alone stays red). 0.2.1 is the release that ships WP-1..WP-8.
-    ["export const PLUGIN_VERSION = '0.2.1'", 1],
+    // a bump in one alone stays red). 0.2.2 is the session-5 release (WP-A..WP-E:
+    // the functional probe, the wedge watchdog, the budget ladder, [DEGRADED],
+    // desktopWarning, the fourth doctor status and the three guest patch steps);
+    // 0.2.1 shipped WP-1..WP-8 before it.
+    ["export const PLUGIN_VERSION = '0.2.2'", 1],
     ['pluginVersion: PLUGIN_VERSION', 1],
     // WP-3.4/C4 — A HIDDEN BRIDGE INVENTORIES NOTHING. Nineteen names used to come
     // back from a reveal that had FAILED (offline, grant off, wrong target), which
@@ -2492,7 +3019,47 @@ const NEEDLES = {
     // `reveal-required`, and a bind of a Linux guest reveals nothing (the gate
     // still requires the Windows target to match).
     ['if (grantFor(agent) === true) markRevealed(agent)', 1],
-    ['const guiNote = \'desktop automation uses the MCP windows tools; cua_vm_gui screenshots are the noVNC stream, not a framebuffer\'', 1]
+    ['const guiNote = \'desktop automation uses the MCP windows tools; cua_vm_gui screenshots are the noVNC stream, not a framebuffer\'', 1],
+    // =====================================================================
+    // WP-C (SOL §5.4) — THE PLUGIN SURFACE: the budget ladder, the two tool
+    // sets, the `[DEGRADED]` prefix, `desktopWarning`, the fourth status.
+    //
+    // WP-C added NO gate assertion of its own (§8: A–D must leave the gate at
+    // exactly 1237), so these are the rows its behaviour is pinned by — and they
+    // land here, in WP-E, with the two rows they REPLACE (see the note under the
+    // retired `execute: boundedExecute(...)` literal above). WP-C's own proof is
+    // `tests/windows-mcp-gate.mjs` (C-1..C-16, 115 checks).
+    // ---------------------------------------------------------------------
+    // C1..C3 — THE LADDER'S INPUT. One env var, read at CALL TIME, clamped to
+    // 200..120000; every other rung is DERIVED from it (S2 asserts the
+    // derivation and the guest-side ordering, which a needle cannot).
+    ['const WIN_MCP_CALL_TIMEOUT_MS = 25_000', 1],
+    ['function winMcpCallTimeoutMs()', 1],
+    ['DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS', 1],
+    // C4/C5 — THE TWO FROZEN SETS. Their exact membership and their
+    // DISJOINTNESS are asserted (S3), because `Object.freeze` is not what makes
+    // them disjoint and a list is not a set.
+    ['const WIN_MCP_CALL_RETRY_TOOLS = Object.freeze([', 1],
+    ['const WIN_MCP_ELEMENT_LANE_TOOLS = Object.freeze([', 1],
+    // C6 — the retry budget is a DERIVATION, never an independent constant
+    // (M-18 names this exact declaration).
+    ['const WIN_MCP_CALL_RETRY_BUDGET_MS', 1],
+    // C7/C8 — the frozen sentence and the prefix itself. One string, printed by
+    // five tools and by nothing else (S4 asserts the shape with it).
+    ['const DEGRADED_ELEMENT_LANE_SENTENCE =', 1],
+    ['[DEGRADED]', 1],
+    // C9 — the FOUR-argument description template: the facts are an ARGUMENT
+    // (the registration loop must not cost an SSH child per tool).
+    ['function windowsToolDescription(guestName, guestDescription, computerName, facts)', 1],
+    // C10/C11 — the two routable codes the model branches on.
+    ['relay-unresponsive', 1],
+    ['child-wedged', 1],
+    // C12 — C9's field on BOTH surfaces (the reveal and the doctor): one string,
+    // computed once, so the two can never disagree. `min 2` is the two FIELDS.
+    ['desktopWarning', 2],
+    // C13 — the unmeasured branch's own condition: `measured:false` is UNKNOWN,
+    // and S5 asserts it comes FIRST.
+    ['measured !== true', 1]
   ],
   proxy: [
     ['export function prefixRootPaths(text, prefix)', 1],
@@ -2543,7 +3110,17 @@ const NEEDLES = {
     ['DSH_CUA_CLIP_AGENT=1', 1],
     ['DSH_CUA_WIN_LEGACY_BIOS=1', 1],
     ['DSH_CUA_MCP_STATE_POLL_MS=10000', 1],
-    ['DSH_CUA_WIN_ISO_SHA256=1', 1]
+    ['DSH_CUA_WIN_ISO_SHA256=1', 1],
+    // E-2 (SOL §7.2): THE FOUR KNOBS THIS RELEASE ADDS ARE DOCUMENTED WHERE AN
+    // OPERATOR LOOKS. Each one changes behaviour a support ticket will ask
+    // about — the wedge deadline (how long a guest call may hang), the two
+    // desktop-facts cadences (how loud a half-broken guest is) and the per-call
+    // transport budget (why a call gives up in 25 s, not 45) — so an operator
+    // must be able to find the name without reading python.
+    ['DSH_CUA_MCP_WEDGE_DEADLINE_MS=20000', 1],
+    ['DSH_CUA_MCP_FACTS_REFRESH_MS=60000', 1],
+    ['DSH_CUA_MCP_FACTS_FULL_REFRESH_MS=900000', 1],
+    ['DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS=25000', 1]
   ]
 }
 
@@ -2628,7 +3205,7 @@ let failures = 0
 let total = 0
 const missing = []
 
-console.log(`cua-vm gate — ${ROOT}`)
+if (!values.quiet) console.log(`cua-vm gate — ${ROOT}`)
 
 for (const [key, spec] of Object.entries(FILES)) {
   const file = pick(spec.name)
@@ -3446,9 +4023,9 @@ function sourceOf(label, name) {
  * PLUGIN_VERSION 0.2.0 (plugins/dsh-cua-vm/package.json)` is actionable; "the
  * versions disagree" is not. This assertion was RED the moment it was written —
  * index.js already exported 0.2.0 while the manifest still said 0.1.0 — and it is
- * the gate, not a review note, that made WP-7.1's bump unmissable. It is green
- * now that both say 0.2.1 (the WP-1..WP-8 release); a future bump in ONE file
- * turns it red again.
+ * the gate, not a review note, that made WP-7.1's bump unmissable. It was green
+ * while both said 0.2.1 (the WP-1..WP-8 release) and is green again at 0.2.2 (the
+ * session-5 WP-A..WP-E release); a future bump in ONE file turns it red again.
  */
 {
   total += 1
@@ -3483,7 +4060,7 @@ function sourceOf(label, name) {
     if (!process.argv.includes('--quiet')) console.log(`  ok   WP-6.6 plugins/dsh-cua-vm/package.json version ${packageVersion} === index.js PLUGIN_VERSION`)
   } else {
     failures += 1
-    missing.push(`WP-6.6: plugins/dsh-cua-vm/package.json version ${JSON.stringify(packageVersion)} ≠ index.js PLUGIN_VERSION ${JSON.stringify(pluginVersion)} — §4.8/WP-7.1: both must be the same release (0.2.1), so the doctor's pluginVersion names the build that is actually installed. Bump BOTH (WP-5.10 / WP-8.1) or the release identity is a guess.`)
+    missing.push(`WP-6.6: plugins/dsh-cua-vm/package.json version ${JSON.stringify(packageVersion)} ≠ index.js PLUGIN_VERSION ${JSON.stringify(pluginVersion)} — §4.8/WP-7.1: both must be the same release (0.2.2), so the doctor's pluginVersion names the build that is actually installed. Bump BOTH (WP-5.10 / WP-8.1) or the release identity is a guess.`)
     console.log(`  FAIL WP-6.6 plugin identity: package.json ${packageVersion} ≠ PLUGIN_VERSION ${pluginVersion} (owner: WP-7.1 / writer G)`)
   }
 }
@@ -3550,6 +4127,337 @@ function sourceOf(label, name) {
   }
 }
 
+/* ====================================================================== *
+ * E-3 (SOL §7.2) — THE SEMANTIC ASSERTIONS S1..S6.
+ *
+ * A needle says a line EXISTS. Five of this release's contracts are about
+ * ORDER, MEMBERSHIP or DERIVATION, and those are exactly the properties a
+ * "helpful" refactor breaks while every needle stays green: the kill can move
+ * after the answer, the host budget can drop below the guest deadline, a tool
+ * can join the retry set, `[DEGRADED]` can move behind the contract note, the
+ * unmeasured warning can fall below the dead-lane one, and the guest's steps
+ * can swap.
+ *
+ * COMMENTS ARE STRIPPED FIRST, and that is not cosmetic. WP-C left two of the
+ * old literals verbatim inside doc comments so the previous needle rows would
+ * stay green; an order check that reads raw text would have accepted the
+ * comment as the call (WP-A's report called this out as its one false-green
+ * risk, and M-01 is the row that proves the stripping works).
+ * ====================================================================== */
+
+/** Python: drop `#` comments, honouring ' " and escapes (no `#` inside them). */
+function stripPythonComments(text) {
+  let out = ''
+  for (const line of text.split('\n')) {
+    let quote = null
+    let cut = line.length
+    for (let i = 0; i < line.length; i += 1) {
+      const ch = line[i]
+      if (quote !== null) {
+        if (ch === '\\') { i += 1; continue }
+        if (ch === quote) quote = null
+        continue
+      }
+      if (ch === '"' || ch === "'") { quote = ch; continue }
+      if (ch === '#') { cut = i; break }
+    }
+    out += `${line.slice(0, cut)}\n`
+  }
+  return out
+}
+
+/** JS: drop `//` and block comments, honouring ' " ` and escapes. */
+function stripJsComments(text) {
+  let out = ''
+  let quote = null
+  let block = false
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    const next = text[i + 1]
+    if (block === true) {
+      if (ch === '*' && next === '/') { block = false; i += 1 }
+      continue
+    }
+    if (quote !== null) {
+      out += ch
+      if (ch === '\\') { out += next ?? ''; i += 1; continue }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '/' && next === '*') { block = true; i += 1; continue }
+    if (ch === '/' && next === '/') {
+      while (i < text.length && text[i] !== '\n') i += 1
+      out += '\n'
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; out += ch; continue }
+    out += ch
+  }
+  return out
+}
+
+/** The source of one file, or '' — a missing file is a FAIL, not a throw. */
+function textOf(name) {
+  const file = pick(name)
+  return file === null ? '' : readFileSync(file, 'utf8')
+}
+
+/** `Object.freeze([ ... ])` → its string members, in order. `null` if absent. */
+function frozenListOf(source, name) {
+  const marker = `const ${name} = Object.freeze([`
+  const at = source.indexOf(marker)
+  if (at === -1) return null
+  const close = source.indexOf('])', at)
+  if (close === -1) return null
+  return [...source.slice(at + marker.length, close).matchAll(/'([^']+)'/gu)].map((match) => match[1])
+}
+
+/**
+ * S1 — KILL BEFORE ANSWER (C4.6, relay `_wedge_watch`).
+ *
+ * A client that is answered before the child is dead can immediately retry into
+ * the same wedged process, and the answer says "restarted" about a process that
+ * is still holding the window. The order is the whole fix; both call sites
+ * existing is not.
+ */
+{
+  total += 1
+  const relayText = textOf('cua-mcp-relay.py')
+  const start = relayText.indexOf('def _wedge_watch(')
+  const end = start === -1 ? -1 : relayText.indexOf('def _child_ref(', start)
+  const body = stripPythonComments(start === -1 ? '' : relayText.slice(start, end === -1 ? relayText.length : end))
+  const killAt = body.indexOf('self._kill_wedged_child(')
+  const answerAt = body.indexOf('self._answer_wedged(')
+  const ok = body !== '' && killAt !== -1 && answerAt !== -1 && killAt < answerAt
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S1 the wedge watchdog KILLS the child before it answers the pending ids (C4.6, comments stripped first)')
+  } else {
+    failures += 1
+    missing.push(`S1: docker/cua-mcp-relay.py _wedge_watch() must call self._kill_wedged_child( BEFORE self._answer_wedged( — an answer before the kill lets the client retry into the same wedged child (kill=${killAt}, answer=${answerAt}; comments stripped, so a commented-out call cannot satisfy this)`)
+    console.log('  FAIL S1 wedge watchdog order')
+  }
+}
+
+/**
+ * S2 — THE TWO LADDERS, IN THE ONLY ORDER THAT WORKS (C5).
+ *
+ * The guest's 20 s watchdog starts its clock AFTER the host's 25 s per-request
+ * budget begins, so the guest's answer must be able to arrive first. If the
+ * host budget were <= the guest deadline, every wedge would be replaced by a
+ * local `timeout` and `child-wedged` could never reach the model — the exact
+ * regression M-10 applies.
+ *
+ * THE DERIVATION HALF IS ASSERTED STRUCTURALLY, NOT BY SPELLING, and the revise
+ * round is why: the ladder used to spell three one-line returns
+ * (`winMcpCallTimeoutMs() + 1_000`, `(2 * winMcpCallEnvelopeMs()) + 4_000`, …)
+ * and a legitimate WP-C fix replaced them with ONE reading per call
+ * (`winMcpCallNumbers()`), which is strictly stronger — it also stops the race
+ * and the per-request timer drifting apart when the env var changes mid-session
+ * (the split C5 exists to prevent). A spelling pin would have failed on the
+ * better code, so this reads the invariant instead: every rung is COMPUTED from
+ * the call-time value, and all three readers route through that one reading.
+ * A hardcoded `26_000`/`56_000`/`30_000`, or a rung that read the env on its own,
+ * fails here.
+ */
+{
+  total += 1
+  const indexText = textOf('index.js')
+  const relayText = textOf('cua-mcp-relay.py')
+  const number = (raw) => (raw === null ? null : Number(String(raw).replace(/_/gu, '')))
+  const hostMatch = /const WIN_MCP_CALL_TIMEOUT_MS = ([\d_]+)/u.exec(indexText)
+  const guestMatch = /WEDGE_DEADLINE_MS = ([\d_]+)/u.exec(relayText)
+  const host = number(hostMatch === null ? null : hostMatch[1])
+  const guest = number(guestMatch === null ? null : guestMatch[1])
+  // The ONE reading: `call` from the call-time reader, `envelope = call + 1 s`,
+  // `attempts` from the retry flag, `total = attempts × envelope + 4 s`.
+  const ladderAt = indexText.indexOf('function winMcpCallNumbers(')
+  const ladderBody = ladderAt === -1 ? '' : indexText.slice(ladderAt, indexText.indexOf('\n}', ladderAt))
+  const callRead = ladderBody.includes('winMcpCallTimeoutMs()')
+  const envelopeDerived = /const envelope = call \+ 1_000/u.test(ladderBody)
+  const attemptsDerived = /attempts = retried === true \? 2 : 1/u.test(ladderBody)
+  const totalDerived = /attempts \* envelope\) \+ 4_000/u.test(ladderBody)
+  const readers = ['winMcpCallEnvelopeMs', 'winMcpCallRetryBudgetMs', 'winMcpCallGuardMs']
+  const routed = readers.filter((name) => {
+    const at = indexText.indexOf(`function ${name}()`)
+    const body = at === -1 ? '' : indexText.slice(at, indexText.indexOf('\n}', at))
+    return body.includes('winMcpCallNumbers(')
+  })
+  const ok = host !== null && guest !== null && host > guest
+    && callRead && envelopeDerived && attemptsDerived && totalDerived && routed.length === readers.length
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   S2 the host per-call budget (${host} ms) EXCEEDS the guest wedge deadline (${guest} ms), and envelope/attempts/total are all COMPUTED from the one call-time reading that every rung routes through (C5)`)
+  } else {
+    failures += 1
+    missing.push(`S2: the budget ladder must satisfy host WIN_MCP_CALL_TIMEOUT_MS (${host}) > guest WEDGE_DEADLINE_MS (${guest}) AND derive every rung from ONE call-time reading — winMcpCallNumbers(): reads winMcpCallTimeoutMs()=${callRead}, envelope=call+1s=${envelopeDerived}, attempts=${attemptsDerived}, total=attempts*envelope+4s=${totalDerived}, rungs routed through it=${routed.length}/3 (${routed.join(',')}) — a host budget at or under the guest's deadline turns every child-wedged into a local timeout, and a hardcoded rung stops scaling with DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS (C5)`)
+    console.log('  FAIL S2 per-call budget ladder')
+  }
+}
+
+/**
+ * S3 — THE TWO SETS: EXACT MEMBERSHIP, AND DISJOINT (C7).
+ *
+ * `[DEGRADED]` is placed by membership in the element set, and a retry is
+ * allowed only for the read-only set. If a tool joined both, the plugin would
+ * both warn about the lane and pay TWO timeouts on the one call class that
+ * cannot recover by waiting. Order is asserted too: the sets are read by index
+ * in two places and a reorder is fine, so the check compares membership, not
+ * position.
+ */
+{
+  total += 1
+  const indexText = textOf('index.js')
+  const element = frozenListOf(indexText, 'WIN_MCP_ELEMENT_LANE_TOOLS')
+  const retried = frozenListOf(indexText, 'WIN_MCP_CALL_RETRY_TOOLS')
+  const ELEMENT = ['find_elements', 'tool_invoke', 'tool_get_text', 'tool_set_value', 'tool_wait_for']
+  const RETRY = ['tool_list_windows', 'tool_capture_window', 'tool_read_clipboard']
+  const sameSet = (got, want) => Array.isArray(got) && got.length === want.length && want.every((name) => got.includes(name))
+  const overlap = Array.isArray(element) && Array.isArray(retried) ? element.filter((name) => retried.includes(name)) : ['<unparsed>']
+  const ok = sameSet(element, ELEMENT) && sameSet(retried, RETRY) && overlap.length === 0
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S3 the element-lane set is exactly the five, the retry set exactly the three read-only tools, and they are DISJOINT (C7)')
+  } else {
+    failures += 1
+    missing.push(`S3: WIN_MCP_ELEMENT_LANE_TOOLS must be exactly ${JSON.stringify(ELEMENT)} (got ${JSON.stringify(element)}) and WIN_MCP_CALL_RETRY_TOOLS exactly ${JSON.stringify(RETRY)} (got ${JSON.stringify(retried)}), DISJOINT (overlap ${JSON.stringify(overlap)}) — a retried element call doubles the cost of the one lane that fails in milliseconds (C7)`)
+    console.log('  FAIL S3 tool sets')
+  }
+}
+
+/**
+ * S4 — THE `[DEGRADED]` SHAPE (C8): sentence FIRST, contract note, suffix LAST.
+ *
+ * The prefix is the only thing a model reads before choosing a tool, so it must
+ * sit at position 0 of the description — before the guest's own prose and before
+ * the contract note. Moving it behind either one is invisible to a presence
+ * needle and makes the warning decorative.
+ */
+{
+  total += 1
+  const indexText = textOf('index.js')
+  const start = indexText.indexOf('function windowsToolDescription(')
+  const end = start === -1 ? -1 : indexText.indexOf('function guestToolDefinition(', start)
+  const body = stripJsComments(start === -1 ? '' : indexText.slice(start, end === -1 ? indexText.length : end))
+  const sentenceAt = body.indexOf('DEGRADED_ELEMENT_LANE_SENTENCE')
+  const contractAt = body.indexOf('windowsToolContract(')
+  const suffixAt = body.indexOf('(dsh-cua, Windows computer')
+  const ok = body !== '' && sentenceAt !== -1 && contractAt !== -1 && suffixAt !== -1
+    && sentenceAt < contractAt && contractAt < suffixAt
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S4 windowsToolDescription() renders [DEGRADED] FIRST, then the contract note, then the (dsh-cua, Windows computer …) suffix (C8)')
+  } else {
+    failures += 1
+    missing.push(`S4: index.js windowsToolDescription() must order the template [DEGRADED] (${sentenceAt}) < windowsToolContract( (${contractAt}) < "(dsh-cua, Windows computer" (${suffixAt}) — a prefix that is not first is a warning the model reads after it has chosen the tool (C8)`)
+    console.log('  FAIL S4 [DEGRADED] description shape')
+  }
+}
+
+/**
+ * S5 — UNMEASURED BEFORE DEAD (C9).
+ *
+ * `measured:null` and `measured:true, elementLaneOk:false` are different
+ * diagnoses with different next actions (call the doctor vs rebuild the guest).
+ * The unmeasured branch must be evaluated first, because every later branch
+ * reads `measured === true` — a reorder turns "nobody looked" into "nothing is
+ * broken", which is the state the report was actually in.
+ */
+{
+  total += 1
+  const indexText = textOf('index.js')
+  const start = indexText.indexOf('function windowsDesktopWarnings(')
+  const end = start === -1 ? -1 : indexText.indexOf('\nfunction ', start + 1)
+  const body = stripJsComments(start === -1 ? '' : indexText.slice(start, end === -1 ? indexText.length : end))
+  const unmeasuredAt = body.indexOf('measured !== true')
+  const deadAt = body.indexOf('elementLaneOk === false')
+  const ok = body !== '' && unmeasuredAt !== -1 && deadAt !== -1 && unmeasuredAt < deadAt
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S5 windowsDesktopWarnings() tests the UNMEASURED state before the dead element lane (C9)')
+  } else {
+    failures += 1
+    missing.push(`S5: index.js windowsDesktopWarnings() must test "measured !== true" (${unmeasuredAt}) BEFORE "elementLaneOk === false" (${deadAt}) — the unmeasured branch is the one that says "nobody looked", and every later branch assumes measured:true (C9)`)
+    console.log('  FAIL S5 desktop warning order')
+  }
+}
+
+/**
+ * S6 — THE GUEST'S STEP ORDER (D-20, C14).
+ *
+ * Both patch steps run AFTER the `dsh-cua` wheel is installed and BEFORE the
+ * clipboard tasks; the desktop-token probe runs after both patches (it imports
+ * the patched modules) and before the tasks that depend on the session it
+ * proves. The order is not cosmetic: `dsh-cua-scale` edits the same two files,
+ * so a reorder makes each step's `count == 1` anchor gate depend on luck.
+ */
+{
+  total += 1
+  const ps1 = textOf('cua-firstboot.ps1')
+  const at = (name) => ps1.indexOf(`Step '${name}' {`)
+  const order = ['dsh-cua-scale', 'dsh-cua-typetext', 'dsh-cua-savepath', 'desktop-token-probe', 'clipboard-tasks']
+  const index = Object.fromEntries(order.map((name) => [name, at(name)]))
+  const ok = order.every((name) => index[name] !== -1)
+    && order.every((name, position) => position === 0 || index[order[position - 1]] < index[name])
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S6 the guest steps run dsh-cua-scale < dsh-cua-typetext < dsh-cua-savepath < desktop-token-probe < clipboard-tasks (C14)')
+  } else {
+    failures += 1
+    missing.push(`S6: docker/windows-oem/cua-firstboot.ps1 must order ${order.join(' < ')} — got ${order.map((name) => `${name}=${index[name]}`).join(', ')} (each patch step's count==1 anchor depends on the previous one having finished) (C14)`)
+    console.log('  FAIL S6 guest patch step order')
+  }
+}
+
+/**
+ * E1 — THE MUTATION MODE IS PRESENT, AND IT IS THIS FILE'S OWN.
+ *
+ * R10's permanent half: the pairs are worthless if nothing ever runs them, and
+ * a mode that is claimed but not spelled is a mode someone deletes in a cleanup.
+ * Asserted against the RUNNER'S OWN SOURCE (never a mutation target, per §7.3).
+ */
+{
+  total += 1
+  const selfText = readFileSync(SELF, 'utf8')
+  const modeOk = selfText.includes("mutations: { type: 'boolean'")
+    && selfText.includes('if (values.mutations) {')
+    && selfText.includes('await runMutations()')
+    && selfText.includes('red, ${results.length - proved} false-green')
+  if (modeOk) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   E1 --mutations is a real mode of this runner (option, branch, runner, false-green counter)')
+  } else {
+    failures += 1
+    missing.push('E1: tools/check-cua-vm.mjs must keep the --mutations mode: the `mutations` option, the `if (values.mutations)` branch, `await runMutations()`, and the false-green counter in the summary — a mode that CI cannot invoke is a claim, not a gate (C15)')
+    console.log('  FAIL E1 mutation mode')
+  }
+}
+
+/**
+ * E2 — THE MUTATION TABLE IS FROZEN AND ITS TARGETS HAVE NOT DRIFTED.
+ *
+ * This is the cheap half of `--mutations`: it runs on EVERY gate invocation and
+ * costs 22 in-memory searches instead of 22 subprocesses. It catches the two
+ * failures that make a mutation table rot silently — a row dropped from the
+ * table (the count is the contract: 22, JE1 added M-21/M-22) and a `find` literal that no longer
+ * occurs because the line it targeted was reworded (the pair then "passes" by
+ * mutating nothing, which is the false-green the runner would report only if
+ * someone ran it).
+ */
+{
+  total += 1
+  const ids = MUTATIONS.map((row) => row.id)
+  const uniqueIds = new Set(ids).size === ids.length && ids.length === 22
+  const drift = []
+  for (const row of MUTATIONS) {
+    const file = pick(row.file)
+    if (file === null) { drift.push(`${row.id}: ${row.file} missing`); continue }
+    const hits = readFileSync(file, 'utf8').split(row.find).length - 1
+    if (hits < 1 || (row.all !== true && hits !== 1)) drift.push(`${row.id}: ${hits} × ${JSON.stringify(row.find)}`)
+  }
+  const ok = uniqueIds && drift.length === 0
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   E2 the mutation table carries ${MUTATIONS.length} unique pairs and every find literal still occurs exactly where it should (E-4)`)
+  } else {
+    failures += 1
+    missing.push(`E2: the mutation table must carry 22 unique pairs whose find literals still occur (ids=${ids.length}/${new Set(ids).size} unique; drift: ${drift.length === 0 ? 'none' : drift.join('; ')}) — a drifted literal mutates nothing and the pair goes quiet (E-4)`)
+    console.log('  FAIL E2 mutation table drift')
+  }
+}
+
 if (failures > 0) {
   // THE COUNT IS PART OF THE FAILURE, not only of the success. A red gate that
   // prints "3 assertion(s) failed" and nothing about the 1,100 that passed reads
@@ -3562,6 +4470,8 @@ if (failures > 0) {
   process.exit(1)
 }
 
-console.log(`\npersonal VM wired end to end: registry, accounting, shutdown, space, Windows, proxy, compose.`)
-console.log(`${total} assertion(s) across ${Object.keys(FILES).length} file(s).`)
+if (!values.quiet) {
+  console.log(`\npersonal VM wired end to end: registry, accounting, shutdown, space, Windows, proxy, compose.`)
+  console.log(`${total} assertion(s) across ${Object.keys(FILES).length} file(s).`)
+}
 process.exit(0)

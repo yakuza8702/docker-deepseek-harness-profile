@@ -142,6 +142,84 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
+      # WP-A/WP-B/WP-C — THE BEHAVIOURAL SUITES. `tools/ci-gates.mjs` above is the
+      # TEXT gate (needles + semantic assertions); these three drive the real
+      # code: the relay is started on an ephemeral port with a SYNTHETIC wedged
+      # child, the client modules are imported and stubbed, and the plugin is
+      # driven through the fake Windows bridge. They need nothing but node and
+      # python3, which this runner already has.
+      - name: Run the bridge behavioural suites (relay-wedge, modules-unit, windows-mcp-gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tests/relay-wedge.mjs
+          node tests/modules-unit.mjs
+          node tests/windows-mcp-gate.mjs
+          {
+            echo '## Bridge suites'
+            echo ''
+            # FLOORS, not exact counts: the three suites and the fix rounds that
+            # follow this landing keep ADDING checks to the same files, so an
+            # exact number here goes stale the moment one lands. Measured at this
+            # landing (2026-11-20 21:16 UTC): relay-wedge 26, modules-unit 445,
+            # windows-mcp-gate 124 (guest-patch 24). The suites themselves print
+            # the exact number and fail on their own contract, so this line only
+            # has to be honest, not exhaustive.
+            echo '`tests/relay-wedge.mjs` ≥26 checks (WP-A) · `tests/modules-unit.mjs` ≥445 (WP-B) · `tests/windows-mcp-gate.mjs` ≥124, 0 PENDING (WP-C) — measured floors; the suites print the exact totals.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # WP-D — THE GUEST-PATCH SUITE. It applies firstboot's here-strings to the
+      # PINNED dsh-cua==0.4.1 evidence copies and RUNS the patched functions, so
+      # it needs those two files (`tooldefects-evidence/{bridge.py,server.py}`,
+      # byte-identical to the wheel the guest installs). They are deliberately
+      # NOT in this repository — they are third-party GPL-licensed sources — so a
+      # checkout without them SKIPS this suite with the missing path printed,
+      # exactly like the image-artifact gates above: skipped by path, never
+      # counted as a pass. Set `GUEST_EVIDENCE` to run it.
+      - name: Run the guest-patch suite (needs the pinned 0.4.1 evidence copies)
+        shell: bash
+        run: |
+          set -o pipefail
+          EVIDENCE="${GUEST_EVIDENCE:-$(dirname "$GITHUB_WORKSPACE")/tooldefects-evidence}"
+          if [ ! -f "$EVIDENCE/bridge.py" ] || [ ! -f "$EVIDENCE/server.py" ]; then
+            echo "SKIP tests/guest-patch.mjs: the pinned dsh-cua==0.4.1 evidence copies are not in this checkout ($EVIDENCE)."
+            echo "::warning title=guest-patch skipped::needs tooldefects-evidence/{bridge.py,server.py}; set GUEST_EVIDENCE to run the 24 checks"
+            {
+              echo '## Guest patch'
+              echo ''
+              echo "SKIPPED by path: \`$EVIDENCE/{bridge.py,server.py}\` is absent. The 24 checks run inside the image build, where the pinned wheel is."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node tests/guest-patch.mjs
+          {
+            echo '## Guest patch'
+            echo ''
+            echo '`tests/guest-patch.mjs` ≥24 checks (WP-D) against the pinned 0.4.1 copies.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # WP-E / C15 / R10 — THE REVERT-PROOF HARNESS. Twenty pairs, each one a
+      # revert applied to a COPY of the tree and judged by the same gate. A row
+      # is green only when the judge exits non-zero AND names the expected
+      # assertion; a red for the wrong reason is a false green and fails the run.
+      # It copies the checkout and spawns the gate 22 times (~10 s here, more on a
+      # cold runner), which is why
+      # it is its own step and not part of `ci-gates.mjs`.
+      - name: Run the mutation harness (revert-proof pairs)
+        shell: bash
+        run: |
+          set -o pipefail
+          node tools/check-cua-vm.mjs --mutations 2>&1 | tee mutations.log
+          status=${PIPESTATUS[0]}
+          {
+            echo '## Mutation harness'
+            echo ''
+            echo '```'
+            cat mutations.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
       - name: Explain what was skipped
         if: always()
         run: |

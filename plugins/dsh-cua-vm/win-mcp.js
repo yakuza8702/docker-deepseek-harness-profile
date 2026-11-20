@@ -251,6 +251,36 @@ export const RELAY_DOWN = 'RELAY_DOWN'
 export const RELAY_SKEW = 'RELAY_SKEW'
 
 /**
+ * THE FOURTH ANSWER — THE ONE THE HOST HALF OF R1 WAS MISSING (C1/C2, §11).
+ *
+ * `RELAY_OK` is an ACCEPT-LOOP answer and nothing more (frozen sentence C1): the
+ * relay answered the cheap `RELAY_PING` handshake inside 2 s. It says NOTHING
+ * about the MCP child behind it, which is why the measured 7-minute outage was
+ * reported as healthy — the child was wedged and the accept loop was fine.
+ *
+ * This token is the other half: the FUNCTIONAL probe (`RELAY_FN` + a real
+ * `initialize`/`tools/list` round trip) ran and the child did NOT answer. It is
+ * the STRONGEST evidence class in `RELAY_ANSWER_RANK` (rank 3: the child was
+ * measured and failed — stronger than "the harness could not read an answer"),
+ * and at the same time the WEAKEST claim about usability, because the caller may
+ * not call tools yet. Those two facts are not in tension, they are the point:
+ *
+ *   rank 3   → a consumer collapsing several answers keeps THIS one (it knows
+ *              more than SKEW/DOWN do);
+ *   relayOk  → stays `false` for it (`relayAnswerRelayOk()`), so
+ *              `shouldUpgradeToRelay()` and the 10 s upgrade watch keep meaning
+ *              "the lane can be used", never "the child is dead but the port is
+ *              open". A token that made `relayOk` true would let a wedged child
+ *              pass the one gate that exists to catch it.
+ *
+ * NOT the same value as `RELAY_DOWN`: DOWN is a TRANSPORT fact ("nothing
+ * answered on that port"), this is a CHILD fact ("the relay answered and its
+ * child did not"). They have different next actions — restart the relay vs.
+ * restart the computer / repair the child — so they cannot share a string.
+ */
+export const RELAY_UNRESPONSIVE = 'RELAY_UNRESPONSIVE'
+
+/**
  * DEFECT 3 (JURY-CO1): WHAT "THE GUEST ANSWERED" IS ALLOWED TO MEAN — AND THE
  * RANKING A CONSUMER MUST USE WHEN IT COLLAPSES SEVERAL ANSWERS INTO ONE.
  *
@@ -296,7 +326,12 @@ export const RELAY_ANSWER_RANK = Object.freeze({
   [RELAY_OK]: 0,
   [RELAY_BAD]: 1,
   [RELAY_DOWN]: 1,
-  [RELAY_SKEW]: 2
+  [RELAY_SKEW]: 2,
+  // C2: THE CHILD WAS MEASURED AND FAILED. Ranked above SKEW because "the child
+  // did not answer an initialize/tools/list round trip" is a measurement, while
+  // SKEW is "the harness could not read what the relay said". Rank orders
+  // EVIDENCE, never usability — `relayOk` for this token is still false.
+  [RELAY_UNRESPONSIVE]: 3
 })
 
 /** The rank of one probe status; an unknown/empty status ranks 0 (no evidence). */
@@ -307,6 +342,22 @@ export function relayAnswerRank(status) {
 /** `true` when `left` carries stronger evidence than `right` (SKEW > DOWN). */
 export function relayAnswerOutranks(left, right) {
   return relayAnswerRank(left) > relayAnswerRank(right)
+}
+
+/**
+ * MAY THE CALLER USE THE LANE? — the ONE predicate for `relayOk`, shared by the
+ * functional probe and every consumer that carries its answer forward.
+ *
+ * `RELAY_OK` is the only status that makes it true. Every other token is false
+ * — including the rank-3 `RELAY_UNRESPONSIVE`, whose whole contract is "strong
+ * evidence, useless lane": the relay IS listening (so it is not DOWN) and the
+ * child is NOT answering (so it must not pass the gate that decides whether a
+ * `tools/call` can be sent). Keeping this a function rather than an inline
+ * `status === RELAY_OK` is what stops the rank-3 token from being "stronger, so
+ * surely it counts as up" in a future edit.
+ */
+export function relayAnswerRelayOk(status) {
+  return String(status ?? '') === RELAY_OK
 }
 
 /**
@@ -535,7 +586,7 @@ export const PAYLOAD_SKEW_SEMANTICS = 'payload.skew is true only when the guest 
  *     profileRootWritable, error }`. `measured !== true` means EVERY field is
  *     unknown — never `false` (a `false` is a measurement).
  */
-export const DOCTOR_FACTS_FIELDS = 'canonical: transport, relayPort, relayOk, relayStatus, transportCommand, transportReason, interpreter, probeMode, relayDetail, repair, payload (all top-level); interpreterMissing rides along in the transport facts and passes through via the doctor spread when a client exists (absent, not false, when none does); aliases kept for existing consumers: command (= transportCommand), reason (= transportReason). payload as windows_mcp_doctor emits it: { measured, relayHash, expectedRelayHash, skew, port, portMeasured, relayPresent, portMismatch }; relayPresent is true (hash read) / false (measured, no script) / null (not measured), and a MEASURED empty hash= is normalized on the wire to relayHash: null + relayPresent: false, never relayHash: ""; portMismatch is true only when both the guest-measured port and the harness port are known and differ; skew is the relay-answered-but-unreadable evidence flag, not a hash comparison. Client-only facts (WP-4.3/4.5): lastFailureKind on the client facts — ssh-closed | auth | handshake | unknown | null, beside the byte-identical lastError text (ssh-closed is the boot race, auth is a key/account problem, handshake means the session existed and the MCP exchange did not complete); desktop on windowsMcpDoctor — the guest-measured desktop facts { measured, at, stale, source, schema, user, session, python, dshCuaVersion, pywin32Version, win32ui, uiaLane, uiaLaneOk, elementLaneOk, scaleFix, workDir, workDirWritable, profileRootWritable, error }, where measured !== true means every field is unknown and never false.'
+export const DOCTOR_FACTS_FIELDS = 'canonical: transport, relayPort, relayOk, relayStatus, transportCommand, transportReason, interpreter, probeMode, relayDetail, repair, payload (all top-level); interpreterMissing rides along in the transport facts and passes through via the doctor spread when a client exists (absent, not false, when none does); aliases kept for existing consumers: command (= transportCommand), reason (= transportReason). payload as windows_mcp_doctor emits it: { measured, relayHash, expectedRelayHash, skew, port, portMeasured, relayPresent, portMismatch }; relayPresent is true (hash read) / false (measured, no script) / null (not measured), and a MEASURED empty hash= is normalized on the wire to relayHash: null + relayPresent: false, never relayHash: ""; portMismatch is true only when both the guest-measured port and the harness port are known and differ; skew is the relay-answered-but-unreadable evidence flag, not a hash comparison. Client-only facts (WP-4.3/4.5): lastFailureKind on the client facts — ssh-closed | auth | handshake | unknown | null, beside the byte-identical lastError text (ssh-closed is the boot race, auth is a key/account problem, handshake means the session existed and the MCP exchange did not complete); desktop on windowsMcpDoctor — the guest-measured desktop facts { measured, at, stale, source, schema, user, session, python, dshCuaVersion, pywin32Version, win32ui, uiaLane, uiaLaneOk, elementLaneOk, scaleFix, workDir, workDirWritable, profileRootWritable, error }, where measured !== true means every field is unknown and never false; relayFunctional is CLIENT-ONLY like desktop and lastFailureKind — the last functional-probe answer { status, relayOk, measured, reason, budgetMs, elapsedMs, initializeMs, toolsListMs, tools, evidence { lastSuccessfulCallAgeMs, outstandingRequestAgeMs, childRestarts, lastWedgeAt, childPid, wedgeDeadlineMs }, evidenceAt, exitCode, mode: functional }, null until one ran (nothing measured is not a healthy child), relayOk false for RELAY_UNRESPONSIVE because rank-3 evidence is not a usable lane, and status RELAY_DOWN when the transport never delivered a token.'
 
 /** The env override, VERBATIM (no trim, no re-quoting), or null when unset. */
 function winMcpCommandOverride() {
@@ -843,8 +894,21 @@ export function runSshCapture({ argv, spawnImpl, timeoutMs, now, onStdout }) {
   })
 }
 
-/** The token line, exactly as the probe program prints it. */
-const RELAY_TOKEN_RE = /RELAY_(OK|BAD|DOWN)/u
+/**
+ * The token line, exactly as the probe programs print it.
+ *
+ * C2: THE SET IS FOUR NOW. `RELAY_UNRESPONSIVE` is the functional probe's
+ * child-dead answer (see RELAY_UNRESPONSIVE), and it is read by the SAME
+ * classifier as the cheap handshake's three — one owner for "a line that is a
+ * token", so the functional probe cannot invent a second, disagreeing parser.
+ *
+ * The alternation ORDER is irrelevant for correctness (`RELAY_OK` and
+ * `RELAY_UNRESPONSIVE` diverge at byte 6) and the cheap program can only ever
+ * print OK/BAD/DOWN: a guest that printed the functional token at the cheap
+ * probe would be classified as having answered, and `relayOk` would still be
+ * false because only `RELAY_OK` sets it (relayAnswerRelayOk).
+ */
+const RELAY_TOKEN_RE = /RELAY_(OK|BAD|DOWN|UNRESPONSIVE)/u
 
 /**
  * One candidate, inside whatever budget is left. `status` is null when the
@@ -1018,6 +1082,367 @@ export async function relayProbe(options = {}) {
   relayProbeCache.at = now()
   relayProbeCache.answer = answer
   log(`mcp-win: relay probe 127.0.0.1:${port} → ${answer.status} after ${candidates.length} carrier(s)${detail === '' ? '' : ` (${detail})`}`)
+  return answer
+}
+
+/* ------------------------------------------------------------------ *
+ * THE FUNCTIONAL PROBE (C1/C2/C3, §11) — R1's OTHER HALF
+ * ------------------------------------------------------------------ */
+
+/**
+ * HOW LONG THE CHILD MAY TAKE to answer `initialize` + `tools/list`, in the
+ * probe's own words (C2). This is the budget the ANSWER reports, not the SSH
+ * budget: a child that has not answered two frames in 5 s is not slow, it is
+ * wedged, and the relay's own watchdog kills it at 20 s.
+ */
+export const RELAY_FN_BUDGET_MS = 5000
+
+/**
+ * The probe program's WHOLE wall (C2 step 6). It is larger than the child budget
+ * because it also carries the evidence read and two TCP connects; the SSH child
+ * is killed at RELAY_FUNCTIONAL_PROBE_TIMEOUT_MS, which is larger again, so the
+ * program's own bound is always the one that fires first and a slow guest
+ * produces a TOKEN rather than a truncated capture.
+ */
+export const RELAY_FN_TOTAL_MS = 12000
+
+/** The session's own read deadline inside the program (C2 step 4). */
+export const RELAY_FN_SESSION_BUDGET_MS = 9000
+
+/** How long the relay's outer SSH child may live. */
+export const RELAY_FUNCTIONAL_PROBE_TIMEOUT_MS = 20000
+
+/**
+ * THE REASON SET, CLOSED (C3). A value outside it is a protocol violation, so
+ * the host normalizes to `'no-evidence'` rather than forwarding a word the
+ * doctor's sentence was never written for.
+ */
+export const RELAY_FN_REASONS = Object.freeze(['', 'child-silent', 'child-eof', 'session-busy', 'no-evidence'])
+
+/**
+ * THE FUNCTIONAL PROBE PROGRAM (C2, §11). A REAL SESSION, not a flag.
+ *
+ * WHY A PROGRAM AND NOT `--ping --functional`. §11 freezes this: a new CLI mode
+ * is a dependency on the guest PAYLOAD, which is staged at machine-create and
+ * never refreshed — the exact stale-payload failure the cheap probe was fixed
+ * for (§27/Appendix A). A base64 program needs nothing from the guest but a
+ * python interpreter, and it keeps `usage()` byte-identical.
+ *
+ * What it does, in order (C2):
+ *   1. socket 1: send `RELAY_FN`, read ONE line (<= 8 KiB, <= 3 s) and parse it
+ *      as the relay's live counters. No line / garbage ⇒ `RELAY_UNRESPONSIVE` +
+ *      `{"measured":false,"reason":"no-evidence"}`, exit 3.
+ *   2. `busy === true` ⇒ `RELAY_OK` + `{"measured":false,"reason":"session-busy"}`,
+ *      exit 4. The relay is fine; NOBODY MEASURED the child, and the answer says
+ *      so instead of borrowing the relay's health.
+ *   3. socket 2: the three frames `connect()` sends — `initialize` (id 900001),
+ *      `notifications/initialized`, `tools/list` (id 900002) — so the probe
+ *      exercises the real session path and not a bespoke ping.
+ *   4. read until both ids answered or 9 s; time each answer.
+ *   5. print exactly two lines: the token (`RELAY_OK` iff BOTH answered AND
+ *      `tools >= 1`; otherwise `RELAY_UNRESPONSIVE` with `child-silent` /
+ *      `child-eof`) and the JSON answer.
+ *   6. the whole program is bounded by RELAY_FN_TOTAL_MS.
+ *
+ * `tools >= 1` is not decoration (research Q2, upstream #332): a `tools/list`
+ * that advertises nothing is not proof of a working child.
+ */
+export function relayFunctionalProbeProgram(port = relayPort()) {
+  const target = Number.isInteger(Number(port)) ? Number(port) : RELAY_PORT_DEFAULT
+  const version = MCP_PROTOCOL_VERSION
+  return String.raw`import json as _j
+import socket as _s
+import sys as _y
+import time as _t
+
+_T0 = _t.time()
+_WALL = ${RELAY_FN_TOTAL_MS / 1000}
+_SESSION = ${RELAY_FN_SESSION_BUDGET_MS / 1000}
+_PORT = ${target}
+_VERSION = '${version}'
+
+
+def _left():
+    return max(0.05, _WALL - (_t.time() - _T0))
+
+
+_ev = None
+try:
+    _c = _s.create_connection(('127.0.0.1', _PORT), min(3.0, _left()))
+    _c.settimeout(min(3.0, _left()))
+    _c.sendall(b'RELAY_FN')
+    _b = b''
+    while len(_b) < 8192:
+        _p = _c.recv(8192 - len(_b))
+        if not _p:
+            break
+        _b += _p
+        if b'\n' in _b:
+            break
+    _c.close()
+    _ev = _j.loads(_b.split(b'\n', 1)[0].decode('utf-8', 'replace'))
+    if not isinstance(_ev, dict):
+        _ev = None
+except Exception:
+    _ev = None
+
+if _ev is None:
+    print('RELAY_UNRESPONSIVE')
+    print(_j.dumps({'measured': False, 'reason': 'no-evidence', 'mode': 'functional', 'at': None}))
+    _y.exit(3)
+
+_A = dict(_ev)
+_A['mode'] = 'functional'
+
+if _ev.get('busy') is True:
+    _A['status'] = 'RELAY_OK'
+    _A['measured'] = False
+    _A['reason'] = 'session-busy'
+    _A['elapsedMs'] = int((_t.time() - _T0) * 1000)
+    print('RELAY_OK')
+    print(_j.dumps(_A))
+    _y.exit(4)
+
+_INIT = _j.dumps({'jsonrpc': '2.0', 'id': 900001, 'method': 'initialize',
+                  'params': {'protocolVersion': _VERSION, 'capabilities': {'tools': {}},
+                             'clientInfo': {'name': 'dsh-cua-vm', 'version': '1.0.0'}}}) + '\n'
+_NOTE = _j.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {}}) + '\n'
+_LIST = _j.dumps({'jsonrpc': '2.0', 'id': 900002, 'method': 'tools/list', 'params': {}}) + '\n'
+
+_a_init = False
+_a_list = False
+_eof = False
+_init_ms = None
+_list_ms = None
+_tools = None
+_buf = b''
+_started = _t.time()
+try:
+    _c = _s.create_connection(('127.0.0.1', _PORT), min(3.0, _left()))
+    _c.settimeout(min(2.0, _left()))
+    _c.sendall(_INIT.encode())
+    _c.sendall(_NOTE.encode())
+    _c.sendall(_LIST.encode())
+    _deadline = min(_T0 + _WALL, _started + _SESSION)
+    while _t.time() < _deadline and not (_a_init and _a_list):
+        try:
+            _p = _c.recv(65536)
+        except _s.timeout:
+            continue
+        except Exception:
+            _eof = True
+            break
+        if not _p:
+            _eof = True
+            break
+        _buf += _p
+        while b'\n' in _buf:
+            _line, _buf = _buf.split(b'\n', 1)
+            try:
+                _m = _j.loads(_line.decode('utf-8', 'replace'))
+            except Exception:
+                continue
+            if not isinstance(_m, dict):
+                continue
+            if _m.get('id') == 900001:
+                _a_init = True
+                _init_ms = int((_t.time() - _started) * 1000)
+            elif _m.get('id') == 900002:
+                _a_list = True
+                _list_ms = int((_t.time() - _started) * 1000)
+                _r = _m.get('result')
+                _tl = _r.get('tools') if isinstance(_r, dict) else None
+                _tools = len(_tl) if isinstance(_tl, list) else 0
+    _c.close()
+except Exception:
+    _eof = True
+
+_ok = bool(_a_init and _a_list and isinstance(_tools, int) and _tools >= 1)
+_A['status'] = 'RELAY_OK' if _ok else 'RELAY_UNRESPONSIVE'
+_A['measured'] = _ok
+_A['reason'] = '' if _ok else ('child-eof' if _eof else 'child-silent')
+_A['budgetMs'] = ${RELAY_FN_BUDGET_MS}
+_A['elapsedMs'] = int((_t.time() - _T0) * 1000)
+_A['initializeMs'] = _init_ms
+_A['toolsListMs'] = _list_ms
+_A['tools'] = _tools if isinstance(_tools, int) else None
+_A['evidenceAt'] = _ev.get('at')
+print(_A['status'])
+print(_j.dumps(_A))
+_y.exit(0 if _ok else 3)
+`
+}
+
+/**
+ * THE ONE COMMAND (C2/B-3): `py -3 -c "<base64 program>"`.
+ *
+ * Same carrier rationale as `relayProbeCandidates` — base64 is A-Z a-z 0-9 + / =
+ * so `"`, `%`, `^`, `&` and `|` cannot be mangled by `ssh → cmd.exe → python`.
+ * No candidate list: every candidate the cheap probe proves also proves an
+ * interpreter, so the functional probe starts from that interpreter and there is
+ * nothing to fall back to (a second candidate would double a 20 s budget).
+ */
+export function relayFunctionalProbeCommand(port = relayPort(), interpreter = null) {
+  const encoded = Buffer.from(relayFunctionalProbeProgram(port), 'utf8').toString('base64')
+  const carrier = `exec(__import__('base64').b64decode('${encoded}').decode())`
+  const head = String(interpreter ?? '').trim()
+  return `${head === '' ? 'py -3' : head} -c "${carrier}"`
+}
+
+/** A non-negative integer, or `null`. Never `0` for "the guest did not say". */
+function evidenceInt(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.floor(value)
+  return null
+}
+
+/** An ISO-8601 string, or `null`. */
+function evidenceIso(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value : null
+}
+
+/**
+ * C3's evidence object, TYPED. The relay's `RELAY_FN` line and the facts file's
+ * `relay` object share these names, so this is the one normalizer for both.
+ *
+ * HONESTY RULE: an absent key is `null`, never `0`. A relay that predates a
+ * counter must not look like "a fresh child with no restarts and no outstanding
+ * request" — that is the same defect class as `measured:false` being read as
+ * `measured:false` ⇒ "all facts false".
+ */
+export function normalizeRelayEvidence(parsed) {
+  if (parsed === null || parsed === undefined || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  // A line that carries NONE of the six counters is not an evidence line (it is
+  // the answer half only). Reporting six `null`s would say "measured, all
+  // unknown"; `null` says "nothing to read", which is what happened.
+  const EVIDENCE_KEYS = ['lastSuccessfulCallAgeMs', 'outstandingRequestAgeMs', 'childRestarts', 'lastWedgeAt', 'childPid', 'wedgeDeadlineMs']
+  if (EVIDENCE_KEYS.some((key) => Object.hasOwn(parsed, key)) !== true) return null
+  const evidence = {
+    lastSuccessfulCallAgeMs: evidenceInt(parsed.lastSuccessfulCallAgeMs),
+    outstandingRequestAgeMs: evidenceInt(parsed.outstandingRequestAgeMs),
+    childRestarts: evidenceInt(parsed.childRestarts),
+    lastWedgeAt: evidenceIso(parsed.lastWedgeAt),
+    childPid: evidenceInt(parsed.childPid),
+    wedgeDeadlineMs: evidenceInt(parsed.wedgeDeadlineMs)
+  }
+  if (parsed.busy !== undefined) evidence.busy = parsed.busy === true
+  if (parsed.attached !== undefined) evidence.attached = parsed.attached === true
+  if (parsed.mode !== undefined) evidence.mode = parsed.mode
+  if (parsed.at !== undefined) evidence.at = evidenceIso(parsed.at)
+  return evidence
+}
+
+/** A C3 `reason`, or `''` when the guest said something outside the closed set. */
+function relayFunctionalReason(value) {
+  const text = typeof value === 'string' ? value : ''
+  return RELAY_FN_REASONS.includes(text) ? text : ''
+}
+
+/**
+ * THE FUNCTIONAL PROBE, HOST SIDE (C2/B-4) — ask the guest, in ONE ssh child,
+ * whether the relay's MCP child answers a real session. Never throws.
+ *
+ * WHY NO `onStdout` SEAM. `runSshCapture`'s early-settle callback fires on the
+ * FIRST token — which here is line 1 of 2, so settling there would truncate the
+ * JSON evidence line and turn a measured child into `no-evidence`. The capture is
+ * therefore allowed to run to close/EOF: the program's own 12 s wall is the
+ * bound, and the outer SSH child is killed at 20 s.
+ *
+ * `measured` is the honest marker (C3): `true` only when the answer itself says
+ * so. `status` is the token; `relayOk` is `relayAnswerRelayOk(status)` — so
+ * `RELAY_UNRESPONSIVE` can never be read as a usable lane, even though it is the
+ * strongest evidence in the ranking.
+ */
+export async function relayFunctionalProbe(options = {}) {
+  const normalized = typeof options === 'function' ? { sshArgsFactory: options } : (options ?? {})
+  const {
+    host = '127.0.0.1',
+    port: sshPort,
+    user = 'cua',
+    keyPath,
+    timeoutMs = RELAY_FUNCTIONAL_PROBE_TIMEOUT_MS,
+    interpreter = null,
+    sshArgsFactory,
+    spawnImpl = spawn,
+    now = () => Date.now(),
+    log = () => {}
+  } = normalized
+  const port = relayPort()
+  const startedAt = now()
+  const requested = timeoutMs === undefined || timeoutMs === null
+    ? RELAY_FUNCTIONAL_PROBE_TIMEOUT_MS
+    : Math.round(Number(timeoutMs))
+  const budget = Number.isFinite(requested) ? Math.max(1, requested) : RELAY_FUNCTIONAL_PROBE_TIMEOUT_MS
+  const command = relayFunctionalProbeCommand(port, interpreter)
+  const answer = {
+    mode: 'functional',
+    port,
+    status: RELAY_DOWN,
+    relayOk: false,
+    measured: false,
+    reason: '',
+    budgetMs: RELAY_FN_BUDGET_MS,
+    elapsedMs: 0,
+    initializeMs: null,
+    toolsListMs: null,
+    tools: null,
+    evidence: null,
+    evidenceAt: null,
+    exitCode: null,
+    detail: '',
+    connectionLevel: false,
+    cached: false
+  }
+  let capture = null
+  try {
+    const argv = typeof sshArgsFactory === 'function'
+      ? sshArgsFactory({ host, port: sshPort, user, keyPath, remoteCommand: command })
+      : sshArgv({ host, port: sshPort, user, keyPath, remoteCommand: command })
+    capture = await runSshCapture({ argv, spawnImpl, timeoutMs: budget, now })
+  } catch (error) {
+    // Belt and braces: runSshCapture never rejects, and a probe must still be an
+    // ANSWER if a future edit makes it throw.
+    answer.detail = `functional probe failed: ${error?.message ?? error}`.slice(0, 240)
+    answer.elapsedMs = Math.max(0, now() - startedAt)
+    log(`mcp-win: relay functional probe 127.0.0.1:${port} → ${answer.status} (${answer.detail})`)
+    return answer
+  }
+  answer.elapsedMs = Math.max(0, now() - startedAt)
+  answer.exitCode = capture.exitCode ?? null
+  answer.detail = String(capture.stderr || capture.detail || '').trim().slice(0, 240)
+  answer.connectionLevel = capture.connectionLevel === true
+
+  const seen = RELAY_TOKEN_RE.exec(capture.stdout)
+  const tokenStatus = seen === null ? null : `RELAY_${seen[1]}`
+  const parsed = parseLastJsonObject(capture.stdout)
+
+  // NO TOKEN AT ALL. The transport never delivered the program's first line (a
+  // spawn failure, ssh's own 255, an interpreter that does not exist), so this is
+  // a TRANSPORT answer: RELAY_DOWN, and the reason is NOT a child reason — the
+  // child was never asked (C2: DOWN vs UNRESPONSIVE are different diagnoses).
+  if (tokenStatus === null) {
+    answer.status = RELAY_DOWN
+    answer.relayOk = false
+    answer.measured = false
+    answer.reason = ''
+    log(`mcp-win: relay functional probe 127.0.0.1:${port} → ${answer.status} (no token; ${capture.detail || 'no detail'})`)
+    return answer
+  }
+
+  answer.status = tokenStatus
+  answer.relayOk = relayAnswerRelayOk(tokenStatus)
+  answer.measured = parsed !== null && parsed.measured === true
+  answer.reason = relayFunctionalReason(parsed?.reason)
+  // A token WITHOUT a measured answer must still explain itself: `RELAY_OK` with
+  // no JSON is "the program's answer line was lost", not health.
+  if (answer.measured !== true && answer.reason === '') answer.reason = 'no-evidence'
+  if (answer.measured === true) answer.reason = ''
+  answer.initializeMs = evidenceInt(parsed?.initializeMs)
+  answer.toolsListMs = evidenceInt(parsed?.toolsListMs)
+  answer.tools = evidenceInt(parsed?.tools)
+  answer.evidence = normalizeRelayEvidence(parsed)
+  answer.evidenceAt = evidenceIso(parsed?.evidenceAt) ?? evidenceIso(parsed?.at)
+  answer.detail = answer.measured === true ? '' : String(capture.stderr || '').trim().slice(0, 240)
+  log(`mcp-win: relay functional probe 127.0.0.1:${port} → ${answer.status} measured=${answer.measured}${answer.reason === '' ? '' : ` reason=${answer.reason}`}`)
   return answer
 }
 
@@ -1809,6 +2234,62 @@ export function relayRepairMeasurement(record) {
 }
 
 /**
+ * C6 — THE REPAIR'S SENTENCE. The ONE owner of "the repair could not tell us
+ * anything", so `windows_mcp_doctor({repair:true})` can never answer
+ * `ok:false, reason:''` again (R1b, measured: the diagnostic verb was silent on
+ * the one occasion a user reaches for it).
+ *
+ * THE RETURN CONTRACT (and each half has a reason):
+ *
+ *   measured === true WITH a guest `reason`
+ *                       → `''`. The record speaks for itself: `task-missing`,
+ *                         `no-interactive-session`, `relay-missing`,
+ *                         `probe-skew`, … Rewriting it here would be a second,
+ *                         disagreeing diagnosis. This is the ONLY input that
+ *                         returns an empty string.
+ *   measured === true WITHOUT a `reason`
+ *                       → `'the repair ran and reported no reason'` (+ `: detail`
+ *                         when the record carries one). PRE-REVISE DEFECT #8: a
+ *                         measured, failed repair with an empty reason used to
+ *                         return `''`, which reached the model as
+ *                         `forcedRepair.reason:''` — the same silence R1b fixed,
+ *                         one branch further in.
+ *   measured !== true   → a NON-EMPTY sentence naming WHY nothing was measured.
+ *                         There is no such thing as "an unmeasured repair that
+ *                         needs no explanation": that is the value the defect
+ *                         produced.
+ *
+ * The caller's rule (index.js, WP-C) is
+ * `String(answer?.reason ?? record?.reason ?? '') || describeRepairRecord(record)`,
+ * so this function is the last line of defence: a record with no `reason` of its
+ * own still yields words, never `''`.
+ *
+ * `unmeasured` outside the closed set (or absent) normalizes to `no-record`: the
+ * honest reading of "this record does not say why" is "nothing came back", and
+ * the detail is passed through verbatim — it is the only bytes that name the
+ * actual error (an ssh stderr line, a throttle window, "bridge disabled").
+ */
+export function describeRepairRecord(record) {
+  if (relayRepairMeasured(record) === true) {
+    // A measured record that NAMED a cause speaks for itself: `''` tells the
+    // caller "keep the record's own `reason` byte-identical" (C6).
+    const why = String(record?.reason ?? '').trim()
+    if (why !== '') return ''
+    // MEASURED AND SILENT — and `''` is not an answer (DEFECT #8): the guest
+    // answered the repair and named no cause, which is a fact the model must be
+    // able to read. `forcedRepair.reason:''` on a measured, failed repair is the
+    // same silence R1b was about, one branch further in.
+    const said = String(record?.detail ?? '').trim()
+    return said === '' ? 'the repair ran and reported no reason' : `the repair ran and reported no reason: ${said}`
+  }
+  const values = Object.values(RELAY_REPAIR_UNMEASURED)
+  const said = String(record?.unmeasured ?? '').trim()
+  const unmeasured = said !== '' && values.includes(said) ? said : RELAY_REPAIR_UNMEASURED.NO_RECORD
+  const detail = String(record?.detail ?? '').trim()
+  return `the guest never answered the repair (${unmeasured}): ${detail === '' ? 'no detail' : detail}`
+}
+
+/**
  * THE REPAIR PROGRAM (one self-contained SSH command, §4.4).
  *
  * It is generated HERE, not read from the guest, because the whole point is that
@@ -2488,6 +2969,139 @@ export function sshArgv({ host = '127.0.0.1', port, user = 'cua', keyPath, remot
   return args
 }
 
+/* ------------------------------------------------------------------ *
+ * C5 — THE BUDGET LADDER, AND WHY IT IS A LADDER
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE GUEST'S WEDGE DEADLINE (C4), mirrored here as EVIDENCE ONLY.
+ *
+ * The relay kills a child that has not answered in 20 s and answers the pending
+ * id with `child-wedged` (C4.4/C4.5). The host's per-call timer must be strictly
+ * LARGER than this, or a `child-wedged` line can never reach the model: the
+ * host would give up first and report a nameless timeout, which is the R3 defect
+ * wearing a new number. This constant is not a second knob — the guest owns the
+ * deadline (DSH_CUA_MCP_WEDGE_DEADLINE_MS); it is here so the margin below is
+ * arithmetic a reader can check, and so a test can assert it.
+ */
+export const WIN_MCP_WEDGE_DEADLINE_MS = 20_000
+
+/**
+ * THE TRANSPORT BUDGET — one JSON-RPC REQUEST, 25 s (C5).
+ *
+ * `WEDGE_DEADLINE_MS + 5 000`: the guest's clock starts AFTER the host's (the
+ * request has to be written, forwarded and answered), so the margin is
+ * structural, not cosmetic. With 25 s the guest's `child-wedged` answer is the
+ * FIRST thing the model can see; the host timer is the backstop for the case the
+ * guest is too dead to send it.
+ */
+export const WIN_MCP_TRANSPORT_BUDGET_MS = 25_000
+
+/**
+ * THE ENVELOPE — how long the HARNESS waits around one request (26 s).
+ *
+ * It is the transport budget plus 1 s of harness-side overhead (registration,
+ * the wrapper's own bookkeeping). `boundedExecute` is declared with this number
+ * so its 250 ms `TIMEOUT_LEAD_MS` keeps the branchable error in front of the
+ * harness guard (the §28 pattern).
+ */
+export const WIN_MCP_CALL_ENVELOPE_MS = 26_000
+
+/**
+ * THE RETRY BUDGET — TWO envelopes plus 4 s (56 s), for the three read-only
+ * tools only (C7). The whole retry budget is inside the documented
+ * `toolCallTimeoutMs: 120000` envelope (research Q1c).
+ */
+export const WIN_MCP_CALL_RETRY_BUDGET_MS = 56_000
+
+/** The registration budget for a single-attempt tool: envelope + 4 s. */
+export const WIN_MCP_CALL_GUARD_MS = 30_000
+
+/** The env override, READ AT CALL TIME (C5) — never captured at module load. */
+export const WIN_MCP_CALL_TIMEOUT_ENV = 'DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS'
+
+/** The clamp C5 freezes: 200 ms .. 120 000 ms. */
+export const WIN_MCP_CALL_TIMEOUT_MIN_MS = 200
+export const WIN_MCP_CALL_TIMEOUT_MAX_MS = 120_000
+
+/**
+ * THE DOCUMENTED ENVELOPE (research Q1c): `toolCallTimeoutMs: 120000` is the
+ * longest wall the harness was told about.
+ *
+ * INVARIANT (one line, and the derived ladder below is the proof): no derived
+ * budget — envelope, retry budget or guard — may exceed this, so raising the
+ * transport to its frozen ceiling can never ask for a wall outside the documented
+ * envelope (at 120 000 the unclamped arithmetic would derive 121 000 / 246 000 /
+ * 125 000 and the harness would cut a retry it never agreed to run).
+ */
+export const WIN_MCP_TOOL_CALL_ENVELOPE_MS = 120_000
+
+/**
+ * R3'S TRANSPORT HALF, AS A SENTENCE A TEST CAN POINT AT.
+ *
+ * A retry is a JSON-RPC REQUEST retry ON THE SAME SESSION. The per-call timer
+ * rejects exactly one request (its id is dropped from `pending`) and NEVER closes
+ * the SSH child, so the documented reconnect policy `{500 ms, 30 000 ms, 10
+ * attempts}` is untouched and is not re-implemented here. The client test
+ * asserts the structural half of this: after a per-call timeout the child is
+ * still alive, was never killed, and the next request on the same session
+ * succeeds. A "retry" that reconnected would change the id space and pay a
+ * handshake — and would make `child-wedged`/`relay-unresponsive` meaningless.
+ */
+export const WIN_MCP_RETRY_SEMANTICS = 'a call retry is a JSON-RPC request retry on the SAME session: the per-call timer rejects one request and never closes the SSH child, so the reconnect policy is untouched and a transport reconnect is never a retry'
+
+/**
+ * THE TRANSPORT BUDGET, resolved the way C5 freezes it: the env override read at
+ * CALL TIME, clamped to 200..120000, defaulting to WIN_MCP_TRANSPORT_BUDGET_MS.
+ *
+ * Reading it here (a function, not a const) is the whole point: a test — or a
+ * session — can lower the budget to 200 ms and every call follows, without a
+ * module reload and without touching the 60 s attach handshake.
+ */
+export function winMcpTransportBudgetMs(env = process.env) {
+  // THE SAME ROUNDING AS index.js — `Math.floor`, not `Math.round`. Two readers
+  // of ONE knob must agree on '25000.5' (index.js's winMcpCallTimeoutMs() floors
+  // it to 25 000); a rounding split makes the transport time out 1 ms after the
+  // envelope the plugin declared, which is a silent split budget, not a style
+  // difference.
+  const value = Math.floor(Number(String(env?.[WIN_MCP_CALL_TIMEOUT_ENV] ?? '').trim()))
+  // NON-POSITIVE / NON-FINITE IS UNSET, not a zero budget — index.js's reader
+  // makes the same choice for the same reason.
+  if (Number.isFinite(value) !== true || value <= 0) return WIN_MCP_TRANSPORT_BUDGET_MS
+  return Math.min(WIN_MCP_CALL_TIMEOUT_MAX_MS, Math.max(WIN_MCP_CALL_TIMEOUT_MIN_MS, value))
+}
+
+/**
+ * THE LADDER, DERIVED — never three independent constants (C5).
+ *
+ * `envelope = transport + 1 000`, `retryBudget = 2 * envelope + 4 000`,
+ * `guard = envelope + 4 000`, each CLAMPED to WIN_MCP_TOOL_CALL_ENVELOPE_MS.
+ * A caller that scales the transport (a test, the env var) scales all three, so
+ * the ordering `guest 20 000 < transport < envelope < retry budget` cannot be
+ * broken by editing one number — and the clamps keep the whole retry budget
+ * inside the documented 120 000 envelope even at the transport's ceiling (where
+ * transport and envelope coincide and the retry budget degenerates to one
+ * attempt, which is exactly what a 120 000 ms single request means).
+ *
+ * The `Math.floor` below is index.js's rounding, not a local taste: the plugin
+ * and the transport must derive from the SAME integer ('25000.5' is 25 000 in
+ * both readers).
+ */
+export function winMcpCallBudgets(transportMs = winMcpTransportBudgetMs()) {
+  const raw = Number(transportMs)
+  const transport = Number.isFinite(raw) === true && raw >= 1 ? Math.floor(raw) : WIN_MCP_TRANSPORT_BUDGET_MS
+  // No derived budget may name a wall longer than the documented envelope.
+  const capped = (value) => Math.min(WIN_MCP_TOOL_CALL_ENVELOPE_MS, value)
+  const envelope = capped(transport + 1_000)
+  return {
+    wedgeDeadlineMs: WIN_MCP_WEDGE_DEADLINE_MS,
+    transportMs: transport,
+    envelopeMs: envelope,
+    retryBudgetMs: capped((2 * envelope) + 4_000),
+    guardMs: capped(envelope + 4_000)
+  }
+}
+
 /**
  * A JSON-RPC-over-stdio MCP client.
  *
@@ -2552,6 +3166,13 @@ export function createDshCuaClient({
     reason: '',
     /** The last repair record (Appendix B + attempt facts), null until one ran. */
     repair: null,
+    /**
+     * C2/C3: the LAST functional-probe answer (or null before one ran), minus
+     * nothing — the whole C3 shape, so `doctorFacts()` can report a measured child
+     * without opening a second SSH session. It is written by
+     * `relayFunctionalProbe()` on the client, never by a read path.
+     */
+    relayFunctional: null,
     /**
      * DEFECT 2: when the last upgrade attempt was made. 0 means "never", and the
      * throttle compares against RELAY_UPGRADE_INTERVAL_MS so a flapping relay
@@ -2621,17 +3242,43 @@ export function createDshCuaClient({
     child.stdin.write(`${JSON.stringify(message)}\n`)
   }
 
-  const request = (method, params = {}) => new Promise((resolve, reject) => {
+  /**
+   * C5/B-7: THE BUDGET OF ONE REQUEST, not of the client.
+   *
+   * `timeoutMs` (the `createDshCuaClient` option, 60 s by default) is the ATTACH
+   * HANDSHAKE budget and stays exactly what it was: `connect()` calls `request()`
+   * without a per-call value, so nothing about the handshake moves. A
+   * `tools/call` supplies its own, which is the whole R3 split — one 45 s (now
+   * 25 s) constant can no longer do the handshake's job and the tool's job at
+   * once.
+   *
+   * Anything that is not a finite number >= 1 falls back to the client budget
+   * rather than producing a `setTimeout(NaN)` (which fires immediately) or a
+   * negative timer: a bad override must degrade to TODAY'S behaviour, never to
+   * "every call times out at once".
+   */
+  const perCallBudget = (value) => {
+    if (value === undefined || value === null) return timeoutMs
+    const raw = Number(value)
+    return Number.isFinite(raw) === true && raw >= 1 ? raw : timeoutMs
+  }
+
+  const request = (method, params = {}, perCallTimeoutMs = timeoutMs) => new Promise((resolve, reject) => {
     if (child === null) {
       reject(mcpError('not-connected', 'the Windows MCP bridge is not connected'))
       return
     }
     const id = nextId
     nextId += 1
+    const budgetMs = perCallBudget(perCallTimeoutMs)
     const timer = setTimeout(() => {
+      // ONE REQUEST GIVES UP — THE SESSION DOES NOT (R3 transport half, see
+      // WIN_MCP_RETRY_SEMANTICS). Dropping the id is the entire teardown: the
+      // child keeps running, so the caller's retry is a request retry on the
+      // same session and not a reconnect.
       pending.delete(id)
-      reject(mcpError('timeout', `the guest did not answer ${method} within ${timeoutMs} ms`))
-    }, timeoutMs)
+      reject(mcpError('timeout', `the guest did not answer ${method} within ${budgetMs} ms`))
+    }, budgetMs)
     timer.unref?.()
     pending.set(id, { resolve, reject, timer, method })
     try {
@@ -3053,6 +3700,24 @@ export function createDshCuaClient({
         // string would read as a kind nobody defined.
         lastFailureKind: state.lastFailureKind === '' ? null : state.lastFailureKind,
         repair: record,
+        /**
+         * B-5: THE CHILD, AS LAST MEASURED (C3).
+         *
+         * `relayOk`/`relayStatus` are the CHEAP probe's answer — the accept loop
+         * (C1). They cannot tell a healthy child from a wedged one, which is why
+         * the 7-minute outage was reported as healthy. This field is the other
+         * half: the last `RELAY_FN` + `initialize`/`tools/list` round trip, with
+         * the C3 counters (`lastSuccessfulCallAgeMs`, `outstandingRequestAgeMs`,
+         * `childRestarts`, `lastWedgeAt`, `childPid`, `wedgeDeadlineMs`) around
+         * it. `null` means NOTHING has been measured in this process — never
+         * "the child is fine", and never `measured:false` borrowed from a probe
+         * that did not run.
+         *
+         * It is here rather than in `payload` because it is not payload identity:
+         * `payload` answers "is the guest running the relay we expect", this
+         * answers "did its child answer".
+         */
+        relayFunctional: state.relayFunctional ?? null,
         payload: {
           // DEFECT 1: the same marker `relayDoctorFacts()` carries — the two
           // doctors must agree field for field (P2), including this one.
@@ -3070,10 +3735,28 @@ export function createDshCuaClient({
         }
       }
     },
-    async callTool(toolName, args = {}) {
+    async callTool(toolName, args = {}, options = {}) {
       await assertOnline()
-      const result = await request('tools/call', { name: windowsGuestToolName(toolName), arguments: args })
-      return result
+      // C5/B-7: THE TRANSPORT BUDGET IS PER CALL, AND IT IS EXPLICIT.
+      //
+      // A caller that names one (index.js does — `{timeoutMs: 25_000}`) gets
+      // EXACTLY that budget in this request's timer. A caller that does not still
+      // gets the frozen transport budget rather than the client's 60 s attach
+      // handshake: a tool call and a handshake are different jobs with different
+      // budgets, and conflating them was R3.
+      const budgetMs = options?.timeoutMs ?? winMcpTransportBudgetMs()
+      try {
+        return await request('tools/call', { name: windowsGuestToolName(toolName), arguments: args }, budgetMs)
+      } catch (error) {
+        // B-8: A `child-wedged` ANSWER IS A ROUTABLE CODE. The guest's sentence
+        // (C4.5 — "the call did not return, so its effect is UNKNOWN") is kept
+        // VERBATIM; only the `code` is added here, so index.js can branch on it
+        // and the model still reads the guest's own words.
+        if (error?.code === 'timeout') throw error
+        const message = String(error?.message ?? '')
+        if (message.startsWith('child-wedged:')) throw mcpError('child-wedged', message)
+        throw error
+      }
     },
     /**
      * DEFECT 2, THE CALL SITE: `syncWindowsMcp()` in index.js re-validates the
@@ -3140,6 +3823,32 @@ export function createDshCuaClient({
       const record = await repairRelay({ host, port: sshPort, user, keyPath, spawnImpl, log, ...(options ?? {}) })
       state.repair = record
       return record
+    },
+    /**
+     * THE FUNCTIONAL PROBE, FROM THE CLIENT (C2/C3/B-5).
+     *
+     * `windows_mcp_doctor` runs this before building its verdict (§5.2 C-6) and
+     * `relayFunctionalProbe` is the ONE implementation: this method is a thin
+     * delegation to the module-level function — the plugin must never re-implement
+     * the probe. Never throws (the module function never does), and the answer is
+     * remembered on the client so `doctorFacts()` — which is synchronous and
+     * side-effect free — can carry it.
+     *
+     * It does NOT touch `state.relayOk`: a `RELAY_UNRESPONSIVE` answer must not be
+     * turned into anything else, and a `RELAY_OK` here is the ACCEPT LOOP's fact
+     * (C1), not a lane decision. `shouldUpgradeToRelay()` keeps deciding lanes
+     * from the cheap probe exactly as before.
+     */
+    async relayFunctionalProbe(options = {}) {
+      const answer = await relayFunctionalProbe({ host, port: sshPort, user, keyPath, spawnImpl, log, ...(options ?? {}) })
+      // B-5: the C3 object WITHOUT `stdin` (the module function never sets one —
+      // it never writes to the child) is what the doctor reports.
+      state.relayFunctional = answer
+      return answer
+    },
+    /** The last functional answer, for a synchronous reader. `null` until one ran. */
+    relayFunctionalFacts() {
+      return state.relayFunctional
     },
     /**
      * TEARDOWN, AND THE FACTS DIE WITH THE COMPUTER (JURY-CO1 defect 3).

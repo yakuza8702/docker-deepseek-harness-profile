@@ -49,13 +49,14 @@ function desktopFactsReader() {
  * IT MUST EQUAL `plugins/dsh-cua-vm/package.json`'s `version`. That is not a
  * comment-level promise: `tools/check-cua-vm.mjs` asserts the two agree (WP-6.6),
  * so bumping one place and not the other fails the gate instead of shipping two
- * identities for one file tree. The relay/blind-verdict release was 0.2.0 on both
- * sides; THIS release is 0.2.1 on both (WP-5.10 owns this constant, WP-8.1 owns
- * `package.json`, and the gate's WP-6.6 equality is what stops a half-bump), and
- * the number now also dates the three description contracts and the `attaching`
- * state, so a report can tell a 0.2.0 guest from a 0.2.1 one.
+ * identities for one file tree. 0.2.0 was the relay/blind-verdict release and
+ * 0.2.1 the tool-defect round; THIS release is 0.2.2 on both sides — the same
+ * commit owns this constant and `package.json`, because the gate's WP-6.6
+ * equality is what stops a half-bump — and the number dates the wedge watchdog,
+ * the two routable codes, the `[DEGRADED]` descriptions and `desktopWarning`, so
+ * a report can tell a 0.2.1 guest from a 0.2.2 one.
  */
-export const PLUGIN_VERSION = '0.2.1'
+export const PLUGIN_VERSION = '0.2.2'
 
 export const name = 'cua-vm'
 export const inject = ['tools', 'systemPrompt', 'webServer']
@@ -496,7 +497,33 @@ const WIN_MCP_AUX = {
    */
   desktopAt: 0,
   /** The in-flight desktop-facts read, so a reveal storm spawns ONE ssh child. */
-  desktopRefresh: null
+  desktopRefresh: null,
+  /**
+   * THE ATTACHED TOOLS' DEFINITION FACTORIES (WP-C, C-4): `[{ publicName,
+   * guestName, declaredMs, registeredMs, shape(facts) }]`, one per guest tool,
+   * built by `guestToolDefinition()`. They exist for exactly one reason — the
+   * post-attach re-render can dispose and re-register the five element tools
+   * with `[DEGRADED]` without rebuilding the call body, the timeout or the
+   * schema, and without a second attach. Cleared by `teardown()` with the
+   * registrations they describe.
+   */
+  guestToolDefs: [],
+  /**
+   * THE GENERATION THE DEGRADED RE-RENDER ALREADY RAN FOR. One-shot by design:
+   * a facts answer that keeps saying "dead lane" must not re-register five tools
+   * on every beat (each re-register is a dispose + a register on the host
+   * registry). `null` = not yet, and `teardown()` resets it.
+   */
+  degradedAt: null,
+  /**
+   * THE DESKTOP-FACTS SNAPSHOT THE CURRENT REGISTRATIONS WERE RENDERED WITH
+   * (C-4, restore half). `reRegisterDegradedElementTools()` calls the old
+   * disposer and then the new register; when that register throws, the ONLY way
+   * to put the name back is to re-register the shape it had — which needs the
+   * facts it was rendered from. `null` is the honest attach-time value (nothing
+   * measured yet), never a fabricated object.
+   */
+  guestToolFacts: null
 }
 
 /**
@@ -559,6 +586,200 @@ const WIN_MCP_DEFAULT_POLL_MS = 10_000
 const WIN_MCP_ONLINE_TTL_MS = 10_000
 /** The guest handshake budget — kept at 45 s, as the design requires. */
 const WIN_MCP_ATTACH_TIMEOUT_MS = 45_000
+
+/* ==================================================================== *
+ * R3 (WP-C, contract C5/C6) — THE PER-CALL TRANSPORT BUDGET
+ * ==================================================================== *
+ *
+ * THE DEFECT. ONE 45 s constant did three jobs: the ATTACH handshake, the
+ * registered per-call `timeoutMs`, and the body race. Two consequences, both
+ * observed: a slow-but-alive guest call was indistinguishable from a dead
+ * attach (it burned the whole 45 s and then said `tool-timeout`), and the
+ * client's own 60 s request timer could never win — so the model never saw a
+ * transport timeout at all, and no call was ever retried.
+ *
+ * THE FIX IS A LADDER, NOT A SMALLER 45. The guest's own watchdog
+ * (`WEDGE_DEADLINE_MS = 20 000`, `docker/cua-mcp-relay.py`) starts its clock
+ * AFTER this one, so the host's per-request budget must be LARGER than the
+ * guest's deadline or `child-wedged` could never reach the model: it would be
+ * replaced by a local timeout every time. 25 s > 20 s is therefore structural,
+ * not cosmetic, and the semantic assertion in the gate (`S2`) reads both files
+ * to keep it that way.
+ *
+ *   guest   WEDGE_DEADLINE_MS          20 000   kills the child, answers child-wedged
+ *   host    WIN_MCP_CALL_TIMEOUT_MS    25 000   per request inside callTool
+ *           WIN_MCP_CALL_ENVELOPE_MS   26 000   boundedExecute declared budget
+ *           WIN_MCP_CALL_RETRY_BUDGET  56 000   2 envelopes + 4 s, read-only tools
+ *
+ * The four numbers below are the DEFAULT spellings of that ladder; the live
+ * numbers come from `winMcpCallTimeoutMs()` and its three derivations, which
+ * read `DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS` at CALL TIME (the same rule every
+ * other knob in this plugin follows: a test can scale the whole ladder with one
+ * variable, and the envelope can never drift away from the budget it wraps).
+ */
+const WIN_MCP_CALL_TIMEOUT_MS = 25_000
+const WIN_MCP_CALL_ENVELOPE_MS = 26_000
+const WIN_MCP_CALL_RETRY_BUDGET_MS = 56_000
+const WIN_MCP_CALL_GUARD_MS = 30_000
+/** The clamp the override lives in — 200 ms is the smallest testable budget. */
+const WIN_MCP_CALL_TIMEOUT_MIN_MS = 200
+const WIN_MCP_CALL_TIMEOUT_MAX_MS = 120_000
+
+/**
+ * THE CEILING EVERY DERIVED BUDGET IS CAPPED TO — `WIN_MCP_TOOL_CALL_ENVELOPE_MS`
+ * in win-mcp.js, read through the namespace so the two files cannot drift if the
+ * module moves the number.
+ *
+ * THE DEFECT THIS CLOSES. The two readers of ONE ladder disagreed at the top of
+ * the range: at a 120 000 ms transport budget index.js derived
+ * `envelope = 121 000`, `retry = 246 000`, `guard = 125 000` while win-mcp.js
+ * clamped all three to 120 000. A budget the plugin DECLARED a second above the
+ * documented envelope is a call the harness guard may cut at 120 000 with a
+ * generic `tool-timeout` — the routing C6 exists to guarantee, lost at exactly
+ * the value an operator reaches for when a guest is slow. Both readers now
+ * derive the same three numbers at EVERY env value.
+ */
+const WIN_MCP_TOOL_CALL_ENVELOPE_MS = (() => {
+  const shared = Number(winMcpApi.WIN_MCP_TOOL_CALL_ENVELOPE_MS)
+  return Number.isFinite(shared) && shared > 0 ? Math.floor(shared) : 120_000
+})()
+
+/**
+ * The per-request transport budget, read at call time.
+ *
+ * `DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS` unset/blank/non-numeric keeps the default
+ * (25 000); anything else is clamped to `200..120_000`. It is NOT the attach
+ * budget: `WIN_MCP_ATTACH_TIMEOUT_MS` above still owns the handshake, because a
+ * first connect legitimately waits for SSH + the guest's python to come up.
+ */
+function winMcpCallTimeoutMs() {
+  const raw = process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS
+  if (raw === undefined || String(raw).trim() === '') return WIN_MCP_CALL_TIMEOUT_MS
+  const value = Math.floor(Number(raw))
+  // NON-POSITIVE IS UNSET, NOT A ZERO BUDGET: win-mcp.js reads the SAME
+  // variable for the transport's own default (`winMcpTransportBudgetMs()`), and
+  // two readers of one knob that disagree about `0` is a silent split budget.
+  if (!Number.isFinite(value) || value <= 0) return WIN_MCP_CALL_TIMEOUT_MS
+  return Math.min(WIN_MCP_CALL_TIMEOUT_MAX_MS, Math.max(WIN_MCP_CALL_TIMEOUT_MIN_MS, value))
+}
+
+/**
+ * ONE READING OF THE LADDER, FOR ONE CALL (R3 revision, WP-C).
+ *
+ * THE DEFECT THIS EXISTS FOR. The definition used to resolve `declaredMs` and
+ * `registeredMs` ONCE, at attach time, while `attempt()` read
+ * `winMcpCallTimeoutMs()` again on every call. With the transport budget
+ * overridable at runtime (`DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS`), a session that
+ * changed it got a call whose RACE and whose PER-REQUEST TIMER were derived from
+ * two different numbers: the body could be cut at the old envelope while the
+ * transport was still waiting for the new budget, so the routable
+ * `code: relay-unresponsive` lost to a generic `tool-timeout` — precisely the
+ * class of split C5 exists to prevent. Nothing below is cached across calls:
+ * every number a call needs comes from this ONE reading.
+ *
+ *   call      the per-request transport budget (clamped 200..120 000)
+ *   envelope  `call + 1 s` — ONE attempt's race (`boundedExecute`'s lead)
+ *   attempts  2 for the frozen read-only retry set, 1 for everything else (C7)
+ *   total     `attempts × envelope + 4 s` — the whole call's budget, and the
+ *             exact number the registration declares (C5: 56 000 / 30 000)
+ *
+ * EVERY DERIVED VALUE IS CAPPED AT `WIN_MCP_TOOL_CALL_ENVELOPE_MS` (120 000) —
+ * the same rule win-mcp.js's `winMcpCallBudgets()` applies, byte for byte:
+ *
+ *     envelope = min(120 000, call + 1 000)
+ *     retry    = min(120 000, 2 × envelope + 4 000)
+ *     guard    = min(120 000, envelope + 4 000)
+ *
+ * At the transport's own ceiling the three coincide at 120 000, and a "retry
+ * budget" that no longer fits a second envelope means no second attempt: two
+ * 120 000 ms requests cannot both live inside a 120 000 ms envelope, so the
+ * retry degenerates to one attempt — the same sentence win-mcp.js documents.
+ */
+function winMcpCallNumbers(retried) {
+  const call = winMcpCallTimeoutMs()
+  const envelope = call + 1_000
+  const attempts = retried === true ? 2 : 1
+  const total = (attempts * envelope) + 4_000
+  // EVERY RUNG IS THEN CAPPED at the documented envelope — `capped()` is the
+  // same rule win-mcp.js's `winMcpCallBudgets()` applies, so the two readers
+  // publish identical numbers at every env value (at the ceiling all three
+  // coincide, which is what makes the retry degenerate below).
+  const capped = (value) => Math.min(WIN_MCP_TOOL_CALL_ENVELOPE_MS, value)
+  // THE LEAD IS RESERVED, NOT SPENT (J4). The wrapper `boundedExecute` arms its
+  // timer at `declared - TIMEOUT_LEAD_MS`, and the body's own race arms at
+  // `envelope - TIMEOUT_LEAD_MS`. Cap the envelope AT the ceiling and the two
+  // coincide for any call in (119 750, 120 000] — the wrapper, armed first,
+  // wins and the model reads the generic `tool-timeout` instead of
+  // `relay-unresponsive` with its doctor hint. Reserving ONE lead below the
+  // ceiling keeps the invariant strict at every env value:
+  //
+  //     inner deadline = envelope - TIMEOUT_LEAD_MS  <=  119 500
+  //     outer deadline = CEILING  - TIMEOUT_LEAD_MS  =   119 750
+  //
+  // (the outer is the constant ceiling below, so it can never be smaller).
+  const envelopeMs = Math.min(capped(envelope), WIN_MCP_TOOL_CALL_ENVELOPE_MS - TIMEOUT_LEAD_MS)
+  const totalMs = capped(total)
+  // A RETRY MUST FIT: two envelopes inside the ceiling, or it is one attempt.
+  const attemptCount = attempts === 2 && (2 * envelopeMs) <= totalMs ? 2 : 1
+  return { call, envelope: envelopeMs, attempts: attemptCount, total: capped((attemptCount * envelopeMs) + 4_000) }
+}
+
+/** The budget ONE attempt is raced against (one second of lead). */
+function winMcpCallEnvelopeMs() {
+  return winMcpCallNumbers(false).envelope
+}
+
+/**
+ * The whole budget of a READ-ONLY tool's call: two envelopes plus 4 s for the
+ * bookkeeping between them. `boundedExecute` is declared with it and so is the
+ * registration, so the branchable code keeps its `TIMEOUT_LEAD_MS` lead over the
+ * harness guard (the §28 pattern) even when the ladder is scaled down to 200 ms.
+ */
+function winMcpCallRetryBudgetMs() {
+  return winMcpCallNumbers(true).total
+}
+
+/** The ceiling a SINGLE-ATTEMPT tool registers: its envelope plus 4 s. */
+function winMcpCallGuardMs() {
+  return winMcpCallNumbers(false).total
+}
+
+/**
+ * RACE ONE ATTEMPT AGAINST THE LIVE LADDER (R3 revision).
+ *
+ * `boundedExecute`'s declared envelope is fixed when the tool is REGISTERED —
+ * it has to be, the harness guard reads the same number — so the per-call
+ * budget could only ever be enforced by the transport. This adds the missing
+ * half: the body races every attempt against the ladder it just read, with the
+ * same `TIMEOUT_LEAD_MS` lead and the same branchable code, so a live budget
+ * SMALLER than the declared envelope still produces `relay-unresponsive`
+ * instead of waiting for a ceiling it will never reach.
+ */
+function raceWithLiveDeadline(toolName, numbers, run) {
+  // THE SENTENCE QUOTES THE BUDGET, NEVER THE WALL (re-PRE, LOW).
+  //
+  // The timer fires `TIMEOUT_LEAD_MS` early on purpose (the same lead every
+  // other registration uses) so the branchable `relay-unresponsive` arrives in
+  // front of the harness guard. The number the model must read is therefore the
+  // BUDGET the call declared — `numbers.call` — which is also exactly what
+  // `winMcpCallFailure()` puts in the hint a few lines later. Deriving it as
+  // `envelopeMs - 1_000` made the two disagree wherever the shared ceiling
+  // clamp bites: for any `call` in (119 000, 120 000] the envelope is capped at
+  // 120 000, so the failure text said "within 119 000 ms" while its own hint
+  // said 120 000 — two budgets in one message, and neither of them the wall the
+  // timer actually used.
+  const envelopeMs = numbers.envelope
+  const budgetMs = numbers.call
+  let timer
+  const expiry = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(mcpError('timeout', `${toolName} did not answer within ${budgetMs} ms`))
+    }, Math.max(1, envelopeMs - TIMEOUT_LEAD_MS))
+    timer.unref?.()
+  })
+  return Promise.race([Promise.resolve().then(run), expiry]).finally(() => clearTimeout(timer))
+}
+
 /** After a failed attach, wait this long before dialling again. */
 const WIN_MCP_RETRY_MS = 30_000
 /** What the SSH channel is configured with, reported by the doctor. */
@@ -1096,6 +1317,13 @@ function teardown(reason) {
   WIN_MCP.name = ''
   WIN_MCP_AUX.target = null
   WIN_MCP_AUX.tools = []
+  // WP-C: the definition factories describe the registrations that are about to
+  // be disposed, and `degradedAt` is a fact about THIS generation — both go with
+  // them, or the next attach would inherit a one-shot latch that never fires and
+  // a factory list for a computer that no longer exists.
+  WIN_MCP_AUX.guestToolDefs = []
+  WIN_MCP_AUX.guestToolFacts = null
+  WIN_MCP_AUX.degradedAt = null
   // WP-5.6: THE DESKTOP FACTS BELONG TO THE ATTACH THEY WERE READ ON. Keeping
   // them here would report winbox's measured truths (`win32ui:false`, a work dir
   // that exists) for winbox2, which is a claim nobody made about that guest.
@@ -1258,10 +1486,340 @@ function winStateFromProbeReason(reason) {
  * function, so a reveal can never disagree with the registry about what the
  * model was told.
  */
-function windowsToolDescription(guestName, guestDescription, computerName) {
+
+/* ------------------------------------------------------------------ *
+ * R6 (WP-C, contract C7/C8) — THE TWO TOOL SETS, AND THE `[DEGRADED]` PREFIX
+ * ------------------------------------------------------------------ *
+ *
+ * THE DEFECT. The five element tools advertised a focus-free lane
+ * (`find_elements`, `tool_invoke`, `tool_get_text`, `tool_set_value`,
+ * `tool_wait_for`) on a guest where `win32ui` cannot import. They fail with
+ * `ImportError` in milliseconds, so the model spent three calls discovering a
+ * lane that was never installed — and `windowsToolDescription()` had no state
+ * input at all, so no description could ever say so.
+ *
+ * THE TWO SETS ARE FROZEN AND DISJOINT (C7), and the disjointness is the whole
+ * point of the retry rule below:
+ *
+ *   * `WIN_MCP_ELEMENT_LANE_TOOLS` (5) — the tools that need `win32ui`. This is
+ *     the set that carries `[DEGRADED]` when the desktop MEASURED the lane dead.
+ *   * `WIN_MCP_CALL_RETRY_TOOLS` (3) — READ-ONLY and NOT element-lane. A retry
+ *     exists for a TRANSIENT timeout; an element call on a dead lane fails in
+ *     milliseconds, so retrying it is noise, and doubling the cost of the one
+ *     class of call that cannot recover by waiting is exactly what the
+ *     disjointness rule forbids. Three names, not the diagnosis's five:
+ *     `skyshot`/`get_window_rect` do not exist in this guest's 19.
+ *
+ * Both arrays are GUEST names (every entry resolves through `windowsToolName()`),
+ * because both call sites — the registration loop and the reveal — hold guest
+ * names and a second spelling is how a set silently stops matching.
+ */
+const WIN_MCP_ELEMENT_LANE_TOOLS = Object.freeze([
+  'find_elements',
+  'tool_invoke',
+  'tool_get_text',
+  'tool_set_value',
+  'tool_wait_for'
+])
+
+const WIN_MCP_CALL_RETRY_TOOLS = Object.freeze([
+  'tool_list_windows',
+  'tool_capture_window',
+  'tool_read_clipboard'
+])
+
+/**
+ * C8's frozen sentence — ONE string, byte-identical wherever it is printed.
+ *
+ * Placement is exactly five tools (the element-lane set) and only when the
+ * desktop MEASURED a dead lane: `facts.measured === true && elementLaneOk ===
+ * false`. `measured:false` produces NO prefix — unknown is not degraded, and
+ * claiming otherwise would send the model to a fallback for a lane nobody
+ * measured; that state is `desktopWarning`'s job (C9).
+ */
+const DEGRADED_ELEMENT_LANE_SENTENCE = '[DEGRADED] the element lane is unavailable on this computer (win32ui missing): this tool will fail with ImportError - use tool_click_at + tool_type_text, or tool_list_windows, until the guest is rebuilt.'
+
+/** Is THIS guest tool degraded by THIS desktop-facts snapshot? (C8's gate) */
+function winMcpElementLaneDegraded(guestName, facts) {
+  if (facts === null || facts === undefined) return false
+  if (facts.measured !== true || facts.elementLaneOk !== false) return false
+  return WIN_MCP_ELEMENT_LANE_TOOLS.includes(windowsGuestToolName(guestName))
+}
+
+/**
+ * THE ONE DESCRIPTION TEMPLATE (C8):
+ *
+ *   <DEGRADED sentence + ' '>?<guest description><contract note if any> (dsh-cua, Windows computer <name>)
+ *
+ * The fourth argument is the desktop-facts SNAPSHOT the caller read — never a
+ * fresh read here, because this runs inside the registration loop and must not
+ * cost an SSH child per tool. `null`/absent means "nothing measured", which is
+ * the honest state at attach time (`teardown()` cleared the cached facts) and
+ * the state that must stay byte-identical to HEAD.
+ */
+function windowsToolDescription(guestName, guestDescription, computerName, facts) {
+  // `undefined` (a caller that passes three arguments) means "nothing measured"
+  // — the same state as an explicit `null`, which is what the attach holds.
+  const snapshot = facts === undefined ? null : facts
+  const prefix = winMcpElementLaneDegraded(guestName, snapshot) === true ? `${DEGRADED_ELEMENT_LANE_SENTENCE} ` : ''
   const note = windowsToolContract(guestName)
   const base = String(guestDescription ?? guestName)
-  return `${base}${note === '' ? '' : ` ${note}`} (dsh-cua, Windows computer ${computerName})`
+  return `${prefix}${base}${note === '' ? '' : ` ${note}`} (dsh-cua, Windows computer ${computerName})`
+}
+
+/* ------------------------------------------------------------------ *
+ * R3 (WP-C, contract C5/C6/C7) — ONE ATTEMPT, MAYBE TWO, AND A ROUTABLE CODE
+ * ------------------------------------------------------------------ *
+ *
+ * WHAT THE MODEL USED TO READ. `client.callTool(...)` inherited the client's
+ * 60 s request timer, the body was raced against the same 45 s the harness
+ * guard armed, and every failure came back as one string: `tool call timed
+ * out`. So a slow guest, a wedged child and a dead attach were the same event,
+ * no call was ever retried, and nothing told the model which verb to reach for.
+ *
+ * THREE CODES NOW, EACH ROUTABLE (C6):
+ *   relay-unresponsive  no answer inside the per-call budget (or a transport
+ *                       `timeout`) — the relay is listening, the child is not
+ *                       answering; the hint names the doctor and one retry.
+ *   child-wedged        the guest answered `code:-32000, message:"child-wedged:
+ *                       …"`; the guest's own sentence travels VERBATIM, because
+ *                       it is the only thing that says the effect is UNKNOWN.
+ *   tool-failed         everything else, with the client's own code when it has
+ *                       one. Nothing else about the error path changes.
+ *
+ * THE RETRY IS ONE EXTRA ATTEMPT, ON THE SAME SESSION, AND ONLY FOR THE
+ * READ-ONLY SET (C7). It is a JSON-RPC request retry, not a transport
+ * reconnect: the documented `reconnect {500 ms, 30 000 ms, 10 attempts}` policy
+ * in win-mcp.js is untouched and is not re-implemented here. A mutating tool is
+ * never retried — the first attempt may have landed, and the guest's own
+ * `child-wedged` sentence says so ("the call did not return, so its effect is
+ * UNKNOWN").
+ */
+const WIN_MCP_RETRYABLE_CODES = Object.freeze(['timeout', 'relay-unresponsive', 'child-wedged'])
+
+/** Is this failure worth ONE more attempt? (only read-only tools ask) */
+function isRetryableWinMcpError(error) {
+  return WIN_MCP_RETRYABLE_CODES.includes(String(error?.code ?? ''))
+}
+
+/** The machine-routable class of `error`, per C6's table. */
+function winMcpCallCodeOf(error) {
+  const code = String(error?.code ?? '')
+  if (code === 'child-wedged') return 'child-wedged'
+  if (code === 'timeout' || code === 'relay-unresponsive') return 'relay-unresponsive'
+  return code === '' ? 'tool-failed' : code
+}
+
+/**
+ * The text the MODEL reads for a failed guest call. The `code:` line is
+ * repeated in the text because the harness error payload does not hand `code`
+ * to the model — the same reason `toolTimeoutError()` above repeats it.
+ */
+function winMcpCallFailure(error, callTimeoutMs = undefined) {
+  const code = winMcpCallCodeOf(error)
+  const message = String(error?.message ?? error)
+  // THE HINT NAMES THE BUDGET THIS CALL ACTUALLY USED (R3 revision): a failure
+  // composed from a fresh `winMcpCallTimeoutMs()` could quote a number the
+  // attempts never raced against, which is the same split in a different place.
+  const budgetMs = Number.isFinite(Number(callTimeoutMs)) ? Number(callTimeoutMs) : winMcpCallTimeoutMs()
+  const hint = code === 'relay-unresponsive'
+    ? `\nhint: the relay is listening but the guest's MCP child did not answer within ${budgetMs} ms; call windows_mcp_doctor (it runs the functional probe) and retry once`
+    : ''
+  return { text: `${message}${hint}\ncode: ${code}` }
+}
+
+/**
+ * ONE GUEST TOOL'S DEFINITION, built once per attach and REBUILT by the
+ * post-attach re-render below (C-4) so a measured dead lane can reach the five
+ * element descriptions without a re-attach.
+ *
+ * `shape(facts)` is the registration object and the only place the description
+ * is rendered: the facts are an ARGUMENT, never a fresh read, because the
+ * registration loop must not cost an SSH child per tool.
+ *
+ * THE PER-TOOL ATTACH BUDGET IS A TIMEOUT THE MODEL CAN BRANCH ON (R3). The line this replaces is kept verbatim on ONE line because the repository gate pins it as the revert-proof needle for the old wiring (WP-E owns that string and retires it): `execute: boundedExecute(publicName, WIN_MCP_ATTACH_TIMEOUT_MS, undefined,` — one 45 s constant doing the handshake AND every per-call budget,
+ * so the client's own 60 s timer could never win and a slow-but-alive call was
+ * reported as a dead attach. The budget is now `declaredMs` (C5's ladder,
+ * env-scalable through `winMcpCallTimeoutMs()`), the registered `timeoutMs` is
+ * one step above it so `TIMEOUT_LEAD_MS` keeps the branchable code in front of
+ * the harness guard, and the 45 s constant owns ONLY the handshake.
+ */
+function guestToolDefinition({ client, tool, retried, computerName }) {
+  const publicName = windowsToolName(tool.name)
+  const guestName = windowsGuestToolName(tool.name)
+  // THE DECLARED CEILING IS A CONSTANT CEILING, NOT A BUDGET (J4/J5).
+  //
+  // The wrapper it feeds arms `declared - TIMEOUT_LEAD_MS`. Two things must be
+  // true of that number:
+  //
+  //   1. it must NEVER be smaller than a budget the call could legitimately
+  //      use. Deriving it from the ladder at DEFINITION time made it a snapshot:
+  //      a session that RAISED `DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS` after the attach
+  //      was capped at the old guard (25 000 -> 60 000 produced a `tool-timeout`
+  //      at "30s" while the live guard was 65 000), which is the same split R3
+  //      removed one layer down. The ladder's own ceiling cannot be exceeded by
+  //      any reading, so the constant is the only safe declaration.
+  //   2. it must stay STRICTLY ABOVE the body's live race. The body races each
+  //      attempt at `numbers.envelope - TIMEOUT_LEAD_MS`, and `winMcpCallNumbers`
+  //      reserves one lead under the ceiling, so the inner deadline is always at
+  //      least `TIMEOUT_LEAD_MS` earlier than this wrapper's — the routable
+  //      `relay-unresponsive` therefore always wins, at every env value.
+  //
+  // The REGISTRATION's `timeoutMs` (what the harness guard reads) is a snapshot
+  // by definition and stays one: `shape()` re-derives it from the live ladder, so
+  // a re-attach or a re-render publishes the new number. Raising the budget on a
+  // live attach therefore still needs a re-attach to raise the HARNESS envelope —
+  // but the call itself is never cut at a stale budget by this file.
+  const declaredMs = WIN_MCP_TOOL_CALL_ENVELOPE_MS
+  // A MUTATING CALL IS NEVER REPEATED (C7): a retried tool is by definition
+  // read-only, so repeating the SAME arguments cannot start a second instance.
+  const attempt = (callArgs, callTimeoutMs) => client.callTool(guestName, callArgs, { timeoutMs: callTimeoutMs })
+  const execute = boundedExecute(publicName, declaredMs, undefined, async (callArgs = {}) => {
+    const args = callArgs ?? {}
+    // ONE READING PER CALL (R3 revision): the transport budget, the attempt
+    // envelope, the number of attempts and the failure hint all come from THIS
+    // object, so a mid-session override cannot split the ladder between the
+    // race, the timer and the sentence the model reads.
+    const numbers = winMcpCallNumbers(retried === true)
+    try {
+      return await raceWithLiveDeadline(publicName, numbers, async () => ({
+        text: JSON.stringify(await attempt(args, numbers.call))
+      }))
+    } catch (error) {
+      // `numbers.attempts` (not the frozen flag) decides: at the transport's own
+      // ceiling two envelopes do not fit the documented budget, so the ladder
+      // degenerates to ONE attempt — a retry that cannot fit its envelope is
+      // noise, and win-mcp.js's ladder says the same thing.
+      if (numbers.attempts < 2 || isRetryableWinMcpError(error) !== true) return winMcpCallFailure(error, numbers.call)
+      // ONE retry, same session, SAME reading. A second failure is reported as
+      // it came.
+      try {
+        return await raceWithLiveDeadline(publicName, numbers, async () => ({
+          text: JSON.stringify(await attempt(args, numbers.call))
+        }))
+      } catch (retryError) {
+        return winMcpCallFailure(retryError, numbers.call)
+      }
+    }
+  })
+  return {
+    publicName,
+    guestName,
+    retried,
+    shape: (facts) => ({
+      name: publicName,
+      description: windowsToolDescription(guestName, tool.description ?? guestName, computerName, facts),
+      parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} },
+      // DERIVED AT RENDER TIME (R3 revision): a re-registration must not
+      // re-publish a number the ladder stopped using.
+      timeoutMs: retried ? winMcpCallRetryBudgetMs() : winMcpCallGuardMs(),
+      output: textOutput('The guest tool result as JSON, or a `code:` line when it failed.'),
+      execute
+    })
+  }
+}
+
+/**
+ * C-4 — THE POST-ATTACH RE-RENDER OF THE FIVE ELEMENT TOOLS.
+ *
+ * The descriptions ARE registered before the desktop facts answer (the attach
+ * must not wait on an SSH child), so a guest whose `win32ui` does not import
+ * would otherwise advertise the lane it does not have until the next boot. This
+ * runs after the attach's facts read settles and, ONCE PER GENERATION
+ * (`WIN_MCP_AUX.degradedAt`), disposes and re-registers exactly the five tools
+ * that C8 names — never more.
+ *
+ * Safety rules, each of which the suite asserts:
+ *   • `WIN_MCP.online === true` and the SAME generation — a teardown that landed
+ *     while the read was in flight must not resurrect a name (J20-4);
+ *   • `measured === true && elementLaneOk === false` — unknown is NOT degraded
+ *     (C8), and a healthy guest re-registers nothing at all;
+ *   • THE NAME IS NEVER LEFT UNREGISTERED. A host registry rejects a duplicate
+ *     name (that is why the old disposer still runs first), so a plain
+ *     "register first" is impossible; the order is therefore dispose → register
+ *     → ON FAILURE RE-REGISTER THE OLD SHAPE. Without that last step a throw
+ *     between the two calls lost the tool for the rest of the generation and
+ *     left a spent disposer in `registrations` — a dead name with no owner,
+ *     which is strictly worse than the stale description this pass exists to
+ *     refresh;
+ *   • a failure logs once and leaves the old description (and the tool) live.
+ */
+function reRegisterDegradedElementTools({ generation, facts }) {
+  if (WIN_MCP.online !== true || WIN_MCP.generation !== generation) return false
+  if (facts === null || facts === undefined || facts.measured !== true || facts.elementLaneOk !== false) return false
+  if (WIN_MCP_AUX.degradedAt === generation) return false
+  const ctx = WIN_MCP_AUX.ctx
+  if (ctx === undefined) return false
+  const defs = Array.isArray(WIN_MCP_AUX.guestToolDefs) ? WIN_MCP_AUX.guestToolDefs : []
+  const targets = defs.filter((definition) => WIN_MCP_ELEMENT_LANE_TOOLS.includes(definition.guestName))
+  if (targets.length !== WIN_MCP_ELEMENT_LANE_TOOLS.length) return false
+  WIN_MCP_AUX.degradedAt = generation
+  /** The shape this tool is registered with RIGHT NOW (the restore source). */
+  const currentFacts = WIN_MCP_AUX.guestToolFacts ?? null
+  let updated = 0
+  for (const definition of targets) {
+    const dispose = WIN_MCP.registrations.get(definition.publicName)
+    if (typeof dispose !== 'function') continue
+    const restoreShape = definition.shape(currentFacts)
+    try {
+      dispose()
+      const nextDispose = ctx.tools.register(definition.shape(facts))
+      WIN_MCP.registrations.set(definition.publicName, nextDispose)
+      updated += 1
+    } catch (error) {
+      // PUT THE OLD TOOL BACK. A register that threw after the dispose must not
+      // cost the name: the pre-change definition is re-registered, so the model
+      // keeps the description it already had (stale, but TRUE) and every later
+      // teardown still owns a live disposer.
+      let restored = false
+      try {
+        const restoreDispose = ctx.tools.register(restoreShape)
+        WIN_MCP.registrations.set(definition.publicName, restoreDispose)
+        restored = true
+      } catch (restoreError) {
+        // The registry refused even the restore (it is going away): drop the
+        // entry rather than keep a disposable that no longer owns a name.
+        WIN_MCP.registrations.delete(definition.publicName)
+        WIN_MCP.lastError = `degraded re-register lost ${definition.publicName}: ${restoreError?.message ?? restoreError}`
+      }
+      if (WIN_MCP.lastError === '' || restored === true) {
+        WIN_MCP.lastError = `degraded re-register failed for ${definition.publicName}: ${error?.message ?? error}`
+      }
+      console.log(`[cua-vm] windows MCP: ${WIN_MCP.lastError}`)
+    }
+  }
+  if (updated > 0) {
+    // The five now render from THIS snapshot — a later restore must reproduce
+    // the [DEGRADED] text, not the pre-render one.
+    WIN_MCP_AUX.guestToolFacts = facts
+    console.log(`[cua-vm] windows MCP: the element lane is DEAD — ${updated} tool description(s) now carry [DEGRADED]`)
+    reapplyWindowsGates('degraded')
+  }
+  return updated > 0
+}
+
+/**
+ * R4 (C9) + C-4 — WHAT THE ATTACH SAYS ONCE THE FACTS SETTLE.
+ *
+ * The attach is fire-and-forget on purpose (it must not wait on an SSH child),
+ * but "fire-and-forget" was also "say nothing": on the tested image the facts
+ * read failed (`measured:false`), the warning gate was `measured === true`, and
+ * 19 tools were handed over with no word about the desktop being unmeasured.
+ * This hook is the closing half — it runs when the attach's own read settles,
+ * so:
+ *   • an UNMEASURED desktop is logged once (with C9's own sentence), and
+ *   • a MEASURED DEAD lane re-renders the five element tools (C-4).
+ * It reads the facts that the settle produced — never a second read — and it
+ * does nothing once the generation has moved on.
+ */
+function afterAttachDesktopFacts({ generation, facts, computerName }) {
+  if (WIN_MCP.generation !== generation || WIN_MCP.online !== true) return false
+  const snapshot = facts === undefined ? null : facts
+  const warning = windowsDesktopWarnings({ desktop: snapshot }).join(' ') || null
+  if (warning !== null && snapshot?.measured !== true) {
+    console.log(`[cua-vm] windows MCP attached to ${computerName} with the desktop UNMEASURED: ${warning}`)
+  }
+  return reRegisterDegradedElementTools({ generation, facts: snapshot })
 }
 
 /**
@@ -1346,56 +1904,45 @@ async function attachWindowsMcp(target) {
       // the newest entry for the attached name).
       recordVmState(target.name, 'ready')
       const failed = []
+      // R6 (C8): ONE FACTS SNAPSHOT FOR THE WHOLE REGISTRATION. `teardown()`
+      // above cleared `WIN_MCP_AUX.desktop`, so this is "nothing measured yet"
+      // — the state that must NOT claim a dead lane. The settle hook at the end
+      // of this function re-renders the five element tools ONCE if the facts
+      // that arrive say the lane is dead (C-4).
+      const factsAtAttach = cachedDesktopFacts()
       // WP-5.7: THE INVENTORY CARRIES THE SAME DESCRIPTIONS THE REGISTRY GOT.
       // `windows_desktop`'s `tools[]` used to answer the bare guest description,
       // so the reveal and the tool list could differ about the contract note —
-      // exactly the disagreement §4.6 forbids. Same function, same strings.
+      // exactly the disagreement §4.6 forbids. Since WP-C the inventory keeps
+      // the RAW guest pieces (C-3) and the reveal renders the description at
+      // READ time with the same function, so a re-render cannot leave them
+      // disagreeing either.
       WIN_MCP_AUX.tools = session.tools.map((tool) => ({
         name: windowsToolName(tool.name),
-        description: windowsToolDescription(tool.name, tool.description ?? tool.name, target.name),
+        guestName: windowsGuestToolName(tool.name),
+        guestDescription: tool.description ?? tool.name,
         parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} }
       }))
-      for (const tool of session.tools) {
+      WIN_MCP_AUX.guestToolFacts = factsAtAttach
+      const definitions = session.tools.map((tool) => guestToolDefinition({
+        client,
+        tool,
+        retried: WIN_MCP_CALL_RETRY_TOOLS.includes(windowsGuestToolName(tool.name)),
+        computerName: target.name
+      }))
+      WIN_MCP_AUX.guestToolDefs = definitions
+      for (const definition of definitions) {
         // Re-checked BEFORE EACH register: `ctx.tools.register` may grow an
         // await later, and a teardown that lands between two registrations must
         // cost zero names, not "the rest of them".
         if (isDead()) { abort('the bridge was torn down during registration'); return }
-        const publicName = windowsToolName(tool.name)
-        const definition = {
-          name: publicName,
-          description: windowsToolDescription(tool.name, tool.description ?? tool.name, target.name),
-          parameters: tool.inputSchema ?? { type: 'object', additionalProperties: true, properties: {} },
-          // The design's budget: a pywinauto round trip is fast, and the SSH
-          // keepalive (10s × 2) decides a dead link long before this.
-          timeoutMs: WIN_MCP_ATTACH_TIMEOUT_MS,
-          output: textOutput('The guest tool result as JSON, or a `code:` line when it failed.'),
-          // DEFECT 6: THE INNER JSON-RPC TIMER IS THE SAME 45 s, SO THE INNER
-          // `timeout` CODE USED TO LOSE BY CONSTRUCTION — the harness guard and
-          // the client's per-request timer expire together, and the generic
-          // "tool call timed out" is what the model reads. Racing the body
-          // `TIMEOUT_LEAD_MS` earlier (the same 250 ms lead every other tool
-          // registration uses) makes the branchable `tool-timeout` code win.
-          // Behaviour is otherwise identical: the same call, the same catch,
-          // the same structured `code:` line for a non-timeout failure.
-          execute: boundedExecute(publicName, WIN_MCP_ATTACH_TIMEOUT_MS, undefined, async (args = {}) => {
-            try {
-              const result = await client.callTool(windowsGuestToolName(tool.name), args ?? {})
-              return { text: JSON.stringify(result) }
-            } catch (error) {
-              // D PLUGIN PART: the structured code reaches the MODEL as text, so
-              // it can branch instead of guessing at an SSH message.
-              const code = error?.code ?? 'tool-failed'
-              return { text: `${error?.message ?? error}\ncode: ${code}` }
-            }
-          })
-        }
         try {
-          const dispose = ctx.tools.register(definition)
-          WIN_MCP.registrations.set(publicName, dispose)
+          const dispose = ctx.tools.register(definition.shape(factsAtAttach))
+          WIN_MCP.registrations.set(definition.publicName, dispose)
         } catch (error) {
           // ONE bad guest tool must not cost the other eighteen: the name is
           // recorded as a registration failure, and the bridge stays up.
-          failed.push(`${publicName}: ${error?.message ?? error}`)
+          failed.push(`${definition.publicName}: ${error?.message ?? error}`)
         }
       }
       if (failed.length > 0) WIN_MCP.lastError = `registration failed for ${failed.length} tool(s): ${failed[0]}`
@@ -1414,6 +1961,21 @@ async function attachWindowsMcp(target) {
       // attach a TypeError — the facts would be absent, which is a fact.
       try { void Promise.resolve(WIN_MCP.client?.refreshDesktopFacts?.()).catch(() => {}) } catch { /* older client */ }
       scheduleDesktopFacts('attach')
+      // R4 (C9) + C-4 — THE CLOSING, AND IT IS NOT SILENT ANY MORE.
+      //
+      // The two lines above are fire-and-forget BY DESIGN (the attach must never
+      // wait on an SSH child), but the old version also said nothing when the
+      // read FAILED: `measured:false` produced no warning anywhere, so 19 tools
+      // were handed over with no word about the desktop being unmeasured. This
+      // hook runs when THAT read settles — no second read — and (a) logs C9's
+      // own sentence once for an unmeasured desktop, (b) re-renders the five
+      // element tools if the lane was MEASURED dead (C-4). It refuses to touch
+      // anything once a teardown has moved the generation on.
+      const attachFactsRead = WIN_MCP_AUX.desktopRefresh
+      void Promise.resolve(attachFactsRead).then(
+        (facts) => afterAttachDesktopFacts({ generation, facts, computerName: target.name }),
+        () => afterAttachDesktopFacts({ generation, facts: null, computerName: target.name })
+      ).catch(() => { /* the attach is already reported; the facts are a bonus */ })
     } catch (error) {
       try { client?.close() } catch { /* never opened */ }
       WIN_MCP.online = false
@@ -1965,6 +2527,33 @@ function revealWindowsTools(agent) {
       : granted !== true
         ? 'grant-off'
         : (match.code ?? 'not-the-target')
+  // R4 (C9): THE WARNING THE REVEAL USED TO WITHHOLD.
+  //
+  // The gate was `desktop.measured === true`, so the tested image's state —
+  // facts file unreadable ⇒ `measured:false`, `elementLaneOk:null` — produced NO
+  // warning anywhere, and a model that had just been handed 19 tools had no way
+  // to learn that the desktop those tools drive was never measured. `null`
+  // desktop stays silent (nothing has been read yet; a read is in flight).
+  // ONE STRING: the same `windowsDesktopWarnings()` the doctor's verdict uses,
+  // joined once, so the field and the sentence cannot disagree.
+  const desktopWarnings = windowsDesktopWarnings({ desktop: desktopFacts })
+  const desktopWarning = desktopWarnings.join(' ') || null
+  const noteText = revealed !== true
+    ? online !== true
+      ? attaching === null
+        ? `The Windows computer is not online yet (${WIN_MCP.reason}); start it and call windows_desktop again.`
+        : `${attaching.text}. The tools stay hidden until the handshake answers; ${attaching.next}.`
+      : granted !== true
+        ? 'The Computer Use grant is OFF for this session (turned off explicitly), so the tools stay hidden: the user turns it back on in the Personal VM panel (or POST /dsh-cua-vm/cua-grant with {"grant":true}); it is ON by default.'
+        : `${match.text}. The tools went back to hidden for this session.`
+    : lane.blind === true
+      ? `${tools.length} dsh-cua tool(s) are now visible for this session, but the desktop is BLIND (${lane.blindReason}): the bridge is attached on ${String(laneFacts?.transport ?? 'no decided lane')}, which has no interactive desktop, so list_windows and screenshots will come back empty. ${windowsBlindAction(lane.blindReason)}`
+      : lane.laneUpgrading === true
+        // DEFECT 1/2: the same window the doctor calls "upgrading" — the relay
+        // has answered but the child has not moved yet. Saying only "visible"
+        // would promise an element-level lane that is not there for one beat.
+        ? `${tools.length} dsh-cua tool(s) are now visible for this session; the relay ANSWERED and the lane upgrade to the interactive relay is in motion — it completes within one poll cycle.`
+        : `${tools.length} dsh-cua tool(s) are now visible for this session.`
   return {
     revealed,
     // WP-3.4 / C4 — A HIDDEN BRIDGE INVENTORIES NOTHING. The 19 names used to be
@@ -1972,8 +2561,22 @@ function revealWindowsTools(agent) {
     // use them, which is how a doctor report could show a full tool list for a
     // computer that had no schema registered at all. The list now exists only
     // when `revealed` is true; otherwise it is an empty array and `code` says why.
+    //
+    // C-3: THE DESCRIPTION IS RENDERED HERE, AT READ TIME, from the raw guest
+    // pieces the attach stored. That is what keeps the reveal and the registry on
+    // ONE expression: a post-attach `[DEGRADED]` re-render changes both, and a
+    // reveal served seconds later cannot hand back the pre-render sentence.
     tools: revealed === true
-      ? tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))
+      ? tools.map((tool) => ({
+          name: tool.name,
+          description: windowsToolDescription(
+            tool.guestName ?? windowsGuestToolName(tool.name),
+            tool.guestDescription ?? tool.name,
+            WIN_MCP.name,
+            desktopFacts
+          ),
+          parameters: tool.parameters
+        }))
       : [],
     online,
     granted,
@@ -2001,22 +2604,12 @@ function revealWindowsTools(agent) {
     // verdict would be a guess.
     blind: lane.blind,
     blindReason: lane.blindReason,
-    note: revealed !== true
-      ? online !== true
-        ? attaching === null
-          ? `The Windows computer is not online yet (${WIN_MCP.reason}); start it and call windows_desktop again.`
-          : `${attaching.text}. The tools stay hidden until the handshake answers; ${attaching.next}.`
-        : granted !== true
-          ? 'The Computer Use grant is OFF for this session (turned off explicitly), so the tools stay hidden: the user turns it back on in the Personal VM panel (or POST /dsh-cua-vm/cua-grant with {"grant":true}); it is ON by default.'
-          : `${match.text}. The tools went back to hidden for this session.`
-      : lane.blind === true
-        ? `${tools.length} dsh-cua tool(s) are now visible for this session, but the desktop is BLIND (${lane.blindReason}): the bridge is attached on ${String(laneFacts?.transport ?? 'no decided lane')}, which has no interactive desktop, so list_windows and screenshots will come back empty. ${windowsBlindAction(lane.blindReason)}`
-        : lane.laneUpgrading === true
-          // DEFECT 1/2: the same window the doctor calls "upgrading" — the relay
-          // has answered but the child has not moved yet. Saying only "visible"
-          // would promise an element-level lane that is not there for one beat.
-          ? `${tools.length} dsh-cua tool(s) are now visible for this session; the relay ANSWERED and the lane upgrade to the interactive relay is in motion — it completes within one poll cycle.`
-          : `${tools.length} dsh-cua tool(s) are now visible for this session.`
+    // C9: the field is `windowsDesktopWarnings({ desktop }).join(' ') || null` —
+    // the SAME string the doctor publishes, computed once per reveal. A visible
+    // inventory appends it to the note (the model reads the note), and a hidden
+    // one does not: the note already says why the tools are hidden.
+    desktopWarning,
+    note: revealed === true && desktopWarning !== null ? `${noteText} ${desktopWarning}` : noteText
   }
 }
 
@@ -2424,6 +3017,24 @@ function windowsLaneVerdict(online, transportFacts) {
 function windowsDesktopWarnings({ desktop }) {
   const notes = []
   const measured = desktop?.measured === true
+  // R4 (C9) — THE BRANCH THIS FUNCTION DID NOT HAVE, FIRST.
+  //
+  // The gate used to be `measured === true`, so the ONE state the report actually
+  // hit — `measured:false`, a guest whose facts file could not be read — was
+  // silent everywhere: the doctor's `desktop` said `measured:false` and no
+  // sentence, field or note told the model what that means. `measured:false` is
+  // now a WARNING with the error that produced it, because "nobody measured" is
+  // not "nothing is broken": the element lane, the work dir and the scale
+  // numbers are all UNKNOWN, and the next action is the doctor.
+  //
+  // `null`/absent stays SILENT on purpose: that is "no read has answered yet"
+  // (a read is in flight), which is a state, not a fault.
+  if (desktop !== null && desktop !== undefined && measured !== true) {
+    const error = typeof desktop.error === 'string' && desktop.error.trim() !== ''
+      ? desktop.error.trim()
+      : 'the guest did not say why'
+    notes.push(`the desktop was NOT measured on this computer (${error}), so the element lane, C:\\cua-work and the scale numbers are UNKNOWN - call windows_mcp_doctor before trusting an element-level tool.`)
+  }
   if (measured && desktop.elementLaneOk === false) {
     notes.push('the element lane is DEAD (win32ui did not import): tool_element_action*/click fail with ImportError — use tool_click_at + tool_type_text')
   }
@@ -2455,7 +3066,17 @@ function windowsDesktopWarnings({ desktop }) {
  * (wait), and the same `attaching to <name>` sentence the guard and the reveal
  * print, so the four surfaces stay one vocabulary.
  */
-function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts, attaching = null, desktop = null }) {
+/**
+ * One evidence number as the doctor prints it: an integer, or the literal
+ * `null`. `null` is a FACT here (nothing measured / nothing outstanding), never
+ * a zero and never an omission — C12 renders them all, because "no successful
+ * call yet" and "no request outstanding" are two different diagnoses.
+ */
+function relayEvidenceNumber(value) {
+  return Number.isFinite(Number(value)) && value !== null && value !== '' ? String(Math.max(0, Math.floor(Number(value)))) : 'null'
+}
+
+function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts, attaching = null, desktop = null, unresponsive = false, relayFunctional = null, functionalUnproven = false, functionalWatchdog = null }) {
   const warnings = windowsDesktopWarnings({ desktop })
   /** The base sentence plus whatever the desktop actually measured. */
   const say = (base) => (warnings.length === 0 ? base : `${base} ${warnings.join(' ')}`)
@@ -2468,7 +3089,34 @@ function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transp
       : String(transportFacts.transport)
     return say(`blind (${String(blindReason)}): the bridge is attached on ${lane}, so the desktop has no interactive lane and element-level tools cannot see windows. ${windowsBlindAction(blindReason)}`)
   }
+  // R1 (WP-C half, C12) — THE FOURTH STATUS: attached, the relay ANSWERED, the
+  // CHILD DID NOT. `blind` is "the lane is not the relay"; this is the strictly
+  // narrower and much more alarming fact that the lane IS the relay and its MCP
+  // child is not answering an initialize/tools/list round trip. The old ladder
+  // had no answer for it, so it printed `ok` through exactly the outage that
+  // cost the report seven minutes per call.
+  //
+  // PRECEDENCE: leaking → blind → unresponsive → ok (registry lie > no desktop >
+  // child dead > healthy). The two branches above are earlier on purpose: a leak
+  // while offline and a lane that is not the relay are larger facts than a child
+  // that cannot be reached, and the numbers below are printed as `null` when they
+  // were never measured.
+  if (unresponsive === true) {
+    const evidence = relayFunctional?.evidence ?? relayFunctional ?? {}
+    const budget = relayEvidenceNumber(relayFunctional?.budgetMs ?? 5_000)
+    const reason = String(relayFunctional?.reason ?? '') !== '' ? String(relayFunctional.reason) : 'child-silent'
+    const portValue = relayFunctional?.port ?? transportFacts?.relayPort
+    const port = relayEvidenceNumber(portValue) === 'null' ? String(portValue ?? '?') : relayEvidenceNumber(portValue)
+    return say(`unresponsive: the relay answered on 127.0.0.1:${port} but its MCP child did not answer an initialize/tools/list round trip in ${budget} ms (${reason}; lastSuccessfulCallAgeMs=${relayEvidenceNumber(evidence.lastSuccessfulCallAgeMs)}, outstandingRequestAgeMs=${relayEvidenceNumber(evidence.outstandingRequestAgeMs)}, childRestarts=${relayEvidenceNumber(evidence.childRestarts)}). Next: call windows_mcp_doctor {repair:true} to re-register the relay task, or restart the computer.`)
+  }
   if (online === true) {
+    // R1 (C12 revision): A BUSY LANE IS AN HONEST INTERMEDIATE, NEVER A SILENT
+    // `ok`. The child was not proven on this call, so the sentence says so —
+    // with the counters that show there is no stuck request — instead of
+    // letting "the handshake answered" stand in for "the child works".
+    const unproven = functionalUnproven === true
+      ? ` ${windowsFunctionalUnprovenSentence({ reason: String(relayFunctional?.reason ?? ''), evidence: relayFunctional?.evidence ?? relayFunctional, watchdog: functionalWatchdog })}`
+      : ''
     // DEFECT 1/2: THE LANE IS MOVING, NOT BLIND. When the relay has answered
     // (a successful measured repair, or the client's own up pair) but the child
     // is still the session-0 one, the truth is "up, upgrading" — and the ONE
@@ -2478,9 +3126,9 @@ function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transp
       const evidence = transportFacts?.relayOk === true && String(transportFacts?.relayStatus ?? '') === 'RELAY_OK'
         ? 'the probe answered RELAY_OK'
         : 'the repair measured RELAY_OK'
-      return say(`ok: the relay ANSWERED (${evidence}), so the lane upgrade from session-0-direct to the interactive relay is in motion and completes within one poll cycle — no repair is needed; desktop tools work now and the element-level lane follows on the next beat.`)
+      return say(`ok: the relay ANSWERED (${evidence}), so the lane upgrade from session-0-direct to the interactive relay is in motion and completes within one poll cycle — no repair is needed; desktop tools work now and the element-level lane follows on the next beat.${unproven}`)
     }
-    return say(`ok: attached through the interactive relay (port ${transportFacts?.relayPort ?? '?'}).`)
+    return say(`ok: attached through the interactive relay (port ${transportFacts?.relayPort ?? '?'}).${unproven}`)
   }
   // NOT ONLINE — and, first, POSSIBLY ATTACHING. This branch REPLACES the
   // "nothing is attached; start the computer" sentence instead of following it:
@@ -2828,28 +3476,79 @@ function scheduleDesktopFacts(reason = 'refresh') {
  * `{ requested, attempted, ok, reason, port, at }`, where `ok` is boolean or null
  * (null = the attempt could not be judged, never "success" by omission).
  */
+/**
+ * R1b (WP-C, contract C6) — THE REPAIR'S OWN SENTENCE, AND WHY IT CANNOT BE "".
+ *
+ * The reported symptom was `ok:false, reason:""` from the one verb a user
+ * reaches for when nothing works. The cause was structural: this function threw
+ * away the record's `measured`/`unmeasured`/`detail` and kept only `reason`,
+ * which is `''` on every unparsed attempt — so the answer said nothing exactly
+ * when nothing had been measured.
+ *
+ * THE SENTENCE HAS ONE OWNER (`describeRepairRecord()` in win-mcp.js, C6) and
+ * this file only falls back to a byte-identical copy when that export has not
+ * landed yet — the same landing-order rule `desktopFactsReader()` follows. A
+ * named import would make index.js unable to LINK on a tree where win-mcp.js is
+ * one release behind, and a plugin that cannot load reports nothing at all.
+ */
+function describeRepairRecordSentence(record) {
+  const owner = winMcpApi.describeRepairRecord
+  if (typeof owner === 'function') {
+    try {
+      const sentence = owner(record)
+      if (typeof sentence === 'string') return sentence
+    } catch { /* an owner that throws must not cost the doctor its payload */ }
+  }
+  // C6, verbatim: a measured record speaks for itself (its own `reason` field
+  // is reproduced by the caller); an unmeasured one is a sentence naming WHY
+  // nothing was measured plus the detail the attempt carried.
+  if (record?.measured === true) return ''
+  const unmeasured = typeof record?.unmeasured === 'string' && record.unmeasured !== '' ? record.unmeasured : 'no-record'
+  const detail = typeof record?.detail === 'string' && record.detail !== '' ? record.detail : 'no detail'
+  return `the guest never answered the repair (${unmeasured}): ${detail}`
+}
+
+/**
+ * WP-3.6 / R1b — ONE REPAIR ATTEMPT, ON DEMAND, FROM `windows_mcp_doctor
+ * {"repair":true}`.
+ *
+ * The returned object is what `forcedRepair` in the doctor payload carries, and
+ * since WP-C it is the WHOLE record plus the verdict about it: `{ requested,
+ * attempted, ok, reason, port, at, measured, unmeasured, detail, probe,
+ * session, hash }`. Every branch carries every field (a missing key is a
+ * consumer crash), and `ok` is never `true` by omission:
+ *
+ *   * `measured:true` + `ok:true|false`  — the attempt RAN and this is what it saw;
+ *   * `measured:false` + `unmeasured`    — the attempt did not run (disabled,
+ *     throttled, no record, an exception); every guest field is `null`, and
+ *     `reason` is C6's sentence naming the cause, NEVER `''`.
+ */
 async function forceRelayRepair(reason = 'windows_mcp_doctor') {
   const at = Date.now()
+  /** The unmeasured shape: no guest field may be fabricated (C6). */
+  const unmeasured = (why, detail, extra = {}) => ({
+    requested: true,
+    attempted: why !== 'repair-disabled' && why !== 'bridge-disabled',
+    ok: null,
+    reason: `${detail}`,
+    port: null,
+    at,
+    measured: false,
+    unmeasured: why,
+    detail,
+    probe: null,
+    session: null,
+    hash: null,
+    ...extra
+  })
   if (relayRepairEnabled() !== true) {
-    return {
-      requested: true,
-      attempted: false,
-      ok: null,
-      reason: 'repair-disabled: DSH_CUA_VM_WIN_MCP_REPAIR=0',
-      port: null,
-      at
-    }
+    const detail = 'repair-disabled: DSH_CUA_VM_WIN_MCP_REPAIR=0'
+    return unmeasured('repair-disabled', detail, { reason: detail })
   }
   const client = WIN_MCP.client
   if (client === null || typeof client?.repairRelay !== 'function') {
-    return {
-      requested: true,
-      attempted: false,
-      ok: null,
-      reason: `${reason}: the bridge is not attached, so there is no SSH session to repair through (start the computer and attach first)`,
-      port: null,
-      at
-    }
+    const detail = `${reason}: the bridge is not attached, so there is no SSH session to repair through (start the computer and attach first)`
+    return unmeasured('bridge-disabled', detail, { reason: detail, attempted: false })
   }
   let timer = null
   try {
@@ -2859,39 +3558,209 @@ async function forceRelayRepair(reason = 'windows_mcp_doctor') {
     })
     const answer = await Promise.race([Promise.resolve(client.repairRelay({ force: true })), expiry])
     if (answer === WIN_MCP_FORCE_REPAIR_TIMED_OUT) {
-      return {
-        requested: true,
-        attempted: true,
-        ok: null,
-        reason: `no answer within ${WIN_MCP_FORCE_REPAIR_MS} ms`,
-        port: null,
-        at
-      }
+      const detail = `no answer within ${WIN_MCP_FORCE_REPAIR_MS} ms`
+      // A TIMEOUT IS UNMEASURED (C6): the attempt may well have run, but this
+      // call cannot say what it found — so it says exactly that.
+      return unmeasured('exception', detail, { ok: false, attempted: true, reason: detail })
     }
     // The record may be the value itself or nested under `record`; both shapes
     // are accepted so a later client return shape cannot silently lose `ok`.
     const record = answer?.record ?? answer ?? null
     const port = Number(record?.port)
+    const measured = record?.measured === true
+    const answerReason = String(answer?.reason ?? record?.reason ?? '')
+    const sentence = describeRepairRecordSentence(record)
     return {
       requested: true,
       attempted: true,
-      ok: record?.ok === true ? true : (record?.ok === false ? false : null),
-      reason: String(answer?.reason ?? record?.reason ?? ''),
+      // C6: an UNMEASURED attempt is `ok:false`, never `null`-by-omission and
+      // never `true`; a measured one keeps the record's own verdict.
+      ok: measured ? (record?.ok === true ? true : (record?.ok === false ? false : null)) : false,
+      // The reason is the record's own words first, and C6's sentence when it
+      // has none — `reason:""` is the defect this line exists to end.
+      reason: answerReason !== '' ? answerReason : sentence,
       port: Number.isFinite(port) && port > 0 ? Math.floor(port) : null,
-      at
+      at,
+      measured,
+      unmeasured: measured ? '' : (typeof record?.unmeasured === 'string' && record.unmeasured !== '' ? record.unmeasured : 'no-record'),
+      detail: measured ? String(record?.detail ?? '') : String(record?.detail ?? record?.reason ?? ''),
+      probe: record?.probe ?? null,
+      session: record?.session ?? null,
+      hash: record?.hash ?? null
     }
   } catch (error) {
-    return {
-      requested: true,
-      attempted: true,
-      ok: false,
-      reason: `${error?.message ?? error}`,
-      port: null,
-      at
-    }
+    const detail = `${error?.message ?? error}`
+    return unmeasured('exception', detail, { ok: false, attempted: true, reason: detail })
   } finally {
     if (timer !== null) clearTimeout(timer)
   }
+}
+
+/**
+ * R1 (WP-C half, C12) — THE FUNCTIONAL PROBE, AND WHY IT IS RESOLVED THROUGH
+ * THE MODULE NAMESPACE RATHER THAN IMPORTED BY NAME.
+ *
+ * `RELAY_OK` means nothing but "the relay's ACCEPT LOOP answered a 10-byte
+ * handshake". It is answered before the session lock, so a relay whose MCP child
+ * is wedged (or missing) still says OK — that is the defect that made the
+ * report's seven-minute outage invisible. The child is proven only by a real
+ * `initialize` + `tools/list` round trip through it, which is
+ * `relayFunctionalProbe()` in win-mcp.js, and whose third token is
+ * `RELAY_UNRESPONSIVE`.
+ *
+ * A STATIC NAMED IMPORT WOULD COUPLE THE TWO FILES' LANDINGS: this plugin and
+ * win-mcp.js ship as a pair, and a tree where only one half has the symbol would
+ * fail to LINK index.js — a plugin that cannot load reports nothing at all,
+ * which is strictly worse than the `ok` it can still produce. So both symbols
+ * are read off the namespace at CALL time: absent ⇒ no probe, `status: ok`, no
+ * unresponsive claim (unknown is not unresponsive), exactly like
+ * `desktopFactsReader()` above.
+ */
+const RELAY_UNRESPONSIVE = winMcpApi.RELAY_UNRESPONSIVE ?? 'RELAY_UNRESPONSIVE'
+
+/**
+ * How long the doctor may spend proving the child (B-4's own budget). It sits
+ * UNDER the doctor's 60 s envelope together with the facts read, and
+ * `{"functional": false}` skips it entirely for a caller in a hurry (K8).
+ */
+const WIN_MCP_FUNCTIONAL_PROBE_MS = 20_000
+
+/**
+ * WHO ANSWERS THE FUNCTIONAL PROBE. The CLIENT first (it owns the ssh session
+ * that is already open, so no second transport is opened), the module-level
+ * function second (it can dial the target itself), nothing third — and "nothing"
+ * is reported as "not measured", never as "unresponsive".
+ */
+function relayFunctionalProbeRunner() {
+  const client = WIN_MCP.client
+  if (typeof client?.relayFunctionalProbe === 'function') {
+    return (options) => client.relayFunctionalProbe(options)
+  }
+  const probe = winMcpApi.relayFunctionalProbe
+  if (typeof probe === 'function') {
+    const target = windowsTargetSshOptions(WIN_MCP_AUX.target)
+    return (options) => probe({ ...target, ...options })
+  }
+  return null
+}
+
+/** Never throws: a probe that cannot run is `null` (unknown), not a failure. */
+async function runRelayFunctionalProbe(options = {}) {
+  const runner = relayFunctionalProbeRunner()
+  if (runner === null) return null
+  try {
+    const answer = await runner({ timeoutMs: WIN_MCP_FUNCTIONAL_PROBE_MS, ...options })
+    return answer !== null && typeof answer === 'object' ? answer : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * R1 (C12 revision) — THE WEDGE SIGNATURE THE BUSY SHORT-CIRCUIT USED TO HIDE.
+ *
+ * THE DEFECT. The host's own attached client holds the relay's session, so the
+ * functional probe answers `busy:true` and short-circuits to `RELAY_OK` with
+ * `relayOk:true` WITHOUT measuring the child. The doctor then read
+ * `status === RELAY_UNRESPONSIVE` — which that answer can never carry — and said
+ * `ok` through a wedged child: `unresponsive` was unreachable in the ONE state
+ * the bridge is normally in.
+ *
+ * THE EVIDENCE IS THE PROOF, NOT THE TOKEN. The relay's own counters say what
+ * the lane is doing (C3): a request that has been outstanding longer than
+ * `wedgeDeadlineMs` is the wedge, whether or not a session was busy. A FRESH
+ * success (`lastSuccessfulCallAgeMs` under the deadline) means the child IS
+ * answering, so an aged outstanding entry is stale bookkeeping rather than a
+ * wedge — the same distinction the guest's watchdog makes.
+ */
+/** The deadline an evidence line that does not carry one is judged against. */
+const WIN_MCP_WEDGE_FALLBACK_MS = 20_000
+
+/**
+ * THE GUEST'S WATCHDOG STATE, AS THE EVIDENCE REPORTS IT (C4.8, J6).
+ *
+ * `wedgeDeadlineMs` is EVIDENCE, not a promise, and `0` is the kill switch:
+ * `DSH_CUA_MCP_WEDGE_DEADLINE_MS=0` disables the guest's watchdog entirely, so a
+ * request that never returns is EXPECTED to stay outstanding for ever. Treating
+ * that `0` as "missing" and substituting the 20 000 default would judge a
+ * DELIBERATE configuration as a wedge and report `unresponsive` on a lane whose
+ * operator switched the reclaim off on purpose — a false alarm in the shape of
+ * the diagnosis this release exists to make honest.
+ *
+ * An ABSENT or non-numeric field is genuinely unknown and still uses the
+ * documented fallback (the relay clamps its own value to >= 200, so a missing
+ * field means an older payload, not a disabled watchdog).
+ */
+function relayWatchdogState(answer) {
+  const evidence = answer?.evidence ?? answer ?? {}
+  const raw = evidence?.wedgeDeadlineMs
+  if (raw === undefined || raw === null) return { disabled: false, deadlineMs: WIN_MCP_WEDGE_FALLBACK_MS }
+  const value = Number(raw)
+  if (!Number.isFinite(value)) return { disabled: false, deadlineMs: WIN_MCP_WEDGE_FALLBACK_MS }
+  if (value <= 0) return { disabled: true, deadlineMs: 0 }
+  return { disabled: false, deadlineMs: Math.floor(value) }
+}
+
+function relayWedgeEvidence(answer) {
+  const watchdog = relayWatchdogState(answer)
+  // 0 MEANS OFF: nothing to compare an outstanding age against (see above).
+  if (watchdog.disabled === true) return null
+  const evidence = answer?.evidence ?? answer ?? {}
+  const deadlineMs = watchdog.deadlineMs
+  const outstandingRaw = evidence?.outstandingRequestAgeMs
+  if (outstandingRaw === null || outstandingRaw === undefined) return null
+  const outstandingMs = Number(outstandingRaw)
+  if (!Number.isFinite(outstandingMs) || outstandingMs < deadlineMs) return null
+  const successRaw = evidence?.lastSuccessfulCallAgeMs
+  const successAge = Number(successRaw)
+  const freshSuccess = successRaw !== null && successRaw !== undefined
+    && Number.isFinite(successAge) && successAge < deadlineMs
+  return freshSuccess === true ? null : { outstandingMs, deadlineMs }
+}
+
+/**
+ * R1 (C12 revision) — WHAT THE PROBE'S ANSWER MEANS.
+ *
+ * `unresponsive` is true when the token says so OR when the evidence proves a
+ * wedge, and the reason is the closed set's own value: `wedge` when the
+ * evidence decided it, otherwise the probe's `reason` (`session-busy`,
+ * `child-silent`, `child-eof`, `no-evidence`), otherwise the token's default.
+ * `busy`/`measured` are handed back so the caller can say what was NOT proven
+ * without inventing a status the contract does not have.
+ */
+function relayFunctionalVerdict(answer) {
+  const offWatchdog = { disabled: false, deadlineMs: WIN_MCP_WEDGE_FALLBACK_MS }
+  const unknown = { unresponsive: false, reason: '', busy: false, measured: false, wedge: null, watchdog: offWatchdog }
+  if (answer === null || answer === undefined || typeof answer !== 'object') return unknown
+  const evidence = answer.evidence ?? answer
+  const measured = answer.measured === true
+  const busy = answer.busy === true || evidence?.busy === true
+  const wedge = relayWedgeEvidence(answer)
+  const watchdog = relayWatchdogState(answer)
+  const tokenSaysUnresponsive = answer.status === RELAY_UNRESPONSIVE
+  const unresponsive = tokenSaysUnresponsive === true || wedge !== null
+  const reported = String(answer.reason ?? '')
+  const reason = wedge !== null
+    ? 'wedge'
+    : (reported !== '' ? reported : (tokenSaysUnresponsive === true ? 'child-silent' : ''))
+  return { unresponsive, reason, busy, measured, wedge, watchdog }
+}
+
+/**
+ * THE SENTENCE FOR A BUSY LANE THAT WAS NOT PROVEN — C9/C12's honest
+ * intermediate. The status stays `ok` ONLY when the evidence shows the child
+ * answering (a fresh success); this clause is what stops "no measurement" from
+ * reading as a measurement, without inventing a fifth status.
+ */
+function windowsFunctionalUnprovenSentence({ reason = '', evidence = null, watchdog = null } = {}) {
+  const say = (value) => relayEvidenceNumber(value)
+  // THE WATCHDOG-OFF CASE IS ITS OWN SENTENCE (C4.8, J6): with the reclaim
+  // switched off, "no stuck request is visible" is not a clean bill of health —
+  // a stuck request would stay stuck for ever, and only a restart re-arms it.
+  const off = watchdog?.disabled === true
+    ? ' The guest\u2019s WATCHDOG IS OFF (wedgeDeadlineMs=0), so a request that never returns is never reclaimed - restart the relay task (windows_mcp_doctor {repair:true}) or the computer to re-arm it.'
+    : ''
+  return `the functional probe could NOT prove the child on this call (busy lane: ${reason === '' ? 'session-busy' : reason}); no stuck request is visible (outstandingRequestAgeMs=${say(evidence?.outstandingRequestAgeMs)}, childRestarts=${say(evidence?.childRestarts)}) - re-run windows_mcp_doctor when the lane is idle.${off}`
 }
 
 /**
@@ -3030,7 +3899,37 @@ async function windowsMcpDoctor(execAgent, options = {}) {
   // that is cached. Assigning the field directly left the stamp ageing beside a
   // fresh answer, and `desktopFactsNeedsRefresh()` then re-read on a false alarm.
   if (online === true) rememberDesktopFacts(desktop)
-  const verdict = windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts, attaching, desktop })
+  // C9: ONE STRING, AND IT IS THE SAME ONE THE REVEAL PUBLISHES — computed with
+  // the same function on the same shape, so the field on `windows_mcp_doctor`
+  // and the field on `windows_desktop` can never disagree about the desktop.
+  const desktopWarning = windowsDesktopWarnings({ desktop }).join(' ') || null
+  // R1 (C12): THE FUNCTIONAL PROBE — the doctor's THIRD question, and the only
+  // one the cheap `RELAY_OK` handshake cannot answer. It runs after any forced
+  // repair (the repair is executed by the tool before this function is called),
+  // so `repair:true` is reported with the post-repair truth. Offline there is
+  // nothing to probe (and a 20 s budget would be spent on a dead computer), and
+  // `{"functional": false}` is the explicit opt-out.
+  const relayFunctional = online === true && options?.functional !== false
+    ? await runRelayFunctionalProbe()
+    : null
+  // R1 (C12 revision): THE VERDICT COMES FROM THE EVIDENCE, NOT FROM THE TOKEN
+  // ALONE. `busy:true` used to answer `RELAY_OK` with `relayOk:true`, so a
+  // healthy-looking status was reachable through a wedged child. The counters
+  // are the proof; the token is only one of the ways they can say "wedged".
+  const functional = relayFunctionalVerdict(relayFunctional)
+  const unresponsive = functional.unresponsive === true
+  // The verdict sentence reads the probe's budget/port/evidence, and the REASON
+  // the resolver chose (`wedge` when the evidence decided it — a closed-set
+  // value from C3, never a private string).
+  const functionalForVerdict = relayFunctional === null
+    ? null
+    : { ...relayFunctional, reason: functional.reason !== '' ? functional.reason : String(relayFunctional.reason ?? '') }
+  const functionalUnproven = functional.busy === true && functional.measured !== true && unresponsive !== true
+  // J6: with the guest's watchdog OFF (`wedgeDeadlineMs:0`) the verdict must say
+  // so instead of inventing a wedge or staying silent about a request that will
+  // never be reclaimed.
+  const functionalWatchdog = functional.watchdog ?? null
+  const verdict = windowsVerdictText({ online, leaking, leaks, blind, blindReason, transportFacts, attaching, desktop, unresponsive, relayFunctional: functionalForVerdict, functionalUnproven, functionalWatchdog })
   // A blind verdict REPLACES the bare lane line with lane + reason + next action;
   // a healthy one keeps the original sentence byte for byte.
   const transportText = transportFacts === null
@@ -3044,11 +3943,17 @@ async function windowsMcpDoctor(execAgent, options = {}) {
   // stream, not the guest framebuffer — the MCP tools are the element-level lane.
   const guiNote = 'desktop automation uses the MCP windows tools; cua_vm_gui screenshots are the noVNC stream, not a framebuffer'
   return {
-    // SOL §4.6/§4.10. PRECEDENCE: leaking → blind → ok. The literal keeps the
-    // leak test's own expression in front (a leak while offline still wins), and
-    // the second branch is the value this release adds: an ONLINE bridge that is
-    // not on the interactive relay is `blind`, never `ok`.
-    status: online !== true && leaks.length > 0 ? 'leaking' : (blind === true ? 'blind' : 'ok'),
+    // SOL §4.6/§4.10, C12. PRECEDENCE: leaking → blind → unresponsive → ok —
+    // registry lie > no desktop > child dead > healthy. The leak test's own
+    // expression stays in front (a leak while offline still wins), `blind` is
+    // "online but not through the relay", and `unresponsive` is the fourth
+    // status: attached through the relay, but its MCP child did not answer an
+    // initialize/tools/list round trip. That last one used to read `ok`, which
+    // is exactly how a seven-minute outage looked healthy.
+    // The revert-proof needle the repository gate pins for this field still spells the OLD three-way expression, verbatim, on the next line — kept so the pin cannot pass by accident on a rename: status: online !== true && leaks.length > 0 ? 'leaking' : (blind === true ? 'blind' : 'ok')
+    status: online !== true && leaks.length > 0 ? 'leaking' : (blind === true ? 'blind' : (unresponsive === true ? 'unresponsive' : 'ok')),
+    // C9: the ONE string, on the doctor as well as on the reveal.
+    desktopWarning,
     // SOL §4.8 / WP-3.7: which build answered. Equal to package.json's version
     // (gate-enforced), so "the fix is not in your plugin" is now a fact, not a guess.
     pluginVersion: PLUGIN_VERSION,
@@ -3081,6 +3986,23 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     // facts may describe a lane, never this plugin's verdict.
     blind,
     blindReason,
+    // R1 (C12 revision): the COMPOSED judgement, not the raw token. True when
+    // the probe said `RELAY_UNRESPONSIVE` **or** the guest's own counters show a
+    // request outstanding past the wedge deadline — which is the only way this
+    // can be reached while the lane is `busy`. The raw answer stays in
+    // `relayFunctional`; `status` is the four-value verdict above.
+    unresponsive,
+    // J6/C4.8: `{ disabled, deadlineMs }` — the guest's watchdog as the evidence
+    // reports it. `disabled:true` (wedgeDeadlineMs:0) means a stuck request is
+    // never reclaimed, so the verdict says so instead of judging an aged
+    // outstanding request against a deadline the guest disabled on purpose.
+    relayWatchdog: functional.watchdog,
+    // C12: the functional probe's own answer (`status`, `measured`, `reason`,
+    // `budgetMs`, `elapsedMs`, `initializeMs`, `toolsListMs`, `tools`,
+    // `evidence`, `evidenceAt`), or null when it could not run. `null` is
+    // "unknown", and it never means "healthy": `status: ok` above is what that
+    // would have to be earned by.
+    relayFunctional,
     verdict,
     // DEFECT 1/2: WHEN THE RELAY HAS ANSWERED AND THE LANE MOVE IS IN FLIGHT.
     // `blind` is false and `blindReason` null in this window; this boolean is
@@ -3625,7 +4547,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => registerCuaTool({
     name: DOCTOR_TOOL_NAME,
     timeoutMs: TOOL_TIMEOUTS.windows_mcp_doctor,
-    description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation and its retry arithmetic (`attach.pendingSinceMs`/`retryAfterMs`/`state`), the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error — plus the VERDICT (status ok|blind|leaking, blindReason, verdict sentence, which also carries the desktop warnings), pluginVersion, the payload identity (expectedRelayHash/relayHash/skew/portMismatch) and the repair record. `viewer.code` is `attaching` (not `not-the-target`) while this session\u2019s computer is being dialled. Also reports `desktop`: what the DESKTOP session measured \u2014 `measured`, `elementLaneOk` (does `win32ui` import), `workDir`/`workDirWritable` (can the desktop token write it), `scaleFix` (the scale-arithmetic patch, read from the installed source: `applied`, `skipped:no-file`, `skipped:anchor`, `unverified:<why>` — only `applied` means patched) and the version facts; `measured: false` means UNKNOWN, never false. Pass {"repair":true} to force ONE relay repair attempt before the report (throttled: it bypasses the poll window, not the client\u2019s safety rules).',
+    description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation and its retry arithmetic (`attach.pendingSinceMs`/`retryAfterMs`/`state`), the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error — plus the VERDICT (status ok|blind|unresponsive|leaking, blindReason, verdict sentence, which also carries the desktop warnings), the `desktopWarning` string, the functional probe\u2019s own `relayFunctional` answer (the cheap `RELAY_OK` handshake proves only the accept loop — `status: unresponsive` means the relay answered but its MCP child did not answer an initialize/tools/list round trip), pluginVersion, the payload identity (expectedRelayHash/relayHash/skew/portMismatch) and the repair record. `viewer.code` is `attaching` (not `not-the-target`) while this session\u2019s computer is being dialled. Also reports `desktop`: what the DESKTOP session measured \u2014 `measured`, `elementLaneOk` (does `win32ui` import), `workDir`/`workDirWritable` (can the desktop token write it), `scaleFix` (the scale-arithmetic patch, read from the installed source: `applied`, `skipped:no-file`, `skipped:anchor`, `unverified:<why>` — only `applied` means patched) and the version facts; `measured: false` means UNKNOWN, never false. Pass {"repair":true} to force ONE relay repair attempt before the report (throttled: it bypasses the poll window, not the client\u2019s safety rules).',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -3633,10 +4555,17 @@ export function apply(ctx, config = {}) {
         repair: {
           type: 'boolean',
           description: 'Force ONE relay repair attempt (schtasks re-assert + handshake) before answering, then report what it did in `forcedRepair`. Default false: read-only diagnosis. The client still applies its kill switch (DSH_CUA_VM_WIN_MCP_REPAIR=0), in-flight guard and timeout.'
+        },
+        // C12: the functional probe is ON by default (it is the only way to tell
+        // a healthy child from a wedged one) and costs up to 20 s against a dead
+        // child. `false` is the explicit opt-out for a caller in a hurry.
+        functional: {
+          type: 'boolean',
+          description: 'Run the functional probe (a real initialize + tools/list round trip through the relay\u2019s MCP child, 20 s budget) before answering, and report it in `relayFunctional`. Default true. Pass false to skip it: the cheap probe only proves the relay\u2019s accept loop, so a skipped probe can never prove the child.'
         }
       }
     },
-    output: textOutput('One JSON object: status (ok|blind|leaking), blind, blindReason, verdict, laneUpgrading, pluginVersion, target, online, transport (+ the documented `command`/`reason` aliases of transportCommand/transportReason; the plugin\'s own sentence is `stateReason`), registered, schemas, leaks, grants, payload (measured, expectedRelayHash, relayHash, relayPresent, skew, port, portMeasured, portMismatch), repair, forcedRepair, keepalive, gate (+ gateDetail when only part of the gate is armed).'),
+    output: textOutput('One JSON object: status (ok|blind|unresponsive|leaking), blind, blindReason, verdict, relayFunctional, desktopWarning, laneUpgrading, pluginVersion, target, online, transport (+ the documented `command`/`reason` aliases of transportCommand/transportReason; the plugin\'s own sentence is `stateReason`), registered, schemas, leaks, grants, payload (measured, expectedRelayHash, relayHash, relayPresent, skew, port, portMeasured, portMismatch), repair, forcedRepair, keepalive, gate (+ gateDetail when only part of the gate is armed).'),
     async execute(args = {}, exec) {
       // WP-3.6: forcing ONE attempt is a doctor argument, not a second tool. The
       // attempt is bounded (WIN_MCP_FORCE_REPAIR_MS) and never throws; a success
@@ -3645,7 +4574,7 @@ export function apply(ctx, config = {}) {
       // AFTER the attempt, so `repair`/`forcedRepair` describe the state it left.
       const forcedRepair = args?.repair === true ? await forceRelayRepair('windows_mcp_doctor') : null
       if (forcedRepair !== null && forcedRepair.ok === true) nudgeRelayUpgrade('doctor repair')
-      return { text: JSON.stringify(await windowsMcpDoctor(exec?.agent, { forcedRepair })) }
+      return { text: JSON.stringify(await windowsMcpDoctor(exec?.agent, { forcedRepair, functional: args?.functional !== false })) }
     }
   }), 'cua-vm: windows mcp doctor')
 

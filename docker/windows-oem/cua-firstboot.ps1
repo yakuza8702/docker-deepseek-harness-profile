@@ -109,6 +109,13 @@ function Step([string]$name, [scriptblock]$body, [switch]$Always) {
   $previous = @($state.steps | Where-Object { $_.step -eq $name } | Select-Object -Last 1)
   $attempts = 1
   if ($previous.Count -gt 0 -and $previous[0].attempts) { $attempts = ([int]$previous[0].attempts) + 1 }
+  # A FAILING STEP MAY ALSO CARRY A FIELD, NOT ONLY A SENTENCE (R9/C14). The
+  # desktop-token probe has to leave `desktopProbe:'failed:<why>'` in the SAME row
+  # that carries ok:false - a reader QUERIES the field, while a thrown sentence
+  # only reaches the log. A step sets $script:pendingStepAnnotation just before it
+  # throws; clearing it here is what stops one failure inheriting another one's
+  # annotation.
+  $script:pendingStepAnnotation = $null
   try {
     $result = & $body
     $entry = @{ step = $name; ok = $true; attempts = $attempts }
@@ -130,6 +137,9 @@ function Step([string]$name, [scriptblock]$body, [switch]$Always) {
   } catch {
     Say "FAILED $name : $($_.Exception.Message)"
     $entry = @{ step = $name; ok = $false; error = $_.Exception.Message; attempts = $attempts }
+    if ($script:pendingStepAnnotation) {
+      foreach ($key in $script:pendingStepAnnotation.Keys) { $entry[$key] = $script:pendingStepAnnotation[$key] }
+    }
   }
   # REPLACE, DO NOT APPEND: two rows for one step made the marker read as a log
   # and left a reader guessing which one was current. @(...) on both sides keeps
@@ -651,15 +661,109 @@ function Invoke-ScaleProbe([string]$PythonPath) {
   return 'unverified:unexpected-probe-output'
 }
 
+# A PROBE WHOSE TEST IS A PROGRAM, NOT A ONE-LINER: write it to a file, run it,
+# read the last non-empty line, delete it. `-c` is ONE command line that Windows
+# re-parses (the clipboard tasks document the same trap for /tr), and the two
+# probes below are multi-line on purpose: they construct a fake control, a fake
+# %TEMP% directory and a counting `os` shim. A file is the only form that
+# survives the quoting without a second escaping language.
+function Invoke-PythonProbeFile([string]$PythonPath, [string]$Name, [string]$Program) {
+  # The PID is in the name so a second pass (or a human running the same probe)
+  # cannot read the first one's file between its write and its delete.
+  $path = Join-Path $env:TEMP ("cua-$PID-" + $Name)
+  try {
+    Set-Content -Path $path -Value $Program -Encoding ASCII -ErrorAction Stop
+  } catch {
+    return 'unverified:probe-write-failed'
+  }
+  try {
+    $check = Invoke-PythonCheck -PythonPath $PythonPath -Statement "exec(compile(open(r'$path').read(), r'$path', 'exec'))"
+  } finally {
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+  }
+  if ($check.exit -ne 0) { return "unverified:$($check.error)" }
+  $line = ''
+  foreach ($text in @($check.lines)) {
+    $trimmed = ([string]$text).Trim()
+    if ($trimmed) { $line = $trimmed }
+  }
+  return $line
+}
+
+# THE type_text PROBE IS ANSWERED BY THE PATCH'S OWN HELPER (R5/C10). It hands
+# `_type_text_delta` the exact pair the defect is about - `hello world` sent,
+# `hello worl` landed - and the three shapes a receipt may take, with NO window,
+# NO desktop and NO accessibility lane involved. That is the difference between
+# "the step ran" and "the code that decides success is the code I shipped": an
+# unpatched wheel answers nothing here, and a patch that lost the tail arithmetic
+# answers TYPE_TEXT_BAD (with its evidence) instead of the word `applied`.
+function Invoke-TypeTextProbe([string]$PythonPath) {
+  $program = @'
+import dsh_cua.bridge as b
+short = b._type_text_delta('', 'hello worl', 'hello world')
+exact = b._type_text_delta('', 'hello world', 'hello world')
+same = b._type_text_delta('abc', 'abc', 'xyz')
+retry = getattr(b, 'TYPE_TEXT_RETRY', None)
+ok = (short == ('short-insert', 'd') and exact == ('verified', '')
+      and same[0] == 'no-effect' and retry == 2)
+print('TYPE_TEXT_OK' if ok else 'TYPE_TEXT_BAD:' + repr((short, exact, same, retry)))
+'@
+  $line = Invoke-PythonProbeFile -PythonPath $PythonPath -Name 'cua-typetext-probe.py' -Program $program
+  if ($line -like 'TYPE_TEXT_OK*') { return 'TYPE_TEXT_OK' }
+  if ($line -like 'TYPE_TEXT_BAD*') { return $line }
+  if ($line -like 'unverified:*') { return $line }
+  return 'unverified:unexpected-probe-output'
+}
+
+# THE save_path PROBE (R7/C11), same shape. It asserts the two HALVES of the
+# allow-list in one run: a path under %TEMP%\win32_mcp_shots is created (and
+# reported as created), a path under neither root is REFUSED, not created, and
+# the sentence names both roots. A `makedirs` that ran on the refused path would
+# be the silent-redirect defect in a new place, so `os.path.isdir` is checked
+# after the refusal, not only the tuple.
+function Invoke-SavePathProbe([string]$PythonPath) {
+  $program = @'
+import os
+import shutil
+import tempfile
+import dsh_cua.server as s
+# A FRESH directory per run: a leftover cua-probe from an earlier pass would make
+# `created` False and turn the probe into a false failure - which, on the apply
+# path, would roll the patch back for no reason.
+tag = 'cua-probe-%d' % os.getpid()
+root = os.path.join(os.environ.get('TEMP', '.'), 'win32_mcp_shots', tag)
+made, where, err = s._ensure_save_dir(os.path.join(root, 'x.jpg'))
+allowed = s._is_allowed_save_dir(os.path.join('C:\\cua-work', 'a', 'b.jpg'))
+blocked_dir = os.path.join(tempfile.gettempdir(), tag + '-blocked')
+blocked, _where, why = s._ensure_save_dir(os.path.join(blocked_dir, 'x.jpg'))
+ok = (made is True and bool(where) and not err and allowed is True
+      and blocked is False and 'C:\\cua-work' in why and '%TEMP%' in why
+      and not os.path.isdir(blocked_dir))
+shutil.rmtree(root, ignore_errors=True)
+print('SAVE_PATH_OK' if ok else 'SAVE_PATH_BAD:' + repr((made, where, err, allowed, blocked, why)))
+'@
+  $line = Invoke-PythonProbeFile -PythonPath $PythonPath -Name 'cua-savepath-probe.py' -Program $program
+  if ($line -like 'SAVE_PATH_OK*') { return 'SAVE_PATH_OK' }
+  if ($line -like 'SAVE_PATH_BAD*') { return $line }
+  if ($line -like 'unverified:*') { return $line }
+  return 'unverified:unexpected-probe-output'
+}
+
 # A STALE .pyc WOULD KEEP THE OLD CODE RUNNING: the interpreter's cache key is the
 # source's mtime and size, and this patch can land inside the same second with the
 # same size class. So the cache is dropped BEFORE the re-import, and again after any
 # rollback (an attempt that failed to import has already written a cache entry for
 # the patched source).
-function Clear-BridgePyc([string]$BridgePath) {
+function Clear-BridgePyc([string]$BridgePath, [string]$Filter = 'bridge.*.pyc') {
   if (-not $BridgePath) { return }
   $cacheDir = Join-Path (Split-Path -Parent $BridgePath) '__pycache__'
-  Get-ChildItem -LiteralPath $cacheDir -Filter 'bridge.*.pyc' -File -ErrorAction SilentlyContinue |
+  # THE FILTER IS A PARAMETER because there are now TWO patched modules: the
+  # scale patch owns bridge.py, and R5/R7 own bridge.py and server.py as well.
+  # The reason the cache is dropped at all is unchanged: the interpreter's cache
+  # key is the source's mtime and size, and an in-place patch can land inside the
+  # same second with the same size class, so a stale <module>.*.pyc would keep
+  # the OLD code running while the file on disk reads patched.
+  Get-ChildItem -LiteralPath $cacheDir -Filter $Filter -File -ErrorAction SilentlyContinue |
     Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
@@ -677,7 +781,7 @@ function Clear-BridgePyc([string]$BridgePath) {
 # the guest, and a restore that is claimed but not measured is the same class of
 # lie as a patch that is claimed but not applied. The caller records this value as
 # `restoreOk` in the marker row and never says "reverted" without it.
-function Restore-BridgeSource([string]$BridgePath, [byte[]]$OriginalBytes, [string]$ExpectedHash = '') {
+function Restore-BridgeSource([string]$BridgePath, [byte[]]$OriginalBytes, [string]$ExpectedHash = '', [string]$Filter = 'bridge.*.pyc') {
   if (-not $BridgePath) { return $false }
   if ($null -eq $OriginalBytes) { return $false }
   if ($OriginalBytes.Length -eq 0) { return $false }
@@ -689,9 +793,15 @@ function Restore-BridgeSource([string]$BridgePath, [byte[]]$OriginalBytes, [stri
   # A restored source with a cache entry for the PATCHED source is still a guest
   # running the wrong code, so the cache goes too - and a cache that cannot be
   # cleared means the restore did not do its job.
-  Clear-BridgePyc -BridgePath $BridgePath
+  # JD2 - THE CACHE THAT MATTERS IS THE ONE FOR *THIS* FILE. The filter used to be
+  # hardcoded to `bridge.*.pyc`, so a `dsh-cua-savepath` rollback restored
+  # server.py, left a patched `server.*.pyc` alive, and still answered
+  # `restoreOk:true` - a guest running the restored-patched mix the rollback
+  # existed to prevent. Both the clearing and the liveness check use the same
+  # filter now, and the caller names it.
+  Clear-BridgePyc -BridgePath $BridgePath -Filter $Filter
   $cacheDir = Join-Path (Split-Path -Parent $BridgePath) '__pycache__'
-  if (@(Get-ChildItem -LiteralPath $cacheDir -Filter 'bridge.*.pyc' -File -ErrorAction SilentlyContinue).Count -gt 0) { return $false }
+  if (@(Get-ChildItem -LiteralPath $cacheDir -Filter $Filter -File -ErrorAction SilentlyContinue).Count -gt 0) { return $false }
   if (-not $ExpectedHash) { return $true }
   # BYTES, NOT INTENT: the file on disk is compared with the hash the gate measured
   # before the patch, so a partial write can never be reported as a restore.
@@ -728,6 +838,14 @@ function Restore-BridgeSource([string]$BridgePath, [byte[]]$OriginalBytes, [stri
 Step 'dsh-cua-scale' {
   $expectedVersion = '0.4.1'
   $expectedHash = '59280ee9079cc09aa94b3813fd7a7665cfebffe68fb7259b752e161abf1f9209'
+  # JD1 - THE SECOND ACCEPTED BASE. bridge.py is patched by TWO steps (this one and
+  # `dsh-cua-typetext`), so a gate on the pristine bytes ALONE locks the second one
+  # out forever: whichever step runs second would answer `skipped:hash-mismatch` on
+  # every boot. This is the hash of the same wheel with the typetext patch already
+  # applied - accepted here, and the mirror image is accepted there. The two edits
+  # touch DISJOINT text, so applying this step's anchors on either base composes to
+  # the same bytes in either order (asserted by tests/guest-patch.mjs D-21).
+  $expectedHashTypeText = '01b55a637f3ec8fe2be085345d675c6ca31aed7b8b34397e848c653792b489a3'
 
   $py = Get-RealPython
   if (-not $py) {
@@ -781,9 +899,23 @@ Step 'dsh-cua-scale' {
     return @{ scaleFix = 'already'; scaleHash = $measureHash; scaleProbe = $alreadyProbe }
   }
 
-  # GATE 2 - THE HASH OF THE FILE THIS WAS PROVEN AGAINST.
-  if ($measureHash -ne $expectedHash) {
-    Say "dsh-cua-scale: skipped (sha256 $measureHash is not the pinned $expectedHash)"
+  # GATE 2 - THE HASH OF A BASE THIS WAS PROVEN AGAINST: the PRISTINE wheel, or the
+  # same wheel with the typetext patch in it (JD1). The normal order puts this step
+  # first (S6), but the order must not be the thing that decides whether a patch
+  # lands - the anchor counts do.
+  $scaleBase = ''
+  if ($measureHash -eq $expectedHash) { $scaleBase = 'pristine' }
+  elseif ($measureHash -eq $expectedHashTypeText) { $scaleBase = 'typetext-patched' }
+  if (-not $scaleBase) {
+    Say "dsh-cua-scale: skipped (sha256 $measureHash is neither the pristine $expectedHash nor the typetext-patched $expectedHashTypeText)"
+    return @{ scaleFix = 'skipped:hash-mismatch'; scaleHash = $measureHash; scaleProbe = 'unverified:hash-mismatch' }
+  }
+  # A HASH IDENTIFIES BYTES, NOT AN EDIT: the accepted non-pristine base must carry
+  # the typetext sentinel, or the number matched something this step was never
+  # proven against and the anchors below would be the only thing between it and a
+  # guessed write.
+  if ($scaleBase -eq 'typetext-patched' -and -not $text.Contains('if expected is not None:')) {
+    Say 'dsh-cua-scale: skipped (the typetext-patched hash matched but its sentinel is absent; not applying to bytes nobody verified)'
     return @{ scaleFix = 'skipped:hash-mismatch'; scaleHash = $measureHash; scaleProbe = 'unverified:hash-mismatch' }
   }
 
@@ -888,8 +1020,768 @@ Step 'dsh-cua-scale' {
     return @{ scaleFix = 'skipped:probe-failed'; scaleHash = $measureHash; scaleProbe = $scaleProbe; restoreOk = $restoreOk }
   }
 
-  Say "dsh-cua-scale: applied + $scaleProbe"
-  return @{ scaleFix = 'applied'; scaleHash = $measureHash; scaleProbe = $scaleProbe }
+  Say "dsh-cua-scale: applied on the $scaleBase base + $scaleProbe"
+  return @{ scaleFix = 'applied'; scaleHash = $measureHash; scaleProbe = $scaleProbe; scaleBase = $scaleBase }
+}
+
+# R5/C10 - THE EXACT-INSERT RECEIPT, INSTALLED IN PLACE UNDER A HASH GATE.
+#
+# THE DEFECT (upstream bridge.py:974-976): `effect_verified = after != before`.
+# `hello world` sent and `hello worl` landing is a CHANGED control, so the receipt
+# read `verified` and `ok` stayed true while one character was lost. Character
+# loss is data loss inside the only input path left when the element lane is dead
+# (R4 + R5 compound: the guest loses the lane, falls back to injection, and the
+# injection lies), and it is what made the reported save step retype into a
+# dialog with the wrong text in it.
+#
+# WHY A PATCH AND NOT A WRAPPER: the relay spawns `python -m dsh_cua.server`
+# itself (child_argv() splits a plain string, so a quoted `-c` program cannot ride
+# along), and the caller that must see `missing` is the tool call, which reaches
+# type_text through the wheel's own `mcp.tool` registration. Same discipline as
+# `dsh-cua-scale`: pinned version, pinned SHA-256, every anchor counted, and the
+# word `applied` only after a probe the PATCH answers.
+#
+# NEVER THROWS. A refusal is a recorded fact (`typeTextFix:'skipped:<why>'`), and
+# a refusal that had to undo a write records the MEASURED rollback (`restoreOk`).
+Step 'dsh-cua-typetext' {
+  $expectedVersion = '0.4.1'
+  $expectedHash = '59280ee9079cc09aa94b3813fd7a7665cfebffe68fb7259b752e161abf1f9209'
+  # JD1 - THE SECOND ACCEPTED BASE, and this one is the NORMAL case: S6 runs
+  # `dsh-cua-scale` first, so by the time this step reads bridge.py the file is
+  # already scale-patched and hashes to this value. Gating on the pristine bytes
+  # alone is the reported defect: scale applied, then this step answered
+  # `skipped:hash-mismatch` on every boot and the R5 fix never landed. The mirror
+  # pin (`$expectedHashTypeText` in the scale step) makes the pair order-proof.
+  $expectedHashScaled = 'd7c3f06dc807d965ee9b7ddb7b9018a3889674e7530969ecaa83cf928aa7c020'
+  # THE IDEMPOTENCE SENTINEL. It exists in the PATCHED file and nowhere in the
+  # pinned one, and it is checked BEFORE the hash gate: the patch changes the
+  # bytes, so a second -Force pass can never hash-match the pinned value. That
+  # order is the only one in which "run it twice" is a no-op instead of a second
+  # copy of the block (which no hash gate could catch).
+  $sentinel = 'if expected is not None:'
+
+  $py = Get-RealPython
+  if (-not $py) {
+    Say 'dsh-cua-typetext: skipped (no python interpreter)'
+    return @{ typeTextFix = 'skipped:no-python'; typeTextHash = ''; typeTextProbe = 'unverified:no-python' }
+  }
+
+  $bridgePath = Get-PythonValue -PythonPath $py -Statement "import importlib.util;print(importlib.util.find_spec('dsh_cua.bridge').origin)"
+  if (-not $bridgePath -or -not (Test-Path -LiteralPath $bridgePath -ErrorAction SilentlyContinue)) {
+    Say "dsh-cua-typetext: skipped (bridge.py not found: '$bridgePath')"
+    return @{ typeTextFix = 'skipped:no-file'; typeTextHash = ''; typeTextProbe = 'unverified:no-file' }
+  }
+
+  $measureHash = ''
+  try { $measureHash = (Get-FileHash -LiteralPath $bridgePath -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $measureHash = '' }
+
+  $dshCuaVersion = Get-PythonValue -PythonPath $py -Statement "import importlib.metadata as m;print(m.version('dsh-cua'))"
+  if ($dshCuaVersion -ne $expectedVersion) {
+    Say "dsh-cua-typetext: skipped (dsh-cua '$dshCuaVersion' is not the pinned '$expectedVersion')"
+    return @{ typeTextFix = 'skipped:version-mismatch'; typeTextHash = $measureHash; typeTextProbe = 'unverified:version-mismatch' }
+  }
+
+  # CRLF -> LF BEFORE MATCHING OR WRITING, exactly like the scale step: the wheel
+  # may ship either ending and the anchors below are written once, in LF.
+  $originalBytes = $null
+  $text = ''
+  try {
+    $originalBytes = [System.IO.File]::ReadAllBytes($bridgePath)
+    $text = [System.Text.Encoding]::UTF8.GetString($originalBytes).Replace("`r`n", "`n")
+  } catch {
+    Say "dsh-cua-typetext: skipped (bridge.py unreadable: $($_.Exception.Message))"
+    return @{ typeTextFix = 'skipped:no-file'; typeTextHash = $measureHash; typeTextProbe = 'unverified:unreadable' }
+  }
+
+  if ($text.Contains($sentinel)) {
+    $alreadyProbe = Invoke-TypeTextProbe -PythonPath $py
+    Say "dsh-cua-typetext: already patched (probe $alreadyProbe)"
+    return @{ typeTextFix = 'already'; typeTextHash = $measureHash; typeTextProbe = $alreadyProbe }
+  }
+
+  # GATE 2 - THE HASH OF A BASE THIS WAS PROVEN AGAINST: pristine, or the same
+  # wheel with the scale patch already applied (JD1).
+  $typeTextBase = ''
+  if ($measureHash -eq $expectedHash) { $typeTextBase = 'pristine' }
+  elseif ($measureHash -eq $expectedHashScaled) { $typeTextBase = 'scale-patched' }
+  if (-not $typeTextBase) {
+    Say "dsh-cua-typetext: skipped (sha256 $measureHash is neither the pristine $expectedHash nor the scale-patched $expectedHashScaled)"
+    return @{ typeTextFix = 'skipped:hash-mismatch'; typeTextHash = $measureHash; typeTextProbe = 'unverified:hash-mismatch' }
+  }
+  # The accepted non-pristine base must really be the scale-patched file.
+  if ($typeTextBase -eq 'scale-patched' -and -not $text.Contains('base_w, base_h = img.size')) {
+    Say 'dsh-cua-typetext: skipped (the scale-patched hash matched but the scale sentinel is absent; not applying to bytes nobody verified)'
+    return @{ typeTextFix = 'skipped:hash-mismatch'; typeTextHash = $measureHash; typeTextProbe = 'unverified:hash-mismatch' }
+  }
+
+  # THREE ANCHORS, EACH EXACTLY ONCE. The helper goes in at module level (a
+  # three-line in-function anchor cannot define one, and the probe has to import
+  # it to answer at all), the state machine replaces the three receipt lines, and
+  # the out dict gains the retry ink. Zero occurrences means the wheel drifted;
+  # two means the replacement would land somewhere nobody verified.
+  $anchorTTHelper = @'
+def type_text(hwnd: int, text: str, delay: float = 0.01) -> dict:
+'@
+  $replacementTTHelper = @'
+# [cua-D4] THE EXACT-INSERT RECEIPT (R5/C10).
+#
+# THE DEFECT THIS REPLACES: `effect_verified = after != before` called a
+# TRUNCATED insert a success. With `hello world` sent and `hello worl` landing the
+# control's text HAD changed, so the receipt said verified and `ok` stayed true
+# while one character was silently lost - and this is the only input path left
+# when the element lane is dead, so the loss reached the caller as success.
+#
+# The compare below is EXACT (`after == before + text`), the failure carries the
+# TAIL that did not land, and the tail is what the two retries post again.
+TYPE_TEXT_RETRY = 2
+# WM_SETTEXT is the restore path: a terminal short insert puts the control back to
+# what it held BEFORE this call instead of leaving half a sentence in it.
+WM_SETTEXT = 0x000C
+
+
+def _type_text_delta(before, after, text):
+    """(state, missing) for one insert attempt. Pure: no Windows call, no state.
+
+    'verified'     after == before + text - EXACT equality is the only success.
+    'short-insert' before is a prefix of after and the landed suffix is a strict
+                   prefix of text, so `missing` is the tail that never arrived.
+    'no-effect'    after == before: nothing landed at all.
+    'unaccounted'  the text changed in a way this receipt cannot attribute to this
+                   insertion (a selection replaced, a maximum length reached
+                   mid-string, or somebody else typing).
+    'unknown'      a read-back was not possible: the effect is UNCONFIRMED, which
+                   is not the same as failed.
+    """
+    if before is None or after is None:
+        return ("unknown", "")
+    if after == before + text:
+        return ("verified", "")
+    if after == before:
+        return ("no-effect", text)
+    if after.startswith(before):
+        landed = after[len(before):]
+        if text.startswith(landed) and landed != text:
+            return ("short-insert", text[len(landed):])
+    return ("unaccounted", "")
+
+
+def _type_text_restore(dest, before):
+    """Put the control's text back to `before`, and MEASURE whether it landed.
+
+    What it can and cannot do, said plainly: WM_SETTEXT replaces the whole text in
+    one message, so a control that lost the tail of an insert gets its ORIGINAL
+    value back. A control this process cannot write (read-only, or a class that
+    ignores WM_SETTEXT) answers False instead, and the caller reports that rather
+    than claiming a clean revert. The verdict is the re-read, never the send.
+    """
+    if before is None:
+        return False
+    try:
+        buf = ctypes.create_unicode_buffer(str(before))
+        res = ctypes.c_size_t(0)
+        user32.SendMessageTimeoutW(w.HWND(dest), WM_SETTEXT, 0,
+                                   ctypes.cast(buf, ctypes.c_void_p).value,
+                                   SMTO_ABORTIFHUNG, _SEND_TIMEOUT_MS, byref(res))
+    except Exception:
+        return False
+    return _read_control_text(dest) == before
+
+
+def type_text(hwnd: int, text: str, delay: float = 0.01) -> dict:
+'@
+  $anchorTT = @'
+        effect_verified = None
+        if before is not None and after is not None:
+            effect_verified = after != before
+'@
+  $replacementTT = @'
+        # [cua-D4] C10 - EXACT COMPARE, THE MISSING TAIL, AND TWO RETRIES.
+        #
+        # `expected` is the only thing this call may call success. `missing` is the
+        # tail that did not land, and each extra attempt posts ONLY that tail:
+        # retyping the whole string would duplicate the part that did arrive.
+        # `restoreOk` is the MEASURED result of putting the control back and is
+        # absent when there was no control to put back (no read-back target).
+        expected = ((before or "") + text) if before is not None else None
+        state, missing = ("unknown", "")
+        if expected is not None:
+            state, missing = _type_text_delta(before, after, text)
+        retries = 0
+        recovered = False
+        while state == "short-insert" and retries < TYPE_TEXT_RETRY:
+            retries += 1
+            for ch in missing:
+                user32.PostMessageW(w.HWND(dest), WM_CHAR, ord(ch), 0)
+                if delay > 0: time.sleep(delay)
+            after = _read_control_text(dest)
+            if after is None:
+                state, missing = ("unknown", "")
+                break
+            state, missing = _type_text_delta(before, after, text)
+            recovered = state == "verified"
+        if state == "verified":
+            effect_verified = True
+        elif state == "unknown":
+            effect_verified = None
+        else:
+            effect_verified = False
+        if state == "short-insert" or state == "unaccounted":
+            # TERMINAL FAILURE: say what is missing, put the control back, and do
+            # NOT return a success receipt. `retries` is how many attempts ran, not
+            # how many were allowed.
+            restore_ok = None
+            if target is not None:
+                restore_ok = _type_text_restore(dest, before)
+            failed = {"ok": False, "reason": state, "hwnd": hwnd, "target_hwnd": dest,
+                      "resolved_by": resolved_by or None,
+                      "typed": len(text), "text_length": len(text),
+                      "effect_verified": False,
+                      "retries": retries, "recovered": False, "missing": missing,
+                      "foreground_changed": foreground_root() != fg_before,
+                      "raise": raise_info, "arbiter": arbiter.receipt(gate),
+                      "before": (before or "")[:80], "after": (after or "")[:80]}
+            if restore_ok is not None:
+                failed["restoreOk"] = restore_ok
+            if state == "short-insert":
+                failed["error"] = (
+                    "the control kept %d of the %d character(s) sent; %r did not land "
+                    "after %d retry attempt(s), so the effect is NOT verified"
+                    % (len(text) - len(missing), len(text), missing, retries))
+            else:
+                failed["error"] = (
+                    "the control's text changed, but not by this insertion (before=%r "
+                    "after=%r): no tail could be identified to retry, so the effect is "
+                    "NOT verified" % ((before or "")[:60], (after or "")[:60]))
+            return failed
+'@
+  $anchorTTReceipt = @'
+        out = {"ok": True, "reason": "typed", "hwnd": hwnd, "target_hwnd": dest,
+               "resolved_by": resolved_by or None,
+               "typed": len(text), "text_length": len(text),
+               "effect_verified": effect_verified,
+'@
+  $replacementTTReceipt = @'
+        out = {"ok": True, "reason": "typed", "hwnd": hwnd, "target_hwnd": dest,
+               "resolved_by": resolved_by or None,
+               "typed": len(text), "text_length": len(text),
+               "effect_verified": effect_verified,
+               # [cua-D4] C10: the retry ink is on EVERY receipt - 0 / False / ''
+               # when the first attempt was exact, the tail and the count when it
+               # was not.
+               "retries": retries, "recovered": bool(recovered),
+               "missing": "" if effect_verified else missing,
+'@
+  $anchorTTHelper = $anchorTTHelper.Replace("`r`n", "`n")
+  $replacementTTHelper = $replacementTTHelper.Replace("`r`n", "`n")
+  $anchorTT = $anchorTT.Replace("`r`n", "`n")
+  $replacementTT = $replacementTT.Replace("`r`n", "`n")
+  $anchorTTReceipt = $anchorTTReceipt.Replace("`r`n", "`n")
+  $replacementTTReceipt = $replacementTTReceipt.Replace("`r`n", "`n")
+
+  $countTTHelper = ([regex]::Matches($text, [regex]::Escape($anchorTTHelper))).Count
+  $countTT = ([regex]::Matches($text, [regex]::Escape($anchorTT))).Count
+  $countTTReceipt = ([regex]::Matches($text, [regex]::Escape($anchorTTReceipt))).Count
+  if ($countTTHelper -eq 0 -or $countTT -eq 0 -or $countTTReceipt -eq 0) {
+    Say "dsh-cua-typetext: skipped (anchor missing: helper=$countTTHelper effect=$countTT receipt=$countTTReceipt)"
+    return @{ typeTextFix = 'skipped:anchor-missing'; typeTextHash = $measureHash; typeTextProbe = 'unverified:anchor-missing' }
+  }
+  if ($countTTHelper -ne 1 -or $countTT -ne 1 -or $countTTReceipt -ne 1) {
+    Say "dsh-cua-typetext: skipped (anchor ambiguous: helper=$countTTHelper effect=$countTT receipt=$countTTReceipt)"
+    return @{ typeTextFix = 'skipped:anchor-ambiguous'; typeTextHash = $measureHash; typeTextProbe = 'unverified:anchor-ambiguous' }
+  }
+
+  $patched = $text.Replace($anchorTTHelper, $replacementTTHelper).Replace($anchorTT, $replacementTT).Replace($anchorTTReceipt, $replacementTTReceipt)
+  if (($patched -eq $text) -or (-not $patched.Contains($sentinel))) {
+    Say 'dsh-cua-typetext: skipped (the replacements produced no change)'
+    return @{ typeTextFix = 'skipped:no-change'; typeTextHash = $measureHash; typeTextProbe = 'unverified:no-change' }
+  }
+
+  $writeError = ''
+  $ttRestoreOk = $true
+  try {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($bridgePath, $patched, $utf8NoBom)
+  } catch {
+    $writeError = $_.Exception.Message
+    # WriteAllText opens with Create (truncate) before it writes a byte, so a
+    # throw here may have left an EMPTY or half-written bridge.py. Nothing is
+    # reported as "skipped, nothing happened" until the original bytes are
+    # MEASURED back in place.
+    $ttRestoreOk = Restore-BridgeSource -BridgePath $bridgePath -OriginalBytes $originalBytes -ExpectedHash $measureHash
+  }
+  if ($writeError) {
+    if ($ttRestoreOk) {
+      Say "dsh-cua-typetext: skipped (bridge.py not writable: $writeError; the original bytes are back in place)"
+    } else {
+      Say "dsh-cua-typetext: NOT RESTORED (bridge.py was not writable: $writeError, and the rollback failed too) - $bridgePath may be truncated or partly written; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ typeTextFix = 'skipped:write-failed'; typeTextHash = $measureHash; typeTextProbe = 'unverified:write-failed'; restoreOk = $ttRestoreOk }
+  }
+
+  Clear-BridgePyc -BridgePath $bridgePath
+
+  # THE PATCH IS NOT CALLED `applied` UNTIL THE MODULES STILL IMPORT: a bridge.py
+  # that no longer loads is worse than an unpatched one, so the original bytes go
+  # back and the refusal is recorded.
+  $importCheck = Invoke-PythonCheck -PythonPath $py -Statement "import dsh_cua.bridge, dsh_cua.server; print('IMPORT_OK')"
+  if ($importCheck.exit -ne 0) {
+    $ttRestoreOk = Restore-BridgeSource -BridgePath $bridgePath -OriginalBytes $originalBytes -ExpectedHash $measureHash
+    if ($ttRestoreOk) {
+      Say "dsh-cua-typetext: import failed after the patch, reverted ($($importCheck.error))"
+    } else {
+      Say "dsh-cua-typetext: NOT RESTORED after a failed import ($($importCheck.error)) - $bridgePath is left patched; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ typeTextFix = 'skipped:import-failed'; typeTextHash = $measureHash; typeTextProbe = 'unverified:import-failed'; restoreOk = $ttRestoreOk }
+  }
+
+  # THE SECOND CHECK IS THE RECEIPT ITSELF, answered by the helper this patch
+  # installed: `short-insert` + the missing tail, exact equality, and the
+  # unchanged case. `unverified:` means the probe could not run and the patch
+  # stays with that fact recorded rather than being called a success.
+  $typeTextProbe = Invoke-TypeTextProbe -PythonPath $py
+  if ($typeTextProbe -like 'TYPE_TEXT_BAD*') {
+    $ttRestoreOk = Restore-BridgeSource -BridgePath $bridgePath -OriginalBytes $originalBytes -ExpectedHash $measureHash
+    if ($ttRestoreOk) {
+      Say "dsh-cua-typetext: probe says $typeTextProbe after the patch, reverted"
+    } else {
+      Say "dsh-cua-typetext: NOT RESTORED after a bad probe ($typeTextProbe) - $bridgePath is left patched; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ typeTextFix = 'skipped:probe-failed'; typeTextHash = $measureHash; typeTextProbe = $typeTextProbe; restoreOk = $ttRestoreOk }
+  }
+
+  Say "dsh-cua-typetext: applied on the $typeTextBase base + $typeTextProbe"
+  return @{ typeTextFix = 'applied'; typeTextHash = $measureHash; typeTextProbe = $typeTextProbe; typeTextBase = $typeTextBase }
+}
+
+# R7/C11 - THE save_path ALLOW-LIST, INSTALLED IN PLACE UNDER A HASH GATE.
+#
+# THE DEFECT (upstream server.py:154-172): `tool_capture_window` opens the
+# caller's `save_path` with no directory handling and no try/except, so
+# `save_path="C:\cua-work\x.jpeg"` on a guest whose firstboot aborted raised
+# `[Errno 2] No such file or directory` - and a screenshot is the only way to get
+# a picture out of the guest, so that guest had no screenshot path except a
+# %TEMP% default nobody knew about (R7). The mitigation in the tree
+# (`Step 'cua-workdir'`) only helps images whose firstboot completed.
+#
+# THE FIX IS NOT A REDIRECT. save_path is never rewritten: the directory is
+# created when it is under C:\cua-work or %TEMP%\win32_mcp_shots, and everything
+# else fails closed with a sentence that names both roots. `created_dir` says
+# whether THIS call made it.
+#
+# Same discipline as `dsh-cua-typetext`: pinned version, pinned SHA-256, every
+# anchor counted once, import + probe before the word `applied`.
+Step 'dsh-cua-savepath' {
+  $expectedVersion = '0.4.1'
+  $expectedHash = '29668590f5ed3b25e82bd8176bbf9268dd9b6108991943cb8db6ae5c7a2d8713'
+  # THE IDEMPOTENCE SENTINEL: the helper name exists in the PATCHED server.py,
+  # nowhere in the pinned one, and it is checked BEFORE the hash gate.
+  $sentinel = '_ensure_save_dir'
+
+  $py = Get-RealPython
+  if (-not $py) {
+    Say 'dsh-cua-savepath: skipped (no python interpreter)'
+    return @{ savePathFix = 'skipped:no-python'; savePathHash = ''; savePathProbe = 'unverified:no-python' }
+  }
+
+  $serverPath = Get-PythonValue -PythonPath $py -Statement "import importlib.util;print(importlib.util.find_spec('dsh_cua.server').origin)"
+  if (-not $serverPath -or -not (Test-Path -LiteralPath $serverPath -ErrorAction SilentlyContinue)) {
+    Say "dsh-cua-savepath: skipped (server.py not found: '$serverPath')"
+    return @{ savePathFix = 'skipped:no-file'; savePathHash = ''; savePathProbe = 'unverified:no-file' }
+  }
+
+  $measureHash = ''
+  try { $measureHash = (Get-FileHash -LiteralPath $serverPath -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $measureHash = '' }
+
+  $dshCuaVersion = Get-PythonValue -PythonPath $py -Statement "import importlib.metadata as m;print(m.version('dsh-cua'))"
+  if ($dshCuaVersion -ne $expectedVersion) {
+    Say "dsh-cua-savepath: skipped (dsh-cua '$dshCuaVersion' is not the pinned '$expectedVersion')"
+    return @{ savePathFix = 'skipped:version-mismatch'; savePathHash = $measureHash; savePathProbe = 'unverified:version-mismatch' }
+  }
+
+  $originalBytes = $null
+  $text = ''
+  try {
+    $originalBytes = [System.IO.File]::ReadAllBytes($serverPath)
+    $text = [System.Text.Encoding]::UTF8.GetString($originalBytes).Replace("`r`n", "`n")
+  } catch {
+    Say "dsh-cua-savepath: skipped (server.py unreadable: $($_.Exception.Message))"
+    return @{ savePathFix = 'skipped:no-file'; savePathHash = $measureHash; savePathProbe = 'unverified:unreadable' }
+  }
+
+  if ($text.Contains($sentinel)) {
+    $alreadyProbe = Invoke-SavePathProbe -PythonPath $py
+    Say "dsh-cua-savepath: already patched (probe $alreadyProbe)"
+    return @{ savePathFix = 'already'; savePathHash = $measureHash; savePathProbe = $alreadyProbe }
+  }
+
+  if ($measureHash -ne $expectedHash) {
+    Say "dsh-cua-savepath: skipped (sha256 $measureHash is not the pinned $expectedHash)"
+    return @{ savePathFix = 'skipped:hash-mismatch'; savePathHash = $measureHash; savePathProbe = 'unverified:hash-mismatch' }
+  }
+
+  # THREE ANCHORS, EACH EXACTLY ONCE: the helper pair goes in above the tool (it
+  # is inserted at the decorator line so it is extractable on its own), the open
+  # block is replaced, and the success payload gains the two fields.
+  $anchorSP = @'
+    saved = ""
+    if save_path:
+        with open(save_path, "wb") as f: f.write(data)
+        saved = save_path
+'@
+  $replacementSP = @'
+    saved = ""
+    created = False
+    save_dir = ""
+    if save_path:
+        # [cua-D5] C11 - CREATE ONLY WHAT WE OWN, AND SAY WHAT WE CREATED.
+        #
+        # The caller's path is used VERBATIM (no silent temp fallback): what
+        # changed is that its directory is created when - and only when - it is
+        # under C:\cua-work or %TEMP%\win32_mcp_shots. Outside those roots nothing
+        # is created and the open is allowed to fail with the sentence that names
+        # both, which is the difference between "your path is wrong" and
+        # "[Errno 2] No such file or directory" with no explanation.
+        created, save_dir, save_err = _ensure_save_dir(save_path)
+        if save_err:
+            return {"success": False, "error": save_err, "created_dir": False}
+        try:
+            with open(save_path, "wb") as f: f.write(data)
+        except OSError as exc:
+            return {"success": False, "error": "save_path could not be written: %s" % (exc,), "created_dir": created}
+        saved = save_path
+'@
+  $anchorSP2 = @'
+@mcp.tool(description="Capture a window screenshot and SAVE IT TO A FILE.
+'@
+  $replacementSP2 = @'
+def _save_path_dir(save_path):
+    """The DIRECTORY a save_path names, in the form the allow-list compares."""
+    return os.path.dirname(os.path.abspath(save_path))
+
+
+def _same_dir(left, right):
+    """Compare two paths the way Windows would: one separator, case folded.
+
+    Normalising INSIDE the predicate is what makes the allow-list testable off
+    Windows: `C:\\cua-work\\x` and `c:/CUA-WORK\\x` are the same directory to the
+    guest, and a test on a Linux host must be able to say so without a guest.
+    """
+    a = str(left).replace("/", "\\").rstrip("\\").lower()
+    b = str(right).replace("/", "\\").rstrip("\\").lower()
+    if not a or not b:
+        return False
+    return a == b or a.startswith(b + "\\")
+
+
+def _temp_shots_root():
+    """The %TEMP%\\win32_mcp_shots root, ABSOLUTE.
+
+    Absolute because the caller compares it with `os.path.abspath(save_path)`: a
+    relative fallback (a service account with no environment, or a harness that
+    only sets TEMP) would never match a real path and would turn a legal save into
+    a refusal - a fail-closed rule is only useful when it is also correct.
+    """
+    base = os.environ.get("TEMP", ".") or "."
+    return os.path.abspath(os.path.join(base, "win32_mcp_shots"))
+
+
+def _is_allowed_save_dir(dirname):
+    """True when `dirname` is C:\\cua-work or %TEMP%\\win32_mcp_shots, or below them.
+
+    THE ALLOW-LIST IS THE WHOLE FIX (R7/C11). The old shape opened the caller's
+    path with no directory handling at all, so a guest whose firstboot aborted had
+    no screenshot path except a %TEMP% default nobody knew. Creating the directory
+    is only safe where the desktop token can write; anywhere else must fail closed
+    and SAY SO, because a silent redirect loses the file the caller asked for.
+    """
+    if not dirname:
+        return False
+    return _same_dir(dirname, "C:\\cua-work") or _same_dir(dirname, _temp_shots_root())
+
+
+def _ensure_save_dir(save_path):
+    """(created, dirname, error) for the directory a caller's save_path needs.
+
+    NOT a redirect: save_path itself is never rewritten, and the %TEMP% default
+    stays a default - this is only reached when the caller named a path. `created`
+    is True only when THIS call made the directory, so a caller can tell "it was
+    already there" from "I created it", and `error` (when set) is a sentence that
+    names both roots. Nothing is created when the path is outside them.
+    """
+    if not save_path:
+        return (False, "default", "")
+    dirname = _save_path_dir(save_path)
+    if os.path.isdir(dirname):
+        return (False, dirname, "")
+    if not _is_allowed_save_dir(dirname):
+        return (False, dirname,
+                "save_path directory '%s' does not exist and is not under C:\\cua-work or "
+                "%%TEMP%%\\win32_mcp_shots; create it first or save under C:\\cua-work"
+                % (dirname,))
+    try:
+        os.makedirs(dirname, exist_ok=True)
+    except OSError as exc:
+        return (False, dirname,
+                "save_path directory '%s' could not be created: %s" % (dirname, exc))
+    return (True, dirname, "")
+
+
+@mcp.tool(description="Capture a window screenshot and SAVE IT TO A FILE.
+'@
+  $anchorSP3 = @'
+           "capture_method": method, "saved_path": saved}
+'@
+  $replacementSP3 = @'
+           "capture_method": method, "saved_path": saved,
+           # [cua-D5] C11: what the CALLER's path needed (created here, or already
+           # there) and the directory a reader can look in after a failure.
+           "created_dir": created, "saved_dir": save_dir or ""}
+'@
+  $anchorSP = $anchorSP.Replace("`r`n", "`n")
+  $replacementSP = $replacementSP.Replace("`r`n", "`n")
+  $anchorSP2 = $anchorSP2.Replace("`r`n", "`n")
+  $replacementSP2 = $replacementSP2.Replace("`r`n", "`n")
+  $anchorSP3 = $anchorSP3.Replace("`r`n", "`n")
+  $replacementSP3 = $replacementSP3.Replace("`r`n", "`n")
+
+  $countSP = ([regex]::Matches($text, [regex]::Escape($anchorSP))).Count
+  $countSP2 = ([regex]::Matches($text, [regex]::Escape($anchorSP2))).Count
+  $countSP3 = ([regex]::Matches($text, [regex]::Escape($anchorSP3))).Count
+  if ($countSP -eq 0 -or $countSP2 -eq 0 -or $countSP3 -eq 0) {
+    Say "dsh-cua-savepath: skipped (anchor missing: open=$countSP helper=$countSP2 payload=$countSP3)"
+    return @{ savePathFix = 'skipped:anchor-missing'; savePathHash = $measureHash; savePathProbe = 'unverified:anchor-missing' }
+  }
+  if ($countSP -ne 1 -or $countSP2 -ne 1 -or $countSP3 -ne 1) {
+    Say "dsh-cua-savepath: skipped (anchor ambiguous: open=$countSP helper=$countSP2 payload=$countSP3)"
+    return @{ savePathFix = 'skipped:anchor-ambiguous'; savePathHash = $measureHash; savePathProbe = 'unverified:anchor-ambiguous' }
+  }
+
+  $patched = $text.Replace($anchorSP, $replacementSP).Replace($anchorSP2, $replacementSP2).Replace($anchorSP3, $replacementSP3)
+  if (($patched -eq $text) -or (-not $patched.Contains($sentinel))) {
+    Say 'dsh-cua-savepath: skipped (the replacements produced no change)'
+    return @{ savePathFix = 'skipped:no-change'; savePathHash = $measureHash; savePathProbe = 'unverified:no-change' }
+  }
+
+  $writeError = ''
+  $spRestoreOk = $true
+  # `Restore-BridgeSource` IS PATH-GENERIC (its name is historical - it was written
+  # for the scale patch): path, original bytes, expected hash. Reusing it here is
+  # deliberate; a second copy of the rollback is a second place for it to be wrong.
+  try {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($serverPath, $patched, $utf8NoBom)
+  } catch {
+    $writeError = $_.Exception.Message
+    $spRestoreOk = Restore-BridgeSource -BridgePath $serverPath -OriginalBytes $originalBytes -ExpectedHash $measureHash -Filter 'server.*.pyc'
+  }
+  if ($writeError) {
+    if ($spRestoreOk) {
+      Say "dsh-cua-savepath: skipped (server.py not writable: $writeError; the original bytes are back in place)"
+    } else {
+      Say "dsh-cua-savepath: NOT RESTORED (server.py was not writable: $writeError, and the rollback failed too) - $serverPath may be truncated or partly written; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ savePathFix = 'skipped:write-failed'; savePathHash = $measureHash; savePathProbe = 'unverified:write-failed'; restoreOk = $spRestoreOk }
+  }
+
+  Clear-BridgePyc -BridgePath $serverPath -Filter 'server.*.pyc'
+
+  $importCheck = Invoke-PythonCheck -PythonPath $py -Statement "import dsh_cua.bridge, dsh_cua.server; print('IMPORT_OK')"
+  if ($importCheck.exit -ne 0) {
+    $spRestoreOk = Restore-BridgeSource -BridgePath $serverPath -OriginalBytes $originalBytes -ExpectedHash $measureHash -Filter 'server.*.pyc'
+    if ($spRestoreOk) {
+      Say "dsh-cua-savepath: import failed after the patch, reverted ($($importCheck.error))"
+    } else {
+      Say "dsh-cua-savepath: NOT RESTORED after a failed import ($($importCheck.error)) - $serverPath is left patched; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ savePathFix = 'skipped:import-failed'; savePathHash = $measureHash; savePathProbe = 'unverified:import-failed'; restoreOk = $spRestoreOk }
+  }
+
+  # THE PROBE ASSERTS BOTH HALVES: an allowed missing directory is created and
+  # reported, and a directory under neither root is refused WITHOUT being created
+  # (a silent makedirs there would be the redirect defect in a new place).
+  $savePathProbe = Invoke-SavePathProbe -PythonPath $py
+  if ($savePathProbe -like 'SAVE_PATH_BAD*') {
+    $spRestoreOk = Restore-BridgeSource -BridgePath $serverPath -OriginalBytes $originalBytes -ExpectedHash $measureHash -Filter 'server.*.pyc'
+    if ($spRestoreOk) {
+      Say "dsh-cua-savepath: probe says $savePathProbe after the patch, reverted"
+    } else {
+      Say "dsh-cua-savepath: NOT RESTORED after a bad probe ($savePathProbe) - $serverPath is left patched; reinstall dsh-cua==$expectedVersion"
+    }
+    return @{ savePathFix = 'skipped:probe-failed'; savePathHash = $measureHash; savePathProbe = $savePathProbe; restoreOk = $spRestoreOk }
+  }
+
+  Say "dsh-cua-savepath: applied + $savePathProbe"
+  return @{ savePathFix = 'applied'; savePathHash = $measureHash; savePathProbe = $savePathProbe }
+}
+
+# R9/C14 - THE DESKTOP TOKEN IS PROVEN AT BUILD TIME, NOT ASSUMED FROM THE
+# MACHINE TOKEN.
+#
+# THE DEFECT (P2-2, and the root cause of the whole report): the lane was
+# asserted by the `dsh-cua` step with `Get-RealPython`, i.e. as SYSTEM (or the
+# elevated user) - the machine token. pywin32 is installed MACHINE-wide and this
+# pass runs at HIGHEST, so `import win32ui` succeeds here even on a guest where
+# the FILTERED desktop token cannot load it. The 3:1 report's image is exactly
+# that guest: it built GREEN (marker ok:true) while every element-lane call failed
+# at tool time with ImportError. There is no host-side fix for it; the build has to
+# fail.
+#
+# SO: the same three assertions run ONCE MORE through an on-demand `/it /rl
+# LIMITED` task - the same token shape the relay's child runs as - and the step
+# THROWS when the marker is absent, stale, was written by a different script, or
+# says any of the three booleans is false. Throwing is the RETRY MECHANISM (a
+# step is only "done" when it is ok:true), so the logon pass re-runs it and the
+# row keeps ok:false until a real desktop token passes it.
+#
+# The marker is a PROOF, not a status: it carries the probe script's own SHA-256
+# and a per-attempt token, so a marker left over from an earlier boot cannot be
+# read as this pass's evidence.
+Step 'desktop-token-probe' {
+  $probeDir = 'C:\ProgramData\cua'
+  $probeScript = Join-Path $probeDir 'desktop-probe.ps1'
+  $probeMarker = 'C:\cua-work\cua-desktop-probe.json'
+  $probeToken = [guid]::NewGuid().ToString('n')
+
+  $py = Get-RealPython
+  if (-not $py) {
+    $script:pendingStepAnnotation = @{ desktopProbe = 'failed:no-python'; desktopSession = -1; desktopScriptSha256 = '' }
+    throw 'desktop-token-probe: no python interpreter, so the desktop token was NOT proven (the python step did not run)'
+  }
+  if (-not $relayAccount) {
+    $script:pendingStepAnnotation = @{ desktopProbe = 'failed:no-account'; desktopSession = -1; desktopScriptSha256 = '' }
+    throw 'desktop-token-probe: no provisioned local account could be resolved, so no /it task can be bound to the desktop'
+  }
+
+  New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+
+  # THE PROBE BODY IS ASCII AND SELF-CONTAINED. It hard-codes the interpreter
+  # path because a task has no environment (the same reason the relay's launcher
+  # carries its interpreter), and it hashes ITSELF at run time - a firstboot that
+  # compares the marker with the file it just wrote therefore compares the file
+  # that actually ran, not a value baked in before the write.
+  $probeText = @'
+# cua-desktop-probe - generated by cua-firstboot.ps1. Runs as the DESKTOP token.
+$ErrorActionPreference = 'Continue'
+$py = '__CUA_PY__'
+$marker = 'C:\cua-work\cua-desktop-probe.json'
+$probe = @{
+  schema = 1
+  at = (Get-Date).ToUniversalTime().ToString('o')
+  user = [string]$env:USERNAME
+  session = -1
+  win32ui = $false
+  uiaLane = $false
+  workDirWritable = $false
+  scriptSha256 = ''
+  probeToken = '__CUA_TOKEN__'
+}
+try { $probe.session = [int]([System.Diagnostics.Process]::GetCurrentProcess().SessionId) } catch { }
+& $py -c "import win32ui, win32gui" 2>$null | Out-Null
+$probe.win32ui = ($LASTEXITCODE -eq 0)
+& $py -c "import pywinauto.controls.uiawrapper; print('UIA_OK')" 2>$null | Out-Null
+$probe.uiaLane = ($LASTEXITCODE -eq 0)
+try {
+  Set-Content -LiteralPath 'C:\cua-work\.desktop-probe' -Value 'ok' -Encoding ASCII -ErrorAction Stop
+  $probe.workDirWritable = (Test-Path -LiteralPath 'C:\cua-work\.desktop-probe')
+} catch { $probe.workDirWritable = $false }
+Remove-Item -LiteralPath 'C:\cua-work\.desktop-probe' -Force -ErrorAction SilentlyContinue
+try { $probe.scriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant() } catch { }
+$probe | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $marker -Encoding ASCII
+'@
+  $probeText = $probeText.Replace('__CUA_PY__', $py).Replace('__CUA_TOKEN__', $probeToken)
+  try {
+    Set-Content -LiteralPath $probeScript -Value $probeText -Encoding ASCII -ErrorAction Stop
+  } catch {
+    $script:pendingStepAnnotation = @{ desktopProbe = 'failed:probe-write'; desktopSession = -1; desktopScriptSha256 = '' }
+    throw "desktop-token-probe: could not write $probeScript ($($_.Exception.Message))"
+  }
+  # C14 says the probe script is hidden: it is machinery, and a reader who finds
+  # it in ProgramData must find the marker next to it, not a stray script.
+  try { (Get-Item -LiteralPath $probeScript).Attributes = [System.IO.FileAttributes]::Hidden } catch { }
+  $probeHash = ''
+  try { $probeHash = (Get-FileHash -LiteralPath $probeScript -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $probeHash = '' }
+  if (-not $probeHash) {
+    $script:pendingStepAnnotation = @{ desktopProbe = 'failed:no-probe-hash'; desktopSession = -1; desktopScriptSha256 = '' }
+    throw "desktop-token-probe: could not hash $probeScript, so the marker could not be tied to the script that wrote it"
+  }
+
+  # /it /rl LIMITED IS THE SAME SHAPE THE RELAY USES: interactive (the user's
+  # session) and the user's own filtered token - not HIGHEST, which would run on a
+  # different desktop and prove nothing about the lane the tools get. /ru names
+  # the account explicitly: /it WITHOUT /ru binds the task to the CALLER, which is
+  # the machine account in the SYSTEM pass, and Windows refuses that create.
+  $trProbe = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File $probeScript"
+  $probeCmd = Join-Path $env:TEMP 'cua-desktop-probe.cmd'
+  @("schtasks /create /tn `"cua-desktop-probe`" /sc ondemand /ru `"$relayAccount`" /it /rl LIMITED /f /tr `"$trProbe`"") |
+    Set-Content -Path $probeCmd -Encoding ASCII
+  & cmd /c $probeCmd
+  $createExit = $LASTEXITCODE
+  Remove-Item -Force $probeCmd -ErrorAction SilentlyContinue
+  if ($createExit -ne 0) {
+    $script:pendingStepAnnotation = @{ desktopProbe = 'failed:task-create'; desktopSession = -1; desktopScriptSha256 = $probeHash }
+    throw "desktop-token-probe: schtasks could not register cua-desktop-probe (exit $createExit); the desktop token is NOT proven"
+  }
+
+  # A PREVIOUS MARKER MUST NOT BE READ AS THIS PASS'S EVIDENCE: delete it before
+  # the run (the token and the boot-time check below are the second and third
+  # guards, because a delete can fail).
+  Remove-Item -LiteralPath $probeMarker -Force -ErrorAction SilentlyContinue
+  $bootAt = (Get-Date).ToUniversalTime().AddMilliseconds(-[Environment]::TickCount64)
+  & schtasks.exe /run /tn 'cua-desktop-probe' 2>&1 | Out-Null
+  $runExit = $LASTEXITCODE
+
+  $deadline = (Get-Date).AddSeconds(30)
+  $markerInfo = $null
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Path -LiteralPath $probeMarker -ErrorAction SilentlyContinue) {
+      try { $markerInfo = Get-Content -LiteralPath $probeMarker -Raw | ConvertFrom-Json } catch { $markerInfo = $null }
+      if ($markerInfo) { break }
+    }
+    Start-Sleep -Milliseconds 500
+  }
+
+  $desktopSession = -1
+  if ($markerInfo) {
+    try { $desktopSession = [int]$markerInfo.session } catch { $desktopSession = -1 }
+  }
+  $why = ''
+  if (-not $markerInfo) {
+    $why = 'no-marker'
+  } elseif ([string]$markerInfo.probeToken -ne $probeToken) {
+    $why = 'stale-marker'
+  } elseif ([string]$markerInfo.scriptSha256 -ne $probeHash) {
+    $why = 'script-mismatch'
+  } else {
+    $markerAt = $null
+    try { $markerAt = ([datetime]::Parse([string]$markerInfo.at)).ToUniversalTime() } catch { $markerAt = $null }
+    if (-not $markerAt -or $markerAt -lt $bootAt) {
+      $why = 'stale-boot'
+    } elseif ($desktopSession -le 0) {
+      # JD3 - A SESSION-0 PROBE PROVES NOTHING. The entire point of this step is
+      # that the DESKTOP token (not the machine token) can load the lane; a task
+      # that ran in Session 0 - no logged-on user, or `/it` ignored - answered with
+      # the machine's rights, which is the R9 lie in a new place. A failed
+      # SessionId read (-1) is the same answer: unproven. Checked BEFORE the three
+      # booleans, because a Session-0 run can make all three true.
+      $why = 'no-session'
+    } elseif ($markerInfo.win32ui -ne $true) {
+      $why = 'win32ui-false'
+    } elseif ($markerInfo.uiaLane -ne $true) {
+      $why = 'uialane-false'
+    } elseif ($markerInfo.workDirWritable -ne $true) {
+      $why = 'workdir-false'
+    }
+  }
+
+  if ($why) {
+    $script:pendingStepAnnotation = @{ desktopProbe = ('failed:' + $why); desktopSession = $desktopSession; desktopScriptSha256 = $probeHash }
+    # THE THROW IS THE POINT: ok:false is what makes the next pass try again, and
+    # a guest that cannot prove the lane must not read as provisioned.
+    throw "desktop-token-probe: the DESKTOP token did not prove the lane ($why); marker '$probeMarker' after 30 s (task run exit $runExit, session $desktopSession, script $probeHash)"
+  }
+
+  Say "desktop-token-probe: ok (session $desktopSession, win32ui/uiaLane/workDirWritable all true, script $probeHash)"
+  return @{ desktopProbe = 'ok'; desktopSession = $desktopSession; desktopScriptSha256 = $probeHash }
 }
 
 Step 'clipboard-tasks' {

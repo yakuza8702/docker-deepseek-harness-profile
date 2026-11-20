@@ -3202,3 +3202,202 @@ guest **A** blocks the merge; any J-failure reopens the package that owns it.
 * **A stale guest is stated, not healed** (X7): nothing re-stages the relay or
   re-runs pip on start, so `desktop.measured:false` is the honest answer and a
   re-create is the documented upgrade.
+
+## 29. Branch `cua-vm-improve` — 2026-11-20: a receipt that was false, a lane that was advertised, a child that wedged, and a doctor that said OK
+
+A Windows guest reported "typing loses characters, every call takes 45 s, and the
+doctor says everything is fine". Ten defects came out of it, and **none of them
+was a missing feature**: each one was a surface that answered a question it had
+not measured. The chain is one line long —
+
+> `type_text` truncates silently → the element lane is dead but advertised → a
+> slow call wedges the child → every call burns 45 s with no retry → the doctor
+> prints `RELAY_OK` → `repair` prints `ok: false, reason: ""`.
+
+The locked plan is `session5-sol.md` (v1.0, §1 the frozen contracts C1–C15, §3–§7
+WP-A…WP-E, §11 the overrides); the diagnosis behind it is
+`session5-diagnosis.md`, and the public-contract research is
+`session5-research.md`. States are **ORACLE → PRE → JURY**: everything in this
+section was measured on this branch's files; nothing in it claims a guest.
+
+### The defect table (R1–R10, as the packages consumed it)
+
+| # | one-line cause | package | the single decision that closed it |
+|---|---|---|---|
+| **R1** | `RELAY_OK` is an accept-loop handshake: `classify()` answers before the session lock, so a relay whose MCP child is wedged still says OK | A + B | split the receipt in two: `RELAY_OK` = accept loop only; a **separate functional probe** (`RELAY_FN`, then a real `initialize` + `tools/list` round trip) proves the child and answers `RELAY_UNRESPONSIVE` when it cannot |
+| **R1b** | `forceRelayRepair()` dropped `measured`/`unmeasured`/`detail`, so an unparsed attempt answered `reason: ""` | B + C | one owner `describeRepairRecord()`; `forceRelayRepair` re-emits the four fields and never answers `""` |
+| **R2** | no request accounting: `serve_client` was a raw pump and `Relay.__init__` had no `pending` | A | passive id-pairing from the forwarded bytes + a watchdog that kills at `WEDGE_DEADLINE_MS = 20000` and answers every pending id with `child-wedged` |
+| **R3** | one 45 s constant did three jobs (handshake, registered `timeoutMs`, body race) while the client's inner timer was 60 s, so the inner `timeout` code lost by construction | B + C | a derived per-call budget ladder (`25_000` base), one retry for three read-only non-element tools, two routable codes |
+| **R4** | the warning gate was `measured === true`, so the tested image's actual state (`measured: false`) was silent everywhere | C | `desktopWarning` with a `measured:false` branch, one string owner, published by the reveal **and** the doctor |
+| **R5** | `effect_verified = after != before` called a truncated insert a success | D | exact compare against `before + text`, `effect_verified:false` + `missing`, retry the tail ×2, restore on terminal failure |
+| **R6** | `windowsToolDescription()` had no state input; `[DEGRADED]` did not exist | C | a frozen prefix on exactly five element tools; the other fourteen byte-identical |
+| **R7** | `server.py` opened the caller's `save_path` with no `makedirs` | D | `makedirs` only under `C:\cua-work` / `%TEMP%\win32_mcp_shots`, `created_dir`, everything else fails closed, **no silent redirect** |
+| **R8** | facts measured once per `--serve` lifetime | A | an adaptive refresh loop (60 s suspect / 900 s healthy / 5 identical suspect passes) + `refreshMs` in the file, written atomically |
+| **R9** | the lane was asserted from the machine token | D | `Step 'desktop-token-probe'`: the three assertions through an `/it /rl LIMITED` task, a fresh marker with `scriptSha256`, and a **throw** when absent |
+| **R10** | nothing above was asserted anywhere (`grep` over `tests/ tools/` → 0 hits) | A–E + E | every behaviour got a numbered check **and** a needle/mutation pair; `node tools/check-cua-vm.mjs --mutations` runs the pairs |
+
+### The overrides that changed the diagnosis (SOL §11 — the numbers there win)
+
+| the diagnosis said | what shipped | why |
+|---|---|---|
+| `WIN_MCP_CALL_TIMEOUT_MS = 20_000` | **25 000** | a 20 s host timer fires *before* a 20 s guest deadline (the guest's clock starts later), so `child-wedged` could never reach the model. The ladder is the fix, and the gate's `S2` asserts the margin |
+| retry 5 tools (`list_windows, skyshot, find_elements, get_window_rect, capture_window`) | **3**: `tool_list_windows, tool_capture_window, tool_read_clipboard` | `skyshot`/`get_window_rect` are not in this guest's 19 tools, and `find_elements` is element-lane — a dead lane fails in milliseconds, so a retry is noise. The sets are disjoint and `S3` pins membership |
+| "four descriptions carry `[DEGRADED]`" | **five**, 14 byte-identical | the set is named and has five members; "four" was a count without a set |
+| WP-C bumps `PLUGIN_VERSION` | **WP-E** bumps it (one line in `index.js`) | otherwise the version-match gate would be red between C and E |
+| facts refresh "60 s" flat | **60 s suspect / 900 s healthy / 5 suspect max** | a flat 60 s re-measures a healthy guest 1 440×/day; a flat 900 s fails to heal the reported guest for 15 minutes |
+| `--ping --functional` flag on the relay | **host-side base64 program + a `RELAY_FN` evidence verb** | a CLI flag re-introduces the stale-payload dependency §27 documented; the program also keeps `usage()` byte-identical |
+| `PROBE_PING_FN`-style prefix | **`RELAY_FN`** | any token prefixed by `RELAY_PING` is swallowed by the 8-byte prefix match |
+| the `repair` reason fix in WP-B | **WP-C** (`forceRelayRepair` lives in `index.js`); WP-B owns the sentence | disjoint file ownership; one owner for the wording |
+
+### The five packages, and the evidence each one produced
+
+| package | files | evidence (measured here) |
+|---|---|---|
+| **WP-A** relay: token set, watchdog, evidence verb, facts loop | `docker/cua-mcp-relay.py`, `tests/relay-wedge.mjs`, `tests/fixtures/fake-wedged-child.py` | `node tests/relay-wedge.mjs` → **PASS — ≥26 check(s)** (26 green at the finish of the JE round; the SOL froze 18 and the fix round added A-19/A-20/A-25…, so the number is a **floor** and the suite prints its own exact total and contract). The suite compiles the relay, spawns it on an ephemeral port with `DSH_CUA_MCP_WEDGE_DEADLINE_MS=800`, and proves the A-3 pair that matters: with a **wedged** child attached the cheap probe still answers `RELAY_OK`, while the functional probe answers `RELAY_UNRESPONSIVE`; a request to the wedged child is answered `{"code": -32000, "message": "child-wedged: …"}` between 0.6 s and 1.6 s, once per id, ascending; the next request succeeds without a reconnect |
+| **WP-B** client truth: fourth token, base64 functional program, `describeRepairRecord`, per-call budget | `plugins/dsh-cua-vm/win-mcp.js`, `tests/modules-unit.mjs` | `node tests/modules-unit.mjs` → **PASS, ≥445 checks** (427 → ≥445; **+18 observed**, not the SOL's +14 — its B-1…B-14 plus the revise-round additions pinned in the same block, e.g. D-9's reason-set check). The decisive ones: a `null` evidence field stays `null` (never 0), a `session-busy` answer is `status: RELAY_OK, measured:false` and is therefore **never** a measured `ok` (the lane is usable, the child is unmeasured), a stub that prints only the token resolves `reason:'no-evidence'` instead of rejecting, and `callTool(…, {timeoutMs: 40})` beats the 60 s default |
+| **WP-C** plugin surface: ladder, sets, `[DEGRADED]`, `desktopWarning`, attach truth, doctor status | `plugins/dsh-cua-vm/index.js`, `tests/windows-mcp-gate.mjs`, `tests/fixtures/fake-win-mcp.mjs` | `node tests/windows-mcp-gate.mjs` → **PASS, ≥124 checks, 0 PENDING** (99 → ≥124; **+25 observed**, not the SOL's +16 — its C-1…C-16 plus the revise/fix-round checks for the same contracts; the suite keeps growing, so this is the floor measured at landing). With `DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS=200`: a hanging `tool_list_windows` makes **exactly 2** attempts and ends `code: relay-unresponsive`, a hanging `tool_type_text` makes **exactly 1**; a dead measured lane puts `[DEGRADED]` on five descriptions in both the registry and `windows_desktop.tools[]`; facts arriving after attach re-register those five exactly once, and a healthy guest never re-registers |
+| **WP-D** guest payload: `type_text`, `save_path`, desktop-token proof | `docker/windows-oem/cua-firstboot.ps1`, `tests/guest-patch.mjs` | `node tests/guest-patch.mjs` → **PASS — ≥24 check(s)** (24 green at the finish of the JE round; the suite grew from the SOL's 20). The here-strings are applied to the pinned 0.4.1 evidence copies and the patched functions are AST-extracted and RUN: a dropped character yields `ok:false, effect_verified:false, reason:'short-insert', missing:'d'`, two retries recover it (`recovered:true, retries:2`), a terminal failure restores with `restoreOk:true` — and the **unpatched** copy still answers `effect_verified:true` for the same stub, which is the proof the defect was real |
+**Counts in this table are LANDING-TIME floors, not a running total.** Three suites
+in it (`relay-wedge`, `modules-unit`, `windows-mcp-gate`) and the WP-D suite are
+being extended by the concurrent fix round, so each row states `≥ the number this
+slot measured` and the suite itself is the authority on its exact total and on
+whether it passes right now. The gate and the mutation table below are the two
+numbers this slot OWNS, and they are exact.
+
+| **WP-E** needles, mutations, identity, docs | `tools/check-cua-vm.mjs`, `plugins/dsh-cua-vm/package.json`, one line of `index.js`, `README.md`, `.env.example`, `BRANCH-NOTES.md`, `.github/workflows/prebuild-gates.yml` | `node tools/check-cua-vm.mjs` → **1309 assertion(s) across 24 file(s)**, exit 0. `node tools/check-cua-vm.mjs --mutations` → **mutations: 22/22 red, 0 false-green**, exit 0 (9.6 s) |
+
+### The gate's arithmetic (a dropped row is a failure, not a new baseline)
+
+```
+baseline (HEAD)                     1237
+WP-A relay needles                   +24   (A1…A24)
+WP-B win-mcp needles                 +13   (B1…B13)
+WP-C index needles                   +13   (net: 2 retired, 15 added)
+WP-D firstboot needles               +10   (D1…D8, plus D9/D10 from JE1:
+                                            savePathFix / desktopProbe, which
+                                            had NO needle and NO pair)
+WP-E gate needles (mode + table)      +2   (E1, E2)
+.env.example rows                     +4
+semantic assertions S1…S6             +6
+                                     ───
+                                    1309
+```
+
+**Two needles were RETIRED, and the reason is the reason R10 exists.** WP-C
+rewrote the per-call `boundedExecute` wiring and the three-way `status:` ladder,
+but left the old literals **verbatim inside doc comments** so the two existing
+rows would stay green. A needle a comment can satisfy pins documentation, not
+wiring: reverting the budget (or the status ladder) while keeping the comment
+would have passed. WP-E replaced both rows with the expressions that actually
+execute:
+
+* `const execute = boundedExecute(publicName, declaredMs, undefined,` — the body
+  race now takes its budget from the ladder, so M-10 (which scales the ladder's
+  input) is the row's coverage;
+* `status: … : (unresponsive === true ? 'unresponsive' : 'ok')),` — the four-value
+  ladder that reports a wedged child instead of `ok`.
+
+The arithmetic above counts the two replacements, so the file's net is +13 (the
+SOL's number) rather than +15.
+
+### The mutation harness (`--mutations`, C15)
+
+Twenty-two reverts, each applied to a **copy** of the tree and judged by this very
+gate: the row passes only when the judge exits **non-zero** *and* its stderr names
+the expected assertion. A red for the wrong reason is a **false green** and fails
+the run. Two of WP-A's disclosed false-green risks were absorbed rather than
+rediscovered:
+
+* **M-01 comments out the kill call** (`pid = …` → `# pid = …`) instead of
+  renaming it. An index-only order check still finds the literal inside a comment,
+  so `S1` strips comment lines (string-aware, for both Python and JS) before
+  comparing — and M-01 is now the row that proves the stripping works.
+* **eleven rows replace a WORD that is also documentation, not a unique
+  literal**: `child-wedged` (M-02), `lastSuccessfulCallAgeMs` (M-04), `refreshMs`
+  (M-05), `relayFunctionalProbeProgram(` (M-07), `describeRepairRecord(` (M-08),
+  `perCallTimeoutMs` (M-09), `relay-unresponsive` (M-12), `desktopWarning` (M-13),
+  `typeTextFix` (M-15), `created_dir` (M-16), `desktop-token-probe` (M-17) — and
+  two more (M-21 `savePathFix`, M-22 `desktopProbe`) are `all: true` for
+  MULTIPLICITY instead: 13 and 8 occurrences, because a marker is the whole rows
+  family and a rename takes all of them. Their replacements (`savePathPatch`,
+  `desktopRun`) deliberately do not contain the needle as a substring — a
+  `desktopProbeMarker` would have left `desktopProbe` matching and the pair would
+  have been a false green. Each
+  word also appears in a docstring, a log line or a public field name, so a
+  single-occurrence substitution leaves a second hit: the row would report
+  `ambiguous` and the table could never be green — and the "honest" way to make
+  it green (pick a shorter literal that happens to occur once) is exactly how a
+  pair drifts into proving nothing. Those rows carry `all: true` (replace every
+  occurrence, require at least one): the "≥1-substitution semantics" the SOL
+  allows, absorbed here rather than rediscovered three sessions later.
+
+The runner is **never** a mutation target: a mutated runner would be the process
+judging its own mutation. E1 asserts the mode exists in the runner's own source
+and E2 asserts the table is 22 unique pairs whose `find` literals still occur —
+the cheap half of `--mutations` runs on **every** gate invocation (22 in-memory
+searches instead of 22 subprocesses), so a drifted literal fails the default run
+too. **JE1 added the last two** (M-21/M-22): the guest markers `savePathFix` and
+`desktopProbe` were pinned by neither a needle nor a pair, so renaming either one
+passed every gate — the doctor then reads an absent marker ("never attempted",
+"never proven") for work the step may well have done.
+
+### Identity
+
+`PLUGIN_VERSION = '0.2.2'` (`index.js`, one line) and `"version": "0.2.2"`
+(`package.json`) in the same landing, asserted equal by `WP-6.6`, which also
+pins the literal in the needle list. A future bump in one file turns the gate
+red; `pluginVersion` in the doctor is how "the fix is not in your plugin" stops
+being a guess.
+
+### PRE revise — the probe vocabulary is aligned to its producers
+
+The first PRE review found one documentation defect (LOW, #7): the same
+`RELAY_UNRESPONSIVE` row listed `session-busy` as a rank-3 reason **and** `wedge`
+as a reason at all, while the program answers the opposite in both cases —
+`session-busy` is a `RELAY_OK`/`measured:false` answer (pinned by
+`modules-unit` B-7), and `wedge` is emitted by nothing. The README's vocabulary
+now has one owner: the **producer table** of the five exits (`no-evidence` →
+`RELAY_UNRESPONSIVE`, `session-busy` → `RELAY_OK` + `measured:false`, the
+measured success, `child-eof`, `child-silent`), with the rank table reduced to the
+tokens those exits actually print.
+
+Two facts are now written down because they are the trap, not the trivia:
+
+* **`session-busy` is not a health verdict.** The probe returns *before* it opens
+  the session socket, so `measured` is `false` and nothing about the child was
+  asked; the token is `RELAY_OK` because the *lane* is fine. `relayOk` is
+  therefore **true** on that answer (`relayAnswerRelayOk()` reads the status, by
+  design) — which is exactly why the verdict must be decided from the evidence
+  numbers the busy answer still carries (`lastSuccessfulCallAgeMs`,
+  `outstandingRequestAgeMs`, `childRestarts`) and never from the token alone.
+* **A member with no producer — HISTORICAL, now closed.** `wedge` was listed in
+  the reason set while the relay's evidence object carries no `reason` field at
+  all (a wedge is `event('wedge', …)` and `lastWedgeAt`), so no probe answer could
+  ever emit it. This slot only documented that; the client owner (agent-5) then
+  removed it, and `RELAY_FN_REASONS` is now the five-member frozen list
+  (`''`/`child-silent`/`child-eof`/`session-busy`/`no-evidence`) with an out-of-set
+  value normalized to `no-evidence`.
+
+**Resolved in the same fix round (not this slot's file):** the dead vocabulary
+member is gone. `tests/modules-unit.mjs` **D-9** pins the exact five members, the
+`Object.freeze`, and `wedge ⇒ no-evidence`, so neither the surplus member nor a
+forwarded unknown can come back. The README now states that the set is exactly
+the producers — nothing surplus, nothing documented that the code cannot answer.
+
+### What this section does not claim
+
+* **No guest measurement is claimed.** WP-D's patches were applied to the
+  **evidence copies** of `dsh-cua==0.4.1` (`bridge.py` `59280ee9…`, `server.py`
+  `29668590…`) and executed there as extracted functions; PowerShell was never
+  executed on this branch, so the ACL taking, the postinstall repairing the DLLs
+  and the desktop-token probe's marker are source-asserted, not run.
+* **The relay's 20 s watchdog was proven against a synthetic wedged child** (a
+  fixture that accepts and never answers), not against a real `WM_GETTEXT` that
+  never returns. The pairing, the kill, the answer and the restart are proven;
+  the *cause* of a real wedge is the guest's business.
+* **The functional probe was proven against stubs** (B-5…B-9) and against the
+  relay's own `RELAY_FN` verb; its 12 s / 9 s budgets were not exercised on a
+  real desktop session.
+* **`--mutations` costs a tree copy + 22 gate runs (~10 s here).** It is a separate invocation
+  and a separate CI step by design (K12): it is not part of the default gate, and
+  a drifted `find` is a failure — never a skipped row.

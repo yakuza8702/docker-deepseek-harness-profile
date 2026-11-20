@@ -119,7 +119,7 @@
  * mutation check (T2).
  */
 import net from 'node:net'
-import { existsSync, mkdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import { registerHooks } from 'node:module'
 
@@ -255,12 +255,30 @@ const checkContract = (label, landed, ok, detail = '', expected = '') => {
 
 const globalTools = new Map()
 const registered = []
+/**
+ * DEFECT #6'S SEAM: a `register()` for this name THROWS, after `skip` matching
+ * calls have gone through. It has to be the HOST registry (that is the one the
+ * plugin calls through `ctx.tools.register`), never a mock of the plugin: the
+ * assertion is about what the plugin does when the registry refuses a name, and
+ * a stub could only prove the stub. `skip` is what aims the throw at the
+ * POST-ATTACH re-render instead of the attach itself (the attach registers the
+ * name once, the re-render registers it again).
+ */
+let registerFailure = null
 const disposed = []
 const changeHandlers = []
 const emitChange = () => { for (const fn of [...changeHandlers]) fn() }
 
 const hostTools = {
   register(definition) {
+    if (registerFailure !== null && registerFailure.name === definition.name) {
+      if (registerFailure.skip > 0) {
+        registerFailure.skip -= 1
+      } else {
+        registerFailure = null
+        throw new Error(`forced register failure for ${definition.name}`)
+      }
+    }
     if (globalTools.has(definition.name)) throw new Error(`duplicate tool ${definition.name}`)
     globalTools.set(definition.name, definition)
     registered.push(definition.name)
@@ -1143,6 +1161,626 @@ try {
   check('(k)-(p) the block hands the suite back a live attach (winbox3, 19 names)',
     blockBoardOk && (await freshDoctor()).target === 'winbox3',
     `names=${prefixed().length} target=${lastDoctor.target}`)
+  /* ================================================================== *
+   * WP-C — THE PER-CALL BUDGET, THE TWO CODES, `[DEGRADED]`, AND THE DESKTOP
+   * THAT WAS NEVER MEASURED (SOL §5.3; contracts C5-C9, C12)
+   *
+   * THE DEFECTS THIS BLOCK DRIVES, one per numbered check:
+   *
+   *   C-1..C-4  ONE 45 s constant did the handshake, the per-call budget and the
+   *             body race, so a slow-but-alive call looked like a dead attach,
+   *             nothing was ever retried and the client's own timer (60 s) could
+   *             not win. The ladder is now 20 000 (guest wedge) < 25 000 (call) <
+   *             26 000 (envelope) < 30 000/56 000 (registered guard/retry), and
+   *             the retry exists for THREE read-only, non-element tools only.
+   *   C-5       A wedged child's `child-wedged` sentence must reach the model
+   *             verbatim with a routable code — the effect of that call is
+   *             UNKNOWN and only the guest's own words say so.
+   *   C-6/C-7   The element tools advertised a lane the guest does not have:
+   *             `[DEGRADED]` on exactly five descriptions, 14 byte-identical.
+   *   C-8..C-11 The warning gate was `measured === true`, so the ONE state the
+   *             report hit — facts unreadable ⇒ `measured:false` — produced no
+   *             warning anywhere. `desktopWarning` now speaks there, stays SILENT
+   *             on `null` (a read in flight), and has ONE owner.
+   *   C-12/C-13 `RELAY_OK` is an accept-loop handshake; the child is proven only
+   *             by the functional probe, so the doctor's verdict has a fourth
+   *             status (`unresponsive`) and the numbers behind it.
+   *   C-14/C-15 `repair:true` answered `ok:false, reason:""` — the one verb a
+   *             user reaches for said nothing. The record's own fields and C6's
+   *             sentence are both reported now.
+   *   C-16      Descriptions are registered before the desktop facts answer, so a
+   *             measured dead lane must reach the five element tools ONCE per
+   *             generation — and a healthy guest must never re-register.
+   *
+   * EVERY CHECK BELOW USES `check(...)`, NEVER `checkContract(...)`: the fields
+   * these assertions read are the ones this package lands, so there is nothing
+   * left to be "pending", and the suite must print 0 PENDING.
+   * ================================================================== */
+  {
+    const CUA = 'mcp__windows__'
+    const DEGRADED_SENTENCE = '[DEGRADED] the element lane is unavailable on this computer (win32ui missing): this tool will fail with ImportError - use tool_click_at + tool_type_text, or tool_list_windows, until the guest is rebuilt.'
+    const ELEMENT_LANE_TOOLS = ['find_elements', 'tool_invoke', 'tool_get_text', 'tool_set_value', 'tool_wait_for']
+    const RETRY_TOOLS = ['tool_list_windows', 'tool_capture_window', 'tool_read_clipboard']
+    const RELAY_UNRESPONSIVE = fake.RELAY_UNRESPONSIVE ?? 'RELAY_UNRESPONSIVE'
+    /** C5's own arithmetic, at the 200 ms budget this block scales the ladder to. */
+    const SCALED_CALL_MS = 200
+    const SCALED_ENVELOPE_MS = SCALED_CALL_MS + 1000
+    const CYCLES_SSH_PORT = 47103
+    const savedCallBudget = process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS
+
+    /** One guest tool call, with the fixture's attempt counter reset for it. */
+    const callGuestTool = async (guest) => {
+      fake.resetCallToolAttempts()
+      const startedAt = Date.now()
+      let text = ''
+      try {
+        const answer = await globalTools.get(`${CUA}${guest}`).execute({}, { agent: agentA.agent })
+        text = String(answer?.text ?? '')
+      } catch (error) {
+        text = String(error?.message ?? error)
+      }
+      return { text, attempts: fake.attemptsFor(guest), elapsedMs: Date.now() - startedAt }
+    }
+    /** Assert the fixture knows this guest tool and the prefix maps one-to-one. */
+    const resolvesAsGuestTool = (guest) => fake.GUEST_TOOLS.some((tool) => tool.name === guest)
+      && realWinMcp.windowsToolName(guest) === `${CUA}${guest}`
+      && String(realWinMcp.windowsGuestToolName(`${CUA}${guest}`)) === guest
+    /** C8's template, rebuilt from the fixture + the shipped contract table. */
+    const renderDescription = (guest, computer, degraded = false) => {
+      const base = fake.GUEST_TOOLS.find((tool) => tool.name === guest)?.description ?? ''
+      const note = String(realWinMcp.windowsToolContract(guest) ?? '')
+      return `${degraded ? `${DEGRADED_SENTENCE} ` : ''}${base}${note === '' ? '' : ` ${note}`} (dsh-cua, Windows computer ${computer})`
+    }
+    /** The same power cycle `reattach()` drives, for the computer this block owns. */
+    const cycleComputer = async (name = 'winbox3') => {
+      rows.set(name, { kind: 'windows', state: 'powered-off', ssh: true, sshPort: CYCLES_SSH_PORT })
+      const down = await waitFor(async () => (await doctor(agentA.agent)).online === false, 8000)
+      rows.set(name, { kind: 'windows', state: 'ready', ssh: true, sshPort: CYCLES_SSH_PORT })
+      const up = await waitFor(() => prefixed().length === 19, 10000)
+      return { down, up }
+    }
+
+    try {
+      process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS = String(SCALED_CALL_MS)
+
+      // ---- C-1: THE TWO SETS, DERIVED FROM BEHAVIOUR ----
+      //
+      // The sets are module constants, so asserting them from the source would
+      // be a string test. They are driven instead: with the ladder scaled to
+      // 200 ms and EVERY guest tool hanging, the tools that make TWO attempts
+      // ARE the retry set — and the members have to resolve through
+      // `windowsToolName()` and exist in the catalogue, or the retry would name
+      // a tool nobody registered.
+      fake.setCallToolBehavior({ hangMs: 5000, code: 'timeout' })
+      const attemptSweep = new Map()
+      for (const tool of fake.GUEST_TOOLS) attemptSweep.set(tool.name, (await callGuestTool(tool.name)).attempts)
+      const twice = [...attemptSweep.entries()].filter(([, count]) => count === 2).map(([name]) => name).sort()
+      const once = [...attemptSweep.entries()].filter(([, count]) => count === 1).map(([name]) => name).sort()
+      const setsResolve = [...RETRY_TOOLS, ...ELEMENT_LANE_TOOLS].every(resolvesAsGuestTool)
+      const disjoint = RETRY_TOOLS.every((guest) => ELEMENT_LANE_TOOLS.includes(guest) === false)
+      check('(C-1) exactly the three read-only non-element tools retry (2 attempts), the other 16 make 1, and both frozen sets are resolvable guest names that are disjoint',
+        JSON.stringify(twice) === JSON.stringify([...RETRY_TOOLS].sort())
+        && once.length === fake.GUEST_TOOLS.length - RETRY_TOOLS.length
+        && setsResolve && disjoint
+        && ELEMENT_LANE_TOOLS.every((guest) => RETRY_TOOLS.includes(guest) === false),
+        `twice=${JSON.stringify(twice)} once=${once.length} resolve=${setsResolve} disjoint=${disjoint}`)
+
+      // ---- C-2: A HANGING READ-ONLY TOOL: TWO ATTEMPTS, ONE ROUTABLE CODE ----
+      fake.resetCallToolAttempts()
+      fake.setCallToolBehavior({ hangMs: 5000, code: 'timeout' })
+      const retriedCall = await callGuestTool('tool_list_windows')
+      check('(C-2) a hanging tool_list_windows makes EXACTLY 2 attempts and the model reads `code: relay-unresponsive` with the doctor hint',
+        retriedCall.attempts === 2
+        && /code: relay-unresponsive$/u.test(retriedCall.text)
+        && /hint: the relay is listening/u.test(retriedCall.text)
+        && /windows_mcp_doctor/u.test(retriedCall.text),
+        `attempts=${retriedCall.attempts} text=${JSON.stringify(retriedCall.text.slice(-90))}`)
+
+      // ---- C-3: A MUTATING CALL IS NEVER REPEATED ----
+      //
+      // `tool_type_text` is the one call whose repeat is DATA LOSS (it types
+      // again), and it is the case the diagnosis's five-tool retry list would
+      // have broken. One attempt, same routable code.
+      fake.resetCallToolAttempts()
+      fake.setCallToolBehavior({ hangMs: 5000, code: 'timeout' })
+      const mutatingCall = await callGuestTool('tool_type_text')
+      check('(C-3) a hanging MUTATING tool (tool_type_text) makes exactly 1 attempt and still reports `code: relay-unresponsive`',
+        mutatingCall.attempts === 1 && /code: relay-unresponsive$/u.test(mutatingCall.text),
+        `attempts=${mutatingCall.attempts} text=${JSON.stringify(mutatingCall.text.slice(-90))}`)
+
+      // ---- C-4: THE LADDER, MEASURED ----
+      //
+      // The old per-call budget was 45 000 ms, so "two attempts inside 3 × 200 ms
+      // + 1.5 s" is the assertion that the constant is gone rather than renamed.
+      const retriedDefinition = globalTools.get(`${CUA}tool_list_windows`)
+      const singleDefinition = globalTools.get(`${CUA}tool_type_text`)
+      check('(C-4) two attempts finish inside 3 × call + 1500 ms, and the registered timeoutMs of a retried tool is at least 2 envelopes',
+        retriedCall.elapsedMs < (3 * SCALED_CALL_MS) + 1500
+        && Number(retriedDefinition?.timeoutMs) >= 2 * SCALED_ENVELOPE_MS
+        && Number(singleDefinition?.timeoutMs) >= SCALED_ENVELOPE_MS,
+        `elapsed=${retriedCall.elapsedMs}ms retryMs=${retriedDefinition?.timeoutMs} singleMs=${singleDefinition?.timeoutMs} envelope=${SCALED_ENVELOPE_MS}`)
+
+      // ---- C-5: THE GUEST'S OWN `child-wedged` SENTENCE ----
+      //
+      // The guest answered `code:-32000`. Its message is the ONLY thing that says
+      // the call did not return and the effect is UNKNOWN, so it must arrive
+      // verbatim with the routable code appended — never rewritten here.
+      const WEDGED_MESSAGE = 'child-wedged: the MCP server did not answer in 20000 ms; killed pid 4242 (restart #1); the call did not return, so its effect is UNKNOWN - re-observe before retrying'
+      fake.resetCallToolAttempts()
+      fake.setCallToolBehavior({ code: 'child-wedged', message: WEDGED_MESSAGE, rpcCode: -32000 })
+      const wedgedCall = await callGuestTool('tool_type_text')
+      check('(C-5) a guest `{"code":-32000,"message":"child-wedged: …"}` reaches the model as `code: child-wedged` with the guest sentence intact',
+        wedgedCall.attempts === 1
+        && wedgedCall.text.startsWith(WEDGED_MESSAGE)
+        && /code: child-wedged$/u.test(wedgedCall.text)
+        && /effect is UNKNOWN/u.test(wedgedCall.text),
+        `attempts=${wedgedCall.attempts} text=${JSON.stringify(wedgedCall.text.slice(0, 78))}`)
+      fake.resetCallToolAttempts()
+
+      // ---- C-8/C-9/C-10/C-11: THE WARNING THAT WAS WITHHELD ----
+      //
+      // Order matters: the doctor READS the facts and stores them, and the
+      // reveal serves that cached copy synchronously — so each pair below is
+      // (doctor, reveal) with no read in between.
+      const UNMEASURED_ERROR = 'fake-win-mcp: the guest has no desktop facts file'
+      fake.setDesktopFacts({ measured: false, error: UNMEASURED_ERROR })
+      const unmeasuredDoctor = await doctor(agentA.agent)
+      const unmeasuredDesk = await desktop()
+      check('(C-8) an UNMEASURED desktop speaks: `desktopWarning` names "was NOT measured" and the error, and the revealed note carries it',
+        typeof unmeasuredDesk.desktopWarning === 'string'
+        && /was NOT measured/u.test(unmeasuredDesk.desktopWarning)
+        && unmeasuredDesk.desktopWarning.includes(UNMEASURED_ERROR)
+        && unmeasuredDesk.desktop?.measured === false
+        && String(unmeasuredDesk.note ?? '').includes(unmeasuredDesk.desktopWarning),
+        `warning=${String(unmeasuredDesk.desktopWarning ?? '').slice(0, 96)} note=${String(unmeasuredDesk.note ?? '').slice(-60)}`)
+
+      fake.resetDesktopFacts()
+      const healthyDoctor = await doctor(agentA.agent)
+      const healthyDesk = await desktop()
+      const HEALTHY_NOTE = `${healthyDesk.tools?.length ?? 0} dsh-cua tool(s) are now visible for this session.`
+      check('(C-9) a HEALTHY measured desktop keeps `desktopWarning` null and the note byte-identical',
+        healthyDesk.desktopWarning === null && healthyDoctor.desktopWarning === null
+        && healthyDesk.note === HEALTHY_NOTE
+        && healthyDoctor.desktop?.measured === true,
+        `warning=${String(healthyDesk.desktopWarning)} note=${JSON.stringify(String(healthyDesk.note ?? '').slice(0, 60))}`)
+
+      // C-10: `desktop === null` is "nothing has been read yet" — a read is IN
+      // FLIGHT — and C9 makes that state SILENT. The hold is what makes the
+      // window observable: the attach's own facts read is parked, so the cached
+      // answer really is null on a live, revealed bridge, and a refresh is
+      // already on its way.
+      const factsGate = fake.holdDesktopFacts()
+      try {
+        const heldCycle = await cycleComputer()
+        const heldReveal = await desktop()
+        check('(C-10) `desktop: null` (a facts read still in flight) yields desktopWarning null — and a read is already in flight',
+          heldCycle.up && fake.desktopFactsHeld()
+          && heldReveal.revealed === true && heldReveal.desktop === null
+          && heldReveal.desktopWarning === null
+          && (fake.desktopFactCalls.reads + fake.desktopFactCalls.refreshes) > 0,
+          `cycle=${JSON.stringify(heldCycle)} desktop=${JSON.stringify(heldReveal.desktop)} reads=${fake.desktopFactCalls.reads} refreshes=${fake.desktopFactCalls.refreshes}`)
+      } finally {
+        factsGate.release()
+      }
+      // let the released read land, so the next pair is not looking at `null`
+      await waitFor(async () => (await doctor(agentA.agent)).desktop?.measured === true, 5000)
+
+      // ---- C-6/C-7/C-16: THE DEAD LANE, MEASURED ----
+      //
+      // The knob is set BEFORE the cycle, so the attach registers healthy
+      // descriptions and the POST-ATTACH hook (C-4) has to re-render the five.
+      fake.setDesktopFacts({ win32ui: false, uiaLane: false, elementLaneOk: false })
+      const registeredBeforeDead = registered.length
+      const deadCycle = await cycleComputer()
+      const degradedLanded = await waitFor(() => registeredDescription('find_elements').startsWith(DEGRADED_SENTENCE), 6000)
+      const deadDesk = await desktop()
+      const revealedByName = new Map((deadDesk.tools ?? []).map((tool) => [String(tool.name), String(tool.description ?? '')]))
+      check('(C-6) a measured DEAD lane puts `[DEGRADED]` on exactly the five element tools, in the REGISTRY and in windows_desktop.tools[]',
+        deadCycle.up && degradedLanded
+        && ELEMENT_LANE_TOOLS.every((guest) => registeredDescription(guest) === renderDescription(guest, 'winbox3', true)
+          && revealedByName.get(`${CUA}${guest}`) === renderDescription(guest, 'winbox3', true)),
+        `landed=${degradedLanded} dead=${ELEMENT_LANE_TOOLS.filter((guest) => registeredDescription(guest) !== renderDescription(guest, 'winbox3', true)).join(',') || 'all five exact'}`)
+      const controls = fake.GUEST_TOOLS.map((tool) => tool.name).filter((guest) => ELEMENT_LANE_TOOLS.includes(guest) === false)
+      check('(C-7) ...and the other 14 descriptions are BYTE-IDENTICAL to the pre-change rendering',
+        controls.length === 14
+        && controls.every((guest) => registeredDescription(guest) === renderDescription(guest, 'winbox3', false)
+          && revealedByName.get(`${CUA}${guest}`) === renderDescription(guest, 'winbox3', false)),
+        `${controls.length} control description(s): ${controls.filter((guest) => registeredDescription(guest) !== renderDescription(guest, 'winbox3', false)).join(',') || 'all identical'}`)
+      // C-16 first half: the re-render really was a RE-REGISTRATION (19 attach
+      // registrations + the five), not a description mutated behind the host's
+      // back — `registered` only grows when `ctx.tools.register` is called.
+      const deadRegistrations = registered.length - registeredBeforeDead
+      fake.resetDesktopFacts()
+      const registeredBeforeHealthy = registered.length
+      const healthyCycle = await cycleComputer()
+      const healthyNamesAt = registered.length
+      await sleep(400)
+      check('(C-16) facts arriving AFTER attach re-register exactly the five element tools once (24 registrations for a dead lane), while a healthy guest never re-registers',
+        deadRegistrations === 24
+        && healthyCycle.up
+        && registered.length - registeredBeforeHealthy === 19
+        && registered.length === healthyNamesAt
+        && registeredDescription('find_elements') === renderDescription('find_elements', 'winbox3', false),
+        `dead=+${deadRegistrations} healthy=+${registered.length - registeredBeforeHealthy} afterSettle=+${registered.length - healthyNamesAt}`)
+
+      // ---- C-11: ONE OWNER, ONE STRING ----
+      //
+      // Three inputs, and for each one the doctor's field and the reveal's field
+      // must be the SAME bytes (both are `windowsDesktopWarnings(...).join(' ')`).
+      const pairs = [
+        { desktop: healthyDoctor.desktop, warning: healthyDoctor.desktopWarning, reveal: healthyDesk.desktopWarning, label: 'healthy' },
+        { desktop: unmeasuredDoctor.desktop, warning: unmeasuredDoctor.desktopWarning, reveal: unmeasuredDesk.desktopWarning, label: 'unmeasured' },
+        { desktop: deadDesk.desktop, warning: deadDesk.desktopWarning, reveal: deadDesk.desktopWarning, label: 'dead-lane' }
+      ]
+      check('(C-11) desktopWarning is ONE string on both surfaces: the doctor\'s field equals the reveal\'s for all three desktop states',
+        pairs.every((pair) => pair.warning === pair.reveal)
+        && pairs[0].warning === null
+        && typeof pairs[1].warning === 'string' && pairs[1].warning !== ''
+        && typeof pairs[2].warning === 'string' && /element lane is DEAD/u.test(pairs[2].warning),
+        pairs.map((pair) => `${pair.label}=${pair.warning === null ? 'null' : `"${pair.warning.slice(0, 34)}…"`}`).join(' | '))
+
+      // ---- C-12: THE FOURTH STATUS, AND ITS PRECEDENCE ----
+      //
+      // `RELAY_OK` is an accept-loop handshake. The child is proven only by the
+      // initialize/tools/list round trip, so a probe that answers
+      // RELAY_UNRESPONSIVE must turn `ok` into `unresponsive` — and a BLIND lane
+      // (`blind` is a larger fact) must still win over it.
+      const unresponsiveAnswer = {
+        status: RELAY_UNRESPONSIVE,
+        measured: false,
+        reason: 'child-silent',
+        budgetMs: 5000,
+        elapsedMs: 5003,
+        initializeMs: null,
+        toolsListMs: null,
+        tools: 0,
+        port: 47999,
+        evidenceAt: '2026-11-20T00:00:00Z',
+        evidence: { lastSuccessfulCallAgeMs: null, outstandingRequestAgeMs: 4321, childRestarts: 2, wedgeDeadlineMs: 20000, childPid: 4242 }
+      }
+      fake.setRelayFunctional(unresponsiveAnswer)
+      const functionalBase = fake.counters.functionalCalls
+      const unresponsiveDoctor = await doctor(agentA.agent)
+      fake.setLane('session-0-direct', { relayStatus: RELAY_DOWN, probeMode: 'handshake' })
+      const blindCycle = await cycleComputer()
+      const blindWithUnresponsive = await doctor(agentA.agent)
+      check('(C-12) the functional probe turns `ok` into `unresponsive`, and a BLIND lane still wins over it (leaking → blind → unresponsive → ok)',
+        fake.counters.functionalCalls > functionalBase
+        && unresponsiveDoctor.status === 'unresponsive'
+        && unresponsiveDoctor.relayFunctional?.status === RELAY_UNRESPONSIVE
+        && blindCycle.up && blindWithUnresponsive.status === 'blind'
+        && /^blind \(/u.test(String(blindWithUnresponsive.verdict ?? '')),
+        `functionalCalls +${fake.counters.functionalCalls - functionalBase} status=${unresponsiveDoctor.status} blindStatus=${blindWithUnresponsive.status}`)
+      // C-13: the verdict has to CARRY the numbers, because they are the
+      // diagnosis ("nothing has ever answered" vs "one request is stuck").
+      check('(C-13) the `unresponsive` verdict names all three evidence numbers — a null stays the literal `null`, never 0',
+        /^unresponsive: the relay answered on 127\.0\.0\.1:47999/u.test(String(unresponsiveDoctor.verdict ?? ''))
+        && /did not answer an initialize\/tools\/list round trip in 5000 ms/u.test(String(unresponsiveDoctor.verdict ?? ''))
+        && /child-silent/u.test(String(unresponsiveDoctor.verdict ?? ''))
+        && /lastSuccessfulCallAgeMs=null/u.test(String(unresponsiveDoctor.verdict ?? ''))
+        && /outstandingRequestAgeMs=4321/u.test(String(unresponsiveDoctor.verdict ?? ''))
+        && /childRestarts=2/u.test(String(unresponsiveDoctor.verdict ?? ''))
+        && /windows_mcp_doctor \{repair:true\}/u.test(String(unresponsiveDoctor.verdict ?? '')),
+        String(unresponsiveDoctor.verdict ?? '').slice(0, 150))
+      fake.setRelayFunctional(null)
+      fake.setLane('interactive-relay')
+      await cycleComputer()
+
+      // ---- C-14/C-15: THE REPAIR THAT SAID NOTHING ----
+      //
+      // The five fields the old `forceRelayRepair()` threw away are the whole
+      // diagnosis: `measured`/`unmeasured` say whether the attempt RAN, and
+      // C6's sentence says why when it did not. `reason:""` is the defect.
+      const doctorWith = async (args) => JSON.parse((await globalTools.get('windows_mcp_doctor').execute(args, { agent: agentA.agent })).text)
+      fake.setRepairResult(null)
+      fake.advanceRepairWindow(60_000)
+      const noRecordRepair = (await doctorWith({ repair: true, functional: false })).forcedRepair ?? {}
+      check('(C-14) `repair:true` with no parsed record answers ok:false, measured:false, unmeasured:"no-record" and a NON-EMPTY reason naming it',
+        noRecordRepair.ok === false && noRecordRepair.measured === false
+        && noRecordRepair.unmeasured === 'no-record'
+        && typeof noRecordRepair.reason === 'string' && noRecordRepair.reason !== ''
+        && /no-record/u.test(noRecordRepair.reason)
+        && noRecordRepair.probe === null && noRecordRepair.session === null && noRecordRepair.hash === null,
+        JSON.stringify(noRecordRepair).slice(0, 190))
+      fake.setRepairResult({ measured: true, ok: false, reason: 'task-missing' })
+      fake.advanceRepairWindow(60_000)
+      const parsedRepair = (await doctorWith({ repair: true, functional: false })).forcedRepair ?? {}
+      const repairFields = ['requested', 'attempted', 'ok', 'reason', 'port', 'at', 'measured', 'unmeasured', 'detail', 'probe', 'session', 'hash']
+      check('(C-15) ...and with a parsed record the reason is BYTE-IDENTICAL to the record\'s own, with all twelve fields present',
+        parsedRepair.measured === true && parsedRepair.ok === false
+        && parsedRepair.reason === 'task-missing'
+        && repairFields.every((field) => Object.hasOwn(parsedRepair, field)),
+        `reason=${JSON.stringify(parsedRepair.reason)} fields=${repairFields.filter((field) => Object.hasOwn(parsedRepair, field)).length}/12`)
+
+      // ---- C-17 (PRE defect #3): THE ENVELOPE CLAMP, BOTH READERS ----
+      //
+      // index.js derived 121 000 / 246 000 / 125 000 at the transport's
+      // 120 000 ceiling while win-mcp.js's ladder clamps all three to
+      // `WIN_MCP_TOOL_CALL_ENVELOPE_MS` — two readers of ONE ladder disagreeing
+      // exactly at the value an operator reaches for on a slow guest. The
+      // numbers are observable where they are PUBLISHED: `shape()` derives each
+      // tool's registered `timeoutMs` at registration time, so one attach at the
+      // ceiling measures both derivations against the module's own.
+      const savedCeilingBudget = process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS
+      process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS = '120000'
+      try {
+        const ceilingCycle = await cycleComputer()
+        const ceilingBudgets = typeof realWinMcp.winMcpCallBudgets === 'function'
+          ? realWinMcp.winMcpCallBudgets(120_000)
+          : null
+        const retryCeiling = Number(globalTools.get(`${CUA}tool_list_windows`)?.timeoutMs)
+        const singleCeiling = Number(globalTools.get(`${CUA}tool_type_text`)?.timeoutMs)
+        check('(C-17) at the transport ceiling index.js derives the SAME clamped ladder as win-mcp.js (120 000, never 121 000/125 000/246 000)',
+          ceilingCycle.up && ceilingBudgets !== null
+          && retryCeiling === ceilingBudgets.retryBudgetMs
+          && singleCeiling === ceilingBudgets.guardMs
+          && retryCeiling === 120_000 && singleCeiling === 120_000,
+          `retry=${retryCeiling} single=${singleCeiling} module=${JSON.stringify(ceilingBudgets === null ? null : { envelope: ceilingBudgets.envelopeMs, retry: ceilingBudgets.retryBudgetMs, guard: ceilingBudgets.guardMs })}`)
+      } finally {
+        if (savedCeilingBudget === undefined) delete process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS
+        else process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS = savedCeilingBudget
+      }
+
+      // ---- C-18/C-19 (PRE defect #1): THE BUSY LANE IS NOT A VERDICT ----
+      //
+      // THE DEFECT. The host's own attached client holds the relay's session, so
+      // the functional probe answers busy:true and SHORT-CIRCUITS to
+      // `RELAY_OK`/`relayOk:true` without measuring the child. The doctor read
+      // `status === RELAY_UNRESPONSIVE` — unreachable from that answer — and said
+      // `ok` through a wedged child. The evidence is now the proof.
+      fake.setRelayFunctional({
+        status: 'RELAY_OK',
+        measured: false,
+        reason: 'session-busy',
+        busy: true,
+        budgetMs: 5000,
+        elapsedMs: 12,
+        tools: 0,
+        port: 47999,
+        evidence: {
+          busy: true,
+          outstandingRequestAgeMs: 41000,
+          lastSuccessfulCallAgeMs: null,
+          childRestarts: 1,
+          childPid: 4242,
+          wedgeDeadlineMs: 20000,
+          lastWedgeAt: '2026-11-20T00:00:00Z'
+        }
+      })
+      const busyWedgedDoctor = await doctor(agentA.agent)
+      check('(C-18) a BUSY probe that answers RELAY_OK can no longer read as ok: a request outstanding past the wedge deadline is `unresponsive`, reason `wedge`',
+        busyWedgedDoctor.status === 'unresponsive'
+        && busyWedgedDoctor.unresponsive === true
+        && busyWedgedDoctor.relayFunctional?.status === 'RELAY_OK'
+        && /^unresponsive: /u.test(String(busyWedgedDoctor.verdict ?? ''))
+        && /\(wedge;/u.test(String(busyWedgedDoctor.verdict ?? ''))
+        && /outstandingRequestAgeMs=41000/u.test(String(busyWedgedDoctor.verdict ?? ''))
+        && /lastSuccessfulCallAgeMs=null/u.test(String(busyWedgedDoctor.verdict ?? '')),
+        `status=${busyWedgedDoctor.status} relayStatus=${busyWedgedDoctor.relayFunctional?.status} verdict=${String(busyWedgedDoctor.verdict ?? '').slice(0, 118)}`)
+      // THE OTHER HALF, so the fix cannot become a false-alarm machine: a busy
+      // lane whose child demonstrably answered (fresh success, young request) is
+      // `ok` — but the call is not silent about what it could not prove.
+      fake.setRelayFunctional({
+        status: 'RELAY_OK',
+        measured: false,
+        reason: 'session-busy',
+        busy: true,
+        budgetMs: 5000,
+        elapsedMs: 9,
+        tools: 0,
+        port: 47999,
+        evidence: {
+          busy: true,
+          outstandingRequestAgeMs: 900,
+          lastSuccessfulCallAgeMs: 120,
+          childRestarts: 0,
+          childPid: 4242,
+          wedgeDeadlineMs: 20000
+        }
+      })
+      const busyOnlyDoctor = await doctor(agentA.agent)
+      check('(C-19) ...while a busy lane WITH a fresh success and no aged request stays ok — and its verdict still says the child was NOT proven',
+        busyOnlyDoctor.status === 'ok' && busyOnlyDoctor.unresponsive === false
+        && /could NOT prove the child/u.test(String(busyOnlyDoctor.verdict ?? ''))
+        && /busy lane: session-busy/u.test(String(busyOnlyDoctor.verdict ?? ''))
+        && /outstandingRequestAgeMs=900/u.test(String(busyOnlyDoctor.verdict ?? '')),
+        `status=${busyOnlyDoctor.status} verdict=${String(busyOnlyDoctor.verdict ?? '').slice(-120)}`)
+      fake.setRelayFunctional(null)
+
+      // ---- C-23 (JURY J6): `wedgeDeadlineMs:0` IS THE KILL SWITCH, NOT A DEFAULT ----
+      //
+      // `DSH_CUA_MCP_WEDGE_DEADLINE_MS=0` disables the guest's watchdog (C4.8),
+      // so an aged outstanding request is EXPECTED to stay outstanding. Judging
+      // it against the 20 000 fallback reported a deliberate configuration as a
+      // `wedge` — a false alarm wearing the diagnosis's own vocabulary.
+      fake.setRelayFunctional({
+        status: 'RELAY_OK',
+        measured: false,
+        reason: 'session-busy',
+        busy: true,
+        budgetMs: 5000,
+        elapsedMs: 9,
+        tools: 0,
+        port: 47999,
+        evidence: {
+          busy: true,
+          outstandingRequestAgeMs: 41000,
+          lastSuccessfulCallAgeMs: null,
+          childRestarts: 1,
+          childPid: 4242,
+          wedgeDeadlineMs: 0
+        }
+      })
+      const offWatchdogDoctor = await doctor(agentA.agent)
+      check('(C-23) a guest whose watchdog is OFF (wedgeDeadlineMs:0) is NOT judged against 20 000: no `wedge` claim, and the verdict names the disabled reclaim',
+        offWatchdogDoctor.status === 'ok'
+        && offWatchdogDoctor.unresponsive === false
+        && offWatchdogDoctor.relayWatchdog?.disabled === true
+        && offWatchdogDoctor.relayWatchdog?.deadlineMs === 0
+        && /WATCHDOG IS OFF/u.test(String(offWatchdogDoctor.verdict ?? ''))
+        && /wedgeDeadlineMs=0/u.test(String(offWatchdogDoctor.verdict ?? ''))
+        && /never reclaimed/u.test(String(offWatchdogDoctor.verdict ?? '')),
+        `status=${offWatchdogDoctor.status} watchdog=${JSON.stringify(offWatchdogDoctor.relayWatchdog)} verdict=${String(offWatchdogDoctor.verdict ?? '').slice(-118)}`)
+      fake.setRelayFunctional(null)
+
+      // ---- C-20 (PRE defect #2): ONE READING PER CALL ----
+      //
+      // `declaredMs`/`registeredMs` used to be resolved at attach while
+      // `attempt()` re-read the env on every call, so a mid-session change split
+      // the ladder. The transport here NEVER gives up by itself
+      // (`ignoreBudget`), so the only thing that can end each attempt is the
+      // plugin's own per-call race — and the budget it must have used is the one
+      // in the sentence.
+      process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS = '320'
+      fake.resetCallToolAttempts()
+      fake.setCallToolBehavior({ hangMs: 5000, ignoreBudget: true })
+      const liveBudgetCall = await callGuestTool('tool_list_windows')
+      const liveBudgets = fake.callOptionsFor('tool_list_windows').map((options) => Number(options?.timeoutMs))
+      check('(C-20) the budget is read ONCE PER CALL: after a mid-session override both attempts carry the new number, the sentence quotes it, and the call is still routed',
+        liveBudgetCall.attempts === 2
+        && liveBudgets.length === 2 && liveBudgets.every((value) => value === 320)
+        && /within 320 ms/u.test(liveBudgetCall.text)
+        && /code: relay-unresponsive$/u.test(liveBudgetCall.text),
+        `attempts=${liveBudgetCall.attempts} budgets=${JSON.stringify(liveBudgets)} elapsed=${liveBudgetCall.elapsedMs}ms text=${JSON.stringify(liveBudgetCall.text.slice(0, 62))}`)
+      fake.setCallToolBehavior(null)
+      fake.resetCallToolAttempts()
+      if (savedCallBudget === undefined) delete process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS
+      else process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS = savedCallBudget
+
+      // ---- C-22 (re-PRE LOW): ONE BUDGET IN ONE FAILURE TEXT ----
+      //
+      // The live-race helper printed `envelopeMs - 1_000` while its timer fired
+      // at `envelopeMs - TIMEOUT_LEAD_MS`, and under the shared ceiling clamp
+      // (`envelope` capped at 120 000) any call in (119 000, 120 000] produced a
+      // sentence saying "119 000 ms" beside a hint quoting the 120 000 budget —
+      // two numbers in one failure, neither of them the budget. The clamped
+      // window cannot be driven in wall clock (one attempt costs 120 s), so the
+      // invariant is pinned on the source, and C-20 above proves the behavioural
+      // half at a value the ladder reaches in milliseconds.
+      const indexSource = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'index.js'), 'utf8')
+      const raceAt = indexSource.indexOf('function raceWithLiveDeadline(')
+      // COMMENTS ARE STRIPPED FIRST, the way the repository gate's own S1 does it:
+      // the helper's docblock explains the defect it fixes by NAMING the stale
+      // expression, and a pin that a comment can satisfy (or fail) is a pin on
+      // documentation rather than on wiring.
+      const codeOnly = (text) => text.replace(/^\s*\/\/.*$/gmu, '')
+      const raceCode = codeOnly(raceAt === -1 ? '' : indexSource.slice(raceAt, indexSource.indexOf('\n}', raceAt)))
+      const hintQuotesTheSameReading = indexSource.includes('winMcpCallFailure(error, numbers.call)')
+        && indexSource.includes('winMcpCallFailure(retryError, numbers.call)')
+      check('(C-22) the live-race failure sentence and the hint quote ONE budget (the call reading), and the timer keeps its 250 ms lead',
+        raceAt !== -1
+        && raceCode.includes('const budgetMs = numbers.call')
+        && raceCode.includes('did not answer within ${budgetMs} ms')
+        && raceCode.includes('envelopeMs - TIMEOUT_LEAD_MS')
+        && raceCode.includes('envelopeMs - 1_000') === false
+        && hintQuotesTheSameReading
+        && /const TIMEOUT_LEAD_MS = 250/u.test(indexSource),
+        `budgetDerived=${raceCode.includes('const budgetMs = numbers.call')} quotesBudget=${raceCode.includes('did not answer within ${budgetMs} ms')} lead=${raceCode.includes('envelopeMs - TIMEOUT_LEAD_MS')} staleNumber=${raceCode.includes('envelopeMs - 1_000')} hintSameReading=${hintQuotesTheSameReading}`)
+
+      // ---- C-24 (JURY J4): THE LEAD IS RESERVED AT THE CEILING ----
+      //
+      // With the envelope capped AT the ceiling, `guard == envelope == 120 000`
+      // for any call in (119 750, 120 000]: the wrapper (armed first) fires at
+      // 119 750 together with the body's race and the model reads the generic
+      // `tool-timeout` — no `relay-unresponsive`, no doctor hint. One attempt at
+      // that scale costs ~120 s, so the INVARIANT is read off the code that
+      // implements it (comments stripped, the C-22 rule) and evaluated at the
+      // three values the defect names; C-20 proves the same ordering
+      // behaviourally at 200 ms.
+      const ladderAt = indexSource.indexOf('function winMcpCallNumbers(')
+      const ladderCode = codeOnly(ladderAt === -1 ? '' : indexSource.slice(ladderAt, indexSource.indexOf('\n}', ladderAt)))
+      const wrapperAt = indexSource.indexOf('function guestToolDefinition(')
+      const wrapperCode = codeOnly(wrapperAt === -1 ? '' : indexSource.slice(wrapperAt, indexSource.indexOf('function reRegisterDegradedElementTools(', wrapperAt)))
+      const ceilingDeadlines = [119750, 119999, 120000].map((call) => ({
+        call,
+        // the two deadlines the implementation arms, at the shared ceiling
+        inner: Math.min(Math.min(120000, call + 1000), 120000 - 250) - 250,
+        outer: 120000 - 250
+      }))
+      check('(C-24) at 119 750 / 119 999 / 120 000 the body race still expires BEFORE the wrapper (119 500 < 119 750), so the model keeps `relay-unresponsive`',
+        ladderAt !== -1 && wrapperAt !== -1
+        && ladderCode.includes('WIN_MCP_TOOL_CALL_ENVELOPE_MS - TIMEOUT_LEAD_MS')
+        && wrapperCode.includes('const declaredMs = WIN_MCP_TOOL_CALL_ENVELOPE_MS')
+        && ceilingDeadlines.every((entry) => entry.inner === 120000 - (2 * 250))
+        && ceilingDeadlines.every((entry) => entry.inner < entry.outer),
+        `reserved=${ladderCode.includes('WIN_MCP_TOOL_CALL_ENVELOPE_MS - TIMEOUT_LEAD_MS')} constantWrapper=${wrapperCode.includes('const declaredMs = WIN_MCP_TOOL_CALL_ENVELOPE_MS')} `
+        + ceilingDeadlines.map((entry) => `${entry.call}:${entry.inner}/${entry.outer}`).join(' '))
+
+      // ---- C-25 (JURY J5): A MID-SESSION RAISE IS NOT CAPPED BY AN ATTACH SNAPSHOT ----
+      //
+      // THIS BLOCK'S BRIDGE IS ATTACHED AT THE 200 ms LADDER, so an attach-time
+      // wrapper declared the 5 200 ms guard. Raising the budget to 4 300 ms puts
+      // the live envelope (5 300 ms) ABOVE that snapshot — the exact repro: the
+      // old wrapper fired at 4 950 ms with `timed out after 5s` / `code:
+      // tool-timeout` while the live guard was 9 300 ms.
+      process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS = '4300'
+      fake.resetCallToolAttempts()
+      fake.setCallToolBehavior({ hangMs: 8000, ignoreBudget: true })
+      const raisedBudgetCall = await callGuestTool('tool_type_text')
+      check('(C-25) raising DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS mid-session is honoured: the call ends `relay-unresponsive` at the NEW budget, never `tool-timeout` at the attach-time guard',
+        /code: relay-unresponsive$/u.test(raisedBudgetCall.text)
+        && /within 4300 ms/u.test(raisedBudgetCall.text)
+        && /code: tool-timeout/u.test(raisedBudgetCall.text) === false
+        && raisedBudgetCall.elapsedMs < 6000,
+        `attempts=${raisedBudgetCall.attempts} elapsed=${raisedBudgetCall.elapsedMs}ms text=${JSON.stringify(raisedBudgetCall.text.slice(0, 74))}`)
+      fake.setCallToolBehavior(null)
+      fake.resetCallToolAttempts()
+      if (savedCallBudget === undefined) delete process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS
+      else process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS = savedCallBudget
+
+      // ---- C-21 (PRE defect #6): A THROWING RE-REGISTER MUST NOT COST THE TOOL ----
+      //
+      // The re-render disposes the old name and then registers the new one. A
+      // throw between them used to leave the tool UNREGISTERED with a spent
+      // disposer in the map: a dead name with no owner, worse than the stale
+      // description the pass exists to refresh. The host registry is made to
+      // refuse ONE name and the assertion is that the tool survives with the
+      // description it already had.
+      // `skip: 1` aims the throw at the RE-RENDER: the attach registers this
+      // name once (that call must succeed, or the cycle only proves the attach's
+      // own error handling), and the re-render's register is the one that fails.
+      registerFailure = { name: `${CUA}find_elements`, skip: 1 }
+      fake.setDesktopFacts({ win32ui: false, uiaLane: false, elementLaneOk: false })
+      const refusalCycle = await cycleComputer()
+      const fourPrefixed = await waitFor(() => ELEMENT_LANE_TOOLS
+        .filter((guest) => registeredDescription(guest).startsWith(DEGRADED_SENTENCE)).length === 4, 6000)
+      const survivor = globalTools.get(`${CUA}find_elements`)
+      const survivorText = survivor === undefined
+        ? ''
+        : String((await survivor.execute({ query: 'ok' }, { agent: agentA.agent }))?.text ?? '')
+      check('(C-21) a re-register that THROWS keeps the tool alive with its old description (and the other four still take [DEGRADED])',
+        refusalCycle.up && fourPrefixed
+        && survivor !== undefined
+        && registeredDescription('find_elements') === renderDescription('find_elements', 'winbox3', false)
+        && /"ok":true/u.test(survivorText)
+        && prefixed().length === 19,
+        `cycle=${JSON.stringify(refusalCycle)} others=${ELEMENT_LANE_TOOLS.filter((guest) => registeredDescription(guest).startsWith(DEGRADED_SENTENCE)).length}/4 alive=${survivor !== undefined} names=${prefixed().length}`)
+      // Hand the next block a HEALTHY, measured bridge again (the teardown block
+      // asserts `desktop.measured === true` before it destroys winbox3).
+      fake.resetDesktopFacts()
+      await cycleComputer()
+      await waitFor(async () => (await doctor(agentA.agent)).desktop?.measured === true, 8000)
+
+      // HAND THE NEXT BLOCK A HEALTHY, MEASURED, ATTACHED BRIDGE: the teardown
+      // check below asserts `desktop.measured === true` for winbox3 before it is
+      // destroyed, so this block owes it exactly the state it found.
+      fake.resetRelayFunctional()
+      fake.setRepairResult({ ok: false, reason: 'relay-stopped', probe: RELAY_DOWN })
+      fake.setLane('interactive-relay')
+      await waitFor(async () => {
+        const state = await doctor(agentA.agent)
+        return state.online === true && state.desktop?.measured === true
+      }, 8000)
+    } finally {
+      if (savedCallBudget === undefined) delete process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS
+      else process.env.DSH_CUA_WIN_MCP_CALL_TIMEOUT_MS = savedCallBudget
+      fake.setCallToolBehavior(null)
+      fake.resetCallToolAttempts()
+      fake.resetRelayFunctional()
+      fake.resetDesktopFacts()
+    }
+  }
+
   // ---- THE TEARDOWN FORGETS THE FACTS (JURY co-juror-1 defect 3, plugin half) ----
   //
   // `desktop` was MEASURED for winbox3. Once that computer is destroyed its
