@@ -3743,6 +3743,51 @@ function sourceOf(label, name) {
       }
     }
   }
+  // F2/F3 — EVERY `await` IN THE INSTALL WATCH IS BUDGETED OR A ROW WRITE.
+  //
+  // The 79-minute wedge was one line: `await windowsBackend.ready(...)` inside a
+  // tick that held `vm:<name>`. Two contracts pin it, and neither is expressible
+  // as a presence needle:
+  //   1. the probe is awaited THROUGH `withDeadline` (F2) — a bare
+  //      `await windowsBackend.…` in this function is the defect, whatever the
+  //      probe's own timeouts say;
+  //   2. the lifecycle key is taken by EXACTLY ONE call site, whose body is the
+  //      single `mutateRegistryWith` row write (F3) — so the key cannot be held
+  //      across a probe, a tail read or a clock.
+  // The allowed `await` heads are enumerated, so an await added tomorrow fails
+  // this row until it is classified: `withDeadline` (probe), `withVmLock` (the
+  // key, one-row-write only), `writeRow` (the door the loop uses), `recordDeath`
+  // and `leave` (the terminal paths), `new Promise` (the tick's sleep), and the
+  // two post-lock ready helpers that were already outside the lock at HEAD.
+  {
+    total += 1
+    const supervisor = stripJsComments(textOf('cua-vm-supervisor.mjs'))
+    const watchStart = supervisor.indexOf('function watchWindowsInstall(name) {')
+    const watchEnd = watchStart === -1 ? -1 : supervisor.indexOf('\n}\n', supervisor.indexOf('WINDOWS_WATCHING.delete(name)', watchStart))
+    const watch = watchStart === -1 || watchEnd === -1 ? '' : supervisor.slice(watchStart, watchEnd)
+    const AWAIT_OK = ['withDeadline', 'withVmLock', 'writeRow', 'recordDeath', 'leave', 'new', 'ensureWindowsConsoleRelay', 'detachWindowsInstallMedia']
+    const heads = [...watch.matchAll(/\bawait\s+([A-Za-z_$][\w$.]*|new\b)/gu)].map((match) => match[1])
+    const bare = heads.filter((head) => AWAIT_OK.includes(head) !== true)
+    const deadlineSites = (watch.match(/withDeadline\(/gu) ?? []).length
+    const probes = (watch.match(/windowsBackend\.ready\(/gu) ?? []).length
+    const probeBudgeted = watch.indexOf('await withDeadline(') !== -1
+      && watch.indexOf('installTickBudgetMs(),') > watch.indexOf('await withDeadline(')
+      && probes === 1
+    const lockSites = (watch.match(/withVmLock\(/gu) ?? []).length
+    const mutates = (watch.match(/mutateRegistryWith\(/gu) ?? []).length
+    const lockIsTheWrite = /withVmLock\(name, async \(\) => mutateRegistryWith\(/u.test(watch)
+      && lockSites === 1
+      && mutates === 1
+    const skipIdiom = /mode: 'try', waitMs: INSTALL_WATCH_LOCK_WAIT_MS/u.test(watch)
+    const ok = watch !== '' && bare.length === 0 && deadlineSites === 1 && probeBudgeted && lockIsTheWrite && skipIdiom
+    if (ok) {
+      if (!quietMode) console.log('  ok   F2/F3 every await in the install watch is either budgeted (withDeadline) or the one locked row write; the lifecycle key has exactly one call site, try-mode, and never spans a probe')
+    } else {
+      failures += 1
+      missing.push(`docker/cua-vm-supervisor.mjs: the install watch must await its probe through withDeadline (F2) and take vm:<name> in ONE call site whose body is the single mutateRegistryWith (F3) — unclassified awaits=${JSON.stringify(bare)}, withDeadline sites=${deadlineSites}, windowsBackend.ready sites=${probes}, budgeted=${probeBudgeted}, withVmLock sites=${lockSites}, mutateRegistryWith sites=${mutates}, lock-is-the-write=${lockIsTheWrite}, skip-idiom=${skipIdiom}; a bare probe await under the key is the 79-minute wedge again`)
+      console.log('  FAIL F2/F3 install-watch await classification')
+    }
+  }
   // P5: THE SHUTDOWN OP ANSWERS BEFORE IT CONVERTS, AND THE STATE IS WRITTEN
   // BEFORE ANYTHING THAT CAN FAIL. Three ORDER assertions, because each of the
   // three defects was a correct-looking call in the wrong place:

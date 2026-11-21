@@ -1827,8 +1827,39 @@ async function guestExec(name, command, timeoutMs = 60000, attempts = 3) {
 const VM_LOCK_CONTEXT = new AsyncLocalStorage()
 
 // The module logs one line a minute when a holder is old; route it through the
-// supervisor's own log so the runbook sentence lands where the operator looks.
-VM_LOCK.useLockLogger((line) => log(line))
+// supervisor's own log so the runbook sentence lands where the operator looks —
+// and let F5 add the one fact the lock cannot know (WHEN the thing the holder
+// was observing finished).
+VM_LOCK.useLockLogger((line) => log(annotateLockSentence(line)))
+
+/**
+ * F5 — THE POISON LINE SAYS WHEN THE THING IT WATCHED ENDED.
+ *
+ * The lock module can only report what it owns (a key, a holder, an age): the
+ * one line that repeated 58 times in the reported incident was
+ *
+ *   lock vm:win-test: install-watch has held it for 3568s — poisoned since
+ *   1800s; new waiters refuse instantly and the only cure is a supervisor restart
+ *
+ * which is TRUE and leaves the reader unable to tell whether an install is still
+ * running. The supervisor knows the row, so it appends the missing half WHEN the
+ * holder is the install watcher and the row is no longer installing. The base
+ * sentence is passed through untouched (it is a contract, and `lock-deadline`
+ * asserts it); this only ADDS a clause, and it never throws into the log path.
+ */
+function annotateLockSentence(line) {
+  const text = String(line ?? '')
+  const match = /^lock vm:([a-z0-9][a-z0-9-]{1,30}): install-watch has held it/u.exec(text)
+  if (match === null) return text
+  let row = null
+  try {
+    row = readRegistry().vms[match[1]] ?? null
+  } catch {
+    return text
+  }
+  const clause = installWatchStaleClause(row)
+  return clause === '' ? text : `${text}${clause}`
+}
 
 /**
  * `withLock(key, fn)` — the raw key form (`@registry`, `@store`, `@ports`,
@@ -2499,6 +2530,16 @@ function qmpCommands(port, commands, { timeoutMs = null, defaultTimeout = null, 
       // microseconds, instead of waiting out the answer budget.
       const detail = error?.code ?? error?.message ?? String(error)
       failWith(new Error(`QMP ${host}:${port} could not be reached${connected ? ' after connecting' : ''} (${detail})`))
+    })
+    // THE PEER'S FIN IS AN ANSWER TOO. A monitor that accepts and then closes
+    // without writing (QEMU gone between `accept` and the greeting, a proxy in
+    // front of the port) emits 'end'/'close' and NOT 'error', so before this
+    // handler the caller waited out the whole answer budget for a socket that
+    // had already said everything it was going to say. That is the same shape
+    // as the bannerProbe wedge the install watch was parked on (2026-11-21):
+    // bounded in size, unbounded in time, because nobody armed a path for it.
+    socket.on('close', () => {
+      failWith(new Error(`QMP ${host}:${port} closed without an answer`))
     })
   })
 }
@@ -4899,6 +4940,94 @@ function windowsProgressTail(name, lines = 5) {
 const WINDOWS_WATCHING = new Set()
 
 /**
+ * F2 — HOW LONG ONE INSTALL-WATCH TICK MAY WAIT FOR ITS VERDICT.
+ *
+ * The wedge of 2026-11-21 was not a slow probe: it was an await with NO
+ * settling path (`bannerProbe` on a peer that accepted and then closed), so one
+ * tick was parked for 79 minutes while it held the lifecycle key. A probe can
+ * always regress; the loop must not care. This is the per-tick HARD deadline —
+ * a `Promise.race` that answers `{ ready: false, alive: true,
+ * budgetExpired: true }` and lets the tick CONTINUE, so a probe that never
+ * settles costs one budget per tick and never a parked loop.
+ *
+ * Overridable for labs and for the tests (`DSH_CUA_INSTALL_TICK_BUDGET_MS`); an
+ * unset variable is not 0 (the read-once-the-raw-string rule this module uses
+ * everywhere — `Number(env ?? '')` is how a knob becomes a zero-second budget).
+ */
+function installTickBudgetMs() {
+  const raw = process.env.DSH_CUA_INSTALL_TICK_BUDGET_MS
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed) && parsed >= 1) return Math.min(300000, Math.trunc(parsed))
+  }
+  return 20000
+}
+
+/**
+ * F2 — `withDeadline(pending, budgetMs, fallback)`: THE BUDGET IS A DEADLINE,
+ * NOT A TIMEOUT ON THE THING INSIDE.
+ *
+ * `fallback` is called with `{ expired: true }` when the budget runs out (so a
+ * caller can mark the verdict `budgetExpired`), and with `{ expired: false,
+ * error }` when the promise REJECTS before the budget (a probe that panics is
+ * not a budget expiry — the verdict must not lie about which happened).
+ *
+ * THREE PROPERTIES, EACH OF THEM THE FIX FOR A REAL FAILURE:
+ *   * IT NEVER REJECTS. The install watch's tail `catch` is fatal to the watch
+ *     (R2: an ended watch is how a finished install stops being observed), so
+ *     the one await that can park the loop must not be able to end it.
+ *   * A LATE SETTLEMENT IS DISCARDED. The rejection handler below is attached
+ *     to the inner promise at once, so a promise that rejects AFTER the budget
+ *     answered cannot become an unhandled rejection (Node would end the
+ *     process, which is a worse outcome than the wedge).
+ *   * THE TIMER IS CLEARED AND UNREF'D. A 20 s timer left armed after the probe
+ *     answered would keep the event loop alive and turn a fast tick into a 20 s
+ *     process exit delay.
+ */
+function withDeadline(pending, budgetMs, fallback) {
+  const parsed = Number(budgetMs)
+  const limitMs = Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 20000
+  const answer = (why) => {
+    try {
+      return typeof fallback === 'function' ? fallback(why) : fallback
+    } catch {
+      return undefined
+    }
+  }
+  let timer = null
+  const expired = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      timer = null
+      resolve({ expired: true, value: answer({ expired: true }) })
+    }, limitMs)
+    if (typeof timer.unref === 'function') timer.unref()
+  })
+  const settled = Promise.resolve(pending).then(
+    (value) => ({ expired: false, failed: false, value }),
+    (error) => ({ expired: false, failed: true, error })
+  )
+  return Promise.race([settled, expired]).then((outcome) => {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
+    if (outcome.expired === true) return outcome.value
+    if (outcome.failed === true) return answer({ expired: false, error: outcome.error })
+    return outcome.value
+  })
+}
+
+/**
+ * F4 — THE WATCH'S OWN BACKSTOP DEADLINE, ON TOP OF THE INSTALL TIMEOUT.
+ *
+ * The install deadline says when the INSTALL has failed; this one says when the
+ * OBSERVER gives up. It is `installTimeout + 10 min`, so a watch that is still
+ * ticking through a row nothing else can move on (a supervisor started against
+ * an ancient `installing` row) leaves on its own instead of running for ever.
+ */
+const INSTALL_WATCH_ABSOLUTE_GRACE_MS = 600000
+
+/**
  * The install watcher: poll until `ready`, or until the timeout says otherwise.
  *
  * READY is `QMP running` AND a guest endpoint that answers (SSH banner first,
@@ -4997,139 +5126,402 @@ async function detachWindowsInstallMedia(name) {
   }
 }
 
+/**
+ * P2 — A VERDICT BELONGS TO THE INSTALL IT WAS FORMED ON.
+ *
+ * The watcher decides OUTSIDE the lifecycle key (`windowsBackend.ready` can take
+ * seconds) and writes INSIDE it (a 2 s try). Nothing about that is a bug until
+ * the row under the decision is replaced in between: a concurrent `windowsStart`
+ * that finds the QEMU dead re-boots into a NEW incarnation and writes a fresh
+ * `startedAt` — and the state guard alone (`state ∈ {installing, booting}`) says
+ * nothing about WHICH install, so a verdict formed on incarnation N would land on
+ * N+1 (marking a computer that has just started installing as `ready`, or as
+ * `error` because the PREVIOUS QEMU died).
+ *
+ * THE EPOCH TOKEN IS THE ROW'S OWN FIELDS, not a new one. `windowsStart`'s BOOT
+ * branch rewrites `startedAt` (`row.startedAt = new Date().toISOString()`), and
+ * the CREATE path writes `createdAt` and no `startedAt` at all — so
+ * `startedAt|createdAt` is stable for the life of one install and changes on
+ * every new start attempt AND on every delete+create of the same name.
+ * `stateSince` would be wrong (it moves on every transition, so a second tick of
+ * the SAME install would be refused), and a token written into the row would be
+ * one more field for a reconcile to lose.
+ */
+function installIncarnation(row) {
+  return `${String(row?.startedAt ?? '')}|${String(row?.createdAt ?? '')}`
+}
+
+/**
+ * P2 — THE SINGLE GUARD EVERY INSTALL-WATCH ROW WRITE PASSES THROUGH.
+ *
+ * Three facts, and the row write happens only if all three hold: the row exists
+ * and is a Windows row, the row is still an install in flight (the state guard
+ * the round already had), and the row is still the SAME INSTALL the verdict was
+ * formed on (`token`). Anything else means the tick has nothing to say.
+ */
+function installRowStillTheOne(row, token) {
+  if (!row || row.kind !== 'windows') return false
+  if (row.state !== 'installing' && row.state !== 'booting') return false
+  return installIncarnation(row) === String(token ?? '')
+}
+
 function watchWindowsInstall(name) {
   assertVmName(name)
   if (WINDOWS_WATCHING.has(name)) return
   WINDOWS_WATCHING.add(name)
   void (async () => {
+    // F4: ONE CLOCK FOR THE WHOLE WATCH. Every terminal condition below is
+    // relative to it, so a row that nothing else can move on still leaves.
+    const watchStartedAt = Date.now()
+    // F2: one line a minute when the budget expires, never one per tick.
+    let budgetLoggedAt = 0
+    // P1: and the same for a row write that keeps losing the key — a retrying
+    // death would otherwise print the skip sentence every tick.
+    let skipLoggedAt = 0
+    // P2: and for a write refused as stale (a tick whose verdict belonged to an
+    // install that has since been replaced).
+    let staleLoggedAt = 0
+    // J2: and for a death the row write could not record because the key was
+    // held — that tick retries every 15 s, so an ungated line would contradict
+    // the one-line-a-minute idiom the three clocks above already keep.
+    let deathLoggedAt = 0
+    // P3/P1: whether the F6 self-check told THIS watch to leave (a watch that was
+    // told to leave must not hand its row to a successor), and the incarnation
+    // this watch OPENED on (the handover test in the `finally`).
+    let toldToLeave = false
+    const openedToken = (() => {
+      try {
+        return installIncarnation(readRegistry().vms[name])
+      } catch {
+        return null
+      }
+    })()
+    /**
+     * F3 — THE LOCK IS TAKEN ONLY AROUND THE ROW WRITE (and never across a
+     * probe).
+     *
+     * This loop used to hold `vm:<name>` for its WHOLE tick, so a 3-second probe
+     * that never settled became a 79-minute hold: every power op was refused,
+     * the idle timer was disabled and the shutdown checkpoint was lost
+     * (`checkpointSkipped: lock-busy`). What the hold bought — serialisation of
+     * the row write against a concurrent power op — is already bought by
+     * `@registry` plus the state guard INSIDE each mutator (`row.state` must
+     * still be `installing`/`booting`). So the tick now probes UNLOCKED and
+     * takes the lifecycle key for a few milliseconds: one `mutateRegistryWith`.
+     *
+     * TRY MODE (C6): a busy computer means this TICK is skipped, never that the
+     * install watch ends (`skipped a tick` is the existing skip idiom).
+     *
+     * THE RETURN VALUE IS THE OUTCOME, NOT A BOOLEAN (P1). Three fates, and the
+     * death path below must tell them apart:
+     *   `{ applied: true }`            the row was written — the tick may stop;
+     *   `{ skipped: true }`            the try-lock was lost to a concurrent
+     *                                  power op — the row was NOT touched and the
+     *                                  tick must be retried, not treated as done;
+     *   `{ stale: true, rowState }`    the guard refused: the row moved on (a
+     *                                  new state, or a NEW INCARNATION, P2).
+     * Collapsing these into one boolean is how the previous shape logged "the
+     * row is 'error'" about a row it had never written and ended the only
+     * observer of the install the concurrent Start had just begun.
+     */
+    const writeRow = async (reason, token, mutate) => {
+      const outcome = await withVmLock(name, async () => mutateRegistryWith((fresh) => {
+        const row = fresh.vms[name]
+        // THE GUARD LIVES INSIDE THE LOCK, ALONGSIDE THE ROW — the decision was
+        // formed outside it, so this is the last instant at which it can be
+        // checked against the row it will actually land on (P2).
+        if (!installRowStillTheOne(row, token)) {
+          const state = row ? String(row.state ?? '') : 'gone'
+          return { applied: false, stale: true, rowState: state, crossIncarnation: row?.kind === 'windows' && (row.state === 'installing' || row.state === 'booting') }
+        }
+        mutate(row)
+        return { applied: true }
+      }, { reason }), { mode: 'try', waitMs: INSTALL_WATCH_LOCK_WAIT_MS, holder: 'install-watch' })
+      if (outcome?.ran !== true) {
+        // SKIP-AND-SAY-SO: the row is not touched by this tick, the loop
+        // re-arms, and the log names who was in the way. RATE LIMITED (P1):
+        // a death that keeps contending would otherwise write this every tick.
+        const at = Date.now()
+        if (at - skipLoggedAt >= 60000) {
+          skipLoggedAt = at
+          log(`windows: ${name} install watch skipped a tick (${outcome?.holder || 'another operation'} held the lock for ${Math.round((outcome?.heldMs ?? 0) / 1000)} s)`)
+        }
+        return { applied: false, skipped: true }
+      }
+      const result = outcome?.value ?? { applied: true }
+      if (result.applied !== true) {
+        // A REFUSED WRITE IS ONE LINE, RATE LIMITED (P2). Silence here would make
+        // a cross-incarnation drop indistinguishable from a tick that decided
+        // nothing — the row it would have landed on is a different install, so
+        // the tick's work is discarded on purpose, not by accident.
+        const at = Date.now()
+        if (at - staleLoggedAt >= 60000) {
+          staleLoggedAt = at
+          log(`windows: ${name} install watch dropped a ${reason} row write (the row is '${result.rowState}' — ${result.crossIncarnation === true ? 'a different start attempt' : 'no longer an install in flight'})`)
+        }
+      }
+      return result
+    }
+    /**
+     * THE DEATH FACTS, READ ONCE PER SUSPICION. A missing pidfile is not proof
+     * of death while the child we spawned has not exited (QEMU writes it during
+     * init), and the pid is the truth once it exists.
+     */
+    const deathFacts = () => {
+      const pid = windowsBackend.qemuPid(name)
+      const pidFileExists = existsSync(windowsPaths(STORE, name).qemuPid)
+      const child = windowsBackend.childState(name)
+      const notYet = !pidFileExists && child.known && child.exited !== true
+      const exitedEarly = !notYet && (!pidFileExists || !windowsBackend.pidAlive(pid))
+      const stderrTail = windowsQemuStderrTail(name, 20)
+      const serialTail = windowsLogTail(name, 40)
+      const why = pidFileExists
+        ? `QEMU (pid ${pid}) is gone`
+        : 'QEMU exited during init before writing its pidfile'
+      const errorText = `${why}${stderrTail === '' ? '; it wrote nothing to qemu-stderr.log (killed or could not exec)' : ''}`
+      const errorLog = stderrTail === ''
+        ? (serialTail === '' ? '(no QEMU stderr and an empty serial log: the guest never spoke)' : serialTail.slice(-4000))
+        : stderrTail.slice(-4000)
+      return { pid, pidFileExists, exitedEarly, stderrTail, errorText, errorLog }
+    }
+    /**
+     * F2: A DEAD QEMU IS AN ERROR, NOT A 60-MINUTE INSTALL — and the write goes
+     * through the same one-row-write door, so this path holds the key for no
+     * longer than the row it repairs.
+     *
+     * P1: THE FACTS ARE TRUE AND THE WRITE MAY NOT HAPPEN. The QEMU really is
+     * gone; the row is only repaired if the try-lock was ours. So the death is
+     * reported as an OUTCOME (`applied` / `skipped` / `stale`) and the caller
+     * decides — the previous version returned "wrote" for a write that lost the
+     * key, and the watch then logged "ended: QEMU died" about a row that still
+     * said `installing`.
+     */
+    const recordDeath = async (token) => {
+      const facts = deathFacts()
+      const errorLog = facts.errorLog
+      const write = await writeRow('windows-install-error', token, (row) => {
+        row.state = 'error'
+        row.error = `the Windows computer did not start: ${facts.errorText}`
+        row.errorLog = errorLog
+        row.installDetail = `error: ${facts.errorText} (see $STORE/windows/${name}/qemu-stderr.log)`
+      })
+      if (write.applied === true) {
+        emitVmState(name, 'error', 'windows-install-error')
+        log(`windows: ${name} died before it could install: ${facts.errorText}`)
+        if (facts.stderrTail !== '') log(`windows: ${name} qemu-stderr.log tail:\n${facts.stderrTail}`)
+      } else if (write.skipped === true) {
+        // J2: RATE LIMITED, like every other contention line in this watch. The
+        // tick retries on its own 15 s cadence, so the sentence names the retry
+        // once a minute and stays quiet while the contention persists.
+        const at = Date.now()
+        if (at - deathLoggedAt >= 60000) {
+          deathLoggedAt = at
+          log(`windows: install watch for ${name} could not record the death this tick (the row write lost the lifecycle lock); retrying`)
+        }
+      }
+      return write
+    }
+    /**
+     * F4 — THE TERMINAL CONDITIONS, READ FROM THE REGISTRY, OUTSIDE THE LOCK.
+     *
+     * This is the half that was missing at HEAD: the state gate, the dead-QEMU
+     * detection and the install deadline all lived INSIDE the tick that hung, so
+     * once a tick was parked no state change could ever stop the watch (the
+     * install finished at 16:35:52 and the guest powered off at 17:05:17 — the
+     * watcher saw neither). A reconsideration of the ROW costs one file read.
+     *
+     * `withPidCheck` is false before the FIRST sleep: the pidfile legitimately
+     * does not exist yet during QEMU's init (see `windowsEarlyDeathWindowMs`).
+     */
+    const terminal = (withPidCheck) => {
+      const snapshot = readRegistry().vms[name]
+      if (!snapshot || snapshot.kind !== 'windows') return { snapshot: null, stop: true, reason: 'the row is gone' }
+      if (snapshot.state !== 'installing' && snapshot.state !== 'booting') return { snapshot, stop: true, reason: `state is ${snapshot.state}` }
+      if (withPidCheck === true && snapshot.installComplete !== true && deathFacts().exitedEarly === true) {
+        return { snapshot, stop: true, died: true }
+      }
+      const timeoutMinutes = Number(snapshot.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
+      const absoluteMs = (Number.isFinite(timeoutMinutes) && timeoutMinutes > 0 ? timeoutMinutes : 60) * 60000 + INSTALL_WATCH_ABSOLUTE_GRACE_MS
+      if (Date.now() - watchStartedAt > absoluteMs) return { snapshot, stop: true, overdue: true, minutes: Math.round(absoluteMs / 60000) }
+      return { snapshot, stop: false }
+    }
+    /**
+     * Leave the watch for a terminal verdict, saying why. Returns true when the
+     * watch should END; a death whose error row lost the lifecycle lock returns
+     * false so the next tick retries it — leaving now would log "the row is
+     * 'error'" about a row that is still `installing`, and the guard inside the
+     * mutator would have nothing to write.
+     */
+    const leave = async (stop) => {
+      if (stop.died === true) {
+        // P1/P2: the death verdict belongs to the row the `terminal()` call
+        // read, so the write is guarded on THAT incarnation — not on whatever
+        // the row is by the time the try-lock is ours.
+        const death = await recordDeath(installIncarnation(stop.snapshot))
+        // NOT WRITTEN ⇒ DO NOT STOP: the next pass retries. A `stale` outcome
+        // also returns false, and the next `terminal()` pass produces the honest
+        // sentence ("the row moved on"), which is how this watch ends and — see
+        // the `finally` — how the successor install gets an observer.
+        if (death.applied !== true) return false
+        log(`windows: install watch for ${name} ended: QEMU died (the row is 'error' with the captured stderr)`)
+        return true
+      }
+      if (stop.overdue === true) {
+        log(`windows: install watch for ${name} stopped (the absolute watch deadline of ${stop.minutes} min expired)`)
+        return true
+      }
+      if (stop.reason !== undefined) log(`windows: install watch for ${name} stopped (${stop.reason})`)
+      return true
+    }
     try {
       let first = true
       for (;;) {
+        // F6: the self-check told this watch to leave (see
+        // `selfhealWedgedInstallWatches`). Checked BETWEEN passes, so the watch
+        // leaves at a point where it holds nothing and its `finally` runs.
+        if (WINDOWS_WATCH_LEAVE.delete(name) === true) {
+          toldToLeave = true
+          return
+        }
+        // 1. F4 — a row that is already done costs no sleep and no probe.
+        const early = terminal(false)
+        if (early.stop) {
+          if (await leave(early) === true) return
+          continue
+        }
         await new Promise((resolve) => setTimeout(resolve, first ? windowsEarlyDeathWindowMs() : 15000))
         first = false
-        // THE TICK BELONGS INSIDE THE LOCK. This loop used to write the row from
-        // outside it, so a tick that started before a shutdown could land after
-        // it and clobber `powered-off` with `installing` (and the same for
-        // suspend). Inside the lock, and guarded on the CURRENT state, a tick can
-        // only touch a computer that is still installing.
-        // C6: TRY. A busy computer means this TICK is skipped, never that the
-        // install watch ends: the `catch` below is fatal to the watch, and an
-        // ended watch is how a finished install stops being observed (R2).
-        const outcome = await withVmLock(name, async () => {
-          const meta = readRegistry().vms[name]
-          if (!meta || meta.kind !== 'windows') return { stop: true }
-          if (meta.state !== 'installing' && meta.state !== 'booting') return { stop: true, reason: `state is ${meta.state}` }
-          // H1: the deadline is per START ATTEMPT. Using createdAt made every
-          // restart of an old computer "timed out" on the first tick.
-          const started = Date.parse(meta.startedAt || meta.createdAt || '') || Date.now()
-          const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
-          const elapsedMinutes = Math.round((Date.now() - started) / 60000)
-          // D3: THE STAGE THE SERIAL LOG PROVES. Read once per tick (a bounded
-          // tail read) and used by BOTH the deadline and the sentence, so the
-          // panel and the timeout can never disagree about whether Setup or
-          // firstboot is the thing being waited on.
-          const serialHead = windowsLogTail(name, 200)
-          const bootedNow = windowsBootedFromDisk(serialHead)
-          const bootedAtMs = Date.parse(meta.bootedAt || '') || (bootedNow ? Date.now() : 0)
-          const bootedStage = bootedAtMs > 0
-          const bootedMinutes = bootedStage ? Math.round((Date.now() - bootedAtMs) / 60000) : 0
-          const sshGraceMinutes = windowsInstallSshGraceMinutes()
-          let verdict
-          try {
-            verdict = await windowsBackend.ready(meta, { ssh: meta.ssh !== false, phase: 'install' })
-          } catch (error) {
-            verdict = { ready: false, endpoint: 'none', alive: false, qmp: 'not answering', error: error?.message ?? String(error) }
-          }
+        // 2. F4 — the row may have moved on DURING the sleep (that is the state
+        //    a wedged tick used to be blind to), and a QEMU that died during it
+        //    is a fact now.
+        const gate = terminal(true)
+        if (gate.stop) {
+          if (await leave(gate) === true) return
+          continue
+        }
+        const meta = gate.snapshot
+        // P2 — THE INCARNATION THIS TICK'S VERDICT BELONGS TO. `meta` is the row
+        // the probe was issued against; every write below carries this token, so
+        // a Start that replaces the row between the probe and the try-lock makes
+        // the write a no-op instead of a wrong answer about the new install.
+        const token = installIncarnation(meta)
+        // H1: the deadline is per START ATTEMPT. Using createdAt made every
+        // restart of an old computer "timed out" on the first tick.
+        const started = Date.parse(meta.startedAt || meta.createdAt || '') || Date.now()
+        const timeoutMinutes = Number(meta.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
+        const elapsedMinutes = Math.round((Date.now() - started) / 60000)
+        // D3: THE STAGE THE SERIAL LOG PROVES. Read once per tick (a bounded
+        // tail read) and used by BOTH the deadline and the sentence, so the
+        // panel and the timeout can never disagree about whether Setup or
+        // firstboot is the thing being waited on.
+        const serialHead = windowsLogTail(name, 200)
+        const bootedNow = windowsBootedFromDisk(serialHead)
+        const bootedAtMs = Date.parse(meta.bootedAt || '') || (bootedNow ? Date.now() : 0)
+        const bootedStage = bootedAtMs > 0
+        const bootedMinutes = bootedStage ? Math.round((Date.now() - bootedAtMs) / 60000) : 0
+        const sshGraceMinutes = windowsInstallSshGraceMinutes()
+        // 3. F2 — THE PROBE, UNDER A HARD DEADLINE, AND WITH THE LIFECYCLE KEY
+        //    NOT HELD. A budget expiry is a VERDICT (the row is untouched this
+        //    tick and the loop re-arms), never a throw: the tail `catch` below
+        //    ends the watch, and an ended watch is how a finished install stops
+        //    being observed (R2).
+        const verdict = {
+          ...await withDeadline(
+            windowsBackend.ready(meta, { ssh: meta.ssh !== false, phase: 'install' }),
+            installTickBudgetMs(),
+            (why) => (why?.expired === true
+              // ALIVE: true — a probe we abandoned says NOTHING about the
+              // process, and "alive: false" would send the tick down the
+              // dead-QEMU path on no evidence.
+              ? { ready: false, endpoint: 'none', alive: true, qmp: 'tick budget expired', budgetExpired: true }
+              // A probe that PANICKED is not a budget expiry: keep the old
+              // semantics (unconfirmed ⇒ let the pidfile decide).
+              : { ready: false, endpoint: 'none', alive: false, qmp: 'not answering', error: why?.error?.message ?? String(why?.error) })
+          ),
           // THE PORT THE SENTENCE NAMES comes from the ROW (the only place it is
           // authoritative after a reconcile); the formatter reads it from the
           // verdict so its call site stays one expression.
           // D3: the stage rides WITH the verdict so the one-line formatter call
           // below describes the same clock the deadline above used.
-          verdict = {
-            ...verdict,
-            sshPort: Number(meta.ports?.ssh ?? 0),
-            installStage: bootedStage ? 'booted' : 'installing',
-            bootedMinutes
+          sshPort: Number(meta.ports?.ssh ?? 0),
+          installStage: bootedStage ? 'booted' : 'installing',
+          bootedMinutes
+        }
+        if (verdict.budgetExpired === true) {
+          // RATE LIMITED: a wedged probe would otherwise write a line every
+          // 15 s for the life of the install.
+          const at = Date.now()
+          if (at - budgetLoggedAt >= 60000) {
+            budgetLoggedAt = at
+            log(`windows: ${name} install watch tick over budget (${Math.round(installTickBudgetMs() / 1000)} s) — the tick was abandoned and the watch continues`)
           }
-          // F2: A DEAD QEMU IS AN ERROR NOW, NOT A 60-MINUTE INSTALL.
+          continue
+        }
+        // C12: a live process observed by the watcher IS corroboration.
+        confirmVmState(name, 'install-watch')
+        // THE TICK'S DECISION, BUILT HERE AND ACTED ON AFTER THE SINGLE ROW
+        // WRITE — the shape the pre-fix code used, with the write moved out of
+        // the lifecycle lock's shadow instead of the decision changing.
+        let decision = { stop: false }
+        // F2 backstop: a QEMU that died BETWEEN the terminal check and the probe.
+        if (verdict.alive !== true && verdict.ready !== true && deathFacts().exitedEarly === true) {
+          // P1 — THIS IS AN IN-TICK STOP PATH, AND IT USED TO STOP UNCONDITIONALLY.
           //
-          // Everything the reported failure looked like from the outside is
-          // checked here, and the FIRST tick is the important one: a start whose
-          // pidfile never appeared (or whose pid is already gone) has no guest,
-          // no serial output and no future — waiting for the timeout just delays
-          // the same answer by an hour. The captured QEMU stderr is attached, so
-          // the row explains itself without anyone reading the host.
-          if (verdict.alive !== true && verdict.ready !== true) {
-            // "alive: false" during an install means the QEMU process is gone —
-            // it is never a transient state of a healthy guest, because the
-            // pidfile is written before the guest runs. The ONLY question left is
-            // whether it died at init (no pidfile/pid) or exited later (a clean
-            // shutdown would have been a state change, and a guest that dies
-            // mid-install is a failure either way).
-            const pid = windowsBackend.qemuPid(name)
-            const pidFileExists = existsSync(windowsPaths(STORE, name).qemuPid)
-            // A MISSING PIDFILE IS NOT PROOF OF DEATH when the child we spawned
-            // has not exited: QEMU writes the pidfile during its init, and a
-            // watchdog that cannot tell "not yet" from "never" would flip a
-            // healthy start to error. The child's own exit state settles it.
-            const child = windowsBackend.childState(name)
-            const notYet = !pidFileExists && child.known && child.exited !== true
-            const exitedEarly = !notYet && (!pidFileExists || !windowsBackend.pidAlive(pid))
-            if (exitedEarly) {
-              const stderrTail = windowsQemuStderrTail(name, 20)
-              const serialTail = windowsLogTail(name, 40)
-              const why = pidFileExists
-                ? `QEMU (pid ${pid}) is gone`
-                : 'QEMU exited during init before writing its pidfile'
-              const errorText = `${why}${stderrTail === '' ? '; it wrote nothing to qemu-stderr.log (killed or could not exec)' : ''}`
-              const errorLog = stderrTail === ''
-                ? (serialTail === '' ? '(no QEMU stderr and an empty serial log: the guest never spoke)' : serialTail.slice(-4000))
-                : stderrTail.slice(-4000)
-              await mutateRegistryWith((fresh) => {
-                const row = fresh.vms[name]
-                if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
-                row.state = 'error'
-                row.error = `the Windows computer did not start: ${errorText}`
-                row.errorLog = errorLog
-                row.installDetail = `error: ${errorText} (see $STORE/windows/${name}/qemu-stderr.log)`
-              }, { reason: 'windows-install-error' })
-              emitVmState(name, 'error', 'windows-install-error')
-              log(`windows: ${name} died before it could install: ${errorText}`)
-              if (stderrTail !== '') log(`windows: ${name} qemu-stderr.log tail:\n${stderrTail}`)
-              return { stop: true, died: true }
-            }
+          // `recordDeath()` says whether the row was actually written. A skipped
+          // write (the try-lock lost to a concurrent windowsStart / checkpoint
+          // hold) means the row still says `installing`: stopping here logged
+          // "ended: QEMU died" about a row that was never written AND removed the
+          // only registered watcher, so the concurrent Start's own
+          // `watchWindowsInstall` was absorbed by it and the install it had just
+          // begun was never observed (2026-11-21 review, P1). So: retry.
+          const death = await recordDeath(token)
+          if (death.applied === true) {
+            decision = { stop: true, died: true }
+          } else if (death.skipped === true) {
+            // THE TICK IS A SKIP, NOT AN ENDING (the log it needs is already in
+            // `recordDeath`, rate limited). `continue` re-enters at the terminal
+            // check, so a row that has moved on in the meantime is reported by
+            // `terminal()` and a row that has not is probed again.
+            continue
+          } else {
+            // STALE (P2): the row is a DIFFERENT install now. Stop — but with a
+            // sentence that names the truth, and let the `finally` hand the new
+            // incarnation to a fresh watch.
+            decision = { stop: true, reason: `the row moved on (state is ${death.rowState}, ${death.crossIncarnation === true ? 'a newer start attempt' : 'no longer an install in flight'})` }
           }
-          if (verdict.ready) {
-            await mutateRegistryWith((fresh) => {
-              const row = fresh.vms[name]
-              if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
-              row.state = 'ready'
-              row.endpoint = verdict.endpoint
-              row.installComplete = true
-              row.installDetail = `ready (${verdict.endpoint} accepting, QMP running)`
-              row.readiness = windowsReadinessSignals(name)
-              delete row.error
-              delete row.errorLog
-              delete row.startedAt
-              delete row.serialTail
-              delete row.installTailAt
-              // D3: the install is over; a stale 'booted' stage would keep
-              // answering a finished row with an install sentence.
-              delete row.installStage
-              delete row.bootedAt
-            }, { reason: 'windows-install-ready' })
-            // SOL §5 WP-4.2: THIS IS THE TRANSITION A CHECKPOINT BOOT TAKES.
-            // The row is `ready` on disk now (the registry hook has already
-            // announced it), and the bridge is about to dial — fire the
-            // re-assert here, before the media detach and before this tick
-            // answers, so `schtasks /run` is in flight while SSH is still
-            // connecting instead of after the first probe has failed.
-            void windowsRelayReassert(name)
-            // WP-4.4: the ready transition is the one the bridge MUST hear, even
-            // if it joined the stream mid-install.
-            emitVmState(name, 'ready', 'windows-install-ready')
-            return { stop: true, ready: true }
-          }
+        } else if (verdict.ready) {
+          const wrote = await writeRow('windows-install-ready', token, (row) => {
+            row.state = 'ready'
+            row.endpoint = verdict.endpoint
+            row.installComplete = true
+            row.installDetail = `ready (${verdict.endpoint} accepting, QMP running)`
+            row.readiness = windowsReadinessSignals(name)
+            delete row.error
+            delete row.errorLog
+            delete row.startedAt
+            delete row.serialTail
+            delete row.installTailAt
+            // D3: the install is over; a stale 'booted' stage would keep
+            // answering a finished row with an install sentence.
+            delete row.installStage
+            delete row.bootedAt
+          })
+          // A ROW WRITE LOST TO A POWER OP (or refused as stale) IS THE RIGHT
+          // OUTCOME: the ready transition is retried by the next tick, and
+          // nothing was clobbered.
+          if (wrote.applied !== true) continue
+          // SOL §5 WP-4.2: THIS IS THE TRANSITION A CHECKPOINT BOOT TAKES.
+          // The row is `ready` on disk now (the registry hook has already
+          // announced it), and the bridge is about to dial — fire the
+          // re-assert here, before the media detach and before this tick
+          // answers, so `schtasks /run` is in flight while SSH is still
+          // connecting instead of after the first probe has failed.
+          void windowsRelayReassert(name)
+          // WP-4.4: the ready transition is the one the bridge MUST hear, even
+          // if it joined the stream mid-install.
+          emitVmState(name, 'ready', 'windows-install-ready')
+          decision = { stop: true, ready: true }
+        } else {
           // D3: THE DEADLINE FOLLOWS THE STAGE.
           //
           // Before the installed disk boots, the 60-minute window is about
@@ -5142,9 +5534,7 @@ function watchWindowsInstall(name) {
           const overDeadline = bootedStage ? bootedMinutes > sshGraceMinutes : elapsedMinutes > timeoutMinutes
           if (overDeadline) {
             const tail = windowsLogTail(name, 40)
-            await mutateRegistryWith((fresh) => {
-              const row = fresh.vms[name]
-              if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
+            const wrote = await writeRow('windows-install-timeout', token, (row) => {
               row.state = 'error'
               if (bootedStage) {
                 // D5: "INSTALLED BUT SSH MISSING" IS NOT "THE INSTALL FAILED".
@@ -5157,47 +5547,38 @@ function watchWindowsInstall(name) {
                 row.error = `the Windows install did not become ready within ${timeoutMinutes} minutes and the installed disk never booted (${verdict.error ?? 'SSH did not answer'}); Windows Setup did not finish — see the serial log tail and the noVNC view`
               }
               row.errorLog = tail.slice(-4000)
-            }, { reason: 'windows-install-timeout' })
+            })
+            if (wrote.applied !== true) continue
             emitVmState(name, 'error', 'windows-install-timeout')
-            return { stop: true, timedOut: true }
+            decision = { stop: true, timedOut: true }
+          } else {
+            // THE PROGRESS SENTENCE IS BUILT BY `formatWindowsInstallDetail`, NOT
+            // HERE. The old inline template interpolated `verdict.endpoint` (which
+            // the port-shape bug left `undefined`) and rendered an empty QMP
+            // status as "not running" — one panel line that was wrong twice.
+            const serialTail = windowsProgressTail(name, 5)
+            const wrote = await writeRow('registry', token, (row) => {
+              row.state = 'installing'
+              // D3: 'booted' is an INSTALL STAGE, not a state — the row keeps
+              // saying `installing` (so the panel still offers Force delete) but
+              // the sentence changes from "Setup is running" to the truth: the
+              // installed disk booted and OpenSSH has not answered yet.
+              row.installDetail = formatWindowsInstallDetail({ phase: 'install', verdict, elapsedMinutes, serialTail })
+              if (bootedStage) {
+                row.installStage = 'booted'
+                // STAMP ONCE: the grace window must not restart on every 15 s
+                // tick (that would wait for ever instead of telling the user).
+                if (!row.bootedAt) row.bootedAt = new Date().toISOString()
+              }
+              // The tail travels with the row so the panel shows Setup progress
+              // without a second call, and an agent reading `status` sees it too.
+              row.serialTail = serialTail
+              row.installTailAt = new Date().toISOString()
+              row.readiness = windowsReadinessSignals(name)
+            })
+            if (wrote.applied !== true) continue
           }
-          // THE PROGRESS SENTENCE IS BUILT BY `formatWindowsInstallDetail`, NOT
-          // HERE. The old inline template interpolated `verdict.endpoint` (which
-          // the port-shape bug left `undefined`) and rendered an empty QMP
-          // status as "not running" — one panel line that was wrong twice.
-          const serialTail = windowsProgressTail(name, 5)
-          await mutateRegistry((fresh) => {
-            const row = fresh.vms[name]
-            if (!row || (row.state !== 'installing' && row.state !== 'booting')) return
-            row.state = 'installing'
-            // D3: 'booted' is an INSTALL STAGE, not a state — the row keeps
-            // saying `installing` (so the panel still offers Force delete) but
-            // the sentence changes from "Setup is running" to the truth: the
-            // installed disk booted and OpenSSH has not answered yet.
-            row.installDetail = formatWindowsInstallDetail({ phase: 'install', verdict, elapsedMinutes, serialTail })
-            if (bootedStage) {
-              row.installStage = 'booted'
-              // STAMP ONCE: the grace window must not restart on every 15 s
-              // tick (that would wait for ever instead of telling the user).
-              if (!row.bootedAt) row.bootedAt = new Date().toISOString()
-            }
-            // The tail travels with the row so the panel shows Setup progress
-            // without a second call, and an agent reading `status` sees it too.
-            row.serialTail = serialTail
-            row.installTailAt = new Date().toISOString()
-            row.readiness = windowsReadinessSignals(name)
-          })
-          return { stop: false }
-        }, { mode: 'try', waitMs: INSTALL_WATCH_LOCK_WAIT_MS, holder: 'install-watch' })
-        if (outcome?.ran !== true) {
-          // SKIP-AND-SAY-SO: the row is not touched by this tick, the loop
-          // re-arms, and the log names who was in the way.
-          log(`windows: ${name} install watch skipped a tick (${outcome?.holder || 'another operation'} held the lock for ${Math.round((outcome?.heldMs ?? 0) / 1000)} s)`)
-          continue
         }
-        const decision = outcome.value
-        // C12: a live process observed by the watcher IS corroboration.
-        confirmVmState(name, 'install-watch')
         if (decision.stop) {
           if (decision.ready) await ensureWindowsConsoleRelay(name)
           // A computer that became ready through the CREATE path (not through
@@ -5220,6 +5601,41 @@ function watchWindowsInstall(name) {
       log(`windows: install watch for ${name} stopped (${error?.message ?? error})`)
     } finally {
       WINDOWS_WATCHING.delete(name)
+      // P3 — THE LEAVE FLAG BELONGS TO THIS WATCH, SO THIS WATCH CLEARS IT.
+      //
+      // `WINDOWS_WATCH_LEAVE` is consumed at the TOP of the loop only. Every
+      // other exit — a terminal verdict from `leave()`, the death backstop, the
+      // catch above — leaves the flag set, and the NEXT `watchWindowsInstall`
+      // for this name then returns silently at its first pass (the loop top
+      // eats the stale flag) with no watcher registered: the install is
+      // unobserved and nothing says so. Clearing it here is the only place that
+      // knows this watch is over.
+      WINDOWS_WATCH_LEAVE.delete(name)
+      // P1 — A WATCH THAT ENDS ON A MOVED-ON ROW MUST NOT TAKE THE SUCCESSOR'S
+      // OBSERVER WITH IT.
+      //
+      // `watchWindowsInstall` refuses to register a second watch for a name, so
+      // the Start that replaced the row called it while THIS watch was still
+      // registered and its call was absorbed. If this watch then returns — and
+      // it must, its verdict belongs to the install that no longer exists — the
+      // new install would have no observer at all. So the row is re-read once,
+      // and a DIFFERENT incarnation that is still an install in flight gets the
+      // watcher this one is releasing. Never after an F6 leave (that decision is
+      // about the loop, not about the row), and never on the SAME incarnation
+      // (that would be a watcher re-arming itself, a spin).
+      if (toldToLeave !== true && openedToken !== null) {
+        let successor = null
+        try {
+          const row = readRegistry().vms[name]
+          if (row && row.kind === 'windows' && (row.state === 'installing' || row.state === 'booting') && installIncarnation(row) !== openedToken) successor = row
+        } catch {
+          successor = null
+        }
+        if (successor !== null) {
+          log(`windows: install watch for ${name} handed the row to the install started after it (startedAt ${successor.startedAt ?? 'unset'}); the successor is observed, not left behind`)
+          watchWindowsInstall(name)
+        }
+      }
     }
   })()
 }
@@ -9353,18 +9769,25 @@ function lockAwareFail(error) {
     return fail(error.message, { code: 'lock-order-violation', lockHeldBy: error.lockHeldBy, lockKey: error.lockKey })
   }
   if (error instanceof VM_LOCK.LockTimeoutError) {
-    const state = (() => {
+    const row = (() => {
       try {
-        return String(readRegistry().vms[error.lockName]?.state ?? 'unknown')
+        return readRegistry().vms[error.lockName] ?? null
       } catch {
-        return 'unknown'
+        return null
       }
     })()
+    const state = row === null ? 'unknown' : String(row.state ?? 'unknown')
     // The frozen sentence (C4), rendered where the state is known:
     //   another operation on <name> has been running for <N>s (<holder>);
     //   the panel still shows <state>
     // plus the C5 runbook when the key is poisoned.
-    return fail(VM_LOCK.lockTimeoutSentence(error, { state }), {
+    // F5: and, when the holder is the install WATCHER over a row that is no
+    // longer installing, the honest clause that says WHEN it finished — the
+    // base sentence is unchanged (it is a contract); this is appended.
+    const sentence = VM_LOCK.lockTimeoutSentence(error, { state })
+    const holder = String(error.lockHeldBy ?? '')
+    const clause = holder === 'install-watch' ? installWatchStaleClause(row) : ''
+    return fail(clause === '' ? sentence : `${sentence}${clause}`, {
       code: 'lock-timeout',
       name: error.lockName,
       lockHeldBy: error.lockHeldBy,
@@ -9374,6 +9797,98 @@ function lockAwareFail(error) {
     })
   }
   return fail(error)
+}
+
+/**
+ * F5 — WHEN THE HOLDER IS AN OBSERVATION LOOP, SAY WHEN THE THING IT OBSERVED
+ * ENDED.
+ *
+ * `another operation on <name> has been running for <N>s (install-watch)` is
+ * TRUE and useless: the reader cannot tell whether an install is still running
+ * or whether the watcher is simply still holding the key of an install that
+ * finished half an hour ago (the live case: install ready 16:35:52, guest off
+ * 17:05:17, holder `install-watch`, age 79 min). The frozen sentence stays
+ * exactly as it is (C4 renders it, and its text is a contract) — this is an
+ * ADDITIVE clause appended when, and only when, the holder is the watcher AND
+ * the row is no longer an install in flight.
+ */
+function installWatchStaleClause(row) {
+  if (!row || row.kind !== 'windows') return ''
+  if (row.state === 'installing' || row.state === 'booting') return ''
+  const when = [row.installTailAt, row.installMedia?.at, row.stateSince]
+    .find((value) => typeof value === 'string' && value !== '')
+  const finished = when === undefined ? 'the install is no longer running' : `the install finished at ${when}`
+  return ` — ${finished} and the install watcher never released it`
+}
+
+/**
+ * F6 — A WEDGED WATCH, WHEN THE OPERATOR ASKS FOR A CURE THAT NEEDS NOBODY.
+ *
+ * The lock itself must never be broken (`cua-vm-lock.mjs` refuses to, on
+ * purpose): a lock broken under a live holder is how two QEMU processes end up
+ * owning one disk. What CAN be cured without a human is the LOOP: a watch whose
+ * holder is older than `installTimeout + 15 min` while the row is no longer
+ * installing is not observing anything any more, so it is told to leave at its
+ * next pass. The `finally` then removes it from `WINDOWS_WATCHING` and — if it
+ * is still running at all — releases the key naturally, by returning.
+ *
+ * OFF BY DEFAULT (`DSH_CUA_VM_SELFHEAL_WEDGED_WATCH=1` turns it on): a loop that
+ * leaves on a timer is a behaviour change, and the conservative answer to
+ * "the holder has not returned" is still the runbook sentence (restart the
+ * supervisor). Nothing here can force a parked `await` to return — with F2/F3
+ * in place the only way to be wedged is a write that never comes back, and that
+ * one needs a fresh process.
+ */
+const WEDGED_WATCH_GRACE_MS = 900000
+/** Watches the F6 self-check told to leave; consumed between passes. */
+const WINDOWS_WATCH_LEAVE = new Set()
+
+function windowsSelfhealWedgedWatch() {
+  const raw = process.env.DSH_CUA_VM_SELFHEAL_WEDGED_WATCH
+  return raw === '1' || raw === 'true'
+}
+
+/**
+ * The wedged watches this process can see: an `install-watch` holder that is
+ * older than the install window + 15 min over a row that is NOT installing.
+ * Read-only — it is the same question `lockSnapshot` answers for the doctor.
+ */
+function wedgedInstallWatches() {
+  const locks = VM_LOCK.lockSnapshot()
+  const registry = readRegistry()
+  const wedged = []
+  for (const [key, lock] of Object.entries(locks)) {
+    if (lock?.holder !== 'install-watch') continue
+    const name = key.startsWith('vm:') ? key.slice(3) : ''
+    const row = name === '' ? null : registry.vms[name]
+    if (!row || row.kind !== 'windows') continue
+    if (row.state === 'installing' || row.state === 'booting') continue
+    const timeoutMinutes = Number(row.installTimeoutMinutes ?? readConfig().windowsInstallTimeoutMinutes)
+    const limitMs = (Number.isFinite(timeoutMinutes) && timeoutMinutes > 0 ? timeoutMinutes : 60) * 60000 + WEDGED_WATCH_GRACE_MS
+    if (lock.heldMs < limitMs) continue
+    wedged.push({ name, heldMs: lock.heldMs, limitMs, state: String(row.state ?? ''), poisonThresholdMs: WEDGED_WATCH_GRACE_MS })
+  }
+  return wedged
+}
+
+/** The F6 self-check: log the explanation, flag the loop, never touch the lock. */
+function selfhealWedgedInstallWatches() {
+  if (windowsSelfhealWedgedWatch() !== true) return 0
+  let wedged
+  try {
+    wedged = wedgedInstallWatches()
+  } catch (error) {
+    log(`windows: the wedged-watch self-check could not read the locks (${error?.message ?? error})`)
+    return 0
+  }
+  let acted = 0
+  for (const entry of wedged) {
+    if (WINDOWS_WATCH_LEAVE.has(entry.name) === true) continue
+    WINDOWS_WATCH_LEAVE.add(entry.name)
+    acted += 1
+    log(`windows: ${entry.name} install watch is WEDGED — install-watch has held vm:${entry.name} for ${Math.round(entry.heldMs / 1000)} s while the row is '${entry.state}' (the limit is ${Math.round(entry.limitMs / 60000)} min); the watch was told to leave at its next pass. THE LOCK IS NEVER FORCE-BROKEN: the holder returns and releases it by itself — if it does not, restart the supervisor (the lock lives in process memory)`)
+  }
+  return acted
 }
 
 const server = createServer((socket) => {
@@ -9435,6 +9950,11 @@ server.on('error', (error) => {
 // The idle timer is a policy, not a constant: it reads config.json every minute,
 // so a change saved from the Plugins page takes effect without a restart.
 setInterval(() => {
+  // F6: THE POISON PATH ALREADY FIRES ONCE A MINUTE — this rides it.
+  // Placed BEFORE the `autoSuspend` early return: a wedged install watch must be
+  // curable on a host where the idle timer is switched off, and it is a
+  // different question from "is this computer idle".
+  selfhealWedgedInstallWatches()
   const config = readConfig()
   if (config.autoSuspend !== true || config.idleSuspendMinutes <= 0) return
   // A THROW IN A TIMER IS FATAL. `readRegistry` throws on a corrupt file, and an

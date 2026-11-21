@@ -3055,6 +3055,151 @@ exit 255
   }
 }
 
+// ---- F2/F3/F4: AN INSTALL THAT NEVER OPENS SSH ---------------------------
+//
+// THE REPORTED SHAPE (2026-11-21, `vm:win-test`): an install whose guest never
+// answered SSH sat at `installing` with the lifecycle key held by `install-watch`
+// for 79 minutes — past the point where the install had actually finished and
+// the guest had powered itself off. Three things were wrong and all three are
+// asserted here, on a row that is genuinely out of luck (SSH never answers):
+//
+//   * the WATCHER must not hold `vm:<name>` across its ticks (F3) — sampled
+//     every 100 ms through the whole grace expiry;
+//   * the row must reach the SSH-GRACE TIMEOUT honestly (the booted-stage
+//     sentence, D3/D5), not stay `installing` for ever;
+//   * nothing may be poisoned (the poison is what makes the refusal permanent).
+//
+// The row is stamped `bootedAt` 20 minutes ago, so the D3 grace window (15
+// minutes after the boot) is already over on the first tick: the same code path
+// a real firstboot failure takes, without the suite paying 15 minutes.
+{
+  const NO_SSH = 'win-nossh'
+  const NS_ROOT = path.join(TMP_ROOT, `cua-smoke-nossh-${process.pid}`)
+  const NS_STORE = path.join(NS_ROOT, 'store')
+  const NS_HOME = path.join(NS_ROOT, 'home')
+  const NS_SOCK = path.join(NS_ROOT, 'supervisor.sock')
+  const NS_DIR = path.join(NS_STORE, 'windows', NO_SSH)
+  for (const dir of [NS_STORE, NS_HOME, NS_DIR, path.join(NS_HOME, '.cua', 'bin')]) mkdirSync(dir, { recursive: true })
+  const nsQmpPort = await closedPort()
+  const nsSshPort = await closedPort()
+  const bootedTwentyMinAgo = new Date(Date.now() - 20 * 60_000).toISOString()
+  const createdLongAgo = new Date(Date.now() - 25 * 60_000).toISOString()
+  writeFileSync(path.join(NS_STORE, 'registry.json'), `${JSON.stringify({
+    version: 2,
+    vms: {
+      [NO_SSH]: {
+        workspace: '/workspace', kind: 'windows', backend: 'qemu', state: 'installing',
+        stateSince: createdLongAgo, createdAt: createdLongAgo, startedAt: createdLongAgo,
+        installComplete: false, installTimeoutMinutes: 60,
+        installStage: 'booted', bootedAt: bootedTwentyMinAgo,
+        windowsVersion: '11', cpu: 2, memory: 6,
+        ports: { qmp: nsQmpPort, ssh: nsSshPort }
+      }
+    }
+  }, null, 2)}\n`)
+  // A LIVE pid (this process): the row has a QEMU, it is the GUEST that is broken.
+  writeFileSync(path.join(NS_DIR, 'qemu.pid'), `${process.pid}\n`)
+  writeFileSync(path.join(NS_DIR, 'disk.qcow2'), 'a Windows disk')
+  writeFileSync(path.join(NS_DIR, 'serial.log'), 'Setup finished, booting the installed disk\n')
+
+  const nsChild = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervisor.mjs')], {
+    env: {
+      ...process.env,
+      CUA_VM_STORE: NS_STORE,
+      CUA_VM_HOME: NS_HOME,
+      CUA_SUPERVISOR_SOCK: NS_SOCK,
+      CUA_BIN: STUB,
+      CUA_WORKSPACE_ROOT: '/workspace',
+      DSH_CUA_WINDOWS_FAKE_HOST_CAPS: '1',
+      DSH_CUA_WINDOWS_OEM_DIR: path.join(REPO, 'docker', 'windows-oem'),
+      DSH_CUA_WINDOWS_QEMU: path.join(STUB_BIN, 'qemu-system-x86_64'),
+      PATH: `${MTOOLS_STUB}:${STUB_BIN}:${process.env.PATH ?? ''}`,
+      DSH_CUA_VM_WINDOWS: '1',
+      DSH_CUA_WINDOWS_EARLY_CHECK_MS: '600',
+      DSH_CUA_WINDOWS_BOOT_SETTLE_MS: '2000',
+      DSH_CUA_VM_LOCK_WAIT_MS: '1500'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  let nsLog = ''
+  nsChild.stdout.on('data', (chunk) => { nsLog += chunk })
+  nsChild.stderr.on('data', (chunk) => { nsLog += chunk })
+  const nsCall = (payload, timeoutMs = 20_000) => new Promise((resolve) => {
+    const socket = net.connect(NS_SOCK)
+    let buffer = ''
+    let settled = false
+    const done = (answer) => {
+      if (settled) return
+      settled = true
+      try { socket.destroy() } catch {}
+      resolve(answer)
+    }
+    const timer = setTimeout(() => done({ ok: false, error: `harness: no answer within ${timeoutMs} ms` }), timeoutMs)
+    socket.setEncoding('utf8')
+    socket.on('connect', () => socket.write(`${JSON.stringify(payload)}\n`))
+    socket.on('data', (chunk) => {
+      buffer += chunk
+      const newline = buffer.indexOf('\n')
+      if (newline === -1) return
+      clearTimeout(timer)
+      try { done(JSON.parse(buffer.slice(0, newline))) } catch (error) { done({ ok: false, error: `harness: bad JSON (${error.message})` }) }
+    })
+    socket.on('error', (error) => { clearTimeout(timer); done({ ok: false, error: `harness: ${error.message}` }) })
+  })
+  try {
+    const nsUp = await waitFor(async () => (await nsCall({ op: 'ping' }, 1000))?.ok === true, 20_000, 200)
+    check('F2/F3: the install-watch smoke supervisor accepts a row that will never answer SSH', nsUp === true,
+      nsUp ? 'up' : nsLog.slice(-200))
+    if (nsUp === true) {
+      const samples = []
+      const deadline = Date.now() + 20_000
+      let reached = null
+      while (Date.now() < deadline && reached === null) {
+        const doctor = await nsCall({ op: 'vmDoctor' }, 10_000)
+        const listed = await nsCall({ op: 'vmList' }, 10_000)
+        const row = listed?.registry?.[NO_SSH] ?? null
+        if (Array.isArray(doctor?.locks)) {
+          samples.push({
+            locks: doctor.locks,
+            state: row === null ? 'gone' : String(row.state ?? ''),
+            installTailAt: row?.installTailAt ?? null
+          })
+        }
+        if (row?.state === 'error') reached = row
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      const installingSamples = samples.filter((sample) => sample.state === 'installing')
+      const finishedSamples = samples.filter((sample) => sample.state === 'error' || sample.state === 'gone')
+      const holds = samples.filter((sample) => sample.locks.some((lock) => Number(lock?.heldMs ?? 0) > 1000))
+      const freeWhileInstalling = installingSamples.filter((sample) => sample.locks.some((lock) => lock?.key === `vm:${NO_SSH}`) === false)
+      const poisoned = samples.filter((sample) => sample.locks.some((lock) => lock?.poisoned === true))
+      // THE SAMPLES MUST BRACKET THE TICK, or "never held" would be a statement
+      // about an idle moment: at least three samples while the row is still
+      // installing, and at least one after the grace verdict landed.
+      check('F3: while the install watch ticks over a row that never opens SSH, `vm:<name>` is NEVER held across a tick — no lock sample shows a hold over 1 s, and the key is free on every sample taken while the row is still installing',
+        installingSamples.length >= 3 && finishedSamples.length >= 1 && holds.length === 0
+        && freeWhileInstalling.length === installingSamples.length,
+        `${samples.length} sample(s): ${installingSamples.length} while installing, ${finishedSamples.length} after the verdict; ${freeWhileInstalling.length} with the key free, holds=${holds.length}${holds.length > 0 ? ` ${JSON.stringify(holds[0].locks)}` : ''}`)
+      check('F2/F4: the row reaches the SSH-GRACE TIMEOUT (the booted-stage sentence, D3/D5) instead of staying `installing` for ever',
+        reached !== null && /OpenSSH did not answer within 15 minutes after the boot/u.test(String(reached?.error ?? '')),
+        `state=${reached?.state ?? 'not reached'} error=${String(reached?.error ?? '').slice(0, 160)}`)
+      check('D5: ...and the panel-facing detail is the SSH-missing sentence, not a blank and not "undefined"',
+        /OpenSSH did not answer/u.test(String(reached?.installDetail ?? '')),
+        String(reached?.installDetail ?? '').slice(0, 160))
+      check('C5: nothing is poisoned and no tick had to be skipped — the row writes never contended with the observation loop',
+        poisoned.length === 0
+        && /poisoned since/u.test(nsLog) === false
+        && /install watch skipped a tick/u.test(nsLog) === false,
+        `poisoned=${poisoned.length} logPoison=${/poisoned since/u.test(nsLog)} skipped=${/install watch skipped a tick/u.test(nsLog)}`)
+    }
+  } finally {
+    try { nsChild.kill('SIGTERM') } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    try { nsChild.kill('SIGKILL') } catch {}
+    try { rmSync(NS_ROOT, { recursive: true, force: true }) } catch {}
+  }
+}
+
 // The suite invented its filesystem root on a host whose /tmp is too small: take
 // the directory away again, so the checkout's parent stays clean.
 if (SMOKE_TMP.created === true) {

@@ -5611,17 +5611,36 @@ export async function bannerProbe(host, port, { timeoutMs = 1500, readBytes = 32
   return new Promise((resolve) => {
     const socket = net.connect(port, host)
     let done = false
+    let timer = null
+    // DECLARED FIRST (TDZ): every resolver below can fire synchronously (a
+    // refused port answers in µs), and all of them go through this one
+    // idempotent door — the first value wins, the rest are dropped.
     const finish = (value) => {
       if (done) return
       done = true
+      if (timer !== null) clearTimeout(timer)
       try { socket.destroy() } catch {}
       resolve(value)
     }
-    socket.setTimeout(timeoutMs)
+    // A HARD DEADLINE, ARMED BEFORE `connect`. `socket.setTimeout()` below is an
+    // IDLE timer: libuv drops it as soon as the stream is closed, so a peer that
+    // ACCEPTED and then FIN'd/destroyed without a byte emitted no 'error' and no
+    // idle 'timeout' — and with no 'end'/'close' handler the promise stayed
+    // pending for the life of the process. That is the install-watch wedge
+    // (2026-11-21, 79 min hold on vm:win-test; ready() at 4757 awaits this
+    // while holding the lifecycle lock). A `setTimeout` is not tied to the
+    // stream, so this probe now settles on EVERY path.
+    timer = setTimeout(() => finish(null), Math.max(1, timeoutMs))
+    socket.setTimeout(timeoutMs) // the idle signal stays — it is just not the deadline any more
     socket.on('connect', () => {
       // SSH speaks first; VNC's server also speaks first. Read the banner.
       socket.once('data', (chunk) => finish(chunk.subarray(0, readBytes).toString('latin1')))
     })
+    // The two paths that used to leave the promise pending for ever: a peer that
+    // ENDS (FIN, orderly half-close) or CLOSES (RST / accept-then-close) without
+    // ever speaking. Neither emits 'error'.
+    socket.on('end', () => finish(null))
+    socket.on('close', () => finish(null))
     socket.on('timeout', () => finish(null))
     socket.on('error', () => finish(null))
   })
