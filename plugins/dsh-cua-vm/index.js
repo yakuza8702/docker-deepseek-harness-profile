@@ -49,14 +49,20 @@ function desktopFactsReader() {
  * IT MUST EQUAL `plugins/dsh-cua-vm/package.json`'s `version`. That is not a
  * comment-level promise: `tools/check-cua-vm.mjs` asserts the two agree (WP-6.6),
  * so bumping one place and not the other fails the gate instead of shipping two
- * identities for one file tree. 0.2.0 was the relay/blind-verdict release and
- * 0.2.1 the tool-defect round; THIS release is 0.2.2 on both sides — the same
- * commit owns this constant and `package.json`, because the gate's WP-6.6
- * equality is what stops a half-bump — and the number dates the wedge watchdog,
- * the two routable codes, the `[DEGRADED]` descriptions and `desktopWarning`, so
- * a report can tell a 0.2.1 guest from a 0.2.2 one.
+ * identities for one file tree — one commit owns this constant and
+ * `package.json`, because that equality is what stops a half-bump.
+ *
+ * THE HISTORY, one line per round, so a report can date the build it is talking
+ * about: 0.2.0 was the relay/blind-verdict release; 0.2.1 the tool-defect round;
+ * 0.2.2 the session-5 round (relay wedge watchdog, the budget ladder, the two
+ * routable codes, the `[DEGRADED]` descriptions, `desktopWarning`); and THIS
+ * release is 0.2.3 — the cold-boot round: the boot-race reason, the stale-payload
+ * verdict, `facts-file-absent`, the narrowed `leaks` field, and the payload
+ * repair that stages the guard. A 0.2.2 harness on a 0.2.3 guest, or the
+ * reverse, is therefore a fact in the payload rather than a guess from a byte
+ * count.
  */
-export const PLUGIN_VERSION = '0.2.2'
+export const PLUGIN_VERSION = '0.2.3'
 
 export const name = 'cua-vm'
 export const inject = ['tools', 'systemPrompt', 'webServer']
@@ -1869,6 +1875,10 @@ async function attachWindowsMcp(target) {
         keyPath: target.keyPath,
         user: target.user ?? 'cua',
         timeoutMs: WIN_MCP_ATTACH_TIMEOUT_MS,
+        // C1 rule 2 (frozen cross-owner edit): the boot window's anchor. The
+        // client asks THIS plugin when the computer last reported `ready`, so
+        // the window and the attach share one clock instead of two.
+        bootWindow: windowsBootReadyAt,
         // The client re-checks this before EVERY call; a stale session must fail
         // with vm-offline instead of hanging on a half-open socket.
         isOnline: () => windowsMcpIsOnline(),
@@ -2344,6 +2354,24 @@ function newestVmStateFor(names) {
 }
 
 /**
+ * C1 RULE 2 — WHERE THE BOOT WINDOW STARTS (frozen contract, WP-2A consumes it).
+ *
+ * The client's `bootWindow` provider answers ONE question: when did THIS
+ * computer last report `ready`? The clock is the newest `vm-state:<name>:ready`
+ * event — the supervisor's own word, stamped by `recordVmState()` — and NOT the
+ * stream's `ready` handshake (`WIN_MCP_STREAM.readyAt`, which says when the
+ * subscription was acknowledged: a different event about a different subject).
+ *
+ * `number | null` epoch ms, exactly. Null means "no ready event for this
+ * computer in this process", which the client turns into `source: 'none'` and a
+ * window that is NOT live — guessing one from nothing is how a doctor cries wolf.
+ */
+function windowsBootReadyAt(name) {
+  const row = newestVmStateFor(new Set([String(name ?? '')]))
+  return row !== null && row.state === 'ready' ? row.at : null
+}
+
+/**
  * THE BUS → THE SAME TWO PATHS THE POLL USES.
  *
  * `vm-removed`  : the row is gone → forget the bindings and tear down (the
@@ -2595,8 +2623,9 @@ function revealWindowsTools(agent) {
     // WP-5.6/5.9: THE MEASURED DESKTOP, OR NULL. Never a read here (see the kick
     // above), so the reveal cannot block on SSH; `measured:false` inside it means
     // "nobody measured", never "everything is broken". One object, read once, so
-    // the answer and the decision to re-read cannot disagree either.
-    desktop: desktopFacts,
+    // the answer and the decision to re-read cannot disagree either. C4: the same
+    // `errorCode`-carrying block the doctor publishes, from the same function.
+    desktop: desktopFactBlock(desktopFacts),
     // The lane, in the same words the doctor uses (`blindReason` is a §4.6 value
     // or null): a reveal on the blind lane succeeds — the names are real — but the
     // note below refuses to pretend they can see a desktop. WP-5.3 keeps both
@@ -2648,7 +2677,13 @@ function revealWindowsTools(agent) {
  *   no-interactive-session the repair record measured session=0 (no Active
  *                         console session for the guest user);
  *   lane-unknown          a client exists but no lane was ever decided;
- *   repair-disabled       `DSH_CUA_VM_WIN_MCP_REPAIR=0` and nothing else is known.
+ *   repair-disabled       `DSH_CUA_VM_WIN_MCP_REPAIR=0` and nothing else is known;
+ *   boot-race             the computer reported `ready` inside its boot window and
+ *                         the logon task's relay has not answered YET (C1). It is
+ *                         appended LAST because it is the only reason that is a
+ *                         bound rather than a fault: the lane is session-0, the
+ *                         probe is DOWN, and the honest answer is "wait" — the
+ *                         same interval the guest's own guard models (90 s).
  */
 const BLIND_REASONS = Object.freeze([
   'probe-skew',
@@ -2656,7 +2691,8 @@ const BLIND_REASONS = Object.freeze([
   'relay-stopped',
   'no-interactive-session',
   'lane-unknown',
-  'repair-disabled'
+  'repair-disabled',
+  'boot-race'
 ])
 const BLIND_REASON_SET = new Set(BLIND_REASONS)
 
@@ -2672,7 +2708,12 @@ const BLIND_ACTIONS = Object.freeze({
   'relay-stopped': 'next: call windows_mcp_doctor with {"repair":true} to start the relay, or restart the computer.',
   'no-interactive-session': 'next: restart the computer (it re-asserts autologon and the logon task, and the relay needs an Active console session to run in).',
   'lane-unknown': 'next: retry once the attach settles, or restart the computer.',
-  'repair-disabled': 'next: unset DSH_CUA_VM_WIN_MCP_REPAIR (repair is disabled) and call windows_mcp_doctor with {"repair":true}.'
+  'repair-disabled': 'next: unset DSH_CUA_VM_WIN_MCP_REPAIR (repair is disabled) and call windows_mcp_doctor with {"repair":true}.',
+  // C7 — the ONLY reason whose next action is "do nothing": the computer is
+  // inside the same 90 s window its own guard models, and the re-probe rides the
+  // poll. Telling the model to repair here is what turned a boot race into a
+  // repair loop, so the sentence says the opposite, in the frozen words.
+  'boot-race': 'next: nothing — the computer reported ready inside its boot window and the relay starts at logon; the re-probe rides the poll, so call windows_mcp_doctor again if the lane is still session-0 after it.'
 })
 
 /** The next action for one closed-set reason; never empty, never throws. */
@@ -2776,11 +2817,21 @@ function classifyBlindReason({ transportFacts, repairEnabled }) {
   //    "up" and "blind" in the same payload and told the model to repeat the
   //    repair that had just worked. Not blind — the upgrade is in motion.
   if (windowsRelayAnswered(transportFacts) === true) return null
-  // 8. A probe that answered at all.
+  // 8. THE BOOT RACE (C1/C7). The computer reported `ready` inside its boot
+  //    window and the logon task's relay has not answered yet: the same 90 s the
+  //    guest's own `cua-relay-guard.ps1` waits for a console session plus its
+  //    listener. It sits HERE — after every MEASURED fact (rules 3-6) and after
+  //    "the relay answered" (rule 7) — because those are evidence and this is a
+  //    BOUND: a measured `session=0` or `hash=''` must never be relabelled
+  //    "wait a bit", and a relay that already answered is not late. It sits
+  //    ABOVE the DOWN/BAD fallback for the one case the fallback gets wrong: a
+  //    relay that has not started yet is not a relay that stopped.
+  if (transportFacts?.bootRace?.live === true && (status === '' || status === 'RELAY_DOWN' || status === 'RELAY_BAD')) return 'boot-race'
+  // 9. A probe that answered at all.
   if (status === 'RELAY_DOWN' || status === 'RELAY_BAD') return 'relay-stopped'
-  // 9. Nothing known, and the one verb that could find out is switched off.
+  // 10. Nothing known, and the one verb that could find out is switched off.
   if (repairEnabled === false) return 'repair-disabled'
-  // 10. The lane is known (session-0-direct) and the relay is not on it.
+  // 11. The lane is known (session-0-direct) and the relay is not on it.
   return 'relay-stopped'
 }
 
@@ -2870,9 +2921,21 @@ function windowsLaneUpgrading(facts) {
  *
  * A missing/old client yields nulls, never invented values.
  */
-function windowsPayloadFacts(transportFacts) {
+function windowsPayloadFacts(transportFacts, forcedRepair = null) {
   const reported = transportFacts?.payload ?? null
   const repair = transportFacts?.repair ?? null
+  /**
+   * D1/D6 — THE REPAIR THAT RAN ON THIS CALL IS A MEASUREMENT.
+   *
+   * `forcedRepair` is `{payload: {staged, guardHash, guardPresent, writes, ms,
+   * detail, relayHash, relayPresent}}` when the payload half ran (the client
+   * measured both files over SSH). On a guest whose client read could not see
+   * them (`measured:false`, `guardPresent:null`) that record is the ONLY
+   * measurement in the process — so the block below prefers the client's value
+   * and falls back to the repair's, and the pair comparability is decided from
+   * a real `true|false` marker, never from `undefined`.
+   */
+  const repairPayload = forcedRepair?.payload ?? null
   const harnessRaw = Number(transportFacts?.relayPort)
   const harnessPort = Number.isFinite(harnessRaw) && harnessRaw > 0 ? Math.floor(harnessRaw) : null
   const repairRaw = Number(repair?.port ?? reported?.port)
@@ -2880,22 +2943,133 @@ function windowsPayloadFacts(transportFacts) {
   // THE MARKERS FIRST — the two flags the documented set promises, read from the
   // client payload and falling back to the repair record (the same measurement,
   // one level down) so a client that predates the payload flags still classifies.
-  const measured = reported?.measured === true || repair?.measured === true
+  // K2: A RECORD THAT DID NOT RUN IS NOT A MEASUREMENT. `staged: 'none'` means
+  // "payload repair not requested" (the poll path, every plain doctor call), so a
+  // record carrying it must not turn `measured` true — `measured:false` is the
+  // field that says NOBODY LOOKED, and publishing true from an unmeasured payload
+  // is the same class of lie the nulls exist to prevent.
+  const payloadRan = repairPayload !== null && repairPayload.staged !== 'none'
+  const measured = reported?.measured === true || repair?.measured === true || payloadRan
   const portMeasured = typeof reported?.portMeasured === 'boolean'
     ? reported.portMeasured === true
     : (typeof repair?.portMeasured === 'boolean' ? repair.portMeasured === true : recordPort !== null)
   // THE WIRE SHAPE OF `hash=` (the claim this comment used to get wrong): a
   // measured empty hash is `relayPresent: false` with `relayHash: null`, NOT a
   // `''` on the wire — `''` only ever exists INSIDE the client/repair record.
-  const rawHash = typeof reported?.relayHash === 'string'
-    ? reported.relayHash
-    : (measured && typeof repair?.hash === 'string' ? repair.hash : null)
+  // K3a: THE FRESH REPAIR MEASUREMENT OUTRANKS A STALE REPORTED ONE.
+  //
+  // `typeof reported.relayHash === 'string'` accepted `''`, and `''` is
+  // MEASURED-ABSENT — so a client read taken before the repair shadowed the hash
+  // the repair had just measured, and the published `relayPresent` went `false`
+  // over the owner's `true`. A usable hash is a NON-EMPTY string; the preference
+  // is reported → repair payload → repair record, and only when none of them has
+  // a usable hash does the measured-absent fact survive as `''`.
+  const reportedHash = typeof reported?.relayHash === 'string' && reported.relayHash !== '' ? reported.relayHash : null
+  const repairPayloadHash = typeof repairPayload?.relayHash === 'string' && repairPayload.relayHash !== ''
+    ? repairPayload.relayHash
+    : null
+  const measuredAbsent = (typeof reported?.relayHash === 'string' && reported.relayHash === '')
+    || (typeof repairPayload?.relayHash === 'string' && repairPayload.relayHash === '')
+    || (measured && repair?.hash === '')
+  const rawHash = reportedHash ?? repairPayloadHash
+    ?? (measured && typeof repair?.hash === 'string' && repair.hash !== '' ? repair.hash : (measuredAbsent === true ? '' : null))
   const relayHash = rawHash === null || rawHash === '' ? null : rawHash
+  const expectedRelayHash = typeof reported?.expectedRelayHash === 'string' && reported.expectedRelayHash !== ''
+    ? reported.expectedRelayHash
+    : null
+  // ---- C6: THE GUARD HALF OF THE PAYLOAD IDENTITY ----
+  //
+  // The same three-valued rule the relay hash already follows, for the file the
+  // repair stages: `guardHash: ''` means the guest MEASURED no guard (a
+  // pre-`e2f0efd` payload), `null` means nobody measured it, and a non-empty
+  // string is the staged guard the guest reported. A build that cannot say what
+  // the guard should be sends `expectedGuardHash: null`, and `stale` then has
+  // nothing to compare — never `false` (which would claim the guest is current).
+  const expectedGuardHash = typeof reported?.expectedGuardHash === 'string' && reported.expectedGuardHash !== ''
+    ? reported.expectedGuardHash
+    : null
+  const rawGuardHash = typeof reported?.guardHash === 'string'
+    ? reported.guardHash
+    : (typeof repairPayload?.guardHash === 'string' ? repairPayload.guardHash : null)
+  const guardHash = rawGuardHash === '' ? null : rawGuardHash
+  // THE PRESENCE MARKERS ARE OBSERVATIONS, NOT THE `stale` VERDICT (PRE P0): they
+  // answer "was a hash read", and the verdict above never keys on them. The
+  // returned `relayPresent` is the WIRE normalisation of `rawHash` below (`null`
+  // not measured, `false` measured-and-absent, `true` a hash); a client/repair
+  // flag is not needed to compute it, which is why no local copy of the reported
+  // one survives here.
+  // THE GUARD TASK, as the record measured it (D1 follow-up). `staged` says what
+  // happened to the FILE; this says whether the onstart task exists. The live
+  // round is the reason both are published.
+  const task = typeof repairPayload?.task === 'boolean'
+    ? repairPayload.task
+    : (typeof reported?.task === 'boolean' ? reported.task : null)
+  /**
+   * `guardPresent` IS ABOUT THE FILE, AND IT IS DERIVED IN THAT ORDER.
+   *
+   *   1. an explicit measured `guardPresent` (the client's, then the repair's);
+   *   2. else the measured hash: non-empty ⇒ present, `''` ⇒ measured absent;
+   *   3. ELSE the record's `task` — the only honest use of it here: C2 rule 5
+   *      registers the task only after the guard's hash verified, so
+   *      `task === true` proves the file was on disk when the register ran. It
+   *      is a LAST resort, never an override of 1 or 2, and `task === false`
+   *      proves nothing about the file (the register step may simply have been
+   *      skipped once the hash already matched — the live defect D3).
+   */
+  const guardPresent = typeof reported?.guardPresent === 'boolean'
+    ? reported.guardPresent
+    : (typeof repairPayload?.guardPresent === 'boolean'
+        ? repairPayload.guardPresent
+        : (typeof rawGuardHash === 'string'
+            ? rawGuardHash !== ''
+            : (task === true ? true : null)))
+  /**
+   * PRE P0 — `stale` HAS EXACTLY ONE OWNER, AND IT IS NOT THIS FILE.
+   *
+   * This function used to re-derive the verdict from presence markers and the
+   * two hashes. Three repros proved it disagreed with the declared owner
+   * (`payloadStale()` in win-mcp.js / `PAYLOAD_STALE_SEMANTICS`) and with the
+   * guest's own `stale=` line:
+   *
+   *   C5  guard MEASURED ABSENT + a current relay  → owner `false`, this file `true`
+   *   C6  nothing but an absent guard              → owner `null`,  this file `true`
+   *   C7  the `task:true` last-resort shape        → owner `null`,  this file `true`
+   *   C9  a PLAIN call (the real client emits no `relayPresent`) → owner `true`,
+   *       this file `null`, while the verdict in the SAME answer said "the guest
+   *       payload is stale" — the field contradicted the sentence.
+   *
+   * A second derivation is a second contract: "agree by construction" is only
+   * true when there is ONE constructor. So the client's own value (produced by
+   * the owner) is published VERBATIM — `true`, `false`, `null` — and a client
+   * that does not carry it yields `null` ("this build cannot say"), never a
+   * local guess. The repair record's `stale` is deliberately NOT consulted: that
+   * is the GUEST's rule (the live D5 divergence), and the owner is the harness's.
+   */
+  const stale = typeof reported?.stale === 'boolean' ? reported.stale : null
+  /**
+   * D1 — `staged` IS PART OF THE PAYLOAD BLOCK, NOT A REPAIR-ONLY SECRET.
+   *
+   * The closed set is `none | current | staged | incomplete | absent`; `none`
+   * means "payload repair not requested on this call", which is exactly true for
+   * every doctor call that did not ask for one. Without this field the ONE fact
+   * the staging half produces was unreachable from the MCP surface.
+   */
+  const staged = typeof repairPayload?.staged === 'string' ? repairPayload.staged : 'none'
+  // ---- C3: THE THIRD PRODUCER OF `skew` ----
+  //
+  // A relay that predates the `RELAY_FN` token answers the TCP handshake, gets
+  // the token and goes quiet: the FUNCTIONAL probe's reason is
+  // `probe-unsupported`, and that is a payload/interpreter skew by definition.
+  // The helper owns the rule (win-mcp.js); this file only feeds it the three
+  // facts it needs. Absent helper (a bundle one release behind) ⇒ only the
+  // client's own flag counts, which is exactly the pre-C3 behaviour.
+  const functionalReason = String(transportFacts?.relayFunctional?.reason ?? '')
+  const evidenceSkew = typeof winMcpApi.relayEvidenceSkew === 'function'
+    ? winMcpApi.relayEvidenceSkew(String(transportFacts?.relayStatus ?? ''), repair, functionalReason) === true
+    : false
   return {
     measured,
-    expectedRelayHash: typeof reported?.expectedRelayHash === 'string' && reported.expectedRelayHash !== ''
-      ? reported.expectedRelayHash
-      : null,
+    expectedRelayHash,
     relayHash,
     // THE HONEST FLAG, verbatim from the client (`relayEvidenceSkew`): `true`
     // only when the guest relay ANSWERED and the probe could not READ it — the
@@ -2903,10 +3077,29 @@ function windowsPayloadFacts(transportFacts) {
     // reason is `probe-skew`. NOT a hash comparison: a differing hash is
     // reported as `relayHash` vs `expectedRelayHash`, and a missing interpreter
     // is `RELAY_DOWN` (+ `interpreterMissing`), never skew.
-    skew: reported?.skew === true,
+    skew: reported?.skew === true || evidenceSkew === true,
     // `true` (hash read) / `false` (measured, absent) / `null` (not measured):
-    // "no hash yet" and "the guest has no relay" are different facts.
-    relayPresent: rawHash === null ? null : rawHash !== '',
+    // "no hash yet" and "the guest has no relay" are different facts. K3a: the
+    // CLIENT'S OWN presence flag wins when it carries one (it is the owner of the
+    // wire shape), and the hash normalisation is only the fallback — the old
+    // expression re-derived from `''` and could publish `false` over the owner's
+    // `true`.
+    relayPresent: typeof reported?.relayPresent === 'boolean'
+      ? reported.relayPresent
+      : (typeof repairPayload?.relayPresent === 'boolean' ? repairPayload.relayPresent : (rawHash === null ? null : rawHash !== '')),
+    // C6: the guard, in the same three-valued shape as the relay's.
+    expectedGuardHash,
+    guardHash,
+    guardPresent,
+    // C6's verdict: `true` when at least one pair was measured on both sides and
+    // they differ, `false` when every comparable pair agrees, `null` when
+    // nothing is comparable. It is NOT skew (see `PAYLOAD_SKEW_SEMANTICS`).
+    stale,
+    // D1: what the payload half of a forced repair did on THIS call (`none`
+    // when it did not run — the poll path and every plain doctor call), and the
+    // separate fact its register step measured.
+    staged,
+    task,
     // Both halves move together: a MEASURED port is the only one reported, and
     // `portMeasured: true` never stands next to `port: null` ("the guest could
     // not say" is `null` / `false`, never a measured nothing).
@@ -2984,14 +3177,47 @@ function windowsLaneVerdict(online, transportFacts) {
   // readers cannot drift apart again.
   const upgrading = online === true && transport !== 'interactive-relay'
     && windowsRelayAnswered(transportFacts) === true
+  // C1 rule 4/C7: the boot window is the SECOND reason a session-0 lane is
+  // moving rather than stuck. It does NOT change `blind` (C1 rule 8: no new
+  // status, `blind` stays true) — it changes the reason, the next action, and
+  // `laneUpgrading`, which is what tells a consumer "this is a wait".
+  const bootRace = transportFacts?.bootRace ?? null
+  const bootRaceLive = online === true && transport !== 'interactive-relay' && bootRace?.live === true
   const blind = online === true && transport !== 'interactive-relay' && upgrading !== true
   return {
     blind,
     blindReason: blind === true ? classifyBlindReason({ transportFacts, repairEnabled: relayRepairEnabled() }) : null,
     // The explicit note the verdict text carries: the lane is moving, not stuck.
-    laneUpgrading: upgrading,
+    laneUpgrading: upgrading === true || bootRaceLive === true,
+    // The window itself, so the doctor can print `live`/`sinceReadyMs`/`source`
+    // instead of leaving "why is it upgrading" to a sentence.
+    bootRace,
     payload: windowsPayloadFacts(transportFacts),
     repair: windowsRepairFacts(transportFacts)
+  }
+}
+
+/**
+ * C4 — THE DESKTOP BLOCK BOTH SURFACES PUBLISH.
+ *
+ * The client's facts plus the two fields THIS file gives meaning to: the
+ * closed-set `errorCode` (`'' | 'facts-file-absent' | 'facts-unparsable' |
+ * 'ssh-failed' | 'read-error'`) and the free-text `error` every existing reader
+ * already prints. One function for `windows_desktop` and `windows_mcp_doctor`, so
+ * the reveal and the doctor cannot disagree about which read failed or why.
+ * `errorCode` is never invented here: an older client that carries none publishes
+ * `''` ("no classified failure"), not a guess.
+ */
+function desktopFactBlock(facts, reportedCode = undefined) {
+  if (facts === null || facts === undefined) return null
+  const errorCode = typeof reportedCode === 'string'
+    ? reportedCode
+    : (typeof facts.errorCode === 'string' ? facts.errorCode : '')
+  const error = typeof facts.error === 'string' ? facts.error : ''
+  return {
+    ...facts,
+    errorCode,
+    error
   }
 }
 
@@ -3030,6 +3256,19 @@ function windowsDesktopWarnings({ desktop }) {
   // `null`/absent stays SILENT on purpose: that is "no read has answered yet"
   // (a read is in flight), which is a state, not a fault.
   if (desktop !== null && desktop !== undefined && measured !== true) {
+    // WP-4B (C4): THE ONE UNMEASURED CASE THAT HAS A CAUSE, NOT A RETRY.
+    //
+    // `errorCode: 'facts-file-absent'` means the guest has no facts WRITER — its
+    // payload predates the writer — so the generic "call windows_mcp_doctor
+    // before trusting an element-level tool" is a dead end: the doctor has
+    // already been called, and no doctor call can make the file appear. The
+    // sentence names the only verb that can (re-create the computer), and it
+    // RETURNS, because appending a second instruction after it would give the
+    // model two.
+    if (desktop.errorCode === 'facts-file-absent') {
+      notes.push('the guest has no desktop-facts file (C:\\cua-work\\cua-desktop-facts.json): its payload predates the facts writer, so the element lane, C:\\cua-work and the scale numbers are UNKNOWN — re-create the computer; no doctor call can make the file appear.')
+      return notes
+    }
     const error = typeof desktop.error === 'string' && desktop.error.trim() !== ''
       ? desktop.error.trim()
       : 'the guest did not say why'
@@ -3107,7 +3346,20 @@ function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transp
     const reason = String(relayFunctional?.reason ?? '') !== '' ? String(relayFunctional.reason) : 'child-silent'
     const portValue = relayFunctional?.port ?? transportFacts?.relayPort
     const port = relayEvidenceNumber(portValue) === 'null' ? String(portValue ?? '?') : relayEvidenceNumber(portValue)
-    return say(`unresponsive: the relay answered on 127.0.0.1:${port} but its MCP child did not answer an initialize/tools/list round trip in ${budget} ms (${reason}; lastSuccessfulCallAgeMs=${relayEvidenceNumber(evidence.lastSuccessfulCallAgeMs)}, outstandingRequestAgeMs=${relayEvidenceNumber(evidence.outstandingRequestAgeMs)}, childRestarts=${relayEvidenceNumber(evidence.childRestarts)}). Next: call windows_mcp_doctor {repair:true} to re-register the relay task, or restart the computer.`)
+    // ---- WP-3B (C3): THE RIGHT VERB FOR A STALE PAYLOAD ----
+    //
+    // `probe-unsupported` means the relay ACCEPTED the connection, was sent
+    // `RELAY_FN` and answered nothing: that is a relay which predates the token,
+    // i.e. a stale guest payload. The same is true when the payload identity
+    // itself says `stale`. In both cases "re-register the relay task" is the
+    // wrong instruction — the task is fine, the BYTES are old, and only a
+    // re-create (the payload is staged at machine create) can replace them. Every
+    // other cause keeps the byte-identical sentence (C-13 pins its prefix).
+    const stalePayload = reason === 'probe-unsupported' || transportFacts?.payload?.stale === true
+    const next = stalePayload === true
+      ? `Next: ${STALE_PAYLOAD_SENTENCE}`
+      : 'Next: call windows_mcp_doctor {repair:true} to re-register the relay task, or restart the computer.'
+    return say(`unresponsive: the relay answered on 127.0.0.1:${port} but its MCP child did not answer an initialize/tools/list round trip in ${budget} ms (${reason}; lastSuccessfulCallAgeMs=${relayEvidenceNumber(evidence.lastSuccessfulCallAgeMs)}, outstandingRequestAgeMs=${relayEvidenceNumber(evidence.outstandingRequestAgeMs)}, childRestarts=${relayEvidenceNumber(evidence.childRestarts)}). ${next}`)
   }
   if (online === true) {
     // R1 (C12 revision): A BUSY LANE IS AN HONEST INTERMEDIATE, NEVER A SILENT
@@ -3117,6 +3369,11 @@ function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transp
     const unproven = functionalUnproven === true
       ? ` ${windowsFunctionalUnprovenSentence({ reason: String(relayFunctional?.reason ?? ''), evidence: relayFunctional?.evidence ?? relayFunctional, watchdog: functionalWatchdog })}`
       : ''
+    // D7: the stale-payload instruction lives in the OK branch too, because a
+    // payload that predates `RELAY_FN` is not a dead child — and a model that
+    // only saw "ok: attached" would never learn it must re-create the computer.
+    const staleClause = windowsStalePayloadClause(transportFacts, relayFunctional)
+    const staleSaid = staleClause === '' ? '' : ` ${staleClause}`
     // DEFECT 1/2: THE LANE IS MOVING, NOT BLIND. When the relay has answered
     // (a successful measured repair, or the client's own up pair) but the child
     // is still the session-0 one, the truth is "up, upgrading" — and the ONE
@@ -3126,9 +3383,9 @@ function windowsVerdictText({ online, leaking, leaks, blind, blindReason, transp
       const evidence = transportFacts?.relayOk === true && String(transportFacts?.relayStatus ?? '') === 'RELAY_OK'
         ? 'the probe answered RELAY_OK'
         : 'the repair measured RELAY_OK'
-      return say(`ok: the relay ANSWERED (${evidence}), so the lane upgrade from session-0-direct to the interactive relay is in motion and completes within one poll cycle — no repair is needed; desktop tools work now and the element-level lane follows on the next beat.${unproven}`)
+      return say(`ok: the relay ANSWERED (${evidence}), so the lane upgrade from session-0-direct to the interactive relay is in motion and completes within one poll cycle — no repair is needed; desktop tools work now and the element-level lane follows on the next beat.${unproven}${staleSaid}`)
     }
-    return say(`ok: attached through the interactive relay (port ${transportFacts?.relayPort ?? '?'}).${unproven}`)
+    return say(`ok: attached through the interactive relay (port ${transportFacts?.relayPort ?? '?'}).${unproven}${staleSaid}`)
   }
   // NOT ONLINE — and, first, POSSIBLY ATTACHING. This branch REPLACES the
   // "nothing is attached; start the computer" sentence instead of following it:
@@ -3509,14 +3766,94 @@ function describeRepairRecordSentence(record) {
 }
 
 /**
+ * D1 — THE REPAIR RECORD'S `payload` SUB-RECORD, CARRIED VERBATIM.
+ *
+ * The staging half of a forced repair writes a SECOND line (`CUA_PAYLOAD
+ * guard=… relay=… stale=… staged=…`), and the client parses it into
+ * `record.payload`. This file's `forcedRepair` dropped that object, so the ONE
+ * fact the staging produces — `staged: 'staged'` — was unobservable through the
+ * MCP surface on the very call that asked for it (the live round's blocking
+ * defect). It is passed through, normalised, with the §1 C2 rule 9 closed set
+ * enforced and every field three-valued where the guest can be silent:
+ *
+ *   staged        none | current | staged | incomplete | absent (never invented)
+ *   guardHash     the staged guard the guest measured, or null (nobody looked)
+ *   guardPresent  the same fact as a boolean, or null
+ *   task          the guard TASK's presence as the guest measured it
+ *                 (boolean | null). `staged` describes the FILE; the live round
+ *                 proved the two come apart (the file landed, the task did not),
+ *                 so "task created" has to be observable on its own.
+ *   writes/ms     what the plan cost, or null
+ *   detail        the guest's own words, '' when it had none
+ *   relayHash/relayPresent  the relay identity the same measurement read (C6's
+ *                 `stale` needs BOTH pairs, so dropping these would leave the
+ *                 block unable to explain its own verdict)
+ */
+function repairPayloadRecord(payload) {
+  if (payload === null || payload === undefined || typeof payload !== 'object') return null
+  const stagedSet = new Set(['none', 'current', 'staged', 'incomplete', 'absent'])
+  const count = (value) => (Number.isFinite(Number(value)) ? Math.max(0, Math.floor(Number(value))) : null)
+  const rawGuard = typeof payload.guardHash === 'string' ? payload.guardHash : null
+  const rawRelay = typeof payload.relayHash === 'string' ? payload.relayHash : null
+  // K3b: AN UNKNOWN WORD IS `incomplete`, NOT `none`. `none` means "the payload
+  // repair was not requested" — the one value that says nothing happened; an
+  // unrecognised word means the record is damaged, which the parser's own closed
+  // set classifies as "try again". Mapping it to `none` made a broken record
+  // read as "we did not ask".
+  const rawStaged = stagedSet.has(String(payload.staged)) ? String(payload.staged) : 'incomplete'
+  /**
+   * K1 RESIDUAL — THE FILE VERDICT HAS ONE OWNER, AND IT IS THE PRODUCER.
+   *
+   * This file used to compensate here: `incomplete` + a proven-current guard hash
+   * was rewritten to `current` with a local `taskDetail`. The producer
+   * (`runPayloadRepair` in win-mcp.js) now makes that distinction ITSELF — its
+   * out-of-budget branch keeps the FILE word when the measure proved it
+   * (`mergedStaged(...) === 'current' ? 'current' : 'incomplete'`) and puts its
+   * reason in `detail` — so the compensation could never fire and was a second
+   * owner of a one-owner word.
+   *
+   * It is deleted: the record's `staged`/`task`/`detail` are published VERBATIM,
+   * with only the closed-set guard above (an unknown word is `incomplete`,
+   * "try again", never `none`). `taskDetail` is gone with it — no producer ever
+   * sent that key, and the starvation reason rides the record's own `detail`.
+   */
+  return {
+    staged: rawStaged,
+    // D1 follow-up: the register step measures its OWN outcome, and a consumer
+    // that reads only `staged` would say "the payload repair landed" about a
+    // guest whose guard task still does not exist.
+    task: typeof payload.task === 'boolean' ? payload.task : null,
+    guardHash: rawGuard === '' ? null : rawGuard,
+    guardPresent: typeof payload.guardPresent === 'boolean'
+      ? payload.guardPresent
+      : (rawGuard === null ? null : rawGuard !== ''),
+    writes: count(payload.writes),
+    ms: count(payload.ms),
+    detail: typeof payload.detail === 'string' ? payload.detail : '',
+    relayHash: rawRelay === '' ? null : rawRelay,
+    relayPresent: typeof payload.relayPresent === 'boolean'
+      ? payload.relayPresent
+      : (rawRelay === null ? null : rawRelay !== '')
+  }
+}
+
+/**
  * WP-3.6 / R1b — ONE REPAIR ATTEMPT, ON DEMAND, FROM `windows_mcp_doctor
  * {"repair":true}`.
  *
  * The returned object is what `forcedRepair` in the doctor payload carries, and
  * since WP-C it is the WHOLE record plus the verdict about it: `{ requested,
  * attempted, ok, reason, port, at, measured, unmeasured, detail, probe,
- * session, hash }`. Every branch carries every field (a missing key is a
- * consumer crash), and `ok` is never `true` by omission:
+ * session, hash, payload }`. Every branch carries every field (a missing key is
+ * a consumer crash), and `ok` is never `true` by omission:
+ *
+ * BUDGET (K4). This call passes `timeoutMs: WIN_MCP_FORCE_REPAIR_MS` (30 000) to
+ * `repairRelay`, and the seam clamps it to `RELAY_REPAIR_TOTAL_MS` (28 000), so
+ * the real wall is 28 000 for the whole attempt — carrier chunks and payload
+ * phase together — under this function's own 30 000 envelope. Before this the
+ * call passed no budget, the seam fell back to `RELAY_REPAIR_TIMEOUT_MS`
+ * (25 000), and the 28 000 ceiling was unreachable: the payload sub-cap bound
+ * first in every real attempt, which starved `register` on a slow guest (K1).
  *
  *   * `measured:true` + `ok:true|false`  — the attempt RAN and this is what it saw;
  *   * `measured:false` + `unmeasured`    — the attempt did not run (disabled,
@@ -3539,6 +3876,10 @@ async function forceRelayRepair(reason = 'windows_mcp_doctor') {
     probe: null,
     session: null,
     hash: null,
+    // D1: the staging half is reported even when the RECORD never parsed (the
+    // live defect: the guard landed, the relay line did not). `null` = the
+    // payload repair did not run on this attempt.
+    payload: null,
     ...extra
   })
   if (relayRepairEnabled() !== true) {
@@ -3556,7 +3897,17 @@ async function forceRelayRepair(reason = 'windows_mcp_doctor') {
       timer = setTimeout(() => resolve(WIN_MCP_FORCE_REPAIR_TIMED_OUT), WIN_MCP_FORCE_REPAIR_MS)
       timer.unref?.()
     })
-    const answer = await Promise.race([Promise.resolve(client.repairRelay({ force: true })), expiry])
+    // C2 rule 4 (frozen cross-owner edit): the DOCTOR's forced repair is the one
+    // caller allowed to stage the guard (`payloadRepair: true`). The 15 s upgrade
+    // watch calls `repairRelay()` without the flag, so a boot race can never push
+    // eight SSH children every minute for the life of the machine.
+    // K4: THE CALLER BUDGET IS THE DOCTOR'S OWN GUARD, so the seam's wall
+    // arithmetic is real: `repairRelay` takes `min(timeoutMs, RELAY_REPAIR_TOTAL_MS)`
+    // (28 000), which is why 30 000 here yields the documented 28 000 wall instead
+    // of the 25 000 default that made the ceiling unreachable. Without this the
+    // payload phase inherited `RELAY_REPAIR_TIMEOUT_MS` and the clamp claim in the
+    // doc below was false.
+    const answer = await Promise.race([Promise.resolve(client.repairRelay({ force: true, payloadRepair: true, timeoutMs: WIN_MCP_FORCE_REPAIR_MS })), expiry])
     if (answer === WIN_MCP_FORCE_REPAIR_TIMED_OUT) {
       const detail = `no answer within ${WIN_MCP_FORCE_REPAIR_MS} ms`
       // A TIMEOUT IS UNMEASURED (C6): the attempt may well have run, but this
@@ -3586,7 +3937,12 @@ async function forceRelayRepair(reason = 'windows_mcp_doctor') {
       detail: measured ? String(record?.detail ?? '') : String(record?.detail ?? record?.reason ?? ''),
       probe: record?.probe ?? null,
       session: record?.session ?? null,
-      hash: record?.hash ?? null
+      hash: record?.hash ?? null,
+      // D1: the staging half of THIS attempt, verbatim (§1 C2 rule 10). `null`
+      // when the record carried none (the poll path, `payloadRepair:false`).
+      // K1 residual: published verbatim — the PRODUCER owns the file/task split,
+      // so there is nothing to correct on this side.
+      payload: repairPayloadRecord(record?.payload ?? null)
     }
   } catch (error) {
     const detail = `${error?.message ?? error}`
@@ -3719,14 +4075,28 @@ function relayWedgeEvidence(answer) {
 }
 
 /**
- * R1 (C12 revision) — WHAT THE PROBE'S ANSWER MEANS.
+ * D7 — A PAYLOAD FACT IS NOT A DEAD CHILD (design decision, documented).
  *
- * `unresponsive` is true when the token says so OR when the evidence proves a
- * wedge, and the reason is the closed set's own value: `wedge` when the
- * evidence decided it, otherwise the probe's `reason` (`session-busy`,
- * `child-silent`, `child-eof`, `no-evidence`), otherwise the token's default.
- * `busy`/`measured` are handed back so the caller can say what was NOT proven
- * without inventing a status the contract does not have.
+ * THE DEFECT. `status` alternated `ok` / `unresponsive` call to call on the same
+ * healthy-but-stale guest, purely because the functional probe runs on some
+ * calls and not others: `RELAY_UNRESPONSIVE` was mapped to `unresponsive`
+ * unconditionally, so a call that probed said "the child is dead" while the next
+ * call, which skipped the probe, said "ok".
+ *
+ * THE DESIGN. `unresponsive` now requires either EVIDENCE (a wedge signature in
+ * the guest's own counters) or a CHILD-LEVEL reason. `probe-unsupported` — the
+ * relay accepted the connection, was sent `RELAY_FN` and answered zero bytes —
+ * is a statement about the PAYLOAD (the guest predates the token), not about the
+ * child's health: the probe never got as far as measuring the child. So it no
+ * longer flips the status; `payload.skew`/`payload.stale` carry the fact, and the
+ * verdict says "re-create the computer" in the OK branch (one sentence, one
+ * vocabulary). `status` therefore stops depending on whether a probe ran.
+ *
+ * WHY NOT A TTL CACHE. A cache would make the false status CONSISTENT rather
+ * than TRUE (every cached call would still say `unresponsive` on a guest whose
+ * child is fine), and it would import a second staleness clock into a verdict
+ * that already carries `bootRace`/`payload`. The cadence was never the defect;
+ * the classification was.
  */
 function relayFunctionalVerdict(answer) {
   const offWatchdog = { disabled: false, deadlineMs: WIN_MCP_WEDGE_FALLBACK_MS }
@@ -3738,12 +4108,16 @@ function relayFunctionalVerdict(answer) {
   const wedge = relayWedgeEvidence(answer)
   const watchdog = relayWatchdogState(answer)
   const tokenSaysUnresponsive = answer.status === RELAY_UNRESPONSIVE
-  const unresponsive = tokenSaysUnresponsive === true || wedge !== null
   const reported = String(answer.reason ?? '')
   const reason = wedge !== null
     ? 'wedge'
     : (reported !== '' ? reported : (tokenSaysUnresponsive === true ? 'child-silent' : ''))
-  return { unresponsive, reason, busy, measured, wedge, watchdog }
+  // D7: `probe-unsupported` is a payload fact (see the design note above). It is
+  // reported as the reason — the verdict's stale-payload clause and
+  // `payload.skew` both consume it — but it is NOT a child-death verdict.
+  const payloadFact = reason === 'probe-unsupported'
+  const unresponsive = wedge !== null || (tokenSaysUnresponsive === true && payloadFact !== true)
+  return { unresponsive, reason, busy, measured, wedge, watchdog, payloadFact }
 }
 
 /**
@@ -3752,6 +4126,23 @@ function relayFunctionalVerdict(answer) {
  * answering (a fresh success); this clause is what stops "no measurement" from
  * reading as a measurement, without inventing a fifth status.
  */
+/**
+ * THE STALE-PAYLOAD SENTENCE (C3/D7) — one string, two branches.
+ *
+ * It is the correct next action whenever the guest payload is provably stale:
+ * the child-level `unresponsive` branch (a wedged child on an old payload) and
+ * the `ok` branch (a healthy child behind a relay that predates `RELAY_FN`).
+ * "re-register the relay task" is the wrong verb in both — the task is fine, the
+ * BYTES are old, and only a re-create replaces them.
+ */
+const STALE_PAYLOAD_SENTENCE = 'The guest payload is stale — re-create the computer (the payload is staged at machine create); repairing the relay task cannot replace it.'
+
+function windowsStalePayloadClause(transportFacts, relayFunctional) {
+  const stale = transportFacts?.payload?.stale === true
+    || String(relayFunctional?.reason ?? '') === 'probe-unsupported'
+  return stale === true ? STALE_PAYLOAD_SENTENCE : ''
+}
+
 function windowsFunctionalUnprovenSentence({ reason = '', evidence = null, watchdog = null } = {}) {
   const say = (value) => relayEvidenceNumber(value)
   // THE WATCHDOG-OFF CASE IS ITS OWN SENTENCE (C4.8, J6): with the reclaim
@@ -3795,7 +4186,16 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     WIN_MCP.lastError = `doctor probe failed: ${error?.message ?? error}`
   }
   const names = globalSchemaNames()
-  const leaks = names.filter((name) => name.startsWith(TOOL_PREFIX))
+  // ---- C5 (RC-5): THE RAW SURFACE, AND THE OFFLINE RESIDUE ----
+  //
+  // `prefixSchemas` is the raw `mcp__windows__*` surface on the global registry
+  // and is filled whether the bridge is online or not. `leaks` is the OFFLINE
+  // RESIDUE: it is empty whenever `online === true`, and offline anything in it
+  // is `status: "leaking"`. The two are separate fields because they answer two
+  // questions — "what is registered" and "what is registered that should not be"
+  // — and reporting one as the other made the doctor claim 19 leaks on a healthy
+  // bridge, contradicting the leak contract it publishes.
+  const prefixSchemas = names.filter((name) => name.startsWith(TOOL_PREFIX))
   const guestTools = Array.isArray(WIN_MCP_AUX.tools) ? WIN_MCP_AUX.tools : []
   const registered = [...WIN_MCP.registrations.keys()]
   // The names the GUEST offered, in their public `mcp__windows__*` form (the
@@ -3877,11 +4277,23 @@ async function windowsMcpDoctor(execAgent, options = {}) {
   // guest to ask (a probe here would race the attach and cost a session).
   // No client means no lane was ever decided, so the keys are simply absent.
   const transportFacts = WIN_MCP.client?.doctorFacts?.() ?? null
+  // C5: `leaks` is the offline residue and NOTHING ELSE. It is derived here, the
+  // first point where `online` is known, and the two pinned expressions below
+  // (`leaking`, `status`) are left byte-for-byte: with `online === true` their
+  // first conjunct is already false, so narrowing `leaks` online cannot change
+  // either verdict — that equivalence is why this shape was chosen over a scoped
+  // leak list that would have needed both pinned expressions rewritten.
+  const leaks = online === true ? [] : prefixSchemas
   // ---- WP-3.1/3.2: THE VERDICT, AND THE FACTS IT RESTS ON ----
   // `leaking` is the same expression the `status` line below uses (the offline
   // lie, unchanged since the leak fix). `blind` is the NEW value: online, but not
   // through the relay, which is the state that used to report `ok`.
   const leaking = online !== true && leaks.length > 0
+  // D1/D6: the forced repair's own measurement is passed into the PAYLOAD facts
+  // pass below (not into `windowsLaneVerdict`, whose signature is a pinned
+  // literal), so a `{repair:true}` answer reports the guard the repair just
+  // staged instead of the pre-repair (empty) client read.
+  const forcedRepairForFacts = options?.forcedRepair ?? null
   const lane = windowsLaneVerdict(online, transportFacts)
   const blind = lane.blind
   const blindReason = lane.blindReason
@@ -3899,6 +4311,10 @@ async function windowsMcpDoctor(execAgent, options = {}) {
   // that is cached. Assigning the field directly left the stamp ageing beside a
   // fresh answer, and `desktopFactsNeedsRefresh()` then re-read on a false alarm.
   if (online === true) rememberDesktopFacts(desktop)
+  // C4: the desktop read's classified failure, as ONE closed-set value. The
+  // client sets it; an older client (or no client) carries none, and `''` is
+  // "no error" — never a guess.
+  const errorCode = typeof desktop?.errorCode === 'string' ? desktop.errorCode : ''
   // C9: ONE STRING, AND IT IS THE SAME ONE THE REVEAL PUBLISHES — computed with
   // the same function on the same shape, so the field on `windows_mcp_doctor`
   // and the field on `windows_desktop` can never disagree about the desktop.
@@ -3912,6 +4328,17 @@ async function windowsMcpDoctor(execAgent, options = {}) {
   const relayFunctional = online === true && options?.functional !== false
     ? await runRelayFunctionalProbe()
     : null
+  // D7/C3: THE PAYLOAD BLOCK IS BUILT AFTER THE PROBE, NOT BEFORE IT.
+  //
+  // `lane.payload` was derived from the client's facts BEFORE this call's probe
+  // ran, so `probe-unsupported` could only reach `payload.skew` on the NEXT
+  // call — one more way the answer depended on cadence. The facts are cheap and
+  // pure, so the block is re-derived once the functional answer for THIS call is
+  // known (and the same object is what the payload publishes).
+  const payloadFacts = windowsPayloadFacts(
+    relayFunctional === null ? transportFacts : { ...(transportFacts ?? {}), relayFunctional },
+    forcedRepairForFacts
+  )
   // R1 (C12 revision): THE VERDICT COMES FROM THE EVIDENCE, NOT FROM THE TOKEN
   // ALONE. `busy:true` used to answer `RELAY_OK` with `relayOk:true`, so a
   // healthy-looking status was reachable through a wedged child. The counters
@@ -3937,7 +4364,7 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     : windowsTransportLine(transportFacts, blindReason)
   // WP-3.6: what `{"repair": true}` did on THIS call (null when not requested).
   // The doctor's own budget stays 60 s; the attempt is bounded below that.
-  const forcedRepair = options?.forcedRepair ?? null
+  const forcedRepair = forcedRepairForFacts
   // ONE LINE FOR THE HUMAN READING THE DOCTOR (and cheap enough to always send):
   // the two desktop lanes are not interchangeable, and a noVNC screenshot is a
   // stream, not the guest framebuffer — the MCP tools are the element-level lane.
@@ -4008,7 +4435,14 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     // `blind` is false and `blindReason` null in this window; this boolean is
     // what says "ok because the upgrade is moving", so a caller can tell it from
     // "attached through the relay" without parsing the sentence.
+    //
+    // C1 rule 4/C7: it is ALSO true inside a live boot window, which is the same
+    // fact from the other direction — the lane is late, not broken.
     laneUpgrading: lane.laneUpgrading === true,
+    // C1: the window itself (`{ live, sinceReadyMs, remainingMs, source,
+    // readyAt, attachedAt, windowMs }`), so "why is it upgrading" is a field
+    // instead of an inference. Null when the client has no attach clock.
+    bootRace: lane.bootRace,
     // THE VERDICT, from the plugin's own state (see the block above) — a probe
     // may never raise it back to true during a power-off.
     online,
@@ -4035,7 +4469,12 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     // The leak surface as the HOST registry sees it (the global view), which is
     // what another session's tool list is built from.
     schemas: names,
+    // C5: `leaks` is the offline residue (empty online), `prefixSchemas` is the
+    // raw bridged surface at all times. A consumer that wants "is anything
+    // leaked" reads `leaks`; one that wants "what does the registry hold under
+    // the prefix" reads `prefixSchemas`.
     leaks,
+    prefixSchemas,
     grants: {
       default: WIN_MCP_AUX.grantDefault === true ? 'on' : 'off',
       on: [...WIN_MCP_AUX.grants.entries()].filter(([, value]) => value === true).map(([key]) => key)
@@ -4049,8 +4488,10 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     // last reported; `measured` is what makes them readable, and a measured
     // `hash=` arrives as `relayPresent: false` + `relayHash: null` (never `''` on
     // the wire). `skew` keeps the client's own definition — the relay ANSWERED
-    // and the probe could not read the answer, never a hash mismatch.
-    payload: lane.payload,
+    // and the probe could not read the answer, never a hash mismatch — and since
+    // D7/C3 the block is derived from THIS call's functional answer
+    // (`payloadFacts`), not from the pre-probe client read.
+    payload: payloadFacts,
     // WP-3.2 / SOL §4.4: the repair's own last record — `attempts`, `lastAt`,
     // `ok`, `reason`, `backoffMs` — plus the two facts that explain a blind
     // verdict (`session`, `probe`) and whether the switch is even on (`enabled`).
@@ -4111,7 +4552,12 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     // failed can write the directory we point `save_path` at). `measured:false`
     // means UNKNOWN — a stale guest that writes no facts file is not a dead lane,
     // and every measurement inside is null rather than a fabricated `false`.
-    desktop,
+    // C4: the desktop block carries `errorCode` (closed set: '' |
+    // 'facts-file-absent' | 'facts-unparsable' | 'ssh-failed' | 'read-error') —
+    // the ONE field that tells "the guest has no facts writer" from "the read
+    // failed", which `error` (free text) cannot say reliably on a localized
+    // guest. Spread rather than replaced: every other key is the client's.
+    desktop: desktopFactBlock(desktop, errorCode),
     implicitTarget: {
       active: WIN_MCP_AUX.implicitTargets.size > 0,
       reason: 'implicit-single-target',

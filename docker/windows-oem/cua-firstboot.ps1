@@ -63,7 +63,12 @@ $marker = 'C:\cua-provision.json'
 # An empty hash is recorded as '' rather than omitted: a reader must be able to
 # tell "this script could not hash itself" from "this marker predates the field".
 # ---------------------------------------------------------------------------
-$scriptVersion = '1.2.0'
+# WP-1A (RC-1): 1.3.0. A PROVISIONING-CONTRACT CHANGE, so the payload's own number
+# moves: the marker gains a top-level `guardSha256`, and the guard/launcher steps
+# become measure-then-write so a re-entry cannot overwrite a repair. This is the
+# GUEST's number, not the plugin's - a harness reports its `PLUGIN_VERSION` and the
+# guest reports this; the two are compared only through `payload.stale`.
+$scriptVersion = '1.3.0'
 $scriptSha256 = ''
 try {
   if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -ErrorAction Stop)) {
@@ -80,6 +85,13 @@ try {
 # (a second `pip install` while the first holds the wheel cache, a second
 # Register-ScheduledTask on a running one). The marker makes it idempotent: a
 # stage that already succeeded is SKIPPED, and -Force re-runs everything.
+# THE TOP-LEVEL IDENTITY FIELDS ARE THE HARNESS'S COMPARISON, NOT DECORATION.
+# `scriptSha256` is the hash of the file being executed, so `payload.stale` is a
+# field comparison against the payload a computer was provisioned with instead of
+# the byte-count archaeology the diagnosis had to do; `scriptVersion` is the
+# one-line answer to "which provisioning contract is this guest running". Both live
+# at the TOP level (not only inside a step row) for exactly that reason, and
+# `guardSha256` joins them at the end of the run.
 $state = @{ started = (Get-Date).ToString('o'); scriptVersion = $scriptVersion; scriptSha256 = $scriptSha256; steps = @() }
 if (Test-Path $marker) {
   try {
@@ -425,6 +437,33 @@ function Resolve-RelayPort {
     if ([int]::TryParse($env:DSH_CUA_MCP_RELAY_PORT, [ref]$parsedPort) -and $parsedPort -gt 0 -and $parsedPort -lt 65536) { return $parsedPort }
   }
   return 47999
+}
+
+# WP-1A - THE LAUNCHER IS THE SOURCE OF TRUTH ON A RE-ENTRY, AND A PASS MUST NOT
+# UNDO A REPAIR. `mcp-relay-task` rewrites `mcp-relay-host.vbs` on every run; the
+# harness's repair rewrites the same file with the port it probes. Without a read
+# here, the next provisioning pass replaces the harness's `--serve --port <n>` with
+# this script's env-or-47999 value and the guest re-opens the very split the repair
+# closed. The rule below is the guard's `Get-LauncherPort` deliberately: same
+# regex, same 1..65535 clamp, same "0 means it does not say" answer, so the guest
+# and the boot guard read the one file the same way.
+function Get-RelayLauncherPort([string]$LauncherPath) {
+  try {
+    if (-not $LauncherPath) { return 0 }
+    if (-not (Test-Path -LiteralPath $LauncherPath -ErrorAction SilentlyContinue)) { return 0 }
+    $content = Get-Content -LiteralPath $LauncherPath -Raw -ErrorAction Stop
+    if (-not $content) { return 0 }
+    # The port appears in the informational comment line and in the Run line; both
+    # carry the same command, and the FIRST `--port <digits>` is the one that runs.
+    $match = [regex]::Match([string]$content, '--port\s+([0-9]{1,5})')
+    if (-not $match.Success) { return 0 }
+    $value = 0
+    if (-not [int]::TryParse($match.Groups[1].Value, [ref]$value)) { return 0 }
+    if ($value -lt 1 -or $value -gt 65535) { return 0 }
+    return $value
+  } catch {
+    return 0
+  }
 }
 
 $relayPort = Resolve-RelayPort
@@ -2339,13 +2378,86 @@ Step 'relay-guard-task' {
   New-Item -ItemType Directory -Force -Path 'C:\ProgramData\cua' | Out-Null
   $guardScript = 'C:\ProgramData\cua\cua-relay-guard.ps1'
   $guardSource = Find-OemPayloadFile -Name 'cua-relay-guard.ps1'
+
+  # WP-1A - MEASURE, THEN WRITE. This used to be an unconditional copy with
+  # `-Force`, so every pass rewrote the guard even when the bytes were identical -
+  # mtime churn on the one file the boot guard runs, and no way for the marker to
+  # say "the guard is current" instead of "I wrote it again". Now both sides are
+  # hashed first: equal means nothing is written and the row records a MEASURED
+  # `already current`, different means the payload copy lands (so a guest whose OEM
+  # copy is newer converges, which is the direction this step is for).
+  #
+  # A MISSING OR UNMEASURABLE HASH IS NOT "EQUAL": the write happens unless BOTH
+  # sides were measured and they match, because "I could not measure it" must not
+  # be read as "it is current" - that is the same class of lie as a patch that
+  # claims `applied` without its probe.
+  $stagedHash = ''
+  try {
+    if (Test-Path -LiteralPath $guardScript -ErrorAction SilentlyContinue) {
+      $stagedHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+  } catch { $stagedHash = '' }
+  $sourceHash = ''
   if ($guardSource) {
-    Copy-Item -LiteralPath $guardSource -Destination $guardScript -Force
-    Say "relay guard: $guardSource -> $guardScript"
-  } elseif (Test-Path -LiteralPath $guardScript -ErrorAction SilentlyContinue) {
-    # A re-run after the payload directory is gone: the staged copy is the same
-    # bytes and is what the boot task already names, so keep it.
-    Say "relay guard: no staged copy found; keeping the existing $guardScript"
+    try { $sourceHash = (Get-FileHash -LiteralPath $guardSource -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $sourceHash = '' }
+  }
+  $stagedPresent = [bool](Test-Path -LiteralPath $guardScript -ErrorAction SilentlyContinue)
+  $copyGuard = $false
+  if ($guardSource) {
+    if (-not $stagedPresent) { $copyGuard = $true }
+    elseif (-not $sourceHash) { $copyGuard = $true }
+    elseif (-not $stagedHash) { $copyGuard = $true }
+    elseif ($sourceHash -ne $stagedHash) { $copyGuard = $true }
+  }
+  $guardState = ''
+  if ($copyGuard) {
+    # JURY DEFECT 7 - THE COPY IS NOT CALLED `staged` UNTIL THE STAGED FILE IS
+    # MEASURED to BE the source bytes. This block used to set `staged` around an
+    # unconditional copy while the script runs under
+    # $ErrorActionPreference = 'Continue', so a FAILED copy was not even
+    # catchable: the row said `staged` while the disk still held the old file (the
+    # `guardSha256` field stayed honest only because it is re-read later - the WORD
+    # a human reads did not). `-ErrorAction Stop` makes the failure catchable, and
+    # the re-hash makes the word a MEASUREMENT, the same rule as the two hashes
+    # that decided to copy in the first place.
+    $copyError = ''
+    try {
+      Copy-Item -LiteralPath $guardSource -Destination $guardScript -Force -ErrorAction Stop
+    } catch {
+      $copyError = $_.Exception.Message
+    }
+    $afterCopyHash = ''
+    try { $afterCopyHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $afterCopyHash = '' }
+    if ($afterCopyHash -and $afterCopyHash -eq $sourceHash) {
+      $guardState = 'staged'
+      if ($copyError) {
+        # The cmdlet complained and the bytes still landed (a transient lock, an AV
+        # scan): the measurement wins, and the log says which one it was.
+        Say "relay guard: the copy reported an error, but the staged file MEASURES as the source ($afterCopyHash); recording 'staged'"
+      } else {
+        Say "relay guard: $guardSource -> $guardScript (sha256=$afterCopyHash)"
+      }
+    } else {
+      # A STALE OR ABSENT GUARD WITH A REGISTERED TASK IS THE "task that does
+      # nothing" FAILURE this step already throws on when neither side exists -
+      # a failed copy is the same fact one line later. Record the MEASURED word on
+      # the row and throw, so the next pass retries instead of the marker claiming
+      # a write that did not happen.
+      $guardState = 'copy-failed'
+      $script:pendingStepAnnotation = @{ guardState = 'copy-failed'; guardSha256 = $afterCopyHash }
+      Say "relay guard: COPY FAILED ($copyError) - $guardScript measures '$afterCopyHash', not the source '$sourceHash'"
+      throw "relay guard: '$guardSource' could not be written to $guardScript ($copyError); the boot task would run bytes the payload never shipped"
+    }
+  } elseif ($guardSource) {
+    # THE COMMON RE-ENTRY: nothing is written, and the row says so - "already
+    # current" is a measured fact (both hashes present and equal), not a guess.
+    $guardState = 'already current'
+    Say "relay guard: already current (sha256=$stagedHash); not rewriting $guardScript"
+  } elseif ($stagedPresent) {
+    # A re-run after the payload directory is gone: the staged copy is what the
+    # boot task already names, so keep it and say which hash is in place.
+    $guardState = 'kept'
+    Say "relay guard: no staged copy found; keeping the existing $guardScript (sha256=$stagedHash)"
   } else {
     throw 'cua-relay-guard.ps1 is in neither the OEM payload nor C:\ProgramData\cua; the boot guard would be a task that does nothing'
   }
@@ -2377,8 +2489,11 @@ Step 'relay-guard-task' {
   # is stale" must be visible from the marker rather than inferred from behaviour.
   $guardHash = ''
   try { $guardHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $guardHash = '' }
-  Say "relay guard registered (cua-mcp-host-guard: onstart, SYSTEM, /rl HIGHEST) -> $guardScript sha256=$guardHash"
-  return @{ guardSha256 = $guardHash }
+  Say "relay guard registered (cua-mcp-host-guard: onstart, SYSTEM, /rl HIGHEST) -> $guardScript sha256=$guardHash ($guardState)"
+  # `guardSha256` is the EFFECTIVE hash on disk (source when this pass copied,
+  # staged when it kept what was there) - the number the harness compares against
+  # `expectedGuardHash`, not this payload's idea of what it should be.
+  return @{ guardSha256 = $guardHash; guardState = $guardState }
 }
 
 # THE SESSION-0 DEFECT, FIXED AT ITS ROOT.
@@ -2409,6 +2524,19 @@ Step 'relay-guard-task' {
 Step 'mcp-relay-task' {
   New-Item -ItemType Directory -Force -Path 'C:\ProgramData\cua' | Out-Null
   $relayScript = 'C:\ProgramData\cua\mcp-relay.py'
+
+  # WP-1A - ADOPT, DO NOT OVERWRITE. This step rewrites the launcher below, so the
+  # port it writes decides where the relay listens. On a re-entry the launcher may
+  # already name a port the HARNESS repaired (`--serve --port <n>`) while this
+  # script's value comes from the environment or the 47999 default; writing the
+  # latter would undo the repair and leave the guard probing a port nothing
+  # listens on. So the launcher wins when it names a legal port, and the read
+  # happens HERE - before the port is used anywhere in this step (the value below must come after it, which is what the gate's S12 reads).
+  $launcherPort = Get-RelayLauncherPort -LauncherPath 'C:\ProgramData\cua\mcp-relay-host.vbs'
+  if ($launcherPort) {
+    $script:relayPort = $launcherPort
+    Say "mcp relay: launcher names --port $launcherPort; adopting it instead of re-resolving (a harness repair must survive a provisioning pass)"
+  }
 
   # THE BODY COMES FROM THE OEM PAYLOAD, searched exactly where
   # cua-clip-agent.ps1 is searched: $PSScriptRoot (Setup\Scripts), the setup.img
@@ -2612,6 +2740,13 @@ Step 'mcp-relay-reassert' {
   }
   throw "mcp-relay-reassert: the relay is still not answering after -Ensure (exit $($guardResult.exit))"
 } -Always
+
+# WP-1A - ONE TOP-LEVEL FIELD FOR "IS THE GUARD STALE". The hash is READ BACK from
+# the row the step wrote rather than recomputed here, so the summary and the step
+# cannot disagree: if the step was skipped by the marker (a previous pass already
+# ok:true) the row still carries the hash that pass measured.
+$guardRow = @($state.steps | Where-Object { $_.step -eq 'relay-guard-task' } | Select-Object -Last 1)
+$state.guardSha256 = if ($guardRow.Count -gt 0 -and $guardRow[0].guardSha256) { [string]$guardRow[0].guardSha256 } else { '' }
 
 $state.finished = (Get-Date).ToString('o')
 $state | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $marker

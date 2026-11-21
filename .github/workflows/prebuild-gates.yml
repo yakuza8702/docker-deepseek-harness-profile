@@ -160,12 +160,15 @@ jobs:
             echo ''
             # FLOORS, not exact counts: the three suites and the fix rounds that
             # follow this landing keep ADDING checks to the same files, so an
-            # exact number here goes stale the moment one lands. Measured at this
-            # landing (2026-11-20 21:16 UTC): relay-wedge 26, modules-unit 445,
-            # windows-mcp-gate 124 (guest-patch 24). The suites themselves print
-            # the exact number and fail on their own contract, so this line only
-            # has to be honest, not exhaustive.
-            echo '`tests/relay-wedge.mjs` ≥26 checks (WP-A) · `tests/modules-unit.mjs` ≥445 (WP-B) · `tests/windows-mcp-gate.mjs` ≥124, 0 PENDING (WP-C) — measured floors; the suites print the exact totals.'
+            # exact number here goes stale the moment one lands. Measured at the
+            # FLOORS, measured at the JURY docs round (2026-11-21 04:50 UTC):
+            # relay-wedge 26, modules-unit 472, windows-mcp-gate 137,
+            # guest-patch 29. They are floors, not snapshots — checks keep landing
+            # in these same files (windows-mcp-gate printed 142 four minutes
+            # later), and the suites print their own exact totals. The suites
+            # themselves print the exact number and fail on their own contract, so
+            # this line only has to be honest, not exhaustive.
+            echo '`tests/relay-wedge.mjs` ≥26 checks (WP-A) · `tests/modules-unit.mjs` ≥472 (WP-B/CB) · `tests/windows-mcp-gate.mjs` ≥137, 0 PENDING (WP-C) — measured floors; the suites print the exact totals.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # WP-D — THE GUEST-PATCH SUITE. It applies firstboot's here-strings to the
@@ -183,11 +186,11 @@ jobs:
           EVIDENCE="${GUEST_EVIDENCE:-$(dirname "$GITHUB_WORKSPACE")/tooldefects-evidence}"
           if [ ! -f "$EVIDENCE/bridge.py" ] || [ ! -f "$EVIDENCE/server.py" ]; then
             echo "SKIP tests/guest-patch.mjs: the pinned dsh-cua==0.4.1 evidence copies are not in this checkout ($EVIDENCE)."
-            echo "::warning title=guest-patch skipped::needs tooldefects-evidence/{bridge.py,server.py}; set GUEST_EVIDENCE to run the 24 checks"
+            echo "::warning title=guest-patch skipped::needs tooldefects-evidence/{bridge.py,server.py}; set GUEST_EVIDENCE to run the 29 checks"
             {
               echo '## Guest patch'
               echo ''
-              echo "SKIPPED by path: \`$EVIDENCE/{bridge.py,server.py}\` is absent. The 24 checks run inside the image build, where the pinned wheel is."
+              echo "SKIPPED by path: \`$EVIDENCE/{bridge.py,server.py}\` is absent. The 29 checks run inside the image build, where the pinned wheel is."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -195,14 +198,14 @@ jobs:
           {
             echo '## Guest patch'
             echo ''
-            echo '`tests/guest-patch.mjs` ≥24 checks (WP-D) against the pinned 0.4.1 copies.'
+            echo '`tests/guest-patch.mjs` ≥29 checks (WP-D/WP-1A) against the pinned 0.4.1 copies.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # WP-E / C15 / R10 — THE REVERT-PROOF HARNESS. Twenty pairs, each one a
       # revert applied to a COPY of the tree and judged by the same gate. A row
       # is green only when the judge exits non-zero AND names the expected
       # assertion; a red for the wrong reason is a false green and fails the run.
-      # It copies the checkout and spawns the gate 22 times (~10 s here, more on a
+      # It copies the checkout and spawns the gate 29 times (~14 s here, more on a
       # cold runner), which is why
       # it is its own step and not part of `ci-gates.mjs`.
       - name: Run the mutation harness (revert-proof pairs)

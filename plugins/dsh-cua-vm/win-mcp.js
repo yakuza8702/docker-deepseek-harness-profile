@@ -540,7 +540,7 @@ export function resetExpectedRelayHashCache() {
  * `interpreterMissing: true`), and a missing/old script is `measured` with an
  * empty or different `relayHash`.
  */
-export const PAYLOAD_SKEW_SEMANTICS = 'payload.skew is true only when the guest relay ANSWERED and the harness probe could not read the answer (payload/interpreter mismatch): relayStatus RELAY_SKEW or RELAY_BAD, or the guest repair record says reason=probe-skew. It is not a hash comparison: a differing relayHash is reported as relayHash vs expectedRelayHash, and a missing interpreter is RELAY_DOWN (interpreterMissing), never skew.'
+export const PAYLOAD_SKEW_SEMANTICS = 'payload.skew is true only when the guest relay ANSWERED and the harness probe could not read the answer (payload/interpreter mismatch): relayStatus RELAY_SKEW or RELAY_BAD, the guest repair record says reason=probe-skew, or the functional probe answered `probe-unsupported` (TCP accepted, RELAY_FN sent, zero bytes back — a relay that predates the token). It is not a hash comparison: a differing relayHash is reported as relayHash vs expectedRelayHash, and a missing interpreter is RELAY_DOWN (interpreterMissing), never skew.'
 
 /**
  * DEFECT 5: THE DOCTOR FIELD SET, AND WHICH NAMES ARE CANONICAL.
@@ -586,7 +586,7 @@ export const PAYLOAD_SKEW_SEMANTICS = 'payload.skew is true only when the guest 
  *     profileRootWritable, error }`. `measured !== true` means EVERY field is
  *     unknown — never `false` (a `false` is a measurement).
  */
-export const DOCTOR_FACTS_FIELDS = 'canonical: transport, relayPort, relayOk, relayStatus, transportCommand, transportReason, interpreter, probeMode, relayDetail, repair, payload (all top-level); interpreterMissing rides along in the transport facts and passes through via the doctor spread when a client exists (absent, not false, when none does); aliases kept for existing consumers: command (= transportCommand), reason (= transportReason). payload as windows_mcp_doctor emits it: { measured, relayHash, expectedRelayHash, skew, port, portMeasured, relayPresent, portMismatch }; relayPresent is true (hash read) / false (measured, no script) / null (not measured), and a MEASURED empty hash= is normalized on the wire to relayHash: null + relayPresent: false, never relayHash: ""; portMismatch is true only when both the guest-measured port and the harness port are known and differ; skew is the relay-answered-but-unreadable evidence flag, not a hash comparison. Client-only facts (WP-4.3/4.5): lastFailureKind on the client facts — ssh-closed | auth | handshake | unknown | null, beside the byte-identical lastError text (ssh-closed is the boot race, auth is a key/account problem, handshake means the session existed and the MCP exchange did not complete); desktop on windowsMcpDoctor — the guest-measured desktop facts { measured, at, stale, source, schema, user, session, python, dshCuaVersion, pywin32Version, win32ui, uiaLane, uiaLaneOk, elementLaneOk, scaleFix, workDir, workDirWritable, profileRootWritable, error }, where measured !== true means every field is unknown and never false; relayFunctional is CLIENT-ONLY like desktop and lastFailureKind — the last functional-probe answer { status, relayOk, measured, reason, budgetMs, elapsedMs, initializeMs, toolsListMs, tools, evidence { lastSuccessfulCallAgeMs, outstandingRequestAgeMs, childRestarts, lastWedgeAt, childPid, wedgeDeadlineMs }, evidenceAt, exitCode, mode: functional }, null until one ran (nothing measured is not a healthy child), relayOk false for RELAY_UNRESPONSIVE because rank-3 evidence is not a usable lane, and status RELAY_DOWN when the transport never delivered a token.'
+export const DOCTOR_FACTS_FIELDS = 'canonical: transport, relayPort, relayOk, relayStatus, transportCommand, transportReason, interpreter, probeMode, relayDetail, repair, payload (all top-level); interpreterMissing rides along in the transport facts and passes through via the doctor spread when a client exists (absent, not false, when none does); aliases kept for existing consumers: command (= transportCommand), reason (= transportReason). payload as windows_mcp_doctor emits it: { measured, relayHash, expectedRelayHash, skew, port, portMeasured, relayPresent, portMismatch, expectedGuardHash, guardHash, guardPresent, task, stale } - relayPresent/guardPresent/task are three-valued (true measured present / false MEASURED absent / null nothing measured) and are emitted by BOTH producers through one owner (payloadPresence), because index.js keys the comparability of the relay pair on relayPresent and its guardPresent last resort on task; stale is the C6 answer payloadStale() returns (true differ / false agree / null no comparable pair), never a comparison of two possibly-null fields; relayPresent is true (hash read) / false (measured, no script) / null (not measured), and a MEASURED empty hash= is normalized on the wire to relayHash: null + relayPresent: false, never relayHash: ""; portMismatch is true only when both the guest-measured port and the harness port are known and differ; skew is the relay-answered-but-unreadable evidence flag, not a hash comparison. Client-only facts (WP-4.3/4.5): lastFailureKind on the client facts — ssh-closed | auth | handshake | unknown | null, beside the byte-identical lastError text (ssh-closed is the boot race, auth is a key/account problem, handshake means the session existed and the MCP exchange did not complete); desktop on windowsMcpDoctor — the guest-measured desktop facts { measured, at, stale, source, schema, user, session, python, dshCuaVersion, pywin32Version, win32ui, uiaLane, uiaLaneOk, elementLaneOk, scaleFix, workDir, workDirWritable, profileRootWritable, error }, where measured !== true means every field is unknown and never false; relayFunctional is CLIENT-ONLY like desktop and lastFailureKind — the last functional-probe answer { status, relayOk, measured, reason, budgetMs, elapsedMs, initializeMs, toolsListMs, tools, evidence { lastSuccessfulCallAgeMs, outstandingRequestAgeMs, childRestarts, lastWedgeAt, childPid, wedgeDeadlineMs }, evidenceAt, exitCode, mode: functional }, null until one ran (nothing measured is not a healthy child), relayOk false for RELAY_UNRESPONSIVE because rank-3 evidence is not a usable lane, and status RELAY_DOWN when the transport never delivered a token.'
 
 /** The env override, VERBATIM (no trim, no re-quoting), or null when unset. */
 function winMcpCommandOverride() {
@@ -1117,7 +1117,7 @@ export const RELAY_FUNCTIONAL_PROBE_TIMEOUT_MS = 20000
  * the host normalizes to `'no-evidence'` rather than forwarding a word the
  * doctor's sentence was never written for.
  */
-export const RELAY_FN_REASONS = Object.freeze(['', 'child-silent', 'child-eof', 'session-busy', 'no-evidence'])
+export const RELAY_FN_REASONS = Object.freeze(['', 'child-silent', 'child-eof', 'session-busy', 'no-evidence', 'probe-unsupported'])
 
 /**
  * THE FUNCTIONAL PROBE PROGRAM (C2, §11). A REAL SESSION, not a flag.
@@ -1167,16 +1167,25 @@ def _left():
 
 
 _ev = None
+# THE THREE FLAGS ARE INITIALISED OUTSIDE THE try (C3): an exception inside the
+# read must not erase the fact that the socket WAS connected and the token WAS
+# sent - that pair plus zero bytes IS the diagnosis (see the branch below).
+_connected = False
+_sent = False
+_bytes = 0
 try:
     _c = _s.create_connection(('127.0.0.1', _PORT), min(3.0, _left()))
+    _connected = True
     _c.settimeout(min(3.0, _left()))
     _c.sendall(b'RELAY_FN')
+    _sent = True
     _b = b''
     while len(_b) < 8192:
         _p = _c.recv(8192 - len(_b))
         if not _p:
             break
         _b += _p
+        _bytes = len(_b)
         if b'\n' in _b:
             break
     _c.close()
@@ -1188,7 +1197,11 @@ except Exception:
 
 if _ev is None:
     print('RELAY_UNRESPONSIVE')
-    print(_j.dumps({'measured': False, 'reason': 'no-evidence', 'mode': 'functional', 'at': None}))
+    # THREE WORLDS, THREE REASONS (C3). TCP never accepted -> the lane is down
+    # (no-evidence, unchanged). TCP accepted, RELAY_FN sent, ZERO bytes back ->
+    # the relay predates the token: probe-unsupported. Bytes came back but were
+    # not the JSON line -> no-evidence (unchanged).
+    print(_j.dumps({'measured': False, 'reason': ('probe-unsupported' if (_connected and _sent and _bytes == 0) else 'no-evidence'), 'mode': 'functional', 'at': None}))
     _y.exit(3)
 
 _A = dict(_ev)
@@ -1474,6 +1487,114 @@ export const RELAY_UPGRADE_WATCH_MS = 15_000
 /** The one log line the upgrade writes; tests and the doctor match on it. */
 export const RELAY_UPGRADE_LOG = 'upgrading mcp transport to the interactive relay'
 
+/* ------------------------------------------------------------------ *
+ * C1 — THE BOOT-RACE WINDOW (RC-2, ticket item a)
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE WINDOW, AND WHY IT IS 90 s.
+ *
+ * A boot race is not a blind lane and not a stopped relay: it is the bounded,
+ * expected interval between "the supervisor says the computer is ready" and "the
+ * logon task's relay answers". `90000` MIRRORS THE GUARD'S OWN BUDGET — the
+ * Windows-side `cua-relay-guard.ps1` waits up to 90 s for an `Active` console
+ * session and then up to 20 s for the listener — because a harness that models a
+ * different window than the guest would disagree with it about when a lane is
+ * late. It is a constant on both sides on purpose (C10: no env knob; a knob here
+ * would let the two sides drift).
+ */
+export const BOOT_RACE_WINDOW_MS = 90000
+
+/**
+ * THE ATTACH'S OWN CAP INSIDE THE WINDOW: 24 s.
+ *
+ * The ladder's last probe offset (20 s) plus one probe timeout (4 s) is exactly
+ * this number, and `24000 < WIN_MCP_ATTACH_TIMEOUT_MS = 45000` leaves the
+ * handshake its budget after the ladder gives up (S7 asserts the arithmetic).
+ */
+export const BOOT_RACE_ATTACH_MS = 24000
+
+/** One probe inside the window. Short on purpose: a closed port answers at once. */
+export const BOOT_RACE_PROBE_TIMEOUT_MS = 4000
+
+/**
+ * THE THROTTLE THE WINDOW HANDS TO `shouldUpgradeToRelay` — 10 s, four times
+ * faster than the normal 60 s. Without it the first failed upgrade attempt
+ * inside the window would lock the next out for 60 s, so a relay that binds at
+ * ready+50 s would not be picked up until ready+99 s, long after the window
+ * closed. The 15 s `setInterval` and its teardown are NOT touched (C1 rule 7):
+ * at a 10 s throttle every 15 s beat is already an attempt.
+ */
+export const BOOT_RACE_UPGRADE_INTERVAL_MS = 10000
+
+/**
+ * THE LADDER'S SCHEDULE, in ms SINCE THE FIRST PROBE.
+ *
+ * `[0, 8000, 20000]` — the first probe is the attach's own, then two retries.
+ * Frozen and strictly ascending; `last <= BOOT_RACE_ATTACH_MS` is the bound, and
+ * the DELTAS (8 000 / 12 000) are what the transport's `sleep` seam records.
+ */
+export const BOOT_RACE_PROBE_OFFSETS_MS = Object.freeze([0, 8000, 20000])
+
+/**
+ * THE WINDOW'S TRUTH TABLE — the ONLY place it lives.
+ *
+ *   source  'stream'  the newest `vm-state:<name>:ready` event for THIS computer
+ *                     (`readyAt`, epoch ms) — the anchor C1 rule 2 nominates;
+ *           'attach'  only this client's first attach is known (`attachedAt`);
+ *           'none'    neither: NO window, `live:false`, and the doctor keeps
+ *                     saying `relay-stopped` (guessing a window from nothing is
+ *                     how a doctor cries wolf);
+ *   live    `sinceReadyMs >= 0 && sinceReadyMs < windowMs` AND `measured !== true`.
+ *
+ * A MEASURED fact outranks the window (C1 rule 4): a repair record that measured
+ * `session: 0` or `hash: ''` is evidence, and evidence must never be relabelled
+ * "wait a bit". `remainingMs` is what the doctor prints; it ages honestly because
+ * the caller recomputes this object on every read (a stored snapshot would claim
+ * a stale `live`).
+ */
+export function bootRaceFacts({
+  readyAt = null,
+  attachedAt = null,
+  nowMs = null,
+  windowMs = BOOT_RACE_WINDOW_MS,
+  relayStatus = '',
+  measured = false
+} = {}) {
+  // `Number(null)` is 0, which would silently mean "the epoch" — a null/absent
+  // clock must mean NOW, and only a real number may be honoured.
+  const at = nowMs === null || nowMs === undefined
+    ? Date.now()
+    : (Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now())
+  const usable = (value) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null)
+  const ready = usable(readyAt)
+  const attached = usable(attachedAt)
+  const window = Number.isFinite(Number(windowMs)) && Number(windowMs) >= 0 ? Number(windowMs) : BOOT_RACE_WINDOW_MS
+  // 'stream' WINS over 'attach': the supervisor's ready event is the real anchor,
+  // the client's own attach is only the fallback when no event was seen.
+  const source = ready !== null ? 'stream' : (attached !== null ? 'attach' : 'none')
+  const anchorAt = ready !== null ? ready : attached
+  const sinceReadyMs = anchorAt === null ? null : at - anchorAt
+  const live = source !== 'none'
+    && sinceReadyMs !== null
+    && sinceReadyMs >= 0
+    && sinceReadyMs < window
+    && measured !== true
+  return {
+    live,
+    source,
+    windowMs: window,
+    readyAt: ready,
+    attachedAt: attached,
+    anchorAt,
+    sinceReadyMs,
+    remainingMs: live === true ? Math.max(0, window - sinceReadyMs) : 0,
+    measured: measured === true,
+    relayStatus: String(relayStatus ?? ''),
+    at
+  }
+}
+
 /**
  * The upgrade decision, pure so it can be asserted without an SSH child:
  * only a LIVE session-0 attach, never while a request is in flight (closing the
@@ -1507,6 +1628,34 @@ export function shouldUpgradeToRelay({
 }
 
 /**
+ * THE LADDER (C1 rules 5-6): the attach's own probe, then TWO retries at the
+ * frozen offsets, so a relay that binds at ready+37 s is caught INSIDE the
+ * boot window instead of being reported as a stopped relay.
+ *
+ * Each probe is `force: true` — the cheap probe caches for
+ * `RELAY_PROBE_TTL_MS = 10000`, and an unforced re-probe would answer from the
+ * cache the first probe just wrote, making the ladder decorative.
+ *
+ * The bound is structural: `last(offsets) + one probe = 20000 + 4000 = 24000 =
+ * BOOT_RACE_ATTACH_MS`, and that is < the 45 s attach budget, so the handshake
+ * still has room after the ladder gives up.
+ */
+async function bootRaceProbeLadder({ log = () => {}, now = () => Date.now(), sleep, ...rest } = {}) {
+  const pause = typeof sleep === 'function'
+    ? sleep
+    : (ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); timer.unref?.(); })
+  const probeOptions = { ...rest, log, now }
+  let probe = await relayProbe({ ...probeOptions, force: true, timeoutMs: BOOT_RACE_PROBE_TIMEOUT_MS })
+  for (let index = 1; index < BOOT_RACE_PROBE_OFFSETS_MS.length; index += 1) {
+    if (probe?.ok === true) break
+    const wait = BOOT_RACE_PROBE_OFFSETS_MS[index] - BOOT_RACE_PROBE_OFFSETS_MS[index - 1]
+    if (wait > 0) await pause(wait)
+    probe = await relayProbe({ ...probeOptions, force: true, timeoutMs: BOOT_RACE_PROBE_TIMEOUT_MS })
+  }
+  return probe
+}
+
+/**
  * DECIDE THE LANE for one attach: probe, then pick the command.
  *
  *   relay answers RELAY_OK         → the relay command  (transport: interactive-relay)
@@ -1527,9 +1676,35 @@ export function shouldUpgradeToRelay({
  */
 export async function resolveGuestMcpTransport(options = {}) {
   const normalized = typeof options === 'function' ? { sshArgsFactory: options } : (options ?? {})
-  const { log = () => {} } = normalized
-  const probe = await relayProbe({ ...normalized, log })
+  const {
+    log = () => {},
+    // C1 rule 2: a ZERO-ARG provider. The plugin owns how a computer is dated
+    // (`windowsBootReadyAt(name)`); the client adapts it to this shape, so the
+    // transport never learns the plugin's stream model.
+    bootWindow: bootWindowProvider = null,
+    now = () => Date.now(),
+    sleep = null,
+    measured = false,
+    attachedAt = null
+  } = normalized
+  const readyAt = typeof bootWindowProvider === 'function' ? bootWindowProvider() : null
+  const bootWindow = bootRaceFacts({ readyAt, attachedAt, nowMs: now(), measured })
+  // TWO NAMES, ONE OBJECT: `bootWindow` is what the ladder's gate reads (and the
+  // name the pins use); `bootRace` is what the facts travel under, so the client
+  // and the doctor speak the same word as the payload field.
+  const bootRace = bootWindow
   const override = winMcpCommandOverride()
+  let probe
+  if (bootWindow.live !== true) {
+    // OUTSIDE THE WINDOW (or no anchor at all): ONE probe, exactly as before —
+    // a genuinely dead relay must not cost 24 s of ladder.
+    probe = await relayProbe({ ...normalized, log })
+  } else if (override !== null) {
+    // AN OVERRIDE IS A DECISION, NOT A LATE LOGON TASK: no ladder.
+    probe = await relayProbe({ ...normalized, log })
+  } else {
+    probe = await bootRaceProbeLadder({ ...normalized, log, now, sleep })
+  }
   const interpreter = probe?.interpreter ?? null
   const wanted = override ?? (probe.ok === true ? relayConnectCommand(interpreter) : LEGACY_DIRECT_COMMAND)
   // The LANE is a property of the command that will actually run, not of the
@@ -1551,7 +1726,12 @@ export async function resolveGuestMcpTransport(options = {}) {
     interpreterMissing: probe.interpreterMissing === true,
     reason: '',
     detail: probe.detail,
-    override: override !== null
+    override: override !== null,
+    // C1: the window the attach decided in, so the client can publish it and the
+    // doctor can print `remainingMs`. `null` here would be a guess; this is the
+    // same object the ladder was gated on.
+    bootRace,
+    ladder: bootWindow.live === true && override === null
   }
   if (override !== null) {
     if (relayLane === true && probe.ok !== true) {
@@ -1590,10 +1770,21 @@ export async function resolveGuestMcpTransport(options = {}) {
  * a missing script (`measured` + `relayHash: ''`), or two DIFFERENT hashes —
  * that last one is reported by comparing `expectedRelayHash` with `relayHash`.
  */
-export function relayEvidenceSkew(relayStatus, record = null) {
+export function relayEvidenceSkew(relayStatus, record = null, functionalReason = '') {
   if (relayStatus === RELAY_SKEW) return true
   if (relayStatus === RELAY_BAD) return true
-  return record?.reason === 'probe-skew'
+  if (record?.reason === 'probe-skew') return true
+  // THE THIRD PRODUCER (C3, RC-3): the functional probe reached the relay's TCP
+  // port, sent RELAY_FN and got ZERO bytes back — a relay that predates the
+  // token. That is "the relay ANSWERED (its accept loop did) and the probe could
+  // not read an answer", which is exactly what this flag says; reporting it as
+  // "the child is dead" (the old `no-evidence` reading) sent the operator to
+  // re-register a task that was already running.
+  //
+  // The client passes `state.relayFunctional?.reason`; the module-level helper
+  // passes nothing (it has no functional answer, and inventing one would break
+  // the "both doctors carry the same shape" rule at :548).
+  return String(functionalReason ?? '') === 'probe-unsupported'
 }
 
 /**
@@ -1641,6 +1832,10 @@ export async function relayDoctorFacts(options = {}) {
     // DEFECT 3: the finer fact behind a DOWN token (no interpreter on the
     // guest). Additive; consumers that ignore it lose nothing.
     interpreterMissing: facts.interpreterMissing === true,
+    // C1 rule 5: NO CLIENT, NO ATTACH CLOCK. This helper never attaches, so it
+    // has no `attachedAt`; `null` is the honest answer, and it is documented
+    // rather than a disagreement with the client's object.
+    bootRace: null,
     repair: record,
     payload: {
       // DEFECT 1: `measured` rides along so a consumer of the payload ALONE can
@@ -1662,7 +1857,29 @@ export async function relayDoctorFacts(options = {}) {
       // a RELAY_BAD answer, or a guest repair record that says probe-skew. A
       // missing interpreter is NOT skew (it is RELAY_DOWN + interpreterMissing),
       // and a differing hash is reported as relayHash vs expectedRelayHash.
-      skew: relayEvidenceSkew(facts.relayStatus, record)
+      //
+      // C3: THE MODULE HELPER PASSES NO FUNCTIONAL REASON. It has no functional
+      // answer (that is the client's), and inventing one would break the "both
+      // doctors carry the same shape" rule — an absent fact is `''`, not a guess.
+      skew: relayEvidenceSkew(facts.relayStatus, record),
+      // WP-1B / C6: THE GUARD HALF OF THE PAYLOAD IDENTITY, and the one-word
+      // verdict (`stale`) that RC-1 needed. `guardPresent` is three-valued like
+      // relayPresent: true (a hash was read) / false (measured, no script) /
+      // null (nothing measured). `stale` is C6's truth table, computed by its
+      // one owner — never by comparing a field that may be null.
+      expectedGuardHash: expectedGuardHash(),
+      guardHash: record?.payload?.guardHash ?? null,
+      // P1: THE INPUTS THE DERIVATION NEEDS, ON THIS PRODUCER TOO. `relayPresent`
+      // and `task` used to be documented and produced by nobody, so index.js's
+      // re-derivation lost a measured relay pair (`stale: null` where the owner
+      // said `true`) and its `task` last resort never fired.
+      ...payloadPresence(record),
+      stale: payloadStale({
+        expectedRelayHash: expectedRelayHash(),
+        relayHash: record?.measured === true ? (record?.hash ?? null) : null,
+        expectedGuardHash: expectedGuardHash(),
+        guardHash: record?.payload?.guardHash ?? null
+      })
     }
   }
 }
@@ -1717,6 +1934,49 @@ export const DESKTOP_FACTS_TTL_MS = 60000
  */
 export const DESKTOP_FACTS_FAILURE_TTL_MS = 5000
 
+
+/* ------------------------------------------------------------------ *
+ * C4 — WHY THE FACTS FILE IS MISSING (RC-4, ticket item d)
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE ONE CODE FOR "THE GUEST HAS NO FACTS FILE", AND WHY IT IS A CODE.
+ *
+ * `desktop.error` used to be whatever two `type` calls printed on stderr — two
+ * raw cmd.exe lines. It could not tell an operator the one thing that matters:
+ * this guest has no facts WRITER (a pre-change payload), not an empty file. The
+ * classification below is LANGUAGE-FREE on purpose: the guest may be a
+ * translated Windows, and `The system cannot find the path specified` is
+ * localized, so nothing here tests English.
+ */
+export const DESKTOP_FACTS_ABSENT = 'facts-file-absent'
+
+/** The closed set `desktop.errorCode` may name (C4). `''` is a measured answer. */
+export const DESKTOP_FACTS_ERROR_CODES = Object.freeze(['', 'facts-file-absent', 'facts-unparsable', 'ssh-failed', 'read-error'])
+
+/** The absent case's ONE sentence (C4) — never the doubled cmd stderr again. */
+export const DESKTOP_FACTS_ABSENT_ERROR = `facts-file-absent: ${DESKTOP_FACTS_PATH} (the guest payload may predate the facts writer)`
+
+/**
+ * CLASSIFY ONE READ, FIRST MATCH WINS (C4's table, in its frozen order).
+ *
+ *   1. `connectionLevel` — SSH never reached the guest. Checked FIRST because a
+ *      read that never happened also has empty stdout, and calling that a
+ *      missing file would blame the guest for a transport failure.
+ *   2. parsed `null` AND `stdout.trim() === ''` — both `type` calls failed:
+ *      there is no file.
+ *   3. parsed `null`, stdout non-empty — the file exists and is not JSON.
+ *   4. the read threw — `read-error` (there is no capture to look at).
+ *   5. a facts object was parsed — `''`, nothing to report.
+ */
+export function classifyDesktopFactsError({ parsed = null, stdout = '', connectionLevel = false, readError = false } = {}) {
+  if (readError === true) return 'read-error'
+  if (connectionLevel === true) return 'ssh-failed'
+  if (parsed === null || parsed === undefined) {
+    return String(stdout ?? '').trim() === '' ? DESKTOP_FACTS_ABSENT : 'facts-unparsable'
+  }
+  return ''
+}
 /** The schema this side understands; a newer one is still read, field by field. */
 export const DESKTOP_FACTS_SCHEMA = 1
 
@@ -1867,7 +2127,7 @@ function parseLastJsonObject(text) {
  * `false` here is a measurement; a `null` is the absence of one, and conflating
  * them is how "the lane is dead" gets reported on a guest nobody measured.
  */
-function normalizeDesktopFacts(parsed, { error = '', now = () => Date.now(), ttlMs = DESKTOP_FACTS_TTL_MS } = {}) {
+function normalizeDesktopFacts(parsed, { error = '', errorCode = '', now = () => Date.now(), ttlMs = DESKTOP_FACTS_TTL_MS } = {}) {
   const unknown = {
     schema: null,
     user: null,
@@ -1895,6 +2155,10 @@ function normalizeDesktopFacts(parsed, { error = '', now = () => Date.now(), ttl
       source: 'none',
       cached: false,
       ...unknown,
+      // C4: WHY nothing was measured, as a closed code BESIDE the free-text
+      // error. `''` here would mean "classified and fine", so an unclassified
+      // failure falls back to the one code that is always true of it.
+      errorCode: DESKTOP_FACTS_ERROR_CODES.includes(errorCode) && errorCode !== '' ? errorCode : 'facts-unparsable',
       error: error === '' ? 'no desktop facts file was readable in the guest' : error
     }
   }
@@ -1909,6 +2173,9 @@ function normalizeDesktopFacts(parsed, { error = '', now = () => Date.now(), ttl
       source: factString(parsed.source) ?? 'none',
       cached: false,
       ...unknown,
+      // The file PARSED, so the code is `''`: `measured:false` is the guest's
+      // own answer, not a read failure.
+      errorCode: '',
       error: factString(parsed.error) ?? (error === '' ? 'the guest wrote desktop facts but reported measured:false' : error)
     }
   }
@@ -1944,6 +2211,8 @@ function normalizeDesktopFacts(parsed, { error = '', now = () => Date.now(), ttl
     workDir: factString(parsed.workDir),
     workDirWritable: factBool(parsed.workDirWritable),
     profileRootWritable: factBool(parsed.profileRootWritable),
+    // A measured answer has nothing to classify.
+    errorCode: '',
     error: String(parsed.error ?? '')
   }
 }
@@ -2018,10 +2287,21 @@ export async function desktopFacts(options = {}) {
           : sshArgv({ host, port: sshPort, user, keyPath, remoteCommand: DESKTOP_FACTS_COMMAND })
         const capture = await runSshCapture({ argv, spawnImpl, timeoutMs, now })
         const parsed = parseLastJsonObject(capture.stdout)
-        const failure = parsed === null
-          ? String(capture.stderr || capture.stdout || capture.detail || '').trim().slice(0, 240)
-          : ''
-        const facts = normalizeDesktopFacts(parsed, { error: failure, now, ttlMs })
+        // C4: THE CLASSIFICATION HAPPENS HERE AND ONLY HERE, because this is the
+        // one place the CAPTURE is visible (stdout emptiness AND connectionLevel
+        // together decide it). `desktop.error` for the absent case is the frozen
+        // sentence, not the two cmd.exe stderr lines that named nothing.
+        const errorCode = classifyDesktopFactsError({
+          parsed,
+          stdout: capture.stdout,
+          connectionLevel: capture.connectionLevel === true
+        })
+        const failure = parsed !== null
+          ? ''
+          : (errorCode === DESKTOP_FACTS_ABSENT
+              ? DESKTOP_FACTS_ABSENT_ERROR
+              : String(capture.stderr || capture.stdout || capture.detail || '').trim().slice(0, 240))
+        const facts = normalizeDesktopFacts(parsed, { error: failure, errorCode, now, ttlMs })
         // WP-4.2's flag, carried on the answer so a caller can tell "the guest has
         // no facts file" from "the transport never got a session" — both are
         // `measured:false`, and only one of them is worth retrying.
@@ -2041,7 +2321,7 @@ export async function desktopFacts(options = {}) {
       } catch (error) {
         // Belt and braces: nothing above is supposed to throw, and a doctor read
         // that CAN throw is a doctor that takes the panel down with it.
-        return normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}`, now, ttlMs })
+        return normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}`, errorCode: 'read-error', now, ttlMs })
       }
     })()
     if (force !== true) desktopFactsInFlight.set(key, run)
@@ -2053,8 +2333,619 @@ export async function desktopFacts(options = {}) {
   } catch (error) {
     // A shared read that rejected, or an argv builder that threw before the
     // latch existed: still an answer, still never a rejection.
-    return normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}`, now, ttlMs })
+    return normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}`, errorCode: 'read-error', now, ttlMs })
   }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * RC-1 / WP-1B — THE GUARD'S IDENTITY AND THE STAGING CARRIER
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHERE THE GUARD SCRIPT THIS BUILD SHIPS CAN BE READ FROM, harness side.
+ *
+ * One layout only, because the guard has exactly one home in both trees: beside
+ * the relay in `docker/windows-oem/`. Resolved with `new URL(relative,
+ * import.meta.url)` exactly like `RELAY_EXPECTED_HASH_SOURCES` — never
+ * `process.cwd()`, which is the caller's, not the payload's. A build without the
+ * `docker/` tree (an installed plugin bundle) answers `null`, and then a payload
+ * repair MUST NOT pretend: it stages nothing and says `guardSource: 'absent'`.
+ */
+export const GUARD_EXPECTED_HASH_SOURCES = Object.freeze([
+  '../../docker/windows-oem/cua-relay-guard.ps1'
+])
+
+/** Read-once cache: `{ loaded, hash, source }`. Lower-case hex SHA-256. */
+let guardExpectedHashState = { loaded: false, hash: null, source: null }
+
+/** The absolute path of the shipped guard script, or null when this build has none. */
+export function guardExpectedHashSource() {
+  for (const relative of GUARD_EXPECTED_HASH_SOURCES) {
+    try {
+      const url = new URL(relative, import.meta.url)
+      const candidate = decodeURIComponent(url.pathname)
+      if (existsSync(candidate) === true) return candidate
+    } catch {}
+  }
+  return null
+}
+
+/**
+ * THE HASH OF THE GUARD SCRIPT **THIS BUILD** SHIPS (C2 rule 1).
+ *
+ * `null` MEANS "THIS BUILD CANNOT SAY" — never `''` and never "mismatch". `''`
+ * belongs to the guest-side fact "there is no guard file on this guest" (the
+ * measure step writes `guard=''`), and conflating the two is how a harness
+ * without a payload tree would call every guest stale.
+ *
+ * Read ONCE at first use, like `expectedRelayHash`; an explicit `sourcePath`
+ * bypasses the cache (the seam a test uses).
+ */
+export function expectedGuardHash(sourcePath = null) {
+  // J3: A ZERO-BYTE SOURCE IS "NO PAYLOAD", NOT `sha256('')`.
+  //
+  // The old code hashed whatever it read, so an empty (or truncated-to-empty)
+  // `cua-relay-guard.ps1` produced the hash OF EMPTY — a value a guest can
+  // legitimately match: the plan then staged 0 bytes, the verify CONFIRMED it
+  // ("staged" with the hash of nothing) and the task was registered over a
+  // guard that does nothing. `null` already means "this build cannot say"
+  // everywhere else; an empty payload is exactly that case.
+  const hashOfContent = (file) => {
+    try {
+      const bytes = readFileSync(file)
+      return bytes.length === 0 ? null : createHash('sha256').update(bytes).digest('hex').toLowerCase()
+    } catch {
+      return null
+    }
+  }
+  if (sourcePath !== null && sourcePath !== undefined && sourcePath !== '') {
+    return hashOfContent(String(sourcePath))
+  }
+  if (guardExpectedHashState.loaded === true) return guardExpectedHashState.hash
+  const source = guardExpectedHashSource()
+  guardExpectedHashState = {
+    loaded: true,
+    hash: source === null ? null : hashOfContent(source),
+    source
+  }
+  return guardExpectedHashState.hash
+}
+
+/** Which file the cached guard hash came from, or null (diagnostics + tests). */
+export function expectedGuardHashSourcePath() {
+  expectedGuardHash()
+  return guardExpectedHashState.source
+}
+
+/** Forget the read-once guard hash (a test, or a caller that replaced the payload). */
+export function resetExpectedGuardHashCache() {
+  guardExpectedHashState = { loaded: false, hash: null, source: null }
+}
+
+/**
+ * THE STAGING GEOMETRY (C2 rule 2), frozen:
+ * `ceil(32590/3)*4 = 43456` base64 chars → `ceil(43456/6000) = 8` appends,
+ * then 1 decode, 1 verify, 1 register — one measure in front (rule 3).
+ *
+ * WHY NOT `-EncodedCommand` (43 456 chars → ~87k UTF-16) or stdin: cmd.exe's
+ * line limit is 8 191 characters, and `runSshCapture` spawns with
+ * `stdio: ['ignore', 'pipe', 'pipe']`, so stdin is not a channel either. The
+ * carrier is CHUNKED BASE64 APPENDS over the existing SSH child — base64 is
+ * `A-Za-z0-9+/=`, so no quoting hazard survives `ssh → cmd.exe`.
+ */
+export const GUARD_STAGE_CHUNK_CHARS = 6000
+export const GUARD_STAGE_PATH = 'C:\\ProgramData\\cua\\cua-relay-guard.ps1'
+export const GUARD_STAGE_B64_PATH = 'C:\\ProgramData\\cua\\cua-relay-guard.b64'
+export const GUARD_TASK_NAME = 'cua-mcp-host-guard'
+
+/** The staging's own wall (C2 rule 8), enforced BETWEEN chunks. */
+export const RELAY_PAYLOAD_REPAIR_TIMEOUT_MS = 25000
+
+/**
+ * `payload.stale` (C6), the words the docs must quote.
+ *
+ * `true` only when BOTH sides of at least one hash pair were measured and they
+ * differ (relay or guard); `false` when every comparable pair agrees; `null`
+ * when no pair is comparable — a build without the payload source cannot call a
+ * guest stale. It is NOT skew: skew is "the relay answered and the probe could
+ * not read it".
+ */
+export const PAYLOAD_STALE_SEMANTICS = 'payload.stale is true only when BOTH sides of at least one hash pair were measured and they differ (relay or guard); false when every comparable pair agrees; null when no pair is comparable (a build without the payload source cannot call a guest stale). It is not skew: skew is "the relay answered and the probe could not read it".'
+
+/** C2 rule 9: the closed set for `record.payload.staged`, five values. */
+export const PAYLOAD_STAGED_VALUES = Object.freeze(['none', 'current', 'staged', 'incomplete', 'absent'])
+
+/** The second record line's prefix (C2 rule 10). `CUA_RELAY` is frozen. */
+export const RELAY_PAYLOAD_RECORD_PREFIX = 'CUA_PAYLOAD'
+
+const GUARD_POWERSHELL = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+
+/** One PowerShell body as an ssh remote command (single quotes inside only). */
+function guardPowerShell(body) {
+  return `${GUARD_POWERSHELL}"${body}"`
+}
+
+/**
+ * ONE BASE64 APPEND, IN cmd.exe — NOT PowerShell.
+ *
+ * D2/D4 (live, 2026-11-21): a PowerShell child costs ≈2.9 s on `win-test`, and
+ * 12 of them (8 appends + decode + verify + register + measure) could not fit
+ * any deadline inside the doctor's 30 s forced-repair envelope. `cmd.exe` starts
+ * in ≈0.15 s, so the CARRIER became cheap while the DECISIONS stayed in
+ * PowerShell: 8 appends + register now cost ~1.5 s total instead of ~29 s.
+ *
+ * `echo <chunk> >>file` is safe for base64: the alphabet is `A-Za-z0-9+/=`, none
+ * of which cmd.exe interprets. The trailing space `echo` writes before `>>` (and
+ * the CRLF it adds) is stripped by the decoder (`-replace '\s',''`), which the
+ * live run of this exact pair on `win-test` proved (`QUJD`+`REVG` → `ABCDEF`).
+ * Chunk 0 truncates with `>`: no resume state, so a half-written carrier from an
+ * interrupted run is replaced, never continued (C2 rule 8).
+ */
+export function relayStageAppendCommand({ path: target, chunk = '', truncate = false } = {}) {
+  const file = String(target ?? '')
+  const text = String(chunk ?? '')
+  return `cmd /c "echo ${text} ${truncate === true ? '>' : '>>'}${file}"`
+}
+
+/**
+ * DID THIS CHILD FAIL? — ONE predicate for both loops (P3).
+ *
+ * `runSshCapture` RESOLVES on `close` whatever happened, so the exit code is the
+ * only signal a chunk had. Three shapes count as failure: a non-zero exit, a
+ * TIMEOUT (`exitCode` null, the capture's own timer fired — the live run hit this
+ * when the guest's sshd stopped answering mid-carrier and the old loop happily
+ * counted the missing chunk as written), and a spawn-level failure (`detail`
+ * set with no exit code). A clean close with code 0 is the only success.
+ */
+export function relayStepFailed(capture) {
+  if (capture === null || capture === undefined) return true
+  if (capture.timedOut === true) return true
+  if (capture.exitCode === null || capture.exitCode === undefined) {
+    // N2: NO EXIT CODE AT ALL IS A DEATH, NOT A SUCCESS. `runSshCapture` resolves
+    // `{exitCode: null, detail: '', timedOut: false}` when the ssh child is killed
+    // by a SIGNAL (SIGKILL/SIGTERM: no 'exit' event, no timer, no spawn error), and
+    // the old predicate read that as success — a chunk that never landed was
+    // counted as written. A clean `cmd /c echo` always reports a code, so an
+    // unknown code is never a shape a successful step produces (spawn failures
+    // land here too, with their `detail`).
+    return true
+  }
+  return capture.exitCode !== 0
+}
+
+/** The decoded text of a base64 carrier, whitespace-insensitive (see above). */
+function guardCarrierRead(path) {
+  return `([IO.File]::ReadAllText('${path}') -replace '\\s','')`
+}
+
+/** The two hashes a guest can measure, as a PowerShell fragment. */
+function guardHashFragment() {
+  return [
+    `$g=''`,
+    `if (Test-Path '${GUARD_STAGE_PATH}') { $g=(Get-FileHash '${GUARD_STAGE_PATH}' -Algorithm SHA256).Hash.ToLowerInvariant() }`,
+    `$r=''`,
+    `if (Test-Path '${RELAY_SCRIPT}') { $r=(Get-FileHash '${RELAY_SCRIPT}' -Algorithm SHA256).Hash.ToLowerInvariant() }`
+  ].join('; ')
+}
+
+/**
+ * `stale=` FOR THE RECORD LINE — **C6'S TRUTH TABLE, NOT A NEAR MISS** (D5).
+ *
+ * The live round caught the guest printing `stale=0` (guard matches) while the
+ * harness said `payload.stale:true` (relay differs) on the same guest, the same
+ * second. Two rules, one field. From this revision the guest applies the SAME
+ * table: a pair is COMPARABLE only when both sides are non-empty, `1` when a
+ * comparable pair differs, `0` when every comparable pair agrees, and the EMPTY
+ * value when nothing is comparable (`null` on the wire, exactly like
+ * `payloadStale()`). The harness still derives its own `payload.stale` from the
+ * measured hashes with `payloadStale()` — the ONE owner — so the line is a
+ * rendering of the same table and can no longer disagree with the field.
+ */
+function guardStaleFragment(expectedGuard, expectedRelay) {
+  return [
+    `$p=0`,
+    `$d=0`,
+    `if ('${expectedGuard}' -ne '' -and $g -ne '') { $p=$p+1; if ($g -ne '${expectedGuard}') { $d=1 } }`,
+    `if ('${expectedRelay}' -ne '' -and $r -ne '') { $p=$p+1; if ($r -ne '${expectedRelay}') { $d=1 } }`,
+    `$s=''`,
+    `if ($p -gt 0) { $s=$(if ($d -eq 1) { '1' } else { '0' }) }`
+  ].join('; ')
+}
+
+/** Is the guard's scheduled task present? Measured, in the same child. */
+function guardTaskFragment() {
+  return [
+    `$t=0`,
+    `& schtasks /query /tn '${GUARD_TASK_NAME}' 2>$null | Out-Null`,
+    `if ($LASTEXITCODE -eq 0) { $t=1 }`
+  ].join('; ')
+}
+
+/** The record line, assembled from the fragments above. */
+function guardPayloadLine(stagedExpression) {
+  return `'${RELAY_PAYLOAD_RECORD_PREFIX} guard=' + $g + ' relay=' + $r + ' stale=' + $s + ' staged=' + ${stagedExpression} + ' task=' + $t`
+}
+
+/**
+ * THE MEASURE (C2 rule 3): the first step, and the only one a HEAD guest pays.
+ * It now also measures the TASK (D3): a guard file that is already ours does not
+ * prove the task exists, and the live round found exactly that state — file
+ * staged, `cua-mcp-host-guard` absent, and no way for the plan to create it.
+ */
+export function relayGuardMeasureCommand({ expectedGuard = '', expectedRelay = '', port = relayPort() } = {}) {
+  const expected = String(expectedGuard ?? '').toLowerCase()
+  const expectedRelayValue = String(expectedRelay ?? '').toLowerCase()
+  const body = [
+    // P2: THE MEASURE ALSO CLEANS THE CARRIER. The decode's `Remove-Item` is the
+    // happy path, but a decode killed between WriteAllText and Remove-Item (or a
+    // throwing decode on a host where a throw aborts the `;` list) leaves
+    // `cua-relay-guard.b64` behind — and once the guard is CURRENT every later
+    // plan is `[measure]` or `[measure, register]`, so no other step would ever
+    // name it again. Deleting it here is free (same child), idempotent, and
+    // means NO stale carrier can survive a completed repair.
+    `Remove-Item -Force '${GUARD_STAGE_B64_PATH}' -ErrorAction SilentlyContinue`,
+    guardHashFragment(),
+    guardStaleFragment(expected, expectedRelayValue),
+    guardTaskFragment(),
+    `$c=0`,
+    `if ('${expected}' -ne '' -and $g -eq '${expected}') { $c=1 }`,
+    guardPayloadLine(`$(if ($c -eq 1) { 'current' } else { 'incomplete' })`)
+  ].join('; ')
+  return guardPowerShell(body)
+}
+
+/** THE VERIFY: re-hash after the decode and say `staged` only if it EQUALS. */
+function relayGuardVerifyCommand({ expectedGuard = '', expectedRelay = '', port = relayPort() } = {}) {
+  const expected = String(expectedGuard ?? '').toLowerCase()
+  const expectedRelayValue = String(expectedRelay ?? '').toLowerCase()
+  const body = [
+    guardHashFragment(),
+    guardStaleFragment(expected, expectedRelayValue),
+    guardTaskFragment(),
+    `$c=0`,
+    `if ('${expected}' -ne '' -and $g -eq '${expected}') { $c=1 }`,
+    guardPayloadLine(`$(if ($c -eq 1) { 'staged' } else { 'incomplete' })`)
+  ].join('; ')
+  return guardPowerShell(body)
+}
+
+/** THE DECODE: base64 (whitespace-stripped) → UTF-8 without BOM → the guard path.
+ *
+ * J2 — THE DECODE OWNS THE LAST LINE OF DEFENCE AGAINST A CORRUPT CARRIER.
+ *
+ * The carrier path is a fixed guest path, and `repairRelay()`'s single-flight is
+ * PER PROCESS: two harness processes (or a harness and a stale attempt) append
+ * into the same file, and the interleave used to decode a MIXED stream straight
+ * over a good guard — 14 590 bytes of non-verifying script, after which the
+ * register step still created the SYSTEM task (J1). A unique-per-process carrier
+ * name would be the other half of the fix; it is NOT possible here without
+ * breaking the frozen wire contract (the decoder child names the carrier path,
+ * and the guest-side `cua-firstboot.ps1` / every shipped fixture models it), so
+ * the invariant is enforced where it can be enforced atomically instead:
+ *
+ *   1. an EMPTY carrier is not "an empty payload" — refuse without writing, so
+ *      a carrier another attempt reclaimed can never blank the guard;
+ *   2. the DECODED BYTES are hashed and compared to the expected guard hash
+ *      BEFORE `WriteAllText` — a mixed/truncated stream exits non-zero and
+ *      leaves whatever guard was already there untouched.
+ *
+ * `expectedGuard` is the build's own hash, so this is a comparison of the
+ * payload against itself: a legitimate decode always passes, and garbage never
+ * reaches the guard file. `runPayloadRepair` still verifies AFTER the write
+ * (bell and braces) and never registers without a verified guard (J1).
+ */
+function relayGuardDecodeCommand({ expectedGuard = '' } = {}) {
+  const expected = String(expectedGuard ?? '').toLowerCase()
+  const body = [
+    `$b=${guardCarrierRead(GUARD_STAGE_B64_PATH)}`,
+    `if ($b -eq '') { exit 3 }`,
+    `$x=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b))`,
+    ...(expected === '' ? [] : [
+      `$s=[Security.Cryptography.SHA256]::Create()`,
+      `$h=(([BitConverter]::ToString($s.ComputeHash([Text.Encoding]::UTF8.GetBytes($x))) -replace '-','')).ToLowerInvariant()`,
+      `if ($h -ne '${expected}') { Remove-Item -Force '${GUARD_STAGE_B64_PATH}' -ErrorAction SilentlyContinue; exit 4 }`
+    ]),
+    `[IO.File]::WriteAllText('${GUARD_STAGE_PATH}', $x, (New-Object Text.UTF8Encoding($false)))`,
+    `Remove-Item -Force '${GUARD_STAGE_B64_PATH}' -ErrorAction SilentlyContinue`
+  ].join('; ')
+  return guardPowerShell(body)
+}
+
+/**
+ * THE REGISTER (C2 rule 5), byte-compatible with `cua-firstboot.ps1`'s task so a
+ * later provisioning pass cannot see a different shape — and now a **cmd** child
+ * (≈0.15 s instead of ≈2.9 s) that MEASURES its own outcome: `&&` on the query
+ * prints `task=1`, `||` prints `task=0`, so the record's `task` is what the
+ * guest answered, never an assumption.
+ */
+export function relayGuardRegisterCommand({ port = relayPort() } = {}) {
+  return `schtasks /create /tn "${GUARD_TASK_NAME}" /sc onstart /ru SYSTEM /rl HIGHEST /f /tr "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ${GUARD_STAGE_PATH} -Boot -Port ${port}" >nul 2>&1 && schtasks /query /tn "${GUARD_TASK_NAME}" >nul 2>&1 && echo ${RELAY_PAYLOAD_RECORD_PREFIX} task=1 || echo ${RELAY_PAYLOAD_RECORD_PREFIX} task=0`
+}
+
+/**
+ * THE REPAIR SCRIPT'S CARRIER (D2) — the same base64-append geometry as the
+ * guard, for the same reason: cmd.exe's line is 8 191 characters.
+ *
+ * THE LENGTH MOVES WITH THE CONFIGURATION (R2): the script EMBEDS the port and
+ * the account (`--port <n> --user <s>`), so its character count — and therefore
+ * its base64 — changes with their digits. At port=47999 / user=cua it is
+ * ≈13 721 chars → ≈18 300 base64 (UTF-8, not UTF-16: nothing here needs
+ * `-EncodedCommand`), which is **4 appends** of 6 000 + one short decoder that
+ * decodes, deletes the carrier and `Invoke-Expression`s the script (which
+ * prints the frozen `CUA_RELAY` line and exits 0/1 exactly as before). A wider
+ * port or account moves the number by a handful of characters, never the
+ * geometry — the append count is `ceil(base64 / 6 000)`, not a constant.
+ *
+ * Every child is ≤ 6 100 characters. A HEAD/poll repair therefore costs 5 SSH
+ * children (~0.6 s of cmd + one ≈3 s PowerShell) instead of one refused child.
+ */
+export function relayRepairScriptCarrierPlan({ script = '', chunkChars = GUARD_STAGE_CHUNK_CHARS } = {}) {
+  const text = String(script ?? '')
+  const base64 = Buffer.from(text, 'utf8').toString('base64')
+  const size = Number.isFinite(Number(chunkChars)) && Number(chunkChars) >= 1
+    ? Math.floor(Number(chunkChars))
+    : GUARD_STAGE_CHUNK_CHARS
+  const chunks = Math.max(1, Math.ceil(base64.length / size))
+  const steps = []
+  for (let index = 0; index < chunks; index += 1) {
+    steps.push({
+      kind: 'append',
+      command: relayStageAppendCommand({
+        path: RELAY_REPAIR_CARRIER_PATH,
+        chunk: base64.slice(index * size, (index + 1) * size),
+        truncate: index === 0
+      })
+    })
+  }
+  steps.push({ kind: 'exec', command: relayRepairScriptExecCommand() })
+  return steps
+}
+
+/** The short decoder that runs the staged script (and drops the carrier). */
+export function relayRepairScriptExecCommand({ carrier = RELAY_REPAIR_CARRIER_PATH } = {}) {
+  const body = [
+    `$x=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(${guardCarrierRead(carrier)}))`,
+    `Remove-Item -Force '${carrier}' -ErrorAction SilentlyContinue`,
+    `Invoke-Expression $x`
+  ].join('; ')
+  return guardPowerShell(body)
+}
+
+/**
+ * THE PLAN (C2), PURE: it builds command strings and never spawns, which is what
+ * makes the geometry and the ORDER testable without a guest (CB-1, CB-2, CB-3).
+ *
+ * Order: `measure → appends → decode → verify → register`. The first append
+ * TRUNCATES the `.b64` (C2 rule 8) and the rest append.
+ *
+ * **D3 — REGISTRATION IS NOT CONDITIONAL ON THE FILE (C2 rule 5).** The live
+ * round found the exact hole: once the guard file matched, the plan was
+ * `[measure]`, so `register` could never run again — `win-test` had the file and
+ * no task, permanently. The plan now takes BOTH measured facts and includes
+ * `register` unless the FILE matches AND the TASK is present:
+ *
+ *   hash differs                      → measure + 8 appends + decode + verify + register (12)
+ *   hash matches, task absent/unknown → measure + register (2)
+ *   hash matches, task present        → measure only (1, nothing to write)
+ */
+export function relayGuardStagePlan({
+  base64 = '',
+  chunkChars = GUARD_STAGE_CHUNK_CHARS,
+  measuredHash = null,
+  expectedHash = null,
+  expectedRelay = null,
+  taskPresent = null,
+  port = relayPort()
+} = {}) {
+  const expected = String(expectedHash ?? '').toLowerCase()
+  const expectedRelayValue = String(expectedRelay ?? '').toLowerCase()
+  const steps = [{
+    kind: 'measure',
+    command: relayGuardMeasureCommand({ expectedGuard: expected, expectedRelay: expectedRelayValue, port })
+  }]
+  const fileCurrent = measuredHash !== null && measuredHash !== undefined
+    && expected !== ''
+    && String(measuredHash).toLowerCase() === expected
+  // `taskPresent === true` is the ONLY value that lets the plan stop: unknown is
+  // not "present" (D3 — the state that made the task uncreatable).
+  if (fileCurrent === true && taskPresent === true) return steps
+  const text = String(base64 ?? '')
+  // J3: AN EMPTY PAYLOAD CANNOT BE STAGED. Eight appends of nothing plus a
+  // decode of nothing would overwrite the guest guard with a 0-byte file and
+  // then "verify" the hash of empty — the plan must not contain a register for
+  // a guard it could never verify. (The runtime refuses earlier, with
+  // `staged: 'absent'`; this is the PURE builder's half of the same rule, so a
+  // direct caller cannot get a task registered over nothing either.)
+  const payloadAbsent = text.trim() === ''
+  if (fileCurrent !== true) {
+    const size = Number.isFinite(Number(chunkChars)) && Number(chunkChars) >= 1
+      ? Math.floor(Number(chunkChars))
+      : GUARD_STAGE_CHUNK_CHARS
+    const chunks = Math.max(1, Math.ceil(text.length / size))
+    for (let index = 0; index < chunks; index += 1) {
+      const chunk = text.slice(index * size, (index + 1) * size)
+      steps.push({
+        kind: 'append',
+        command: relayStageAppendCommand({ path: GUARD_STAGE_B64_PATH, chunk, truncate: index === 0 })
+      })
+    }
+    steps.push({ kind: 'decode', command: relayGuardDecodeCommand({ expectedGuard: expected }) })
+    steps.push({ kind: 'verify', command: relayGuardVerifyCommand({ expectedGuard: expected, expectedRelay: expectedRelayValue, port }) })
+  }
+  // A register is only ever planned for a guard that IS (or is about to be)
+  // verified: the file already matches, or a non-empty payload with a known
+  // expected hash is about to be decoded and verified.
+  if (fileCurrent === true || (payloadAbsent === false && expected !== '')) {
+    steps.push({ kind: 'register', command: relayGuardRegisterCommand({ port }) })
+  }
+  return steps
+}
+
+/**
+ * `CUA_PAYLOAD` (C2 rule 10) — the SECOND record line, with its own prefix, so
+ * the frozen `CUA_RELAY` grammar (and every fixture that parses it) is untouched.
+ *
+ * `staged` is the §C2-rule-9 WORD, not a boolean: "nothing to do" (`current`)
+ * and "it worked" (`staged`) are different facts. A line that does not parse
+ * yields `null`; a line that parses to an unknown word yields `incomplete` — the
+ * value that means "try again" — and NEVER `staged`.
+ */
+export function parseCuaPayloadRecord(stdout) {
+  // `[ \\t]*` (not `+`): a BARE `CUA_PAYLOAD` line is a MALFORMED record, and the
+  // answer to that is `staged: 'incomplete'` — `null` is reserved for "no line
+  // was printed at all", which a consumer must not confuse with a failed stage.
+  const match = new RegExp(`${RELAY_PAYLOAD_RECORD_PREFIX}[ \\t]*([^\\r\\n]*)`, 'u').exec(String(stdout ?? ''))
+  if (match === null) return null
+  const fields = {}
+  for (const token of match[1].trim().split(/\s+/u)) {
+    const index = token.indexOf('=')
+    if (index <= 0) continue
+    fields[token.slice(0, index)] = token.slice(index + 1)
+  }
+  // J3-adjacent: a hash is hex, CASE-INSENSITIVE. PowerShell's own
+  // `Get-FileHash` prints UPPERCASE by default; our fragments lower-case it
+  // with `.ToLowerInvariant()`, but a guest (or a future launcher) that prints
+  // the native form must not be read as "MEASURED ABSENT" — which is what the
+  // old `/^[0-9a-f]{64}$/` did, and `guardPresent:false` on a matching guard
+  // is exactly the inverted-presence class of defect. Normalize to lower case
+  // so every consumer gets the same string.
+  const hash = (value) => (typeof value === 'string' && /^[0-9a-f]{64}$/iu.test(value) ? value.toLowerCase() : null)
+  const guardHash = hash(fields.guard)
+  const relayHash = hash(fields.relay)
+  return {
+    guardHash,
+    // PRESENCE IS "THIS LINE SPOKE ABOUT IT", NOT "the hash is non-null": the
+    // register line carries `task=` alone, and deriving `false` from its missing
+    // hash would overwrite the measure's `true` in the merge (the live repair
+    // reported `guardPresent:false` on a guest whose guard matched, 2026-11-21).
+    guardPresent: Object.hasOwn(fields, 'guard') ? guardHash !== null : null,
+    relayHash,
+    relayPresent: Object.hasOwn(fields, 'relay') ? relayHash !== null : null,
+    // C6: `1`/`0`, and the EMPTY the guest prints when NO pair was comparable
+    // (D5) — which is `null` here, exactly like `payloadStale()`.
+    stale: fields.stale === '1' ? true : (fields.stale === '0' ? false : null),
+    // D3: the guard TASK, measured by the same child. `null` when the line did
+    // not carry it (a step that only registers prints `task=` alone).
+    task: fields.task === '1' ? true : (fields.task === '0' ? false : null),
+    // THE CLOSED SET OR `incomplete`. A guest that printed `staged=yes` did not
+    // stage anything this harness can trust.
+    staged: PAYLOAD_STAGED_VALUES.includes(fields.staged) ? fields.staged : 'incomplete',
+    // WHICH fields this line actually carried — the merge in runPayloadRepair()
+    // keeps the LAST value of each field a step spoke, so a register-only line
+    // cannot reset the `staged` word the verify just proved.
+    fields
+  }
+}
+
+/**
+ * MERGE ONE STEP'S RECORD INTO THE ATTEMPT'S (D3). Each step speaks about what it
+ * measured: the measure says whether the FILE is `current` and whether the TASK
+ * exists; the verify says `staged`/`incomplete`; the register says `task=` only.
+ * The merge keeps the LAST value a step actually SPOKE for each field (`fields`
+ * presence, not "the value differs from null"), so a register-only line cannot
+ * reset the `staged` word the verify just proved.
+ */
+function mergePayloadRecord(base, parsed) {
+  const next = { ...(base ?? {}) }
+  if (parsed === null || parsed === undefined) return next
+  for (const key of ['guardHash', 'guardPresent', 'relayHash', 'relayPresent', 'stale', 'task']) {
+    if (parsed[key] !== null && parsed[key] !== undefined) next[key] = parsed[key]
+  }
+  const fields = parsed.fields ?? {}
+  if (Object.hasOwn(fields, 'staged') === true) next.staged = parsed.staged
+  return next
+}
+
+/** The record's `staged` word (the closed five), defaulting to the honest one. */
+function mergedStaged(outcome) {
+  return outcome?.staged === 'current' || outcome?.staged === 'staged' ? outcome.staged : 'incomplete'
+}
+
+/**
+ * THE PAYLOAD'S PRESENCE FACTS — **THE ONE OWNER BOTH PRODUCERS CALL** (P1).
+ *
+ * `windowsPayloadFacts()` (index.js) keys the relay pair's COMPARABILITY on the
+ * reported `relayPresent`, and its `guardPresent` ladder has a `task: true`
+ * last resort. Neither producer ever emitted those two fields, so a MEASURED
+ * relay pair was dropped by the doctor's re-derivation (`payload.stale: null`)
+ * while `payloadStale()` said `true` — the published field contradicted the
+ * verdict in the same answer (PRE defect 2).
+ *
+ * THREE-VALUED, LIKE EVERY OTHER MEASUREMENT IN THIS FILE:
+ *   true   a hash was read (the file exists and hashed)
+ *   false  MEASURED ABSENT — the line spoke about it and the value was empty
+ *   null   nothing measured in this process (never "absent")
+ *
+ * `relayPresent` prefers the `CUA_PAYLOAD` line's own presence (it tracks
+ * "this line spoke about relay=" per line) and falls back to the `CUA_RELAY`
+ * record, which measures the relay hash on every parsed attempt — so a repair
+ * run WITHOUT `payloadRepair` still reports the relay fact it measured.
+ */
+export function payloadPresence(record = null) {
+  const payload = record?.payload ?? null
+  const payloadMeasured = payload !== null && payload.staged !== 'none' && payload.staged !== 'absent'
+  // A payload `XPresent: true` is only credible with a MEASURED hash beside it:
+  // the parser can never produce the pair (it derives presence FROM the hash),
+  // so a record that claims "present" over `garbage`/nothing is a fabrication
+  // and is reported as false, not true (probe-4's sweep). An explicit `false`
+  // stands as-is, and a missing field stays null.
+  const payloadPresence = (present, hashValue) => {
+    if (present === null || present === undefined) return null
+    if (present !== true) return false
+    return typeof hashValue === 'string' && /^[0-9a-f]{64}$/iu.test(hashValue.trim()) ? true : false
+  }
+  // THE `CUA_PAYLOAD` ARM: `payload.relayPresent` is already hasOwn-based in
+  // parseCuaPayloadRecord (`relay=` empty ⇒ false, no field ⇒ null), so it is
+  // spoken only when it is a real boolean; anything else falls through.
+  const spoken = payloadMeasured === true && payload.relayPresent !== null && payload.relayPresent !== undefined
+  const recordMeasured = record?.measured === true
+  /**
+   * THE `CUA_RELAY` ARM — READ `hashMeasured`, NOT `hash !== null` (re-PRE N1).
+   *
+   * The frozen grammar is: `hash=<hex>` measured present, `hash=` (EMPTY)
+   * measured ABSENT, and a MISSING field never measured. parseRelayRepairRecord
+   * already encodes that as `hashMeasured`; testing `hash !== null` instead
+   * inverted BOTH non-hash arms (`''` read as present, `null` read as absent —
+   * exactly backwards from DOCTOR_FACTS_FIELDS).
+   */
+  const hashText = typeof record?.hash === 'string' ? record.hash.trim() : null
+  let fromRecord = null
+  if (recordMeasured === true) {
+    if (record?.hashMeasured === false) fromRecord = null            // the field was never spoken
+    else if (hashText !== null) fromRecord = hashText !== ''         // '' = measured absent, hex = present
+    else if (record?.hashMeasured === true) fromRecord = false       // measured, value gone
+    else fromRecord = null
+  }
+  return {
+    relayPresent: spoken === true ? payloadPresence(payload.relayPresent, payload.relayHash) : fromRecord,
+    guardPresent: payloadMeasured === true
+      ? payloadPresence(payload.guardPresent, payload.guardHash)
+      : null,
+    // D3's measured task: `true` after a register the guest confirmed, `false`
+    // when it looked and the task was absent, `null` when nobody looked.
+    task: payloadMeasured === true && payload.task !== undefined ? (payload.task ?? null) : null
+  }
+}
+
+/**
+ * C6's truth table, as ONE function so a consumer cannot re-derive it.
+ *
+ * `null` means NOTHING COMPARABLE (a build without the payload source, or no
+ * measured hash) — never `false`: "this build cannot say" and "the guest agrees
+ * with us" are different answers, and only one of them is actionable.
+ */
+export function payloadStale({ expectedRelayHash = null, relayHash = null, expectedGuardHash = null, guardHash = null } = {}) {
+  const norm = (value) => (typeof value === 'string' && value.trim() !== '' ? value.trim().toLowerCase() : null)
+  const pairs = []
+  const expectedRelay = norm(expectedRelayHash)
+  const measuredRelay = norm(relayHash)
+  const expectedGuard = norm(expectedGuardHash)
+  const measuredGuard = norm(guardHash)
+  if (expectedRelay !== null && measuredRelay !== null) pairs.push(expectedRelay !== measuredRelay)
+  if (expectedGuard !== null && measuredGuard !== null) pairs.push(expectedGuard !== measuredGuard)
+  if (pairs.length === 0) return null
+  return pairs.some(Boolean)
 }
 
 /* ------------------------------------------------------------------ *
@@ -2072,8 +2963,70 @@ export async function desktopFacts(options = {}) {
  */
 export const RELAY_REPAIR_INTERVAL_MS = 60_000
 
-/** The repair's own wall. It waits ≤8 s for a handshake; 25 s covers ssh + PowerShell cold. */
+/**
+ * THE REPAIR'S OWN WALL — the CALLER'S CAP FOR THE WHOLE ATTEMPT (P4).
+ *
+ * It is not "the launcher's budget": since the carrier was chunked, this number
+ * bounds carrier + payload together, and `RELAY_REPAIR_TOTAL_MS` is the absolute
+ * ceiling under it (`min(caller, TOTAL)` — a caller asking for 5 000 gets 5 000,
+ * never 28 000).
+ *
+ * J5 — WHO ACTUALLY PASSES A BUDGET: the forced repair (`windows_mcp_doctor
+ * {repair:true}`) now passes `timeoutMs: WIN_MCP_FORCE_REPAIR_MS = 30 000`, and
+ * `min(caller, TOTAL)` clamps it to 28 000 — so the ceiling IS reached on that
+ * path. The 15 s upgrade watch and the poll call `repairRelay()` WITHOUT a
+ * budget and get `RELAY_REPAIR_TIMEOUT_MS` (25 000): that is the shipped
+ * default, not the ceiling. Say which path you mean when you quote a number.
+ */
 export const RELAY_REPAIR_TIMEOUT_MS = 25_000
+
+/**
+ * THE WHOLE FORCED REPAIR'S ABSOLUTE CEILING (D2/D4) — a CLAMP, not a schedule.
+ *
+ * Two phases share it — the launcher CARRIER (5 children: 4 cmd appends + one
+ * PowerShell exec) and the payload plan (12 children: measure, 8 cmd appends,
+ * decode, verify, register) — and NEITHER phase may outlive it. The live round
+ * measured ≈2.9 s per PowerShell child and ≈0.15 s per cmd child on `win-test`,
+ * so the worst case is 4 × 2 900 + 13 × 150 ≈ 13 550 ms of work; 28 000 leaves
+ * ~2× margin and still ends 2 000 ms before index.js's 30 000 guard, which is
+ * what "the full plan fits" means in wall-clock terms.
+ *
+ * J5 — READ THIS BEFORE QUOTING 28 000: it is the UPPER BOUND of
+ * `min(caller, TOTAL)`, so it only applies when the caller asks for it
+ * (`timeoutMs: RELAY_REPAIR_TOTAL_MS`). With no caller budget the attempt gets
+ * `RELAY_REPAIR_TIMEOUT_MS` (25 000), which is the shipped default. The ceiling
+ * is reachable, the default is lower, and the two are not the same claim.
+ */
+export const RELAY_REPAIR_TOTAL_MS = 28_000
+
+/**
+ * THE PAYLOAD PHASE'S OWN WALL, normalised in ONE place (J4).
+ *
+ * `runPayloadRepair` takes a `deadline`; `deadline = null` (the default when a
+ * caller reaches the phase directly) used to go through `Number(null) === 0`,
+ * so `Math.min(0, startedAt + 25 000)` produced a deadline IN THE PAST and the
+ * phase ran zero children — the "budget was gone before the measure" record on
+ * a guest that would have answered. Non-positive/non-finite is UNSET here, the
+ * same rule the caller side applies, so `null` gives the full staging budget.
+ */
+export function payloadStagingDeadline({ deadline = null, startedAt = 0, budgetMs = RELAY_PAYLOAD_REPAIR_TIMEOUT_MS } = {}) {
+  const start = Number.isFinite(Number(startedAt)) ? Number(startedAt) : 0
+  const budget = Number.isFinite(Number(budgetMs)) && Number(budgetMs) > 0 ? Number(budgetMs) : RELAY_PAYLOAD_REPAIR_TIMEOUT_MS
+  const raw = Number(deadline)
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, start + budget) : start + budget
+}
+
+/**
+ * WHAT ONE REPAIR CHILD COSTS, MEASURED ON THE LIVE GUEST (2026-11-21).
+ *
+ * `win-test` is a 2 vCPU tiny10: a cold `powershell -Command` child costs
+ * ≈2 900 ms (the number that made 12 PowerShell children ≈30 s and cost the
+ * `register` step its turn), and a `cmd /c` child ≈150 ms. These are EVIDENCE,
+ * not budgets — the budgets are the two constants above — but they are exported
+ * so `tests/modules-unit.mjs` can do the arithmetic the round is judged on
+ * (CB-20) instead of asserting a comment.
+ */
+export const RELAY_REPAIR_STEP_MS = Object.freeze({ powershell: 2900, cmd: 150 })
 
 /** What three failures buy: five minutes of silence. */
 export const RELAY_REPAIR_BACKOFF_MS = 300_000
@@ -2086,11 +3039,16 @@ export const RELAY_REPAIR_DISABLED_ENV = 'DSH_CUA_VM_WIN_MCP_REPAIR'
 
 /**
  * The marker a repair child is RECOGNISABLE by: probes carry `-c "exec(…)"`, the
- * relay lane carries `--connect`, and a repair is the only child that carries a
- * base64 PowerShell `-EncodedCommand`. Tests count repairs through spawnImpl by
- * matching this, so it is exported instead of being a literal in a comment.
+ * relay lane carries `--connect`, and every child of the REPAIR CARRIER carries
+ * this filename. D2 (live, 2026-11-21): the repair script used to ride ONE
+ * `-EncodedCommand` — 13 721 chars → 36 592 base64 → a 36 667-character remote
+ * command, past cmd.exe's 8 191-character line, refused by sshd with `exec
+ * request failed on channel 0`. It is now staged in 6 000-char cmd appends into
+ * this carrier file and executed by a short decoder, so every child is
+ * cmd-line-safe.
  */
-export const RELAY_REPAIR_COMMAND_MARKER = '-EncodedCommand'
+export const RELAY_REPAIR_CARRIER_PATH = 'C:\\ProgramData\\cua\\cua-relay-repair.b64'
+export const RELAY_REPAIR_COMMAND_MARKER = 'cua-relay-repair.b64'
 
 /** The frozen record prefix (Appendix B); tests match on it. */
 export const RELAY_REPAIR_RECORD_PREFIX = 'CUA_RELAY'
@@ -2720,6 +3678,260 @@ export function parseRelayRepairRecord(stdout) {
  *   * a success drops the probe cache, because the cached DOWN is the reason
  *     the next attach would still pick the blind lane.
  */
+/**
+ * WP-1B's staging runner: MEASURE, then (only when the hash differs) the
+ * append/decode/verify/register plan, inside ONE 25 s deadline.
+ *
+ * THE GATE IS THE FLAG, AND IT IS THE POINT (C2 rule 4): the 15 s upgrade watch
+ * calls `repairRelay()` WITHOUT `payloadRepair`, because a poll that could stage
+ * would push 8 SSH children every 60 s for the life of the machine. Only the
+ * doctor's forced repair (`windows_mcp_doctor {repair:true}`) passes `true`.
+ *
+ * Costs, frozen by the live evidence: 13 SSH children on a stale guest (the
+ * existing repair program + measure + 8 appends + decode + verify + register)
+ * and 2 on a HEAD guest (the program + the measure, which finds the hash equal
+ * and stages nothing). A doctor that spawns 13 where it should spawn 2 is this
+ * gate broken.
+ *
+ * Never throws: a failed stage is a RECORD with `staged: 'incomplete'` and the
+ * stderr that proves it.
+ */
+async function runPayloadRepair({
+  payloadRepair = false,
+  host = '127.0.0.1',
+  sshPort,
+  user = 'cua',
+  keyPath,
+  sshArgsFactory,
+  spawnImpl = spawn,
+  now = () => Date.now(),
+  log = () => {},
+  port = relayPort(),
+  guardSource = 'local',
+  // THE WHOLE REPAIR'S DEADLINE (D4): the payload phase may never outlive the
+  // launcher phase's budget, or the doctor's 30 s guard cuts `register` — the
+  // step the live round lost.
+  deadline = null
+} = {}) {
+  const base = {
+    staged: 'none',
+    guardHash: null,
+    guardPresent: null,
+    relayHash: null,
+    relayPresent: null,
+    stale: null,
+    guardSource,
+    // J6: `writes` = FILE writes; `steps` = children that completed (so a
+    // [measure, register] plan is writes 0 / steps 2, not "nothing happened").
+    writes: 0,
+    steps: 0,
+    restaged: 0,
+    ms: 0,
+    detail: ''
+  }
+  if (payloadRepair !== true) return base
+  const expected = expectedGuardHash()
+  if (expected === null) {
+    // THIS BUILD CANNOT STAGE (C2 rule 1): say so, write nothing.
+    return { ...base, staged: 'absent', guardSource: 'absent', detail: 'this build has no guard payload source' }
+  }
+  const source = guardExpectedHashSource()
+  let base64 = ''
+  try {
+    base64 = readFileSync(source).toString('base64')
+  } catch (error) {
+    return { ...base, staged: 'incomplete', detail: `guard payload unreadable: ${error?.message ?? error}`.slice(0, 240) }
+  }
+  // J3: 0 BYTES IS NOT A PAYLOAD. Staging "" writes an empty guard and the
+  // verify then CONFIRMS the hash of empty (the plan only got here because the
+  // engine's expected hash used to be `sha256('')`). Say "absent" and write
+  // nothing — `staged: 'absent'` is the word consumers already understand.
+  if (base64 === '') {
+    return { ...base, staged: 'absent', guardSource: 'absent', detail: 'the guard payload is empty (0 bytes); refusing to stage nothing' }
+  }
+  const startedAt = now()
+  // C2 rule 8's own wall, tightened by the shared deadline when one was passed.
+  // J4: one normalizer (`payloadStagingDeadline`) so `null`/0/-1/NaN can never
+  // become a deadline in the past — `Number(null) === 0` was exactly that bug.
+  const stagingDeadline = payloadStagingDeadline({ deadline, startedAt, budgetMs: RELAY_PAYLOAD_REPAIR_TIMEOUT_MS })
+  const expectedRelay = expectedRelayHash()
+  /** One child, bounded by what is LEFT of the staging budget (C2 rule 8). */
+  const runStep = async (step) => {
+    const remaining = stagingDeadline - now()
+    if (remaining <= 0) return null
+    try {
+      const argv = typeof sshArgsFactory === 'function'
+        ? sshArgsFactory({ host, port: sshPort, user, keyPath, remoteCommand: step.command })
+        : sshArgv({ host, port: sshPort, user, keyPath, remoteCommand: step.command })
+      return await runSshCapture({ argv, spawnImpl, timeoutMs: remaining, now })
+    } catch {
+      return null
+    }
+  }
+  let writes = 0
+  // J6: `writes` counts FILE writes (append/decode) and stays 0 for a
+  // [measure, register] plan — that is correct and unchanged. `steps` is the
+  // honest "children that actually completed" counter, so a plan that created
+  // the TASK is not reported as "nothing happened".
+  let steps = 0
+  let detail = ''
+  /**
+   * J1 — THE VERIFY GATE. A guest PowerShell child exits 0 on a MISMATCH
+   * (the decode wrote *something*; only the record's word says whether it is
+   * the payload), so the ONLY stop the old loop knew — the exit code — could
+   * not see a failed verification: the live run answered `staged=incomplete`
+   * and the very next child was `schtasks /create`, leaving a non-verifying
+   * guard and a SYSTEM onstart task. Registration is now withheld unless a
+   * MEASURED fact proved the file: the measure's `current`, or a verify's
+   * `staged` whose hash matches this build's.
+   *
+   * J2 — ONE BOUNDED RE-STAGE. A mismatch right after OUR decode means the
+   * carrier content was wrong (another process's appends, a reclaimed file).
+   * Both `decode` and `verify` failures are retryable WE CARRIER problems; the
+   * pass is re-run ONCE from the measure (which reclaims/cleans the carrier) if
+   * budget remains. Append/register failures are not retried — an access-denied
+   * chunk will not fix itself.
+   */
+  let passMismatch = false
+  let restaged = 0
+  const runPlanPass = async () => {
+    let passOutcome = null
+    let passDetail = ''
+    const measured = await runStep({ kind: 'measure', command: relayGuardMeasureCommand({ expectedGuard: expected, expectedRelay, port }) })
+    if (measured === null) return { budgetGone: true, outcome: null, detail: '', retryable: false }
+    steps += 1
+    passOutcome = parseCuaPayloadRecord(measured?.stdout)
+    if (passOutcome === null) {
+      passDetail = String(measured.stderr || measured.stdout || measured.detail || '').trim().slice(0, 240)
+    }
+    // 2. STAGE — the plan takes BOTH measured facts (D3): the guard hash AND the
+    //    task. `[measure]` is returned only when the file matches AND the task is
+    //    present; a matching file with no task yields `[measure, register]`.
+    const plan = relayGuardStagePlan({
+      base64,
+      measuredHash: passOutcome?.guardHash ?? null,
+      expectedHash: expected,
+      expectedRelay,
+      taskPresent: passOutcome?.task ?? null,
+      port
+    })
+    // THE GATE'S STATE: the measure is a MEASURED proof only when it says the
+    // file is `current` (hash equality with a known expected hash).
+    let guardVerified = passOutcome?.staged === 'current' ? true : null
+    let retryable = false
+    for (const step of plan.slice(1)) {
+      // J1: never create the SYSTEM task over a guard nothing verified.
+      if (step.kind === 'register' && guardVerified !== true) {
+        passDetail = passDetail === '' ? 'the register step was withheld: no pass verified the guard hash' : passDetail
+        break
+      }
+      const capture = await runStep(step)
+      if (capture === null) {
+        // Out of budget: the carrier on the guest is half-written, and the
+        // next call truncates and redoes it (no resume state). The FILE word is
+        // kept when the measure already PROVED it current (index.js's
+        // starved-register rule keys on exactly that pair).
+        passOutcome = { ...(passOutcome ?? {}), staged: mergedStaged(passOutcome) === 'current' ? 'current' : 'incomplete' }
+        passDetail = passDetail === '' ? 'the payload budget ended mid-stage' : passDetail
+        break
+      }
+      // P3: A FAILED CHILD STOPS THE PLAN. A non-zero step is a hard stop, and
+      // only SUCCESSFUL writes are counted. A decode that refuses the carrier
+      // (J2's hash check / empty carrier) lands here.
+      if (relayStepFailed(capture) === true) {
+        passOutcome = { ...(passOutcome ?? {}), staged: 'incomplete' }
+        passDetail = `payload step '${step.kind}' failed (${capture.exitCode === null ? capture.detail || 'no answer' : `exit ${capture.exitCode}`}): ${String(capture.stderr || capture.stdout || '').trim().slice(0, 200)}`
+        // A refused decode is a CARRIER-content verdict, not a permission one.
+        if (step.kind === 'decode') retryable = true
+        break
+      }
+      steps += 1
+      if (step.kind === 'append' || step.kind === 'decode') writes += 1
+      const parsed = parseCuaPayloadRecord(capture.stdout)
+      if (parsed !== null) passOutcome = mergePayloadRecord(passOutcome, parsed)
+      if (step.kind === 'verify') {
+        // J1: the verdict is the WORD plus the hash, never the exit code.
+        const confirmed = parsed !== null && parsed.staged === 'staged'
+          && (expected === '' || String(parsed.guardHash ?? '').toLowerCase() === expected)
+        if (confirmed === true) {
+          guardVerified = true
+        } else {
+          // The WORD (plus hash) is the verdict; stderr only rides along when
+          // the guest failed to print one (stdout is the record itself).
+          const raw = String(capture.stderr || capture.detail || '').trim()
+          if (passDetail === '') {
+            passDetail = `the verify did not report the expected hash${raw === '' ? '' : `: ${raw.slice(0, 160)}`}`
+          }
+          passOutcome = { ...(passOutcome ?? {}), staged: 'incomplete' }
+          retryable = true
+          break
+        }
+      }
+    }
+    return { budgetGone: false, outcome: passOutcome, detail: passDetail, retryable }
+  }
+  try {
+    let pass = await runPlanPass()
+    if (pass.budgetGone === true) {
+      return { ...base, staged: 'incomplete', detail: 'the payload budget was gone before the measure' }
+    }
+    let outcome = pass.outcome
+    detail = pass.detail
+    passMismatch = pass.retryable === true
+    // J2: ONE re-stage when the carrier content was wrong and the wall allows.
+    if (passMismatch === true && now() < stagingDeadline) {
+      const retry = await runPlanPass()
+      if (retry.budgetGone !== true) {
+        restaged = 1
+        outcome = retry.outcome
+        // The retry's verdict REPLACES the first pass's: a healed run must not
+        // publish the mismatch that no longer describes the guest.
+        detail = retry.detail
+        passMismatch = retry.retryable === true
+      }
+    }
+    const staged = mergedStaged(outcome)
+    if (staged === 'incomplete' && detail === '') detail = 'the verify did not report the expected hash'
+    // C6'S ONE OWNER (D5): `stale` is DERIVED from the measured hashes here, not
+    // copied from the guest's line. The line prints the same table now, and this
+    // is the field a consumer reads — two renderings, one rule.
+    const guardHash = outcome?.guardHash ?? null
+    const relayHash = outcome?.relayHash ?? null
+    const task = outcome?.task ?? null
+    log(`mcp-win: payload repair staged=${staged} task=${task} guard=${guardHash ?? ''} relay=${relayHash ?? ''} writes=${writes} steps=${steps}`)
+    const payloadMs = Math.max(0, now() - startedAt)
+    return {
+      staged,
+      guardHash,
+      guardPresent: outcome?.guardPresent ?? null,
+      relayHash,
+      relayPresent: outcome?.relayPresent ?? null,
+      stale: payloadStale({ expectedRelayHash: expectedRelay, relayHash, expectedGuardHash: expected, guardHash }),
+      task,
+      guardSource: 'local',
+      writes,
+      // J6: `writes` is FILE writes only, so a [measure, register] plan is 0 by
+      // definition even though it CREATED THE TASK. `steps` is the honest
+      // "children that completed" counter (measure included) and `restaged`
+      // says the carrier was wrong once and the pass was re-run.
+      steps,
+      restaged,
+      ms: payloadMs,
+      detail
+    }
+  } catch (error) {
+    return {
+      ...base,
+      staged: 'incomplete',
+      guardSource: 'local',
+      writes,
+      steps,
+      ms: Math.max(0, now() - startedAt),
+      detail: `payload repair failed: ${error?.message ?? error}`.slice(0, 240)
+    }
+  }
+}
+
 export async function repairRelay(options = {}) {
   const normalized = typeof options === 'function' ? { sshArgsFactory: options } : (options ?? {})
   const {
@@ -2729,6 +3941,10 @@ export async function repairRelay(options = {}) {
     keyPath,
     force = false,
     timeoutMs = RELAY_REPAIR_TIMEOUT_MS,
+    // C2 RULE 4 — THE FROZEN OPTION NAME. index.js's forced repair passes
+    // `{ payloadRepair: true }`; the 15 s upgrade watch deliberately does not,
+    // because a poll that could stage would write 8 SSH children every 60 s.
+    payloadRepair = false,
     sshArgsFactory,
     spawnImpl = spawn,
     now = () => Date.now(),
@@ -2783,7 +3999,30 @@ export async function repairRelay(options = {}) {
     lastAt: 0,
     ms: 0,
     exitCode: null,
-    detail: ''
+    detail: '',
+    /**
+     * WP-1B / C6: THE PAYLOAD OUTCOME, ALWAYS PRESENT. `staged: 'none'` is the
+     * poll path (payload repair not requested); a requested attempt overwrites
+     * the whole object with what the measure/verify lines proved. `guardSource`
+     * is `'absent'` when this build cannot stage, so a consumer can tell "we did
+     * not try" from "we cannot".
+     */
+    payload: {
+      staged: 'none',
+      guardHash: null,
+      guardPresent: null,
+      relayHash: null,
+      relayPresent: null,
+      stale: null,
+      // D3: the guard TASK's presence as the guest measured it (`null` = not
+      // measured). `staged` describes the FILE; `task` is the other half of
+      // "the payload repair landed", and the live round proved they come apart.
+      task: null,
+      guardSource: expectedGuardHash() === null ? 'absent' : 'local',
+      writes: 0,
+      ms: 0,
+      detail: ''
+    }
   }
 
   // The bridge's own kill switch wins too: a disabled bridge must not reach out.
@@ -2841,15 +4080,77 @@ export async function repairRelay(options = {}) {
   const attempt = (async () => {
     try {
       const script = relayRepairScriptSource({ port, user })
-      // -EncodedCommand takes UTF-16LE base64: the carrier stays alphanumeric,
-      // so cmd.exe cannot re-parse a quote inside the program.
-      const encoded = Buffer.from(script, 'utf16le').toString('base64')
-      const remoteCommand = `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass ${RELAY_REPAIR_COMMAND_MARKER} ${encoded}`
-      const argv = typeof sshArgsFactory === 'function'
-        ? sshArgsFactory({ host, port: sshPort, user, keyPath, remoteCommand })
-        : sshArgv({ host, port: sshPort, user, keyPath, remoteCommand })
-      const capture = await runSshCapture({ argv, spawnImpl, timeoutMs, now })
+      // D2: THE SCRIPT RIDES A CHUNKED CARRIER, NOT ONE 36 667-CHAR COMMAND.
+      // Every child is ≤ 6 100 chars, so sshd accepts it; the last child is the
+      // short decoder that decodes, deletes the carrier and runs the script,
+      // whose own `CUA_RELAY` line and exit code are unchanged.
+      // D4: ONE DEADLINE FOR THE WHOLE ATTEMPT (launcher + payload below), under
+      // the doctor's 30 000 guard — see RELAY_REPAIR_TOTAL_MS.
+      // ONE WALL FOR THE WHOLE ATTEMPT (P4): `min(caller, RELAY_REPAIR_TOTAL_MS)`,
+      // read once and shared by the carrier chunks AND the payload phase below.
+      // `repairRelay({timeoutMs: 5_000})` therefore finishes inside 5 s instead
+      // of running the 28 s ceiling, and a payload step that cannot start
+      // reports 'incomplete' rather than being silently skipped.
+      const repairStartedAt = now()
+      // NON-POSITIVE / NON-FINITE IS UNSET, NOT A ZERO BUDGET: `Number(null)` is 0,
+      // so `{timeoutMs: null}` (or 0) used to collapse the wall to "now" and run
+      // nothing at all. Every other reader in this file treats those as unset; this
+      // one now does too.
+      const callerRaw = Number(timeoutMs)
+      const callerMs = Number.isFinite(callerRaw) && callerRaw > 0 ? callerRaw : RELAY_REPAIR_TIMEOUT_MS
+      const repairDeadline = repairStartedAt + Math.min(callerMs, RELAY_REPAIR_TOTAL_MS)
+      const carrierPlan = relayRepairScriptCarrierPlan({ script })
+      let capture = null
+      let carrierMs = 0
+      // P3: A FAILED CHUNK STOPS THE CARRIER. `runSshCapture` resolves on
+      // `close` whatever the exit code, so without this a chunk-0 `Access is
+      // denied` let the remaining chunks append into the PREVIOUS run's carrier
+      // and the exec ran a corrupt script. An `append` step that exits non-zero
+      // breaks the loop; the `exec` step's exit code is the REPAIR'S OWN verdict
+      // (`exit 0/1` from the script) and is deliberately not a carrier failure.
+      let carrierFailure = ''
+      for (const step of carrierPlan) {
+        const remaining = repairDeadline - now()
+        if (remaining <= 0) {
+          carrierFailure = 'the repair budget ended mid-carrier'
+          break
+        }
+        const argv = typeof sshArgsFactory === 'function'
+          ? sshArgsFactory({ host, port: sshPort, user, keyPath, remoteCommand: step.command })
+          : sshArgv({ host, port: sshPort, user, keyPath, remoteCommand: step.command })
+        const stepCapture = await runSshCapture({ argv, spawnImpl, timeoutMs: remaining, now })
+        carrierMs += stepCapture.ms
+        capture = stepCapture
+        if (step.kind === 'append' && relayStepFailed(stepCapture) === true) {
+          carrierFailure = `carrier chunk failed (${stepCapture.exitCode === null ? stepCapture.detail || 'no answer' : `exit ${stepCapture.exitCode}`}): ${String(stepCapture.stderr ?? '').trim().slice(0, 160)}`
+          break
+        }
+      }
+      if (capture === null) {
+        capture = { stdout: '', stderr: '', exitCode: null, detail: 'the repair budget was gone before its first chunk', ms: 0 }
+      }
+      if (carrierFailure !== '') {
+        // The script never ran, so there is no CUA_RELAY line: the record below
+        // is UNMEASURED and `detail` says why (never a parsed-looking record).
+        capture = { ...capture, stdout: '', stderr: carrierFailure, exitCode: capture.exitCode ?? null, detail: carrierFailure }
+      }
       const parsed = parseRelayRepairRecord(capture.stdout)
+      // WP-1B: THE PAYLOAD HALF, AFTER THE PROGRAM (C2 rule 6 — the launcher the
+      // guard will read already carries `--port`). Gated, bounded, never throws.
+      const payload = await runPayloadRepair({
+        payloadRepair,
+        host,
+        sshPort,
+        user,
+        keyPath,
+        sshArgsFactory,
+        spawnImpl,
+        now,
+        log,
+        port,
+        guardSource: base.payload.guardSource,
+        deadline: repairDeadline
+      })
       const failures = parsed?.ok === true ? 0 : state.failures + 1
       const backoffMs = failures >= RELAY_REPAIR_FAILURES_BEFORE_BACKOFF
         ? RELAY_REPAIR_BACKOFF_MS
@@ -2882,9 +4183,16 @@ export async function repairRelay(options = {}) {
           reason: parsed.reason
         }),
         exitCode: capture.exitCode,
+        payload,
         at: state.lastAt,
         lastAt: state.lastAt,
-        ms: capture.ms,
+        // J6: `ms` is the WHOLE ATTEMPT (carrier + payload), not just the
+        // carrier's chunks — a 12-child payload phase used to be invisible in
+        // the only duration field the record published. The split rides along
+        // so a reader can still say which phase cost what.
+        ms: Math.max(0, now() - repairStartedAt),
+        carrierMs,
+        payloadMs: Number.isFinite(Number(payload?.ms)) ? Math.max(0, Number(payload.ms)) : 0,
         attempts: state.attempts,
         failures,
         backoffMs,
@@ -2917,6 +4225,9 @@ export async function repairRelay(options = {}) {
         // NOTHING WAS MEASURED: the attempt threw before it could read a line.
         measured: false,
         unmeasured: RELAY_REPAIR_UNMEASURED.EXCEPTION,
+        // A requested payload repair that never reached its measure is
+        // `incomplete` — the one value that means "try again".
+        payload: payloadRepair === true ? { ...base.payload, staged: 'incomplete', detail: `payload repair failed: ${error?.message ?? error}`.slice(0, 240) } : base.payload,
         at: state.lastAt,
         lastAt: state.lastAt,
         attempts: state.attempts,
@@ -3124,7 +4435,16 @@ export function createDshCuaClient({
   isOnline,
   onClosed,
   spawnImpl = spawn,
-  log = () => {}
+  log = () => {},
+  /**
+   * C1 rule 2 / WP-2A: THE BOOT ANCHOR, INJECTED. `(name) => number|null` epoch
+   * ms — index.js passes `windowsBootReadyAt`, which reads the newest
+   * `vm-state:<name>:ready` event for THIS computer. The client adapts it to the
+   * zero-arg provider the transport takes, so a test drives the window with a
+   * function and no stream exist. `null` (the default) means "no anchor":
+   * `source:'attach'` becomes the fallback, and `live` is still honest.
+   */
+  bootWindow = null
 }) {
   let child = null
   let buffer = ''
@@ -3174,6 +4494,12 @@ export function createDshCuaClient({
      */
     relayFunctional: null,
     /**
+     * C1: the boot-race window as of the LAST read. Recomputed (never snapshotted
+     * for good) by `computeBootRace()` on every attach, doctor call and upgrade
+     * beat, so `remainingMs` ages honestly and `live` cannot outlive its window.
+     */
+    bootRace: null,
+    /**
      * DEFECT 2: when the last upgrade attempt was made. 0 means "never", and the
      * throttle compares against RELAY_UPGRADE_INTERVAL_MS so a flapping relay
      * cannot turn a blind session into a reconnect loop.
@@ -3182,6 +4508,33 @@ export function createDshCuaClient({
   }
   /** The lane decision of the last attach (null until connect() ran). */
   let decided = null
+  /** The FIRST attach's epoch ms — the fallback anchor when no ready event exists. */
+  let attachedAt = null
+
+  /**
+   * THE WINDOW, RECOMPUTED FROM LIVE INPUTS (C1 rules 3-4).
+   *
+   * The `readyAt` anchor is re-READ from the provider on every call: a newer
+   * `vm-state:<name>:ready` event must win, and a stored snapshot would report a
+   * `live` that the clock has already closed. A MEASURED repair record (one that
+   * measured `session` or `hash`) outranks the window — evidence is never
+   * relabelled "wait a bit".
+   */
+  const computeBootRace = (nowMs = Date.now()) => {
+    const readyAt = typeof bootWindow === 'function' ? bootWindow(name) : null
+    const record = state.repair
+    const measured = record?.measured === true
+      && (record?.sessionMeasured === true || record?.hashMeasured === true)
+    const window = bootRaceFacts({
+      readyAt,
+      attachedAt,
+      nowMs,
+      measured,
+      relayStatus: state.relayStatus ?? ''
+    })
+    state.bootRace = window
+    return window
+  }
 
   /**
    * THE LANE FACTS A PROBE MAY MUTATE — AND THE SNAPSHOT/RESTORE PAIR THE UPGRADE
@@ -3453,12 +4806,19 @@ export function createDshCuaClient({
    */
   async function maybeUpgradeTransport(now = Date.now()) {
     if (state.connected !== true || child === null) return { upgraded: false, reason: 'not-connected' }
+    // C1 RULE 7: THE TIMER IS NOT TOUCHED; THE THROTTLE IS. Inside a live boot
+    // window the pure guard gets the 10 s interval, so the first failed upgrade
+    // at ready+20 s does not lock the next one out until ready+80 s. At every
+    // other moment `intervalMs` is `undefined` and the guard falls back to its
+    // own 60 s default — the 15 s `setInterval` and its teardown are unchanged.
+    const bootRace = computeBootRace(now)
     const decision = shouldUpgradeToRelay({
       transport: state.transport,
       relayOk: state.relayOk,
       lastUpgradeAttemptAt: state.lastUpgradeAttemptAt,
       now,
-      inFlight: pending.size
+      inFlight: pending.size,
+      intervalMs: state.bootRace?.live === true ? BOOT_RACE_UPGRADE_INTERVAL_MS : undefined
     })
     if (decision !== true) {
       return {
@@ -3583,7 +4943,7 @@ export function createDshCuaClient({
       state.desktop = facts
       return facts
     } catch (error) {
-      const facts = normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}` })
+      const facts = normalizeDesktopFacts(null, { error: `desktop facts: ${error?.message ?? error}`, errorCode: 'read-error' })
       state.desktop = facts
       return facts
     }
@@ -3602,7 +4962,24 @@ export function createDshCuaClient({
       // cached from the previous attach (or from boot) would pin this session to
       // the blind lane for its whole life. `spawnImpl` rides along so a test can
       // answer the probe without an ssh binary and a real guest.
-      const facts = await resolveGuestMcpTransport({ host, port: sshPort, user, keyPath, log, spawnImpl })
+      // C1: THE FIRST ATTACH IS THE FALLBACK ANCHOR. Recorded once (a retried
+      // connect keeps the first one — the window belongs to the boot, not to the
+      // attempt), and handed to the transport so the ladder can run even when the
+      // plugin has no stream event for this computer.
+      if (attachedAt === null) attachedAt = Date.now()
+      const facts = await resolveGuestMcpTransport({
+        host,
+        port: sshPort,
+        user,
+        keyPath,
+        log,
+        spawnImpl,
+        bootWindow: () => (typeof bootWindow === 'function' ? bootWindow(name) : null),
+        attachedAt,
+        measured: state.repair?.measured === true
+          && (state.repair?.sessionMeasured === true || state.repair?.hashMeasured === true),
+        now: () => Date.now()
+      })
       decided = facts
       state.transport = facts.transport
       state.relayPort = facts.relayPort
@@ -3614,6 +4991,9 @@ export function createDshCuaClient({
       // with the rest of the lane facts so the doctor can name it.
       state.interpreterMissing = facts.interpreterMissing === true
       state.relayDetail = facts.relayDetail ?? ''
+      // C1 rule 3: the same window the ladder was gated on, published for the
+      // doctor. `computeBootRace()` re-derives it from the same inputs.
+      state.bootRace = facts.bootRace ?? computeBootRace()
       if (facts.reason !== '') {
         state.lastError = facts.reason
         state.reason = facts.reason
@@ -3681,6 +5061,9 @@ export function createDshCuaClient({
       const record = state.repair ?? relayRepairRecord({ host, port: sshPort, user, keyPath })
       const relayStatus = state.relayStatus ?? decided?.relayStatus ?? probe?.status ?? null
       const probeMode = state.probeMode ?? decided?.probeMode ?? probe?.probeMode ?? null
+      // C1 rule 5: RECOMPUTED, NEVER STORED — the window ages between calls, and
+      // a cached one would keep claiming `live` after it closed.
+      const bootRace = computeBootRace()
       return {
         transport: state.transport ?? (probe === null ? null : (probe.ok === true ? 'interactive-relay' : 'session-0-direct')),
         relayPort: state.relayPort ?? relayPort(),
@@ -3718,6 +5101,13 @@ export function createDshCuaClient({
          * answers "did its child answer".
          */
         relayFunctional: state.relayFunctional ?? null,
+        /**
+         * C1: THE WINDOW, WITH `remainingMs`. `null` never appears here — this is
+         * a real object with `live:false` and `source:'none'` when there is no
+         * anchor, which is the honest "no window" the doctor renders as
+         * `relay-stopped` (it must not guess one).
+         */
+        bootRace,
         payload: {
           // DEFECT 1: the same marker `relayDoctorFacts()` carries — the two
           // doctors must agree field for field (P2), including this one.
@@ -3731,7 +5121,23 @@ export function createDshCuaClient({
           port: record?.port ?? null,
           portMeasured: record?.portMeasured === true,
           // DEFECT 4(c): the honest flag — the relay ANSWERED, unreadable.
-          skew: relayEvidenceSkew(relayStatus, record)
+          // C3: the CLIENT passes the functional reason, because it is the only
+          // half that has one — `probe-unsupported` (TCP accepted, token sent,
+          // zero bytes back) is a payload-staleness signal, not a dead child.
+          skew: relayEvidenceSkew(relayStatus, record, state.relayFunctional?.reason ?? ''),
+          // WP-1B / C6: the guard identity and the staleness verdict, the same
+          // four fields relayDoctorFacts() carries (both producers, one shape).
+          expectedGuardHash: expectedGuardHash(),
+          guardHash: record?.payload?.guardHash ?? null,
+          // P1: the SAME two fields, from the SAME owner — the client and the
+          // module helper cannot disagree about the payload's presence.
+          ...payloadPresence(record),
+          stale: payloadStale({
+            expectedRelayHash: expectedRelayHash(),
+            relayHash: record?.measured === true ? (record?.hash ?? null) : null,
+            expectedGuardHash: expectedGuardHash(),
+            guardHash: record?.payload?.guardHash ?? null
+          })
         }
       }
     },

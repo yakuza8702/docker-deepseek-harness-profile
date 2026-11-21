@@ -105,6 +105,10 @@ const scaleStep = stepText('dsh-cua-scale')
 const ttStep = stepText('dsh-cua-typetext')
 const spStep = stepText('dsh-cua-savepath')
 const probeStep = stepText('desktop-token-probe')
+// WP-1A (coldboot): the identity marker and the two re-entry steps.
+const guardStep = stepText('relay-guard-task')
+const relayStep = stepText('mcp-relay-task')
+const tail = ps1.slice(ps1.indexOf("Step 'mcp-relay-reassert'"))
 
 // ---------------------------------------------------------------- D-1..D-7
 check('D-1: both patch steps exist, each pins 0.4.1, its own SHA-256, and a count == 1 gate',
@@ -573,6 +577,99 @@ check('D-24: a Session-0 (or unread) probe is a FAILURE - no-session is thrown B
   && probeStep.indexOf("$why = 'no-session'") > sessionGuard
   && /throw "desktop-token-probe: the DESKTOP token did not prove the lane \(\$why\)/u.test(probeStep),
   `session@${sessionGuard} booleans@${boolGuard}`)
+
+// ------------------------------------------- WP-1A: identity + re-entry (coldboot)
+check('D-11 (WP-1A): the payload is 1.3.0 and publishes a TOP-LEVEL guardSha256 read back from the guard row',
+  /^\$scriptVersion = '1\.3\.0'$/mu.test(ps1)
+  && ps1.includes("$scriptVersion = '1.2.0'") === false
+  && (ps1.match(/\$state\.guardSha256 = /gu) ?? []).length === 1
+  && tail.includes('$state.guardSha256 = ')
+  && tail.includes("$_.step -eq 'relay-guard-task'")
+  && tail.indexOf("$_.step -eq 'relay-guard-task'") < tail.indexOf('$state.guardSha256 = ')
+  && tail.indexOf('$state.guardSha256 = ') < tail.indexOf('$state | ConvertTo-Json')
+  && tail.includes('.guardSha256')
+  && /scriptVersion = \$scriptVersion; scriptSha256 = \$scriptSha256/u.test(ps1),
+  `version=${/\$scriptVersion = '([^']+)'/u.exec(ps1)?.[1]} guardSha256=${(ps1.match(/\$state\.guardSha256 = /gu) ?? []).length}`)
+
+// D-12 ANCHORS THE MEASURE, NOT THE INITIALISER. PRE found the first version
+// vacuous: `stagedAt` was the index of `$stagedHash = ''`, so DELETING the real
+// measurement (the Get-FileHash on the staged guard) left every clause true and
+// the check green while write-always came back. The literal below is the measure.
+const stagedInitAt = guardStep.indexOf("$stagedHash = ''")
+const STAGED_MEASURE = '$stagedHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256)'
+const stagedMeasureAt = guardStep.indexOf(STAGED_MEASURE)
+const compareAt = guardStep.indexOf('-ne $stagedHash')
+const copyAt = guardStep.indexOf('Copy-Item -LiteralPath $guardSource')
+const stagedPathAt = guardStep.indexOf("$guardScript = 'C:\\ProgramData\\cua\\cua-relay-guard.ps1'")
+check('D-12 (WP-1A): the guard is copied only when the measured pair DIFFERS (STAGED measure -> compare -> one guarded copy)',
+  (guardStep.match(/-ne \$stagedHash/gu) ?? []).length === 1
+  && (guardStep.match(/Copy-Item -LiteralPath \$guardSource/gu) ?? []).length === 1
+  && stagedPathAt >= 0 && stagedPathAt < stagedMeasureAt
+  && stagedInitAt >= 0 && stagedMeasureAt > stagedInitAt
+  && guardStep.indexOf('Test-Path -LiteralPath $guardScript') >= 0
+  && guardStep.indexOf('Test-Path -LiteralPath $guardScript') < stagedMeasureAt
+  // The step has a SECOND staged-side hash read (the post-registration identity
+  // one), so a count is the wrong question: the MEASURE must be the FIRST read of
+  // the staged path, and it must be the one assigned to $stagedHash. Delete it and
+  // this index moves past the comparison (or to -1).
+  && stagedMeasureAt >= 0
+  // no staged-side hash read may come BEFORE the measure: `Get-FileHash
+  // -LiteralPath $guardScript` sits inside the measure line (a few chars in), so
+  // the assertion is "not earlier", which the deletion cannot satisfy.
+  && guardStep.indexOf('Get-FileHash -LiteralPath $guardScript') >= stagedMeasureAt
+  && compareAt > stagedMeasureAt && copyAt > compareAt
+  && guardStep.includes('$sourceHash = (Get-FileHash -LiteralPath $guardSource')
+  // The copy sits inside `if ($copyGuard) {` (a try/catch lives there now), so the
+  // assertion is that branch membership, not adjacency.
+  && guardStep.indexOf('if ($copyGuard) {') >= 0
+  && copyAt > guardStep.indexOf('if ($copyGuard) {')
+  && copyAt < guardStep.indexOf('elseif ($guardSource)')
+  && guardStep.includes("$guardState = 'already current'")
+  && guardStep.includes("guardState = $guardState"),
+  `measure@${stagedMeasureAt} (init@${stagedInitAt}) compare@${compareAt} copy@${copyAt}`)
+
+// D-14 — THE OTHER HALF OF MEASURE-THEN-WRITE: an UNMEASURABLE hash is not
+// "equal". With the measure in place but the two empty-hash guards removed, a
+// failed measure yields '' -ne '' = false and the step would report `already
+// current` for a file nobody could read - the same lie as `applied` without its
+// probe. Both guards must exist, and they must come BEFORE the comparison.
+const noStagedAt = guardStep.indexOf('elseif (-not $stagedHash) { $copyGuard = $true }')
+const noSourceAt = guardStep.indexOf('elseif (-not $sourceHash) { $copyGuard = $true }')
+check('D-14 (WP-1A): an unmeasurable staged/source hash FORCES the copy - it can never read as "already current"',
+  noStagedAt >= 0 && noSourceAt >= 0
+  && noStagedAt < compareAt && noSourceAt < compareAt
+  && guardStep.includes("$guardState = 'already current'")
+  && /\(\$sourceHash -ne \$stagedHash\) \{ \$copyGuard = \$true \}/u.test(guardStep),
+  `no-staged@${noStagedAt} no-source@${noSourceAt} compare@${compareAt}`)
+
+// D-15 (WP-1A) — THE STATE WORD IS A MEASUREMENT, NOT AN INTENT (jury defect 7).
+// `Copy-Item` used to run under $ErrorActionPreference = 'Continue' with
+// `$guardState = 'staged'` on the next line: a FAILED copy still recorded
+// `staged`, so the one field a human reads about the write could lie (the hash
+// stayed honest only because it is re-read later). `-ErrorAction Stop` makes the
+// failure catchable and the post-copy re-hash decides the word.
+const copyAt15 = guardStep.indexOf('Copy-Item -LiteralPath $guardSource')
+const rehashAt = guardStep.indexOf('$afterCopyHash = (Get-FileHash -LiteralPath $guardScript')
+const stagedWordAt = guardStep.indexOf("$guardState = 'staged'")
+check('D-15 (WP-1A): a failed copy cannot record "staged" (-ErrorAction Stop + a post-copy re-hash decide the word)',
+  copyAt15 >= 0 && rehashAt > copyAt15 && stagedWordAt > rehashAt
+  && guardStep.includes('-Force -ErrorAction Stop')
+  && guardStep.includes('$copyError = $_.Exception.Message')
+  && /\$afterCopyHash -and \$afterCopyHash -eq \$sourceHash/u.test(guardStep)
+  && guardStep.includes("$guardState = 'copy-failed'")
+  && /\$script:pendingStepAnnotation = @\{ guardState = 'copy-failed'/u.test(guardStep)
+  && /throw "relay guard: '\$guardSource' could not be written/u.test(guardStep),
+  `copy@${copyAt15} rehash@${rehashAt} staged-word@${stagedWordAt}`)
+
+check('D-13 (WP-1A): a re-entry ADOPTS the launcher port (1..65535, the guard\'s own rule) before $relayPort is used',
+  /function Get-RelayLauncherPort\(\[string\]\$LauncherPath\)/u.test(ps1)
+  && ps1.includes("'--port\\s+([0-9]{1,5})'")
+  && /\$value -lt 1 -or \$value -gt 65535/u.test(ps1)
+  && relayStep.includes('Get-RelayLauncherPort -LauncherPath')
+  && relayStep.indexOf('Get-RelayLauncherPort -LauncherPath') < relayStep.indexOf('$relayPort')
+  && relayStep.includes('$script:relayPort = $launcherPort')
+  && relayStep.includes('--serve --port '),
+  `read@${relayStep.indexOf('Get-RelayLauncherPort -LauncherPath')} firstUse@${relayStep.indexOf('$relayPort')}`)
 
 console.log(failures === 0 ? `\nguest patch: PASS — ${checks} check(s)` : `\nguest patch: ${failures} FAILURE(S) of ${checks}`)
 process.exit(failures === 0 ? 0 : 1)

@@ -113,6 +113,53 @@ export const LANES = ['interactive-relay', 'session-0-direct']
 /** A stand-in for the SHA-256 of `C:\ProgramData\cua\mcp-relay.py` (64 hex). */
 export const FIXTURE_RELAY_HASH = '3f2a1c'.repeat(10) + 'beef'
 
+/**
+ * C1 — THE BOOT WINDOW AS THE CLIENT SAW IT (WP-2B's input).
+ *
+ * The real client computes this per `doctorFacts()` call from the harness's
+ * `vm-state:<name>:ready` event. The fixture answers it from a knob so the
+ * doctor's new `boot-race` classification can be driven without a cold boot:
+ * `setBootRace({ live: true, sinceReadyMs: 40000, ... })`.
+ */
+export const BOOT_RACE_DEFAULT = Object.freeze({
+  live: false,
+  sinceReadyMs: null,
+  remainingMs: 0,
+  source: 'none',
+  readyAt: null,
+  attachedAt: null,
+  windowMs: 90000
+})
+
+let BOOT_RACE = null
+
+export function setBootRace(facts) {
+  BOOT_RACE = facts === null || facts === undefined ? null : { ...facts }
+  return BOOT_RACE
+}
+
+function bootRaceAnswer() {
+  return BOOT_RACE === null ? { ...BOOT_RACE_DEFAULT } : { ...BOOT_RACE }
+}
+
+/**
+ * C3/C6 — THE PAYLOAD IDENTITY AS THE CLIENT REPORTS IT.
+ *
+ * `setPayload({ expectedGuardHash, guardHash, stale, ... })` merges over the
+ * lane's own answer, so a test can drive the doctor's `payload.stale` truth table
+ * (true / false / null) and the `probe-unsupported` skew without a guest.
+ */
+let PAYLOAD_OVERRIDES = null
+
+export function setPayload(overrides) {
+  PAYLOAD_OVERRIDES = overrides === null || overrides === undefined ? null : { ...overrides }
+  return PAYLOAD_OVERRIDES
+}
+
+function payloadAnswer(lanePayload) {
+  return { ...(lanePayload ?? {}), ...(PAYLOAD_OVERRIDES ?? {}) }
+}
+
 /** The 19 tools a dsh-cua server inside the guest publishes. */
 export const GUEST_TOOLS = [
   { name: 'tool_click_at', description: 'Click the pixel at x,y', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'] } },
@@ -138,6 +185,15 @@ export const GUEST_TOOLS = [
 
 /** Every client this process created, so a test can leak or close one. */
 export const SESSIONS = []
+
+/**
+ * K4 — THE OPTIONS EVERY `repairRelay()` CALL CARRIED.
+ *
+ * `index.js` owns the caller budget (the win-mcp seam clamps it to
+ * `RELAY_REPAIR_TOTAL_MS`), so "did the doctor pass one" is only observable at
+ * the call. The fixture records them, in order.
+ */
+export const REPAIR_CALLS = []
 
 /* ------------------------------------------------------------------ *
  * APPENDIX B — THE FROZEN REPAIR RECORD
@@ -193,6 +249,10 @@ function unmeasuredRecord(reason = UNMEASURED.NO_RECORD, extra = {}) {
     measured: false,
     unmeasured: reason,
     ok: false,
+    // D1: the staging half's own record (`CUA_PAYLOAD`), or null when the payload
+    // repair did not run. It survives the unmeasured shape on purpose: on
+    // `win-test` the guard landed while the RELAY line never parsed.
+    payload: extra.payload ?? null,
     port: extra.port ?? null,
     task: null,
     running: null,
@@ -223,6 +283,7 @@ function normaliseRecord(record) {
   const unmeasured = record.measured === false || typeof record.unmeasured === 'string'
   if (unmeasured) {
     return unmeasuredRecord(record.unmeasured ?? UNMEASURED.NO_RECORD, {
+      ...(record.payload === undefined ? {} : { payload: record.payload }),
       ...(record.port === undefined ? {} : { port: record.port }),
       ...(record.throttled === true ? { throttled: true } : {}),
       ...(record.disabled === true ? { disabled: true } : {})
@@ -233,6 +294,8 @@ function normaliseRecord(record) {
     measured: true,
     unmeasured: '',
     ok,
+    // D1: the `CUA_PAYLOAD` sub-record, passed through verbatim.
+    payload: record.payload ?? null,
     port: record.port ?? null,
     task: record.task ?? (ok ? 1 : 0),
     running: record.running ?? (ok ? 1 : 0),
@@ -718,7 +781,9 @@ export function createDshCuaClient(options = {}) {
     reason: '',
     lastUpgradeAttemptAt: 0,
     repair: null,
-    payload: null
+    payload: null,
+    // C3: the last functional answer (see `relayFunctionalProbe`).
+    relayFunctional: null
   }
   /** The lane this client last recorded (kept after `close()` so a test can read it). */
   let lastRepairAt = 0
@@ -838,7 +903,11 @@ export function createDshCuaClient(options = {}) {
      */
     async relayFunctionalProbe(_options = {}) {
       counters.functionalCalls += 1
-      return functionalAnswer()
+      const answer = functionalAnswer()
+      // C3: the client keeps the answer so `doctorFacts()` can hand the doctor
+      // the `probe-unsupported` reason that drives `payload.skew`.
+      state.relayFunctional = answer
+      return answer
     },
     /**
      * THE ZERO-SSH FACTS (WP-2.7): synchronous, side-effect free, and the SAME
@@ -859,7 +928,13 @@ export function createDshCuaClient(options = {}) {
         // WP-4.3/4.5: the two additive facts the real `doctorFacts()` carries.
         lastFailureKind: state.lastFailureKind,
         repair: state.repair,
-        payload: state.payload
+        payload: payloadAnswer(state.payload),
+        // C1/C7 (WP-2B): the boot window this client would report — the doctor's
+        // `boot-race` classification reads `transportFacts.bootRace.live`.
+        bootRace: bootRaceAnswer(),
+        // C3: the functional probe's last answer, which is the third producer of
+        // `payload.skew` (`reason: 'probe-unsupported'`).
+        relayFunctional: state.relayFunctional ?? null
       }
     },
     /**
@@ -892,7 +967,9 @@ export function createDshCuaClient(options = {}) {
      * `force` bypasses the window (the doctor's `{ repair: true }` argument).
      * The kill switch is the documented one, and it SPENDS NO CHILD.
      */
-    async repairRelay({ force = false } = {}) {
+    async repairRelay(options = {}) {
+      const { force = false } = options
+      REPAIR_CALLS.push({ ...options })
       // §2.5: ONE attempt in flight, ever. The second caller waits for the first.
       if (repairInFlight !== null) return repairInFlight
       if (process.env.DSH_CUA_VM_WIN_MCP_REPAIR === '0') {

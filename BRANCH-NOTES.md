@@ -3401,3 +3401,238 @@ the producers — nothing surplus, nothing documented that the code cannot answe
 * **`--mutations` costs a tree copy + 22 gate runs (~10 s here).** It is a separate invocation
   and a separate CI step by design (K12): it is not part of the default gate, and
   a drifted `find` is a failure — never a skipped row.
+
+## 30. Branch `cua-vm-improve` — 2026-11-21: the cold boot that was called blind, and the payload nobody could date
+
+The sixth round started from a cold boot: shut a Windows computer down, start it
+again, and for the first ~79 s the failing report was
+
+> `status: blind`, `blindReason: relay-stopped`, `transport: session-0-direct`,
+> "repair the task / restart the computer"
+
+on a computer whose relay was **about to start by itself** at logon. Five defects
+came out of that boot, and **four of the five were truth-telling defects again**:
+the harness could not distinguish "late" from "stopped", could not tell an old
+relay from a dead child, could not say "the guest has no facts writer", and
+reported 19 healthy registrations as 19 `leaks`.
+
+The locked plan is `coldboot-sol.md` (v1.0, C1–C10, WP-1A…WP-6, §6 runbook). This
+section is the implementation record for **WP-6** and the round as a whole.
+
+### The disposition table (RC-1…RC-5, exactly as the SOL decided)
+
+| RC | what it was | code or runbook? | shipped as |
+|---|---|---|---|
+| **RC-1** | the live asset ran a pre-`e2f0efd` payload: no guard task, no guard file, no `cua-workdir`, no facts writer, launcher without `--port` | **both, and the split is the point.** Reprovisioning a fresh computer from a rebuilt HEAD image solves RC-1 for the *acceptance run* with zero code (§6.2) — but it leaves every already-created computer in the field permanently unrepairable, and it leaves "stale payload" undetectable. So the harness learned to SAY `payload.stale` and to stage the **32 590-byte guard** over SSH (which alone restores the lane); the 93 937-byte relay and the 146 276-byte firstboot (the size at this landing — it grows with every step this round added) are explicitly out of scope — that is a reprovision, and the field says so instead of pretending | WP-1A (guest: measure-then-write for the guard and the launcher, `$scriptVersion 1.3.0`, top-level `guardSha256`), WP-1B (harness: `expectedGuardHash()`, `relayGuardStagePlan()`, `repairRelay({payloadRepair:true})`, `payload.stale`) |
+| **RC-2** | the attach committed to session-0 inside a ~79 s boot window and reported `blind` + `relay-stopped` | **code** — a correct guard cannot remove the window (it waits up to 90 s for a console session and the relay pays a ~37 s `pythonw` import) | WP-2A (the 90 s window, `bootRaceFacts()`, the bounded `[0, 8 s, 20 s]` attach ladder with `force: true`, the 10 s in-window throttle), WP-2B (`boot-race` as the seventh `blindReason` + its action sentence, `laneUpgrading: true`) |
+| **RC-3** | `RELAY_FN` silence on a relay predating the token read as `RELAY_UNRESPONSIVE / no-evidence` → "repair the task" on a healthy child | **code** | WP-3A (the `_connected`/`_sent`/`_bytes` flags, `probe-unsupported` as the sixth reason), WP-3B (the verdict names *re-create the computer*, and `payload.skew` gains its third producer) |
+| **RC-4** | `desktop.error` was two raw cmd stderr lines instead of one fact | **code, small** — and load-bearing: it is the only signal that the guest has no facts *writer* (not that the file is empty) | WP-4A (language-free classification, `DESKTOP_FACTS_ABSENT`), WP-4B (`desktop.errorCode`, the one-sentence `error`) |
+| **RC-5** | `leaks` carried 19 names while the bridge was online, contradicting this repository's own README | **code + docs + pin** | WP-5 (`prefixSchemas` = the surface, `leaks` = the offline residue; the two pinned `status`/`leaking` expressions untouched) |
+
+**What the round does not claim.** It does not make a pre-`e2f0efd` guest report
+`relayFunctional.measured: true` or `desktop.measured: true` — those fields are
+written by the **relay**, and refreshing the relay needs a reprovision. After
+WP-1B such a guest reports `blind: false`, `transport: interactive-relay`,
+`payload.stale: true`, `relayFunctional.reason: probe-unsupported`: an honest,
+self-describing "partially repaired" state instead of a silent permanent one.
+
+### The frozen contract, in one place
+
+| id | contract | owner |
+|---|---|---|
+| **C1** | the boot-race window: `BOOT_RACE_WINDOW_MS = 90000` (the guard's own budget), anchor `readyAt` (the newest `vm-state:<name>:ready`), `live` iff inside the window **and nothing measured**, ladder bounded by `BOOT_RACE_ATTACH_MS = 24000 < 45000`, probes `force: true`, throttle `10000 < RELAY_UPGRADE_INTERVAL_MS = 60000`, **no new status value** | A + B |
+| **C2** | the payload-freshness repair: this build's guard bytes (`expectedGuardHash()`, `null` when it cannot say), **`cmd /c echo <chunk> >>file`** carriers over the existing SSH child (`ceil(32590/3)*4 = 43456` chars, 10 864 quads → 8 × 6 000 + decode + verify + register; the launcher is 4 × 6 000 + a short decoder), measure-then-write, **register gated on `taskPresent`**, `payloadRepair: true` GATED, **two budgets** (`RELAY_PAYLOAD_REPAIR_TIMEOUT_MS = 25 000`, `RELAY_REPAIR_TOTAL_MS = 28 000 < 30 000`), `staged ∈ {none,current,staged,incomplete,absent}` + `task` bool, a **second** marker line `CUA_PAYLOAD … task=0\|1` | A |
+| **C3** | `probe-unsupported` (TCP accepted, `RELAY_FN` sent, zero bytes back) as the sixth reason; `payload.skew` gains that producer; the frozen `PAYLOAD_SKEW_SEMANTICS` sentence amended in place | A + B |
+| **C4** | `facts-file-absent`: closed-set `desktop.errorCode`, language-free first-match classification, one-sentence `error` | A + B |
+| **C5** | `prefixSchemas` (always) vs `leaks` (offline residue); the pinned `status`/`leaking` expressions untouched | B |
+| **C6** | `payload.stale` truth table (true/false/null, "null is this build cannot say") | B |
+| **C7** | the blind-reason closed set becomes **seven**, `boot-race` appended last, decided after measured evidence and before the RELAY_DOWN/RELAY_BAD rule | B |
+| **C8** | identities: plugin `0.2.3`, guest `$scriptVersion 1.3.0`, marker key `guardSha256` | E (plugin) + C (guest) |
+| **C9** | the arithmetic as literals: `24000 < 45000`, `25000 < 30000`, `10000 < 60000`, `20000 <= 24000`, `RELAY_UPGRADE_WATCH_MS = 15000` unchanged | E |
+| **C10** | **no new environment variables** — the window mirrors a guest constant, so a knob would let the two sides disagree; tests reach it through function arguments | E |
+
+### The gate's arithmetic (a dropped row is a failure, not a new baseline)
+
+```
+HEAD (6ee70be)                      1309
+WP-6 needles                          +22   (12 winMcp, 9 index, 1 oemBoot — §4.1)
+WP-6 semantic blocks S7…S12            +6
+                                     ───
+                                    1337 assertion(s) across 24 file(s)
+
+mutations                            22 → 28 (M-23…M-28)
+
+PRE review (mimo)                     +1 needle (D12) +1 pair (M-29)
+                                     ───
+                                    1338 assertion(s) across 24 file(s)
+mutations                            29 (M-23…M-29)
+```
+
+The identity moved **once**, in one landing: `package.json` and
+`PLUGIN_VERSION` both `0.2.3`, with the gate's own needle and M-20's `find`
+moving in the same edit — and M-20's *replacement* stays the **previous**
+release (`0.2.2`), because the pair only goes red when the two files disagree.
+
+The suites at this landing (floors, because they keep growing): `relay-wedge`
+**26**, `modules-unit` **≥472** (445 at HEAD, **+27** — CB-1..CB-17, the D-9 update
+to six members, the D2-D4 repair checks and the PRE's CB-24), `windows-mcp-gate`
+**≥137** (124 at HEAD, **+13** — C-14..C-22 plus agent-6's task pin),
+`guest-patch` **≥29** (24 at HEAD, **+5** — D-11..D-14, including D-12's
+staged-measure anchor).
+
+These are **floors measured at 04:50**, not snapshots: `windows-mcp-gate` printed
+**142** four minutes later as another check landed in the same file, and the floors
+still hold (142 ≥ 137). What must not rot is the baseline, because the delta is the
+claim.
+
+**The baselines are first-hand, not remembered.** They were measured by checking
+HEAD `6ee70be` out into a detached worktree and running the four suites there
+(`relay-wedge 26` — unchanged by this round — `modules-unit 445`,
+`windows-mcp-gate 124`, `guest-patch 24`, all exit 0); the "at HEAD" numbers in
+the previous line of this paragraph used to say 427/99/20, which were the
+**session-5** baselines and had no business being compared with this round's
+totals.
+
+### Addendum — D2/D3/D4: what the LIVE repair round changed (and the docs now say)
+
+The first landing of WP-1B was correct in its geometry and wrong in three ways
+that only a guest could show. The shipped shape is below; the README's
+payload-repair section and the C2 row above carry it.
+
+| # | measured defect | shipped shape |
+|---|---|---|
+| **D2** | a `powershell -Command` child costs **≈2.9 s** on the live 2-vCPU guest: 12 of them ≈30 s, i.e. the whole doctor envelope, and `register` (the last step) never ran. The launcher repair's single `-EncodedCommand` was **36 667 characters** (13 721-char script → 36 592 base64 UTF-16LE → 36 667 with the `powershell … Bypass <marker> ` prefix — the live report's own arithmetic) and sshd refused it: `exec request failed on channel 0` (cmd.exe's line is 8 191) | the CARRIER became `cmd /c "echo <chunk> >><file>"` (≈0.15 s a child) while every DECISION stayed in PowerShell; the launcher is staged as **4 × 6 000-char chunks** (max child 6 056) + one short decoder, into `cua-relay-repair.b64`. The decoder is whitespace-insensitive (`-replace '\s',''`), which strips the space `echo` writes and the CRLF it appends — measured on the guest: `QUJD` + `REVG` → `ABCDEF`. Chunk 0 truncates with `>`, so there is still no resume state |
+| **D3** | **registration was conditional on the file.** `win-test` had the guard FILE and no `cua-mcp-host-guard` TASK; a file-only plan was `[measure]`, so the task could never be created — permanently | the plan takes BOTH measured facts: hash differs → measure + 8 appends + decode + verify + register (12); hash matches and task **absent or unknown** → measure + register (2); hash matches and task present → measure only (1). `taskPresent === true` is the only value that lets the plan stop, and the register step measures its OWN outcome (`task=`), which the payload exposes as `payload.task` (three-valued like `guardPresent`) |
+| **D4** | two phases, one envelope: the payload phase could outlive the launcher phase and the doctor's 30 s guard cut `register` | **`RELAY_REPAIR_TOTAL_MS = 28 000`** bounds the whole forced repair (launcher + payload), enforced between children; measured work **10 050 ms + 3 500 ms ≈ 13 550 ms**, the same total the worst-case formula gives (`4 × 2 900 + 13 × 150`), so ~2× margin and 2 000 ms of headroom under `WIN_MCP_FORCE_REPAIR_MS = 30 000` |
+
+One more thing moved with D3: the guest's `CUA_PAYLOAD` line now carries
+`task=0|1`, and its `stale=` is C6's table computed **on the guest** from the two
+comparable pairs (empty when no pair is comparable, which the harness reads as
+`null`). So the guest's own verdict and the harness's `payload.stale` agree by
+construction — the round's own "two sides must not disagree" rule, applied to the
+field that exists to catch disagreement.
+
+### What makes these claims revert-breaking
+
+* **22 needles, each naming its contract.** Every literal is frozen by §1 of the
+  SOL. TWO rows had to move their **spelling**, never their meaning; both are
+  flagged here rather than silently absorbed:
+  * **row 13** — §4.1 spells it `'boot-race',` with a comma, which cannot exist:
+    C7 appends the value **last** to `BLIND_REASONS`, and a last array element has
+    no trailing comma. The row is pinned at
+    `'repair-disabled',\n  'boot-race'\n])`, which proves both properties (the
+    value exists **and** it is last) and is stricter than the original — a rename
+    or a re-order both turn it red. M-25 follows the same literal.
+  * **row 19** — §4.1 says to check that `stale,` is unique and, if it is not,
+    to substitute `stale: stale === true,`. It is **not** unique: the re-register
+    comment in index.js says "(stale, but TRUE)", so the bare literal is
+    comment-satisfiable. The SOL's substitute would need the payload to stop using
+    shorthand, and index.js is B's file (this slot owns one line of it), so the row
+    is **indentation-qualified**: `    stale,` matches the payload property and has
+    no whitespace before the word in the prose. Same intent, no behaviour change,
+    and a comment can no longer satisfy it.
+  * **M-28 / S10** — §4.3 spells the gate `payloadRepair === true`; the
+    implemented guard is its inverse as an **early return**
+    (`if (payloadRepair !== true) return …`), which is the same decision and the
+    only form that can be ORDERED against the staging call. S10 asserts
+    "gate before `relayGuardStagePlan()` is invoked", and M-28 disables that
+    return — so the pair still proves exactly what the SOL wanted (an ungated
+    poll would stage 8 SSH children a minute).
+* **six semantic blocks, because a needle can be satisfied by a comment.** The
+  previous round had two needles satisfied by the old expression preserved
+  verbatim in a doc comment; S7–S12 read arithmetic, order and gating instead.
+  S12 even strips `#` comments first, because the guard step's own prose says
+  "this used to be an unconditional `Copy-Item`" — the raw `index()` found the
+  sentence before the code.
+* **six mutations, each judged by the GATE and each expected to be red for a
+  NAMED reason.** M-23 (`BOOT_RACE_ATTACH_MS = 24000` → `90000`) and M-28
+  (`payloadRepair === true` → `true`) expect `S7`/`S10` deliberately: those
+  reverts must be caught by the *arithmetic* and the *gating*, not by a string.
+* **the suites, not this file, own their totals** — the round's two exact
+  numbers are `1338` and `29/29`.
+
+### Addendum — the PRE review's vacuous pin (and why the count moved by one)
+
+The PRE (mimo) review proved, on a scratch copy, that **deleting the staged-side
+measure** in `Step 'relay-guard-task'`
+
+```powershell
+$stagedHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant()
+```
+
+left the gate **GREEN at 1337** and `tests/guest-patch.mjs` **passing**. Two
+anchors were vacuous for exactly this line:
+
+* **no needle at all** — only the OEM-source side (`$sourceHash`) had a row, so the
+  staged measurement was unpinned;
+* **S12 pointed at the INITIALISATION**, not the measurement: it searched for
+  `'$stagedHash = '`, which matches `$stagedHash = ''` two lines above the real
+  call. The order assertion (`measure < compare < Copy-Item`) therefore held on a
+  file whose measurement had been deleted — measured, not argued: with the line
+  replaced the old anchor still sat at 264 while the measuring assignment was −1.
+
+**The consequence is the WP-1A defect itself, back with zero red:** with the
+measure gone, `elseif (-not $stagedHash) { $copyGuard = $true }` is always true, so
+the guard is copied on **every** provisioning pass — write-always, which is what
+this round exists to end.
+
+The fix is three-part, and each part is what a different layer needs:
+
+| layer | before | after |
+|---|---|---|
+| **needle** (D12) | — | `['$stagedHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant()', 1]` — the CALL, because the variable is assigned three times in the step (`''`, the measure, the catch) |
+| **mutation** (M-29) | — | the exact revert: the measure line becomes `$stagedHash = ''` (init and catch intact, which is what kept it invisible), expect `× $stagedHash = (Get-FileHash` |
+| **S12** | `indexOf('$stagedHash = ')` → 264 (the init) | `indexOf('$stagedHash = (Get-FileHash -LiteralPath $guardScript')` → the measuring assignment; a deleted measure reports **−1** |
+
+Proof on a copy (the scratch scenario, re-run after the fix): the judge exits **1**
+and names BOTH layers — `0/1 × $stagedHash = (Get-FileHash …` and `S12 … the STAGED
+measure — Get-FileHash -LiteralPath $guardScript (-1) must precede its comparison
+(926)`. `--mutations` reports **29/29 red, 0 false-green**.
+
+**Handoff CLOSED (was: agent-7's D-12 anchor).** The note in the previous revision
+said `tests/guest-patch.mjs` D-12 still anchored the initialisation (`staged@1071`).
+The tree has since moved: the suite now reads
+`staged measure -> compare -> one guarded copy (measure@1179 (init@1071)
+compare@1813 copy@1900)`, i.e. it names the **measure** and reports the init beside
+it, and it grew to 29 checks. Gate and suite now say the same thing in their own
+words, so nothing is outstanding for agent-7 on this point.
+
+### The deviation register (what landed differently from the plan, and why)
+
+| # | the plan said | what landed | why it is the better answer |
+|---|---|---|---|
+| **D7** | the verdict for a stale payload must not read as healthy | **`status` stays `ok`** for `probe-unsupported`; the re-create instruction is carried by the **verdict sentence in both the `unresponsive` and the `ok` branch** (`windowsStalePayloadClause`), plus `relayFunctional.reason`, `payload.skew` and `payload.stale`. `relayFunctionalVerdict()` sets `payloadFact` and suppresses `unresponsive` for it | `status` answers the LANE question, and the lane is genuinely up. Without the deviation, a live guest flickered `ok`/`unresponsive` call-to-call (the live report's D7) because `relayFunctional` is per-call. The cost is stated in the README: a consumer reading only `status` sees `ok`, so read the sentence or `payload.stale` |
+| **CI** | `coldboot-sol.md` §3 WP-6 item 6: `.github/workflows/prebuild-gates.yml` **untouched** | the workflow's **count strings** were updated four times (26/472/137/29 today) | the SOL's reason for leaving it alone was that it "already runs both gate modes" — still true, nothing structural changed. But its echo lines state suite sizes as *floors*, and after this round they said `≥445/≥124/≥27` while the suites printed 472/137/29: a CI summary that understates the suite it claims to summarise is the same class of stale claim as a hash a guest cannot produce. The deviation is **strings only** — no step, no trigger, no wiring |
+
+### What this section does not claim
+
+* **Which measurements came from which phase, stated plainly.** This slot (E) ran
+  the **repository** side only. The **live** phase did happen, in two rounds, and
+  neither is this slot's to claim or to hide:
+  * **Round 1 — the verifier's live run (`2026-11-21 01:15–01:53`).** `win-test`
+    was driven read-only (doctor rows for WP-3A/3B, WP-4A/4B, WP-5), cold-booted
+    **twice** (01:27 un-guarded, 01:46 after the guard file existed), and repaired
+    **once**: the guard file `C:\ProgramData\cua\cua-relay-guard.ps1` (32 590 B)
+    was written by the harness repair path at **01:34** — that write IS the test.
+    Its verdicts are honest failures: WP-1B **FAIL** (`forcedRepair` carries no
+    `payload` block, so `staged` is unobservable), WP-2A/2B **NOT OBSERVED** (the
+    window predicate was never reachable: SSH answered ~23 s before the dial and
+    the relay was already up), and it exposed D5/D6/D7 before D2/D3/D4 were fixed.
+    Evidence: `.live-verify/REPORT-live-verification.md` and the raw
+    `repair-after-raw.json`, `timeline-coldboot{1,2}.jsonl`, `suite-*.txt` beside it.
+  * **Round 2 — agent-5's post-fix verification.** The D2/D3/D4 fixes were measured
+    *after* that report, on the same `win-test`, by agent-5: the `cmd /c` child at
+    **≈0.15 s**, the `QUJD` + `REVG` → `ABCDEF` decode, and the two-phase
+    **10 050 + 3 500 ms** repair. Those figures are quoted here with their
+    provenance (a live run this slot did not perform) because the README's
+    payload-repair section explains the carrier with them; they are not archive
+    files in this repository, and a reader who needs the raw output should ask
+    agent-5 for the run, not treat this section as its evidence.
+  * **What is still unverified by anybody:** the fresh reprovision (§6.2) and the
+    full §6.3 acceptance on a new computer. `win-test` cannot report
+    `relayFunctional.measured: true` or `desktop.measured: true` — its relay
+    predates the token — so those two fields have only ever been seen `false` on a
+    live guest.
+* **The payload repair stages the guard only.** Relay/firstboot staging is out of
+  scope by arithmetic (32/47 chunks cannot fit the 30 s forced-repair envelope),
+  and `payload.stale: true` is the honest answer for that case.

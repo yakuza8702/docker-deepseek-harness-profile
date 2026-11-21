@@ -44,7 +44,7 @@ const { values } = parseArgs({
     root: { type: 'string', default: path.resolve(import.meta.dirname, '..') },
     quiet: { type: 'boolean', default: false },
     // E-4 (R10/C15): the mutation harness. A SEPARATE invocation, never part of
-    // the default run — it copies the tree and spawns this very file 22 times.
+    // the default run — it copies the tree and spawns this very file 29 times.
     mutations: { type: 'boolean', default: false }
   }
 })
@@ -86,26 +86,34 @@ function pickIn(rootDir, name) {
  *   red  + some other failure                                     => FALSE GREEN (fails the run)
  *   exit 0                                                        => FALSE GREEN (fails the run)
  *
- * THE TABLE IS FROZEN IN SIZE (22 rows: §7.3's 20 plus JE1's M-21/M-22, which
- * cover the two guest markers that had neither a needle nor a pair).
+ * THE TABLE IS FROZEN IN SIZE (29 rows: §7.3's 20, JE1's M-21/M-22, the
+ * cold-boot round's M-23..M-28, and M-29 from the PRE review — the staged-side
+ * measure that had no row at all).
  *
  * THIRTEEN ROWS CARRY `all: true` (replace every occurrence, require at least
- * one). Eleven of them replace a *word* that is also documentation in its file —
- * M-02 `child-wedged`, M-04 `lastSuccessfulCallAgeMs`, M-05 `refreshMs`, M-07
- * `relayFunctionalProbeProgram(`, M-08 `describeRepairRecord(`, M-09
- * `perCallTimeoutMs`, M-12 `relay-unresponsive`, M-13 `desktopWarning`, M-15
- * `typeTextFix`, M-16 `created_dir`, M-17 `desktop-token-probe` — so a
- * single-occurrence substitution would leave a second hit (a docstring, a
- * test-facing field, a log line) and the needle would stay green. Risk (b) from
- * WP-A's report, absorbed here instead of rediscovered later.
+ * one), and the reasons are two kinds, not one:
  *
- * The other two, M-21/M-22, are `all: true` for MULTIPLICITY rather than for
- * documentation: `savePathFix` occurs 13 times and `desktopProbe` 8 times in
- * `cua-firstboot.ps1`, so no single occurrence is THE marker — a marker is the
- * whole family of rows the doctor reads, and a rename has to take all of them.
- * Their `replace` values deliberately do NOT contain the needle as a substring
- * (`savePathPatch`, `desktopRun`): `desktopProbeMarker` would have left
- * `desktopProbe` matching and the pair would have been a false green.
+ *   • TEN replace a *word* that is also documentation in its file — M-02
+ *     `child-wedged`, M-04 `lastSuccessfulCallAgeMs`, M-05 `refreshMs`, M-07
+ *     `relayFunctionalProbeProgram(`, M-08 `describeRepairRecord(`, M-09
+ *     `perCallTimeoutMs`, M-12 `relay-unresponsive`, M-13 `desktopWarning`, M-15
+ *     `typeTextFix`, M-16 `created_dir` — so a single-occurrence substitution
+ *     would leave a second hit (a docstring, a test-facing field, a log line) and
+ *     the needle would stay green. Risk (b) from WP-A's report, absorbed here
+ *     instead of rediscovered later.
+ *   • TWO (M-21 `savePathFix`, M-22 `desktopProbe`) are `all: true` for
+ *     MULTIPLICITY: 13 and 8 occurrences in `cua-firstboot.ps1`, because a marker
+ *     is the whole family of rows the doctor reads and a rename takes all of
+ *     them. Their `replace` values deliberately do NOT contain the needle as a
+ *     substring (`savePathPatch`, `desktopRun`) — `desktopProbeMarker` would have
+ *     left `desktopProbe` matching and the pair would have been a false green.
+ *   • ONE (M-27 `probe-unsupported`) is multi-site for the cold-boot round: the
+ *     reason lives at the producer (the python program), in the frozen
+ *     `RELAY_FN_REASONS` array and in prose, and RC-3 is exactly what a partial
+ *     rename restores.
+ *
+ * M-17 (`desktop-token-probe`) stays a single-occurrence row: its literal is the
+ * `Step '…'` header, which occurs once.
  *
  * Where a unique literal exists, the row spells the LONGEST one the file offers
  * (`pid = self._kill_wedged_child(proc, age_ms)`, `'RELAY_FN'`,
@@ -113,7 +121,7 @@ function pickIn(rootDir, name) {
  * check has one answer, not a choice between a line and its echo.
  *
  * THE RUNNER IS NEVER A MUTATION TARGET. A mutated runner would be the process
- * judging its own mutation, so every one of the twenty-two rows mutates a
+ * judging its own mutation, so every one of the twenty-nine rows mutates a
  * PACKAGE file and spawns an UNMUTATED judge from the copy: each verdict comes
  * from the same gate CI runs, and no pair can pass by breaking its own judge.
  */
@@ -292,12 +300,12 @@ const MUTATIONS = Object.freeze([
   {
     id: 'M-20',
     file: 'index.js',
-    find: "PLUGIN_VERSION = '0.2.2'",
+    find: "PLUGIN_VERSION = '0.2.3'",
     // THE REPLACEMENT IS DELIBERATELY THE PREVIOUS RELEASE, not the current one:
-    // M-20 has to make the two files DISAGREE, so this `0.2.1` is the mutation's
+    // M-20 has to make the two files DISAGREE, so this `0.2.2` is the mutation's
     // payload, not a claim about this build. A "stale version" sweep that
-    // rewrote it to 0.2.2 would disarm the pair silently — do not.
-    replace: "PLUGIN_VERSION = '0.2.1'",
+    // rewrote it to 0.2.3 would disarm the pair silently — do not.
+    replace: "PLUGIN_VERSION = '0.2.2'",
     expect: 'WP-6.6',
     why: 'one identity, two files: half a bump makes "the fix is not in your plugin" a guess'
   },
@@ -324,6 +332,87 @@ const MUTATIONS = Object.freeze([
     all: true,
     expect: '× desktopProbe',
     why: 'the desktop-token probe is the only proof the desktop can see a session; an orphaned marker key reports it as never run'
+  },
+  /* ---- CB / WP-6 (§4.3): the cold-boot round's six reverts ---- */
+  {
+    // Judged by S7, not by a needle: the ladder's SIZE is an arithmetic fact, and
+    // a string row could be satisfied by the constant being declared and unused.
+    id: 'M-23',
+    file: 'win-mcp.js',
+    find: 'BOOT_RACE_ATTACH_MS = 24000',
+    replace: 'BOOT_RACE_ATTACH_MS = 90000',
+    expect: 'S7',
+    why: 'the ladder must fit inside the 45 s handshake; an equal-window ladder burns the attach and still lands blind'
+  },
+  {
+    // The revert that turns every genuinely-dead relay into a 24 s attach.
+    id: 'M-24',
+    file: 'win-mcp.js',
+    find: 'if (bootWindow.live !== true) ',
+    replace: 'if (false) ',
+    expect: "× if (bootWindow.live !== true)",
+    why: 'a ladder outside the window is a 24 s delay on a relay that is simply off'
+  },
+  {
+    // A closed set read by two surfaces (BLIND_REASONS + BLIND_ACTIONS): a rename
+    // is the silent break, so the row pins the array entry.
+    id: 'M-25',
+    file: 'index.js',
+    // The find follows row 13's corrected spelling (see the row's comment): the
+    // value is the LAST array element, so it has no trailing comma to quote.
+    find: "'boot-race'\n])",
+    replace: "'boot-slow'\n])",
+    expect: "× 'repair-disabled',",
+    why: 'the reason is a closed set; a rename leaves the payload naming a value no consumer knows'
+  },
+  {
+    // Judged by S11: this is the EXACT revert that restores the reported defect
+    // (19 names reported as leaks while the bridge is online).
+    id: 'M-26',
+    file: 'index.js',
+    find: 'const leaks = online === true ? [] : prefixSchemas',
+    replace: 'const leaks = prefixSchemas',
+    expect: 'S11',
+    why: 'restoring the full prefix surface online is RC-5'
+  },
+  {
+    // all: true: the reason occurs at the producer, in the constant and in prose.
+    // A value outside the closed set is normalized to no-evidence (RC-3 returns).
+    id: 'M-27',
+    file: 'win-mcp.js',
+    find: "'probe-unsupported'",
+    replace: "'probe-unknown'",
+    all: true,
+    expect: '× export const RELAY_FN_REASONS',
+    why: 'a reason the normaliser does not know is downgraded to no-evidence, which is RC-3 again'
+  },
+  {
+    // Judged by S10 (gating, not spelling): this is the revert that lets the
+    // 15 s poll stage a 43 KB file every minute. §4.3 spells the find
+    // `payloadRepair === true`; the implemented gate is its inverse as an EARLY
+    // RETURN (`if (payloadRepair !== true) return …`), which is the same decision
+    // and the only form S10 can order against the staging call. Disabling it is
+    // the revert; the spelling is the guard's own.
+    id: 'M-28',
+    file: 'win-mcp.js',
+    find: 'if (payloadRepair !== true) return',
+    replace: 'if (false) return',
+    expect: 'S10',
+    why: 'an ungated stage makes the poll push 8 SSH children a minute for the life of the machine'
+  },
+  {
+    // THE VACUOUS-PIN REVERT (PRE/mimo, measured on this tree): delete the staged
+    // measure and the guard is copied on every provisioning pass, because
+    // `-not $stagedHash` then always holds. Before this row NOTHING went red —
+    // the gate stayed at 1337 and guest-patch still passed. The replacement keeps
+    // the variable and the catch intact (so the step still parses and the init
+    // line still exists), which is precisely what made the deletion invisible.
+    id: 'M-29',
+    file: 'cua-firstboot.ps1',
+    find: '$stagedHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant()',
+    replace: "$stagedHash = ''",
+    expect: '× $stagedHash = (Get-FileHash',
+    why: 'without the staged-side measure the guard is re-copied on every pass (-not $stagedHash always true) — the WP-1A defect, invisible to every row before M-29'
   }
 ])
 
@@ -2027,7 +2116,52 @@ const NEEDLES = {
     ['export function describeRepairRecord(', 1],
     // B13 — the per-call budget: the only reason a 200 ms test beats the 60 s
     // default, and the reason a slow call is not reported as a dead attach.
-    ['perCallTimeoutMs', 1]
+    ['perCallTimeoutMs', 1],
+    // =====================================================================
+    // CB (cold-boot round, WP-6) — THE TRANSPORT HALF: the boot-race window,
+    // the sixth probe reason, the payload guard, and the absent-facts code.
+    //
+    // These are §4.1's rows 1-12, and every literal is FROZEN by §1 of
+    // `coldboot-sol.md`: a writer who rewords one is proposing a contract
+    // change, and this block is where that shows up. The MIN values are the
+    // multi-site rows — a declaration without its consumer is exactly the
+    // "declared but unused" revert S7 and the wiring rows exist to catch.
+    // ---------------------------------------------------------------------
+    // 1-3: THE WINDOW ITSELF. 90000 mirrors the guard's own budget (it waits
+    // up to 90 s for an Active console session); a different number here would
+    // let the two sides disagree about when a lane is late. The offsets are
+    // frozen, ascending and their last value must fit inside the attach budget
+    // (S7 reads all three numbers out of the file).
+    ['export const BOOT_RACE_WINDOW_MS = 90000', 1],
+    ['export const BOOT_RACE_ATTACH_MS = 24000', 1],
+    ['export const BOOT_RACE_PROBE_OFFSETS_MS = Object.freeze([0, 8000, 20000])', 1],
+    // 4: the PURE function. `source`, `live` and `sinceReadyMs` are decided
+    // here and nowhere else, so the doctor cannot invent a window.
+    ['export function bootRaceFacts(', 1],
+    // 5: THE FIELD HAS TWO SITES (min 2) — the client's doctor facts and the
+    // payload that spreads them. One site alone means the doctor reports a
+    // window the transport never computed (or the reverse).
+    ['bootRace,', 2],
+    // 6: THE LADDER'S DOOR. Without this comparison every genuinely-dead relay
+    // pays a 24 s attach ladder before the verdict (M-24 applies this revert).
+    ['if (bootWindow.live !== true) ', 1],
+    // 7: THE THROTTLE, NOT THE TIMER. The pure guard takes 10 s inside a live
+    // window; the 15 s interval and its teardown are untouched (JURY2-CO1).
+    ['BOOT_RACE_UPGRADE_INTERVAL_MS', 2],
+    // 8-9: THE SIXTH REASON. The constant is the closed set the normaliser
+    // enforces, `'probe-unsupported'` occurs at the producer (python) and in
+    // that constant — hence min 2 for the reason and 1 for the array.
+    ['export const RELAY_FN_REASONS = Object.freeze([\'\', \'child-silent\', \'child-eof\', \'session-busy\', \'no-evidence\', \'probe-unsupported\'])', 1],
+    ["'probe-unsupported'", 2],
+    // 10-11: THE GUARD'S BYTES ARE THIS BUILD'S. The sources list is the same
+    // two-layout probe the relay hash uses; expectedGuardHash() returns null
+    // (never '' and never 'mismatch') on a build without the docker/ tree.
+    ['export const GUARD_EXPECTED_HASH_SOURCES', 1],
+    ['export function expectedGuardHash(', 1],
+    // 12: THE ABSENT-FACTS CODE. A closed set on every desktop answer; the
+    // classification is language-free because a translated Windows localises
+    // `The system cannot find the path specified`.
+    ["export const DESKTOP_FACTS_ABSENT = 'facts-file-absent'", 1]
   ],
   oemAnswer: [
     ['<unattend xmlns="urn:schemas-microsoft-com:unattend">', 1],
@@ -2287,7 +2421,28 @@ const NEEDLES = {
     // D7 — the probe's task name, and D8 the retry marker on its character
     // post: the two halves a revert would drop independently.
     ['cua-desktop-probe', 1],
-    ['TYPE_TEXT_RETRY', 1]
+    ['TYPE_TEXT_RETRY', 1],
+    // D11 (CB, WP-1A) — THE MARKER'S NEW IDENTITY FIELD. `guardSha256` is the
+    // top-level key a later provisioning pass (and the harness's own staging
+    // decision) compares, so its assignment is the one line that says the marker
+    // now carries the guard's identity instead of dating the payload by hand.
+    ['$state.guardSha256 = ', 1],
+    // D12 (PRE/mimo, WP-1A) — THE STAGED-SIDE MEASURE, which was a VACUOUS PIN.
+    //
+    // Measured defect: deleting `$stagedHash = (Get-FileHash -LiteralPath
+    // $guardScript -Algorithm SHA256)…` left the gate GREEN at 1337 and
+    // `tests/guest-patch.mjs` PASSING. Nothing targeted it — S12's
+    // `indexOf('$stagedHash = ')` matched the INIT (`$stagedHash = ''`) two lines
+    // above, and only the OEM-SOURCE side (`$sourceHash`) had a row. With the
+    // measure gone, `elseif (-not $stagedHash) { $copyGuard = $true }` is always
+    // true, so the guard is copied on EVERY provisioning pass — the exact WP-1A
+    // defect, back with zero red.
+    //
+    // The literal is the GET-FILEHASH CALL on the staged path, not the variable
+    // name: the variable is assigned three times in this step (`''`, the measure,
+    // and the catch), so only the call distinguishes the measurement from the
+    // initialisation. M-29 applies the revert.
+    ['$stagedHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant()', 1]
   ],
   /**
    * WP-1.7: THE RELAY GUARD — ONE COPY OF "IS THE RELAY LISTENING", AND THE
@@ -3002,11 +3157,12 @@ const NEEDLES = {
     // WP-7.1/WP-8.1: the RELEASE LITERAL tracks the identity — this is the one
     // pre-existing needle whose payload changes with a version bump (the pair
     // still has to agree: the cross-file assertion below compares both files, so
-    // a bump in one alone stays red). 0.2.2 is the session-5 release (WP-A..WP-E:
-    // the functional probe, the wedge watchdog, the budget ladder, [DEGRADED],
-    // desktopWarning, the fourth doctor status and the three guest patch steps);
-    // 0.2.1 shipped WP-1..WP-8 before it.
-    ["export const PLUGIN_VERSION = '0.2.2'", 1],
+    // a bump in one alone stays red). 0.2.3 is the cold-boot round (CB/WP-1..WP-6:
+    // the 90 s boot-race window, the sixth probe reason, the payload-freshness
+    // staging and `payload.stale`, the absent-facts code and the narrowed
+    // `leaks`); 0.2.2 shipped the session-5 package (WP-A..WP-E), and 0.2.1 the
+    // WP-1..WP-8 round before it.
+    ["export const PLUGIN_VERSION = '0.2.3'", 1],
     ['pluginVersion: PLUGIN_VERSION', 1],
     // WP-3.4/C4 — A HIDDEN BRIDGE INVENTORIES NOTHING. Nineteen names used to come
     // back from a reveal that had FAILED (offline, grant off, wrong target), which
@@ -3059,7 +3215,54 @@ const NEEDLES = {
     ['desktopWarning', 2],
     // C13 — the unmeasured branch's own condition: `measured:false` is UNKNOWN,
     // and S5 asserts it comes FIRST.
-    ['measured !== true', 1]
+    ['measured !== true', 1],
+    // =====================================================================
+    // CB (cold-boot round, WP-6) — THE DOCTOR HALF: the seventh blind reason,
+    // the offline `leaks` residue, the payload truth fields.
+    //
+    // §4.1's rows 13-21. `leaks` narrowing is the round's ONE behaviour change
+    // (C5) and it is deliberately the smallest possible expression change: the
+    // pinned `status`/`leaking` expressions are NOT touched, and S11 double-pins
+    // that fact.
+    // ---------------------------------------------------------------------
+    // 13-14: THE SEVENTH REASON. The array entry and the action sentence are
+    // two different strings on purpose: a reason with no action is a verdict the
+    // model cannot act on (M-25 renames the reason and the needle catches it).
+    //
+    // §4.1's row 13 is spelled `'boot-race',` — WITH A COMMA. That literal can
+    // never exist: C7 says the value is appended LAST to BLIND_REASONS, and a
+    // last array element carries no trailing comma. The row is therefore pinned
+    // at the pair that proves BOTH properties the SOL wanted (the value exists,
+    // and it is last: it follows 'repair-disabled' and closes the array). This is
+    // a deviation in SPELLING only, and it is stricter than the original — a
+    // rename or a re-order both turn it red.
+    ["'repair-disabled',\n  'boot-race'\n])", 1],
+    ["'boot-race': 'next: nothing", 1],
+    // 15: THE CLASSIFIER'S OWN DOOR — the ONLY branch that may read the window,
+    // and it sits below the measured rules (S8 asserts the order).
+    ['if (transportFacts?.bootRace?.live === true', 1],
+    // 16-18: THE PREFIX SURFACE vs THE RESIDUE (C5). `prefixSchemas` is always
+    // the raw 19-name surface; `leaks` is empty whenever the bridge is online.
+    // Three literals because they are three different syntactic roles, and S11
+    // reads their order.
+    ['const prefixSchemas = names.filter((name) => name.startsWith(TOOL_PREFIX))', 1],
+    ['const leaks = online === true ? [] : prefixSchemas', 1],
+    ['prefixSchemas,', 1],
+    // 19: `payload.stale` — the field RC-1 needed. §4.1 says to verify this row's
+    // uniqueness before landing and, if `stale,` is not unique, to substitute
+    // `stale: stale === true,`. IT IS NOT UNIQUE here: index.js's re-register
+    // comment says "(stale, but TRUE)", so the bare literal is comment-satisfiable
+    // — the very weakness S7-S12 exist for. The substitution the SOL offers would
+    // require the payload to stop using shorthand, and index.js is B's file (this
+    // slot owns one line of it). So the row is INDENTATION-QUALIFIED: the payload
+    // line is `    stale,`, the prose has no whitespace before the word, and
+    // `\s+stale,` can only match the code. Same intent, no behavior change, no
+    // comment can satisfy it.
+    ['    stale,', 1],
+    // 20-21: the guard pair on the payload, and the desktop error CODE (the
+    // free-text `error` keeps its semantics; the code is what a consumer reads).
+    ['expectedGuardHash:', 1],
+    ['errorCode,', 1]
   ],
   proxy: [
     ['export function prefixRootPaths(text, prefix)', 1],
@@ -4403,6 +4606,263 @@ function frozenListOf(source, name) {
   }
 }
 
+/* ====================================================================== *
+ * CB / WP-6 (§4.2) — THE SIX SEMANTIC BLOCKS S7..S12, one per contract that a
+ * needle cannot express.
+ *
+ * The round's own history is why they exist: two needles in the previous round
+ * were satisfied by the OLD expression preserved verbatim inside a doc comment
+ * (`tools/check-cua-vm.mjs:2860-2872`). A literal can be quoted by prose; an
+ * ORDER, an ARITHMETIC and a GATING cannot. Every block below therefore reads
+ * STRUCTURE — indices, parsed numbers, frozen arrays — and strips comments
+ * first wherever the file it reads is prose-heavy.
+ * ====================================================================== */
+
+/**
+ * S7 — THE BOOT WINDOW'S ARITHMETIC AND ITS WIRING (C1, C9).
+ *
+ * Four numbers decide whether a boot race is modelled or invented: the window
+ * (90 000, mirroring the guard's own budget), the attach ladder (24 000), the
+ * probe offsets ([0, 8000, 20000]) and the in-window throttle (10 000). The
+ * budget arithmetic is the part a needle cannot see:
+ *
+ *     last(offsets) <= BOOT_RACE_ATTACH_MS < WIN_MCP_ATTACH_TIMEOUT_MS
+ *     BOOT_RACE_UPGRADE_INTERVAL_MS < RELAY_UPGRADE_INTERVAL_MS
+ *
+ * A ladder that does not fit inside the 45 s handshake burns the attach and
+ * still lands blind (M-23 applies exactly that revert). A declared-but-unused
+ * throttle is the other half: the constant must reach the guard call site, and
+ * the ladder's probes must pass `force: true` or the 10 s probe cache makes the
+ * whole ladder decorative.
+ */
+{
+  total += 1
+  const mcp = textOf('win-mcp.js')
+  const indexText = textOf('index.js')
+  const num = (raw) => (raw === null || raw === undefined ? null : Number(String(raw).replace(/_/gu, '')))
+  const offsetsMatch = /export const BOOT_RACE_PROBE_OFFSETS_MS = Object\.freeze\(\[([^\]]*)\]\)/u.exec(mcp)
+  const offsets = offsetsMatch === null
+    ? null
+    : offsetsMatch[1].split(',').map((part) => num(part.trim())).filter((value) => value !== null)
+  const attach = num(/export const BOOT_RACE_ATTACH_MS = ([\d_]+)/u.exec(mcp)?.[1] ?? null)
+  const windowMs = num(/export const BOOT_RACE_WINDOW_MS = ([\d_]+)/u.exec(mcp)?.[1] ?? null)
+  const upgrade = num(/export const BOOT_RACE_UPGRADE_INTERVAL_MS = ([\d_]+)/u.exec(mcp)?.[1] ?? null)
+  const relayUpgrade = num(/export const RELAY_UPGRADE_INTERVAL_MS = ([\d_]+)/u.exec(mcp)?.[1] ?? null)
+  const hostAttach = num(/const WIN_MCP_ATTACH_TIMEOUT_MS = ([\d_]+)/u.exec(indexText)?.[1] ?? null)
+  // TWO SITES, TWO FACTS: the DOOR that closes the ladder outside the window,
+  // and the LADDER FUNCTION whose probes must be forced. The ladder is its own
+  // function (it sleeps between rungs), so slicing from the door would measure
+  // the wrong region — that is how a rewrite moves the probe out of the slice and
+  // the assertion goes quietly green.
+  const doorAt = mcp.indexOf('if (bootWindow.live !== true) ')
+  const ladderAt = mcp.indexOf('async function bootRaceProbeLadder(')
+  const ladderEnd = ladderAt === -1 ? -1 : mcp.indexOf('\n}', ladderAt)
+  const ladderSlice = ladderAt === -1 ? '' : mcp.slice(ladderAt, ladderEnd === -1 ? ladderAt + 4000 : ladderEnd)
+  const ascending = Array.isArray(offsets) && offsets.length > 0 && offsets.every((value, position) => position === 0 || offsets[position - 1] < value)
+  const offsetsFit = Array.isArray(offsets) && offsets.length > 0 && attach !== null && offsets[offsets.length - 1] <= attach
+  const attachFits = attach !== null && hostAttach !== null && attach < hostAttach
+  const upgradeFits = upgrade !== null && relayUpgrade !== null && upgrade < relayUpgrade
+  const windowIsNinety = windowMs === 90000
+  const forceInsideLadder = ladderSlice.includes('force: true')
+  // THE THROTTLE IS WIRED WHEN THE CONSTANT IS USED NEXT TO `intervalMs`, in
+  // either shape — inline (`intervalMs: … ? BOOT_RACE_UPGRADE_INTERVAL_MS : …`)
+  // or through a local (`const intervalMs = … BOOT_RACE_UPGRADE_INTERVAL_MS …`;
+  // `shouldUpgradeToRelay({ …, intervalMs })`). Each use is checked with 300
+  // characters of context, because a declared-but-unused constant is the exact
+  // revert this row exists for.
+  const upgradeUses = [...mcp.matchAll(/BOOT_RACE_UPGRADE_INTERVAL_MS/gu)].map((match) => match.index)
+  const throttleWired = upgradeUses.length >= 2
+    && upgradeUses.slice(1).some((at) => /intervalMs/u.test(mcp.slice(Math.max(0, at - 300), at + 300)))
+  const ok = ascending && offsetsFit && attachFits && upgradeFits && windowIsNinety
+    && doorAt !== -1 && ladderAt !== -1 && forceInsideLadder && throttleWired
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   S7 the boot window is 90000, its offsets are frozen/ascending (${JSON.stringify(offsets)}), last ${offsets[offsets.length - 1]} <= attach ${attach} < handshake ${hostAttach}, throttle ${upgrade} < ${relayUpgrade}, and the ladder passes force:true (C1/C9)`)
+  } else {
+    failures += 1
+    missing.push(`S7: the boot-race window's arithmetic/wiring is broken — window=${windowMs} (90000 required), offsets=${JSON.stringify(offsets)} (frozen, ascending), last<=attach: ${offsetsFit}, attach(${attach}) < handshake(${hostAttach}): ${attachFits}, throttle(${upgrade}) < relayUpgrade(${relayUpgrade}): ${upgradeFits}, the door (if (bootWindow.live !== true)) present: ${doorAt !== -1}, the ladder function present: ${ladderAt !== -1}, force:true inside it: ${forceInsideLadder}, the 10 s throttle wired into the upgrade guard: ${throttleWired} — a ladder that does not fit the handshake burns the attach and still lands blind (C1/C9)`)
+    console.log('  FAIL S7 boot-race window arithmetic')
+  }
+}
+
+/**
+ * S8 — THE CLASSIFIER'S ORDER (C7): measured evidence outranks the window.
+ *
+ * `classifyBlindReason` is a rule ladder and its ORDER is the contract: a
+ * measured `session=0` / `hash=''` (rules 3-4) must be decided BEFORE the boot
+ * window is consulted, or a measured dead guest is relabelled "wait a bit" —
+ * the same lie the window exists to stop, with the sign flipped. `'boot-race'`
+ * in turn must come before the RELAY_DOWN/RELAY_BAD rule (rule 8), because it
+ * IS that rule's case with an anchor. Comments are stripped: the rule table is
+ * documented in prose right above the code.
+ */
+{
+  total += 1
+  const indexText = textOf('index.js')
+  const start = indexText.indexOf('function classifyBlindReason(')
+  const end = start === -1 ? -1 : indexText.indexOf('\nfunction ', start + 1)
+  const body = stripJsComments(start === -1 ? '' : indexText.slice(start, end === -1 ? indexText.length : end))
+  const measuredAt = body.indexOf('measuredSession === 0') !== -1
+    ? body.indexOf('measuredSession === 0')
+    : body.indexOf("return 'no-interactive-session'")
+  const bootRaceAt = body.indexOf("'boot-race'")
+  const downAt = body.indexOf("if (status === 'RELAY_DOWN' || status === 'RELAY_BAD')")
+  const ok = measuredAt !== -1 && bootRaceAt !== -1 && downAt !== -1
+    && measuredAt < bootRaceAt && bootRaceAt < downAt
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S8 classifyBlindReason ranks MEASURED evidence above "boot-race", and "boot-race" above the RELAY_DOWN/RELAY_BAD rule (C7)')
+  } else {
+    failures += 1
+    missing.push(`S8: index.js classifyBlindReason() must order measured-session evidence (${measuredAt}) < 'boot-race' (${bootRaceAt}) < the RELAY_DOWN|RELAY_BAD rule (${downAt}) — the window may never be consulted before measured evidence, or a measured dead guest is relabelled "wait a bit" (C7)`)
+    console.log('  FAIL S8 blind-reason order')
+  }
+}
+
+/**
+ * S9 — THE PROBE'S PRODUCER ORDER AND THE SIX-MEMBER SET (C3).
+ *
+ * `probe-unsupported` is only honest if the program can PROVE it was talking to
+ * an old relay: connected, `RELAY_FN` sent, zero bytes back. The flags must be
+ * set in that order (and outside the `try`, so the `except` cannot erase them),
+ * and the reason must be in the closed set — a reason the normaliser does not
+ * know is silently downgraded to `no-evidence`, which is exactly RC-3 again.
+ */
+{
+  total += 1
+  const mcp = textOf('win-mcp.js')
+  const programAt = mcp.indexOf('export function relayFunctionalProbeProgram(')
+  const connectedAt = mcp.indexOf('_connected = True', programAt === -1 ? 0 : programAt)
+  const sentAt = mcp.indexOf("sendall(b'RELAY_FN')", programAt === -1 ? 0 : programAt)
+  const reasonAt = mcp.indexOf("'probe-unsupported'", programAt === -1 ? 0 : programAt)
+  const reasonsMatch = /export const RELAY_FN_REASONS = Object\.freeze\(\[([^\]]*)\]\)/u.exec(mcp)
+  const reasons = reasonsMatch === null ? null : [...reasonsMatch[1].matchAll(/'([^']*)'/gu)].map((match) => match[1])
+  const six = reasons !== null && reasons.length === 6 && reasons[5] === 'probe-unsupported'
+  const ok = programAt !== -1 && connectedAt !== -1 && sentAt !== -1 && reasonAt !== -1
+    && connectedAt < sentAt && sentAt < reasonAt && six
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   S9 the functional program proves probe-unsupported in order (_connected < RELAY_FN sent < reason), and RELAY_FN_REASONS is exactly six members ending with it (C3)`)
+  } else {
+    failures += 1
+    missing.push(`S9: the probe program must set _connected (${connectedAt}) BEFORE sending RELAY_FN (${sentAt}) and name probe-unsupported after both (${reasonAt}), and RELAY_FN_REASONS must be exactly six members ending with 'probe-unsupported' (got ${JSON.stringify(reasons)}) — an unknown reason is normalized to no-evidence, which is RC-3 again (C3)`)
+    console.log('  FAIL S9 probe producer / reason set')
+  }
+}
+
+/**
+ * S10 — PAYLOAD STAGING IS GATED, MEASURED AND LANGUAGE-FREE (C2, C4).
+ *
+ * The single most dangerous mistake in the round: letting the 15 s poll stage a
+ * 43 KB file. The gate is an EARLY RETURN — `if (payloadRepair !== true) return`
+ * — and the assertion is that it runs BEFORE the staging call, i.e. before
+ * `relayGuardStagePlan()` is ever invoked. The plan builder itself is a PURE
+ * function that may be defined anywhere (it builds commands; it executes
+ * nothing), so pinning the definition's position would test the file's layout
+ * instead of the behaviour — which is exactly what S7-S12 exist not to do.
+ *
+ * The other two halves: a build that cannot say the expected hash must take the
+ * `'absent'` path instead of writing, and the facts-file classification must
+ * never branch on the localized English `cannot find`.
+ */
+{
+  total += 1
+  const mcp = textOf('win-mcp.js')
+  const gateMatch = /if \(payloadRepair !== true\) return\b/u.exec(mcp)
+  const gateAt = gateMatch === null ? -1 : gateMatch.index
+  const stageAt = gateAt === -1 ? -1 : mcp.indexOf('relayGuardStagePlan(', gateAt)
+  const planAt = mcp.indexOf('export function relayGuardStagePlan(')
+  const expectedAt = mcp.indexOf('expectedGuardHash()')
+  const absentAt = mcp.indexOf("'absent'")
+  const factsAt = mcp.indexOf('desktopFacts')
+  const factsSlice = factsAt === -1 ? '' : mcp.slice(factsAt, factsAt + 9000)
+  const languageFree = factsSlice !== '' && /cannot find/iu.test(factsSlice) === false
+  const gated = gateAt !== -1 && stageAt !== -1 && gateAt < stageAt
+  const ok = gated && planAt !== -1 && expectedAt !== -1 && absentAt !== -1 && languageFree
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S10 payload staging returns EARLY unless payloadRepair is true (gate < staging call), a build that cannot say the hash takes the \'absent\' path, and the facts classification is language-free (C2/C4)')
+  } else {
+    failures += 1
+    missing.push(`S10: payload staging must be gated by an early return (if (payloadRepair !== true) return… at ${gateAt}) BEFORE relayGuardStagePlan() is called (${stageAt}); the pure plan must exist with an expectedGuardHash() null branch and the 'absent' outcome (plan=${planAt}, expected=${expectedAt}, absent=${absentAt}); and the desktopFacts classification must not branch on localized English 'cannot find' (languageFree=${languageFree}) — the ungated form makes the poll push 8 SSH children a minute (C2/C4)`)
+    console.log('  FAIL S10 payload repair gating')
+  }
+}
+
+/**
+ * S11 — THE LEAKS SHAPE (C5): the prefix surface, then the offline residue.
+ *
+ * `prefixSchemas` is the raw 19-name surface and `leaks` is what is LEFT when
+ * the bridge is offline. The order matters — `leaks` is computed FROM
+ * `prefixSchemas` — and the pinned `status:` expression must still be there
+ * byte-for-byte, because the alternative fix (`leaksScope`) would have had to
+ * touch it, and touching it is forbidden.
+ */
+{
+  total += 1
+  const indexText = textOf('index.js')
+  const prefixAt = indexText.indexOf('const prefixSchemas = names.filter((name) => name.startsWith(TOOL_PREFIX))')
+  const leaksAt = indexText.indexOf('const leaks = online === true ? [] : prefixSchemas')
+  const pinnedStatus = indexText.includes("status: online !== true && leaks.length > 0 ? 'leaking'")
+  const ok = prefixAt !== -1 && leaksAt !== -1 && prefixAt < leaksAt && pinnedStatus
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S11 leaks is the OFFLINE residue of prefixSchemas (prefix < leaks) and the pinned leaking status expression is untouched (C5)')
+  } else {
+    failures += 1
+    missing.push(`S11: index.js must compute const prefixSchemas = names.filter(...) (${prefixAt}) BEFORE const leaks = online === true ? [] : prefixSchemas (${leaksAt}), and keep status: online !== true && leaks.length > 0 ? 'leaking' verbatim (${pinnedStatus}) — restoring the full surface online is the reported defect (C5)`)
+    console.log('  FAIL S11 leaks shape')
+  }
+}
+
+/**
+ * S12 — GUEST IDENTITY, AND MEASURE-THEN-WRITE (WP-1A).
+ *
+ * `$scriptVersion = '1.3.0'` dates a provisioning-contract change (a marker
+ * field and two steps that stop writing unconditionally). The two steps are the
+ * point: the guard's `$stagedHash` must be MEASURED before it is compared, and
+ * the compare must come before the single `Copy-Item`, or a later provisioning
+ * pass overwrites a guard the harness staged from a newer plugin; the launcher's
+ * port must be READ before `$relayPort` is used, or a provisioning pass undoes
+ * the harness's `--port` repair.
+ */
+{
+  total += 1
+  const ps1 = textOf('cua-firstboot.ps1')
+  const versionOk = ps1.includes("$scriptVersion = '1.3.0'")
+  const slice = (marker) => {
+    const at = ps1.indexOf(marker)
+    if (at === -1) return ''
+    const next = ps1.indexOf('\nStep ', at + 1)
+    return ps1.slice(at, next === -1 ? ps1.length : next)
+  }
+  // COMMENTS STRIPPED FIRST, and it is not fastidiousness: the guard step's own
+  // doc comment SAYS "this used to be an unconditional Copy-Item", so a raw
+  // index() finds the prose before the code and the order assertion would pass
+  // on a file that had been reverted. `#` is the comment syntax both ps1 and
+  // python use, and the stripper is string-aware.
+  const guardStep = stripPythonComments(slice("Step 'relay-guard-task' {"))
+  // THE MEASURE, NOT THE INITIALISATION. `$stagedHash = ` alone is satisfied by
+  // `$stagedHash = ''` two lines above the real measurement, which is how the PRE
+  // review proved this block vacuous: deleting the Get-FileHash call left S12
+  // green. The anchor is the ASSIGNMENT THAT MEASURES (`$stagedHash = (Get-FileHash
+  // -LiteralPath $guardScript`): a bare call would match a later, unrelated
+  // FileHash use in the same step and the order check would pass on a deleted
+  // measurement (measured: -1 is the honest answer for "it is gone").
+  const measuredAt = guardStep.indexOf('$stagedHash = (Get-FileHash -LiteralPath $guardScript')
+  const comparedAt = guardStep.indexOf('-ne $stagedHash')
+  const copiedAt = guardStep.indexOf('Copy-Item')
+  const guardOrder = measuredAt !== -1 && comparedAt !== -1 && copiedAt !== -1
+    && measuredAt < comparedAt && comparedAt < copiedAt
+  const relayStep = stripPythonComments(slice("Step 'mcp-relay-task' {"))
+  const portReadAt = relayStep.indexOf('Get-RelayLauncherPort')
+  const portUsedAt = relayStep.indexOf('$relayPort')
+  const portOrder = portReadAt !== -1 && portUsedAt !== -1 && portReadAt < portUsedAt
+  const ok = versionOk && guardOrder && portOrder
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   S12 the guest identity is 1.3.0, the guard step MEASURES $stagedHash before it compares and before the single Copy-Item, and the launcher port is READ before $relayPort is used (WP-1A)')
+  } else {
+    failures += 1
+    missing.push(`S12: cua-firstboot.ps1 must carry $scriptVersion = '1.3.0' (${versionOk}); inside Step 'relay-guard-task' the STAGED measure — Get-FileHash -LiteralPath $guardScript (${measuredAt}) must precede its comparison (${comparedAt}) and the Copy-Item (${copiedAt}); inside Step 'mcp-relay-task' Get-RelayLauncherPort (${portReadAt}) must precede $relayPort (${portUsedAt}) — write-always overwrites a guard/launcher the harness repaired (WP-1A)`)
+    console.log('  FAIL S12 guest identity / measure-then-write')
+  }
+}
+
 /**
  * E1 — THE MUTATION MODE IS PRESENT, AND IT IS THIS FILE'S OWN.
  *
@@ -4430,9 +4890,11 @@ function frozenListOf(source, name) {
  * E2 — THE MUTATION TABLE IS FROZEN AND ITS TARGETS HAVE NOT DRIFTED.
  *
  * This is the cheap half of `--mutations`: it runs on EVERY gate invocation and
- * costs 22 in-memory searches instead of 22 subprocesses. It catches the two
+ * costs 29 in-memory searches instead of 29 subprocesses. It catches the two
  * failures that make a mutation table rot silently — a row dropped from the
- * table (the count is the contract: 22, JE1 added M-21/M-22) and a `find` literal that no longer
+ * table (the count is the contract: 29 — 20 from §7.3, two from JE1's marker pair
+ * (M-21/M-22), six from the cold-boot round (M-23..M-28) and one from the PRE
+ * review (M-29, the staged-side measure that had no row)) and a `find` literal that no longer
  * occurs because the line it targeted was reworded (the pair then "passes" by
  * mutating nothing, which is the false-green the runner would report only if
  * someone ran it).
@@ -4440,7 +4902,7 @@ function frozenListOf(source, name) {
 {
   total += 1
   const ids = MUTATIONS.map((row) => row.id)
-  const uniqueIds = new Set(ids).size === ids.length && ids.length === 22
+  const uniqueIds = new Set(ids).size === ids.length && ids.length === 29
   const drift = []
   for (const row of MUTATIONS) {
     const file = pick(row.file)
@@ -4453,7 +4915,7 @@ function frozenListOf(source, name) {
     if (!process.argv.includes('--quiet')) console.log(`  ok   E2 the mutation table carries ${MUTATIONS.length} unique pairs and every find literal still occurs exactly where it should (E-4)`)
   } else {
     failures += 1
-    missing.push(`E2: the mutation table must carry 22 unique pairs whose find literals still occur (ids=${ids.length}/${new Set(ids).size} unique; drift: ${drift.length === 0 ? 'none' : drift.join('; ')}) — a drifted literal mutates nothing and the pair goes quiet (E-4)`)
+    missing.push(`E2: the mutation table must carry 29 unique pairs whose find literals still occur (ids=${ids.length}/${new Set(ids).size} unique; drift: ${drift.length === 0 ? 'none' : drift.join('; ')}) — a drifted literal mutates nothing and the pair goes quiet (E-4)`)
     console.log('  FAIL E2 mutation table drift')
   }
 }

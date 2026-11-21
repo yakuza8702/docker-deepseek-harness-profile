@@ -594,7 +594,7 @@ blind (see [the relay](#the-interactive-session--the-mcp-server-lives-there-now-
 |---|---|
 | `mcp__windows__<guest tool>` | one per guest tool — `tool_click_at`, `find_elements`, `tool_type_text`, … The prefix is `TOOL_PREFIX = "mcp__windows__"` and `windowsToolName()` is the only place it is added (a name that arrives prefixed is not prefixed twice) |
 | `windows_desktop` | **reveal** — no arguments; unhides this session's bridged tools and returns their names, descriptions and parameters (an empty `tools` list with a `code` until they are really visible, and `blind` + `blindReason` when the lane cannot see a desktop) |
-| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` surface on the global registry (`leaks`), the grants, the keepalive and the last error — plus the **verdict** (`status: ok\|blind\|unresponsive\|leaking` — precedence `leaking → blind → unresponsive → ok`, `blindReason`, `verdict`), `desktopWarning`, the functional probe's own `relayFunctional` answer, `pluginVersion` (**0.2.2** in this release), the payload identity (`expectedRelayHash`/`relayHash`/`skew`/`portMismatch`), the last `repair` record and the guest's measured `desktop` facts (`measured`, `elementLaneOk`, `workDir`, `workDirWritable`, `scaleFix`); `{"repair": true}` forces one attempt first, `{"functional": false}` skips the 20 s functional probe |
+| `windows_mcp_doctor` | **diagnostics** — target, online state, the names this bridge registered, the raw `mcp__windows__*` prefix surface on the global registry (`prefixSchemas`, always) and its OFFLINE residue (`leaks`, empty whenever the bridge is online), `bootRace`, the grants, the keepalive and the last error — plus the **verdict** (`status: ok\|blind\|unresponsive\|leaking` — precedence `leaking → blind → unresponsive → ok`, `blindReason` including `boot-race`, `verdict`), `desktopWarning`, the functional probe's own `relayFunctional` answer, `pluginVersion` (**0.2.3** in this release), the payload identity (`expectedRelayHash`/`relayHash`/`skew`/`portMismatch`, plus `expectedGuardHash`/`guardHash`/`guardPresent` and the one-field verdict `stale`), the last `repair` record and the guest's measured `desktop` facts (`measured`, `elementLaneOk`, `workDir`, `workDirWritable`, `scaleFix`); `{"repair": true}` forces one attempt first, `{"functional": false}` skips the 20 s functional probe |
 
 Why it is worth its cost: `find_elements` + `type_text` return a compact JSON
 receipt (`action_sent`, `effect_verified`) in a few hundred bytes, where the
@@ -906,7 +906,7 @@ documents: `restoreOk: true` means the original bytes are measured back,
 `_ensure_save_dir`) is checked **before** the hash gate, because a second pass
 cannot hash-match a file the first pass rewrote.
 
-`tests/guest-patch.mjs` (≥24 checks) applies the here-strings to the pinned 0.4.1
+`tests/guest-patch.mjs` (≥29 checks) applies the here-strings to the pinned 0.4.1
 evidence copies, AST-extracts the patched functions and runs them against stubs —
 including the **unpatched** copy, which still reports `effect_verified: true` for a
 dropped character. That is the proof the defect was real, not a story.
@@ -1024,10 +1024,25 @@ SSH timeout. The SSH channel is opened with `ServerAliveInterval=10` and
 server.
 
 `windows_mcp_doctor` is the one call that answers "which side is broken": target,
-`online`, `registered`, the raw prefix surface (`schemas`, `leaks`), the grants,
-the revealed sessions, the keepalive and `gateError`. Offline, `leaks` MUST be
-empty; anything else is `status: "leaking"` and is exactly the bug this gate
-exists for.
+`online`, `registered`, the raw prefix surface (`prefixSchemas`), the grants,
+the revealed sessions, the keepalive and `gateError`.
+
+**`prefixSchemas` is the surface; `leaks` is the residue.** Two fields, one
+source, and the difference is the state of the bridge:
+
+| field | online | offline |
+|---|---|---|
+| `prefixSchemas` | the full `mcp__windows__*` surface — **always** (19 names on a complete attach) | the same surface |
+| `leaks` | **empty** | the same surface (`= prefixSchemas`) |
+
+So offline, `leaks` MUST be empty; anything else is `status: "leaking"` and is
+exactly the bug this gate exists for — and ONLINE, `leaks` is empty **by
+definition**, because a visible tool of this plugin is a registration that is
+working, not a leak. Reading `leaks` online (as this page and an earlier version
+of `windows_mcp_doctor` did) reported 19 healthy registrations as 19 leaks; that
+is the defect the `prefixSchemas` field exists to end. The two pinned
+expressions that decide `leaking` and `status` are untouched by the split, and
+they stay correct: when `online === true` their first conjunct is already false.
 
 **Its verdict is computed FIRST, and a probe may never raise it.** The order of the
 sources is the contract:
@@ -1332,12 +1347,13 @@ So there are two probes, and they answer different questions:
   short-circuit below (`session-busy`) also prints it, with `measured: false`.
 
 **What the functional probe can actually answer.** This table is the PRODUCERS,
-not the intent: `win-mcp.js`'s program has exactly five exits, and a reader who
-learns the reasons anywhere else will invent a sixth:
+not the intent: `win-mcp.js`'s program has exactly six exits, and a reader who
+learns the reasons anywhere else will invent a seventh:
 
 | branch | token | `measured` | `reason` | exit (the program's own) |
 |---|---|---|---|---|
-| no `RELAY_FN` line, or an unparsable one | `RELAY_UNRESPONSIVE` | `false` | `no-evidence` | 3 |
+| TCP never connected, no line, or a JSON line this probe cannot parse | `RELAY_UNRESPONSIVE` | `false` | `no-evidence` | 3 |
+| **TCP accepted, `RELAY_FN` sent, ZERO bytes back** (the relay predates the token) | `RELAY_UNRESPONSIVE` | `false` | **`probe-unsupported`** | 3 |
 | the relay's evidence says `busy === true` | **`RELAY_OK`** | **`false`** | **`session-busy`** | 4 |
 | both ids answered and `tools >= 1` | `RELAY_OK` | `true` | `''` | 0 |
 | the child closed the socket while waiting | `RELAY_UNRESPONSIVE` | `false` | `child-eof` | 3 |
@@ -1373,14 +1389,33 @@ bill of health.
 | `RELAY_OK` | 0 | the cheap probe answered; or the functional one answered and the child listed tools (`measured: true`); or it answered `session-busy` (`measured: false` — lane up, child unmeasured) |
 | `RELAY_SKEW` | 1 | the payload answered something unreadable — a payload mismatch, not a dead relay |
 | `RELAY_DOWN` | 2 | the transport never delivered a token: nothing ran |
-| `RELAY_UNRESPONSIVE` | 3 | **the relay answered and its child did not** — `reason` is `child-silent`, `child-eof` or `no-evidence`, and **never** `session-busy` |
+| `RELAY_UNRESPONSIVE` | 3 | **the relay answered and its child did not** — `reason` is `child-silent`, `child-eof`, `no-evidence` or `probe-unsupported`, and **never** `session-busy`. (`probe-unsupported` is a PAYLOAD fact, not a dead child — see the deviation below) |
 
-**The `reason` set is exactly the producers — five members, nothing surplus.**
+**The `reason` set is exactly the producers — six members, nothing surplus.**
 `RELAY_FN_REASONS` (`win-mcp.js`) is the frozen list `''`, `child-silent`,
-`child-eof`, `session-busy`, `no-evidence`: one member for each of the five exits
-above and nothing else. A value from OUTSIDE the set is normalized to
-`no-evidence` rather than forwarded — an unrecognised word means "the evidence
-did not arrive", not a sixth diagnosis.
+`child-eof`, `session-busy`, `no-evidence`, `probe-unsupported`: one member for
+each of the six exits above and nothing else. A value from OUTSIDE the set is
+normalized to `no-evidence` rather than forwarded — an unrecognised word means
+"the evidence did not arrive", not a seventh diagnosis.
+
+**`probe-unsupported` is the one reason that dates the guest.** It is proven by
+the program's own flags — connected, `RELAY_FN` sent, zero bytes back — and it
+means *the relay is healthy and older than the token*, never *the child is
+broken*. The verdict must therefore name the right verb: for this reason (and for
+`payload.stale: true`) the next action is **re-create the computer**, not
+"re-register the relay task" — re-registering a task that is already running
+changes nothing about a payload that predates the probe.
+
+**…and it does NOT move `status`.** This is a deliberate deviation (`D7`), stated
+where a consumer will read it: the doctor's `status` stays **`ok`** for a
+`probe-unsupported` answer, because the lane is genuinely up and the status field
+answers the lane question. The staleness is carried by
+`relayFunctional.reason: "probe-unsupported"`, `payload.skew: true`,
+`payload.stale`/`payload.guardHash`, and by the **verdict sentence**, which names
+re-create in *both* the `unresponsive` and the `ok` branch (`windowsStalePayloadClause`).
+A consumer that reads only `status` will see `ok` on that guest; that is the
+documented trade (no fifth status value), not an oversight. Read the sentence, or
+`payload.stale`, before concluding a stale guest is healthy.
 
 **The retired member.** `wedge` was once listed and never emitted: the relay's
 evidence object carries no `reason` field at all, and a wedge is `event('wedge', …)`
@@ -1468,8 +1503,13 @@ derived from the client's canonical payload
   `skew`.
 * `skew` is **true only when the guest relay ANSWERED and the harness probe could
   not read it** — the exported `PAYLOAD_SKEW_SEMANTICS` in one sentence: the
-  `RELAY_SKEW` token, a `RELAY_BAD` answer, or a guest repair record whose own
-  `reason` is `probe-skew`. It is **not** a hash comparison: a differing hash is
+  `RELAY_SKEW` token, a `RELAY_BAD` answer, a guest repair record whose own
+  `reason` is `probe-skew`, **or the functional probe answered
+  `probe-unsupported`** (TCP accepted, `RELAY_FN` sent, zero bytes back — a relay
+  that predates the token). The constant and this paragraph move together (C3):
+  the third producer is the round's addition, and a skew flag that omits it would
+  report a stale payload as a readable-but-mismatched one. It is **not** a hash
+  comparison: a differing hash is
   `relayHash` ≠ `expectedRelayHash`, and a **missing interpreter** is
   `RELAY_DOWN` plus `interpreterMissing` — never skew.
 * `port` / `portMeasured` are the port the guest relay was **measured answering
@@ -1487,11 +1527,16 @@ dependence on it, so a stale relay is a fact to report (`payload.relayHash`,
 (not the lane) needs a newer relay.
 
 **The mismatch can be repaired from the harness.** When the forced probe is not
-`RELAY_OK` and the lane is `session-0-direct`, one SSH command may be issued: a
-self-contained base64 PowerShell script (`-EncodedCommand`, so cmd.exe quoting
-cannot mangle it) that is **generated in `win-mcp.js`, not read from the guest** —
-a script that depends on a guest file cannot repair a guest file — and does five
-things in order:
+`RELAY_OK` and the lane is `session-0-direct`, one repair attempt may be issued: a
+self-contained PowerShell script that is **generated in `win-mcp.js`, not read from
+the guest** — a script that depends on a guest file cannot repair a guest file —
+staged into `C:\ProgramData\cua\cua-relay-repair.b64` by **4 × 6 000-character
+`cmd /c echo` appends** and started by a short decoder, and it does five things in
+order (the single `-EncodedCommand` that used to carry it was **36 667** characters
+— 13 721-char script → 36 592 base64 (UTF-16LE) → 36 667 with the
+`powershell … Bypass <marker> ` prefix, the live report's own arithmetic — past
+`cmd.exe`'s 8 191-character line, and sshd refused it with `exec request failed on
+channel 0`):
 
 1. **handshake first** — the port is the only truth, so a live relay is never
    restarted (the `WinError 10048` race cannot start);
@@ -1570,25 +1615,187 @@ vouch for it, so a wedged child read `ok` through a seven-minute-per-call outage
 |---|---|---|---|
 | attached through the relay, child answers | `ok` | `interactive-relay` | `null` |
 | attached through the relay, child silent | `unresponsive` | `interactive-relay` | `null` |
+| attached on session-0 **inside the boot window**, nothing measured yet | `blind` | `session-0-direct` | **`boot-race`** (`laneUpgrading: true`) |
 | attached, probe failed, task/session fine | `blind` | `session-0-direct` | `relay-stopped` / `probe-skew` |
 | attached, no `Active` console session | `blind` | `session-0-direct` | `no-interactive-session` |
 | attached, lane never decided | `blind` | `null` | `lane-unknown` |
 | not attached, computer ready | `ok` (`online: false`) | `null` | `null` |
 | not attached, prefixed schemas alive | `leaking` | `null` | `null` |
 
-`blindReason` is a **closed set** — `probe-skew`, `relay-missing`,
-`relay-stopped`, `no-interactive-session`, `lane-unknown`, `repair-disabled` — and
-nothing else is ever written into it; the doctor also prints a `verdict` sentence
+`blindReason` is a **closed set — seven** — `probe-skew`, `relay-missing`,
+`relay-stopped`, `no-interactive-session`, `lane-unknown`, `repair-disabled`,
+`boot-race` — and nothing else is ever written into it; the doctor also prints a `verdict` sentence
 built from the same fields, so the sentence and the JSON cannot disagree.
 `windows_desktop` says `blind` with the same reason in its note, and its `tools`
 list is empty until the names are really visible. Both doctors report
-**`pluginVersion: "0.2.2"`** — this README describes `dsh-cua-vm 0.2.2`, and
+**`pluginVersion: "0.2.3"`** — this README describes `dsh-cua-vm 0.2.3`, and
 `package.json` must equal `PLUGIN_VERSION` (the gate compares the two strings, so
-"the fix is not in your plugin" is a fact rather than a guess). 0.2.2 is the
-session-5 release: the functional probe and its fourth token, the wedge watchdog
-(`child-wedged`), the per-call budget ladder, the two tool sets with `[DEGRADED]`,
-`desktopWarning`, the fourth doctor status, and the three guest patch steps
-(`type_text`, `save_path`, `desktop-token-probe`).
+"the fix is not in your plugin" is a fact rather than a guess). 0.2.3 is the
+cold-boot round: the 90 s boot-race window with its `boot-race` blind reason, the
+sixth probe reason `probe-unsupported`, the harness-side payload-freshness repair
+(guard staging) with the one-field `payload.stale` verdict, the
+`facts-file-absent` error code, and `leaks` narrowed to the offline residue.
+0.2.2 was the session-5 release (the functional probe, the wedge watchdog, the
+per-call budget ladder, `[DEGRADED]`, `desktopWarning`, the fourth doctor status
+and the three guest patch steps).
+
+#### The boot window: `boot-race` is an interval, not a verdict
+
+A Windows computer reports `ready` when the OS is up, but the relay starts at
+**logon** — the guard waits up to 90 s for an `Active` console session and then up
+to 20 s for the listener. Between those two moments the lane is genuinely
+session-0, and the old doctor called that `blind` + `relay-stopped`, i.e. it sent
+the operator to repair a task that was about to start on its own.
+
+The window is now modelled, bounded and self-healing, and it changes **no status
+value** — the closed set stays `ok | blind | unresponsive | leaking`; what changes
+is `blindReason` and the next action:
+
+| constant | value | what it is |
+|---|---|---|
+| `BOOT_RACE_WINDOW_MS` | `90000` | the guard's own budget, mirrored (not a new number) |
+| `BOOT_RACE_ATTACH_MS` | `24000` | the whole attach-side ladder, and `24000 < 45000` leaves the handshake its budget |
+| `BOOT_RACE_PROBE_TIMEOUT_MS` | `4000` | one rung's probe |
+| `BOOT_RACE_PROBE_OFFSETS_MS` | `[0, 8000, 20000]` | frozen, ascending; the last rung still fits the ladder |
+| `BOOT_RACE_UPGRADE_INTERVAL_MS` | `10000` | the in-window upgrade throttle |
+
+`bootRaceFacts()` is pure and decides everything the doctor reports:
+
+* **the anchor is `readyAt`** — the newest `vm-state:<name>:ready` event for THIS
+  computer, not the stream's own subscription handshake;
+* `source` is `'stream'` (that event), `'attach'` (only the client's first attach is
+  known) or `'none'` — and `live` is **false** for `'none'`, because without an
+  anchor there is no window and the honest answer stays `relay-stopped`;
+* `live === true` iff there is a non-negative age **inside** the window and
+  **nothing was measured**. A MEASURED fact outranks the window: a measured
+  `session=0` or `hash=''` must never be relabelled "wait a bit";
+* the ladder runs only with `bootWindow.live === true` (and no command override),
+  every probe in it passes `force: true` (the cheap probe caches for 10 s, and an
+  unforced re-probe would answer from cache), and it is bounded by
+  `BOOT_RACE_ATTACH_MS`;
+* the 15 s watch interval is **untouched**; only the interval handed to the pure
+  upgrade guard changes (10 s inside the window), so a relay that binds at
+  ready+50 s is picked up at ready+50 s instead of being locked out until
+  ready+99 s.
+
+The action sentence for the reason is frozen:
+
+> `next: nothing — the computer reported ready inside its boot window and the relay starts at logon; the re-probe rides the poll, so call windows_mcp_doctor again if the lane is still session-0 after it.`
+
+#### `payload.stale` — the one field that dates a guest
+
+A guest is built from the payload the image had **at machine-create**
+(`setupcomplete.cmd` is one-shot), so an already-created computer can run a
+firstboot and a relay older than the plugin. Nothing in the old doctor could say
+so; the diagnosis had to date the guest by comparing byte counts. There are now
+two comparable pairs — the relay and the guard — and one verdict:
+
+| comparable pairs | `stale` |
+|---|---|
+| at least one pair measured on both sides, and at least one differs | `true` |
+| at least one pair measured on both sides, and every comparable pair agrees | `false` |
+| nothing comparable (`expectedRelayHash === null`, or no measured hash) | `null` |
+
+`null` means **this build cannot say** — never `false`, the same rule
+`expectedRelayHash` already documents. `payload.stale` is not `skew`: skew is "the
+relay answered and the probe could not read it"; stale is "the bytes on the guest
+are not this build's".
+
+> **`PAYLOAD_STALE_SEMANTICS`** — `payload.stale` is true only when BOTH sides of at least one hash pair were measured and they differ (relay or guard); false when every comparable pair agrees; null when no pair is comparable (a build without the payload source cannot call a guest stale). It is not skew: skew is "the relay answered and the probe could not read it".
+
+#### The payload-freshness repair: the guard, over SSH, gated
+
+The harness can bring a pre-`e2f0efd` guest to "guard exists" without a rebuild and
+without touching the relay's 93 937 bytes (which do not fit a doctor call — that
+is a reprovision, and the fields say so):
+
+* **the bytes are this build's**: `expectedGuardHash()` reads
+  `../../docker/windows-oem/cua-relay-guard.ps1` by the same `import.meta.url`
+  two-layout probe the relay hash uses, and returns **`null`** (never `''`, never
+  `'mismatch'`) on a bundle that ships no `docker/` tree;
+* **the carrier is `cmd /c echo <chunk> >>file` — NOT a PowerShell child.** On the
+  live 2-vCPU guest a `powershell -Command` child costs ≈2.9 s and a `cmd /c` child
+  ≈0.15 s (provenance: the pre-fix 36 667-char refusal and the ≈2.5–3 s PowerShell
+  children are archived in `.live-verify/REPORT-live-verification.md`; the post-fix
+  ≈0.15 s `cmd /c` figure is agent-5's follow-up run on the same guest, quoted here
+  with its source rather than as this page's own measurement), so twelve PowerShell
+  children could not fit the doctor's 30 s envelope
+  and the `register` step lost its turn. The carrier therefore became cheap and the
+  decisions stayed in PowerShell. `echo` is safe for base64 (`A-Za-z0-9+/=`: none
+  of it is interpreted by cmd.exe), the decoder is whitespace-insensitive
+  (`-replace '\s',''`, which strips the trailing space `echo` writes and the CRLF it
+  appends — measured on the guest: `QUJD` + `REVG` → `ABCDEF`), and chunk 0
+  TRUNCATES with `>`. There is no resume state: a half-written carrier from an
+  interrupted run is replaced, never continued.
+* **geometry, per carrier.** The guard is 32 590 B → 43 456 base64 chars
+  (`ceil(32590/3)*4` = 10 864 quads × 4) → **8 chunks of 6 000** + decode + verify +
+  register. The LAUNCHER repair is smaller: **4 chunks of 6 000** (max child
+  6 056 chars) + one short decoder — down from a single 36 667-character
+  `-EncodedCommand` that sshd refused with `exec request failed on channel 0`.
+  Never `-EncodedCommand` (a `cmd.exe` line is 8 191 chars), never stdin
+  (`runSshCapture` spawns with `stdio: ['ignore', …]`), never `scp` (that is the
+  supervisor's `cua_vm_put`).
+* **measure before you write, and REGISTRATION IS NOT CONDITIONAL ON THE FILE.**
+  The first step measures the staged guard's hash **and** the scheduled task, and
+  the plan is decided from both facts:
+
+  | measured | plan |
+  |---|---|
+  | hash differs from this build's | measure + 8 appends + decode + verify + register (**12** children) |
+  | hash matches, task absent **or unknown** | measure + register (**2**) |
+  | hash matches, task present | measure only (**1** — nothing to write) |
+
+  Only `taskPresent === true` lets the plan stop: unknown is not "present". That
+  is deliberate — the live round found the exact hole, a guest whose guard FILE
+  matched and whose `cua-mcp-host-guard` task was absent, where a file-only plan
+  was `[measure]` and the task could therefore never be created, permanently.
+* **staging is opt-in**: `repairRelay({ payloadRepair: true })`. The 15 s upgrade
+  watch calls `repairRelay()` *without* it, because a poll that could stage would
+  push **up to seventeen SSH children a minute** for the life of the machine (12
+  payload children: measure, 8 appends, decode, verify, register — plus the
+  launcher carrier's 5: 4 appends and one exec).
+* **budgets, two of them, and both are walls.** `RELAY_PAYLOAD_REPAIR_TIMEOUT_MS =
+  25000` bounds the payload staging (enforced between chunks);
+  `RELAY_REPAIR_TOTAL_MS = 28 000` bounds the **whole forced repair** — launcher
+  carrier plus payload plan — and ends 2 000 ms before `index.js`'s
+  `WIN_MCP_FORCE_REPAIR_MS = 30 000`. The measured work on the live guest is
+  **10 050 ms + 3 500 ms ≈ 13 550 ms** (provenance: agent-5's post-fix run on
+  `win-test`, 2026-11-21, two phases — launcher carrier, then payload plan), which
+  is also what the worst-case formula gives (`4 × 2 900 + 13 × 150`), so the budget
+  carries ~2× margin. Running out
+  reports `staged: 'incomplete'` and the next call **truncates and redoes** the
+  carrier.
+* `record.payload.staged` is a closed set of five — `none` (not requested),
+  `current` (measured equal, nothing written), `staged` (written **and** verified),
+  `incomplete` (deadline, malformed answer, or the verify disagreed — the one value
+  that means "try again"), `absent` (this build cannot say the hash). Only `staged`
+  may be read as "the guard is on disk". Beside it, **`payload.task`** is the
+  guard TASK as the same child measured it (`schtasks /query` exit 0), three-valued
+  exactly like `guardPresent` — `null` when the line did not carry `task=`, never
+  `false` by omission;
+* the outcome travels on a **second marker line** with its own parser
+  (`CUA_PAYLOAD guard=… relay=… stale=0|1 staged=… task=0|1`), and `stale` is C6's
+  table computed **on the guest** from the two comparable pairs (empty when no pair
+  is comparable, which the harness reads as `null`) — so the guest's own verdict and
+  the harness's `payload.stale` agree by construction rather than by luck; the frozen `CUA_RELAY` line is
+  untouched, because extending it would break every fixture at once for no gain.
+
+#### `facts-file-absent`: one fact instead of two lines of cmd noise
+
+`desktop.error` used to be the guest's own stderr, so a guest with no facts
+**writer** (a payload older than the probe) reported two localized cmd lines. It
+now carries a closed-set `errorCode` — `''`, `facts-file-absent`,
+`facts-unparsable`, `ssh-failed`, `read-error` — classified **language-free** and
+**first match wins**: a connection-level failure is `ssh-failed` (a read that
+never reached the guest also has empty stdout, and must not be called a missing
+file); then empty stdout with no parsed object is `facts-file-absent`; then a
+non-empty unparsable stdout is `facts-unparsable`; a thrown read is `read-error`.
+The absent case is exactly one sentence —
+
+> `facts-file-absent: C:\cua-work\cua-desktop-facts.json (the guest payload may predate the facts writer)`
+
+— and `desktop.error` keeps its free-text semantics on every other path, so
+nothing that reads it breaks.
 
 **A late relay heals the live session.** Re-deciding per attach does not cover the
 case that actually bit: the `cua-mcp-host` logon task firing *after* the attach
@@ -1628,8 +1835,14 @@ The repair's three budgets are **module constants, not environment variables** �
 `RELAY_REPAIR_BACKOFF_MS` (`300_000`, after
 `RELAY_REPAIR_FAILURES_BEFORE_BACKOFF` = `3` failures); a caller may narrow the
 wall per attempt, but the throttle is the client's own. `RELAY_REPAIR_COMMAND_MARKER`
-(`'-EncodedCommand'`) is the string that makes a repair child recognisable to a
-test, not an operator switch — no guest variable selects the repair transport.
+(`'cua-relay-repair.b64'`) is the **carrier filename** that makes a repair child
+recognisable to a test — not an operator switch, and no guest variable selects the
+repair transport. Every child of the repair carrier names that file in its command
+line, which is what separates a repair child from a probe (`-c "exec(…)"`) and from
+the relay lane (`--connect`). It was `'-EncodedCommand'` while the whole repair
+script rode one argument on one command line; that shape was refused by sshd (past
+`cmd.exe`'s 8 191-character limit), so the script is staged into this file in
+6 000-character chunks and the marker moved with it.
 
 `DSH_CUA_WIN_MCP_COMMAND` still overrides the command verbatim (the doctor records
 that the relay was bypassed on purpose). The relay's limits are honest ones: it

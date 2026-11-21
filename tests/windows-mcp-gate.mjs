@@ -450,13 +450,24 @@ try {
     prefixed().includes('mcp__windows__tool_click_at') && prefixed().includes('mcp__windows__find_elements')
     && prefixed().filter((name) => name.startsWith('mcp__windows__mcp__windows__')).length === 0,
     prefixed().slice(0, 2).join(','))
-  // `leaks` is the RAW prefix surface the doctor reports; while the bridge is
-  // online those 19 names are the point, and `status` stays "ok". Offline the
-  // same list MUST be empty — asserted below, which is what makes this a leak test.
+  // (a)/CB-C-19 — THE LEAK FIELD IS THE OFFLINE RESIDUE (C5, RC-5).
+  //
+  // THIS ROW IS THE ROUND'S C-19 PIN (not a second copy of it): the label is
+  // spelled with the round's `CB-` prefix so the cold-boot range reads
+  // CB-C-14..CB-C-22 without a hole, and so it cannot be confused with the PRE
+  // round's own C-14..C-22 rows.
+  //
+  // This row used to assert `leaks.length === 19` while the bridge was online,
+  // i.e. it PINNED the defect the round fixes: a healthy bridge reporting 19
+  // leaks contradicts the contract the function documents. `prefixSchemas` is the
+  // raw surface (19 online), `leaks` is empty online and only ever fills while
+  // the bridge is down — the offline arm below (`status ok`, `leaks 0`) is what
+  // still makes this a leak test, and C-20 drives the 19-name offline case.
   const onlineDoctor = await doctor(agentA.agent)
-  check('(a) ...the doctor sees the same 19 registered names and reports status ok online',
-    onlineDoctor.registered.length === 19 && onlineDoctor.status === 'ok' && onlineDoctor.leaks.length === 19,
-    `registered=${onlineDoctor.registered.length} status=${onlineDoctor.status} leaks=${onlineDoctor.leaks.length}`)
+  check('(CB-C-19) ...the doctor sees the same 19 registered names (row (a)), reports status ok, `leaks` is EMPTY online and `prefixSchemas` is the raw 19',
+    onlineDoctor.registered.length === 19 && onlineDoctor.status === 'ok'
+    && onlineDoctor.leaks.length === 0 && onlineDoctor.prefixSchemas.length === 19,
+    `registered=${onlineDoctor.registered.length} status=${onlineDoctor.status} leaks=${onlineDoctor.leaks.length} prefixSchemas=${onlineDoctor.prefixSchemas.length}`)
 
   // ---- (c) the per-agent restriction hides the 19 from whoever may not see them ----
   //
@@ -1777,6 +1788,506 @@ try {
       fake.setCallToolBehavior(null)
       fake.resetCallToolAttempts()
       fake.resetRelayFunctional()
+      fake.resetDesktopFacts()
+    }
+  }
+
+  /* ================================================================== *
+   * COLD-BOOT ROUND — PACKAGE B (the SOL's C-14..C-22 pins, printed as
+   * CB-C-* so they cannot be confused with the PRE round's C-14..C-22 rows;
+   * contracts C1/C3/C4/C5/C6)
+   *
+   * THE FOUR DEFECTS THIS BLOCK DRIVES, one per numbered check:
+   *
+   *   C-14..C-16  A cold boot lands session-0 inside a ~79 s window and the
+   *               doctor called it `blind` + `relay-stopped` — "the relay is
+   *               broken" for a relay that has not started yet. The window is a
+   *               BOUND, so `blind` stays (no new status), the reason becomes
+   *               `boot-race`, `laneUpgrading` turns true and the next action is
+   *               "nothing, wait" — while measured evidence still outranks it.
+   *   C-17        A pre-`e2f0efd` relay answers the TCP handshake, is sent
+   *               `RELAY_FN` and says nothing: the payload is stale, and the old
+   *               verdict told the model to re-register a task that is fine.
+   *   C-18        `desktop.errorCode: 'facts-file-absent'`: one sentence that
+   *               names re-create, instead of the generic "call the doctor"
+   *               dead end (the doctor IS the caller).
+   *   C-19..C-21  `leaks` carried the 19 ONLINE names, contradicting the
+   *               contract it publishes. `prefixSchemas` is the raw surface,
+   *               `leaks` is the offline residue, and the two pinned expressions
+   *               are untouched.
+   *   C-22        `payload.stale`'s truth table, through the doctor.
+   * ================================================================== */
+  {
+    const CUA2 = 'mcp__windows__'
+    const UNRESPONSIVE = fake.RELAY_UNRESPONSIVE ?? 'RELAY_UNRESPONSIVE'
+    /**
+     * MUTATE THE LIVE CLIENT'S LANE FACTS. A reattach costs a power cycle and
+     * only re-derives what `doctorFacts()` returns anyway; the doctor reads that
+     * object synchronously, so the sharper seam is the object itself.
+     */
+    const liveLane = (patch) => Object.assign(fake.SESSIONS.at(-1).state, patch)
+    const SESSION0 = {
+      transport: 'session-0-direct',
+      relayOk: false,
+      relayStatus: 'RELAY_DOWN',
+      probeMode: 'handshake',
+      relayDetail: '',
+      transportReason: 'session-0 fallback (interactive relay not running; desktop automation will be blind)',
+      reason: 'session-0 fallback (interactive relay not running; desktop automation will be blind)'
+    }
+    const LIVE_RELAY = {
+      transport: 'interactive-relay',
+      relayOk: true,
+      relayStatus: 'RELAY_OK',
+      probeMode: 'handshake',
+      relayDetail: '',
+      transportReason: '',
+      reason: ''
+    }
+    const unresponsiveAnswer = (reason) => ({
+      status: UNRESPONSIVE,
+      measured: false,
+      reason,
+      budgetMs: 5000,
+      elapsedMs: 5001,
+      tools: 0,
+      port: 47999,
+      evidence: { lastSuccessfulCallAgeMs: null, outstandingRequestAgeMs: null, childRestarts: 0, childPid: 4242, wedgeDeadlineMs: 20000 }
+    })
+
+    try {
+      // ---- C-14: THE WINDOW IS A WAIT, NOT A FAULT ----
+      liveLane({ ...SESSION0, repair: null })
+      fake.setBootRace({
+        live: true,
+        sinceReadyMs: 40000,
+        remainingMs: 50000,
+        source: 'stream',
+        readyAt: Date.now() - 40000,
+        attachedAt: Date.now(),
+        windowMs: 90000
+      })
+      const bootDoctor = await doctor(agentA.agent)
+      check('(CB-C-14) a LIVE boot window on a session-0 lane reports status blind + blindReason "boot-race" + laneUpgrading true — and never a new status value',
+        bootDoctor.online === true && bootDoctor.status === 'blind'
+        && bootDoctor.blindReason === 'boot-race' && bootDoctor.laneUpgrading === true
+        && bootDoctor.bootRace?.live === true && bootDoctor.bootRace?.source === 'stream'
+        && /^blind \(boot-race\)/u.test(String(bootDoctor.verdict ?? ''))
+        && /next: nothing/u.test(String(bootDoctor.verdict ?? ''))
+        && /boot window/u.test(String(bootDoctor.verdict ?? '')),
+        `status=${bootDoctor.status} reason=${bootDoctor.blindReason} upgrading=${bootDoctor.laneUpgrading} bootRace=${JSON.stringify(bootDoctor.bootRace)}`)
+
+      // ---- C-15: MEASURED EVIDENCE OUTRANKS THE WINDOW (C1 rule 4) ----
+      liveLane({
+        repair: {
+          measured: true,
+          ok: false,
+          session: 0,
+          sessionMeasured: true,
+          probe: 'RELAY_DOWN',
+          hash: '',
+          hashMeasured: true,
+          reason: '',
+          port: 47999,
+          attempts: 1,
+          backoffMs: 0,
+          enabled: true
+        }
+      })
+      const measuredDoctor = await doctor(agentA.agent)
+      check('(CB-C-15) ...but a MEASURED session=0 inside the same window is still no-interactive-session (a measurement is never "wait a bit")',
+        measuredDoctor.status === 'blind'
+        && measuredDoctor.blindReason === 'no-interactive-session'
+        && measuredDoctor.bootRace?.live === true,
+        `status=${measuredDoctor.status} reason=${measuredDoctor.blindReason} live=${measuredDoctor.bootRace?.live}`)
+
+      // ---- C-16: OUTSIDE THE WINDOW THE OLD SENTENCE IS RIGHT ----
+      liveLane({ repair: null })
+      fake.setBootRace({
+        live: false,
+        sinceReadyMs: 120000,
+        remainingMs: 0,
+        source: 'stream',
+        readyAt: Date.now() - 120000,
+        attachedAt: Date.now(),
+        windowMs: 90000
+      })
+      const stoppedDoctor = await doctor(agentA.agent)
+      check('(CB-C-16) outside the window the same facts are `relay-stopped` with laneUpgrading false and the repair instruction',
+        stoppedDoctor.status === 'blind' && stoppedDoctor.blindReason === 'relay-stopped'
+        && stoppedDoctor.laneUpgrading === false
+        && /next: call windows_mcp_doctor with \{"repair":true\}/u.test(String(stoppedDoctor.verdict ?? '')),
+        `status=${stoppedDoctor.status} reason=${stoppedDoctor.blindReason} upgrading=${stoppedDoctor.laneUpgrading}`)
+
+      // ---- C-17: THE RIGHT VERB FOR A STALE PAYLOAD (C3) ----
+      liveLane({ ...LIVE_RELAY })
+      fake.setBootRace(null)
+      fake.setPayload({ stale: false })
+      fake.setRelayFunctional(unresponsiveAnswer('probe-unsupported'))
+      const unsupportedDoctor = await doctor(agentA.agent)
+      fake.setRelayFunctional(unresponsiveAnswer('child-silent'))
+      const silentDoctor = await doctor(agentA.agent)
+      fake.setPayload({ stale: true })
+      const stalePayloadDoctor = await doctor(agentA.agent)
+      check('(CB-C-17) the next action follows the PAYLOAD: `probe-unsupported` stays OK (a payload fact, not a dead child) and still says re-create, while `child-silent` keeps the task sentence',
+        /guest payload is stale/u.test(String(unsupportedDoctor.verdict ?? ''))
+        && /re-create the computer/u.test(String(unsupportedDoctor.verdict ?? ''))
+        && /re-register the relay task/u.test(String(unsupportedDoctor.verdict ?? '')) === false
+        // D7: the probe-unsupported arm is `ok` — the child was never measured.
+        && unsupportedDoctor.status === 'ok' && unsupportedDoctor.unresponsive === false
+        && /re-create the computer/u.test(String(stalePayloadDoctor.verdict ?? ''))
+        && stalePayloadDoctor.unresponsive === true
+        && /re-register the relay task/u.test(String(silentDoctor.verdict ?? '')) === true
+        && /re-create the computer/u.test(String(silentDoctor.verdict ?? '')) === false
+        && silentDoctor.unresponsive === true,
+        `unsupported=${unsupportedDoctor.status} stalePayload=${stalePayloadDoctor.status} silent=${silentDoctor.status}`)
+      fake.setRelayFunctional(null)
+      fake.setPayload(null)
+
+      // ---- D1/D6/D7: THE LIVE-ROUND PINS (three defects, three checks) ----
+      //
+      // The live guest exposed three things a fixture-authored suite could not:
+      // the staging half's record never reached the MCP surface (D1), the payload
+      // block asserted `stale` from an empty pair (D6), and the status flapped
+      // `ok`/`unresponsive` call-to-call because a probe that measured NOTHING was
+      // read as a dead child (D7).
+      const LIVE_EXPECTED_RELAY = 'd36fd41a7d469c087c12335d81c5856ec6f7e2cb646686e365fe89de15b6fc1c'
+      const LIVE_EXPECTED_GUARD = 'e98df18430cbaae5deb19087d183601ac32508a64f9080f43456963ea76c342a'
+      const LIVE_GUEST_RELAY = 'cc369b19e266d35f415a30400ebdf7910b463403726fd2f2e3d905dfb207602f'
+      const doctorWith = async (args) => JSON.parse((await globalTools.get('windows_mcp_doctor').execute(args, { agent: agentA.agent })).text)
+
+      // D6 first: NOTHING measured — the client read failed on the real guest, so
+      // both hashes are unread. C6 says `null`; the old code said `stale:true`.
+      fake.setPayload({ measured: false, expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: null, relayPresent: null, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: null, guardPresent: null })
+      fake.setRepairResult({ ok: false, reason: 'relay-stopped' })
+      const unmeasuredPayloadDoctor = await doctorWith({ functional: false })
+      check('(V-D6) with NOTHING measured the payload block says null (stale null, guardHash null, guardPresent null) — never `stale:true` from an empty pair',
+        unmeasuredPayloadDoctor.payload.stale === null
+        && unmeasuredPayloadDoctor.payload.guardHash === null
+        && unmeasuredPayloadDoctor.payload.guardPresent === null
+        && unmeasuredPayloadDoctor.payload.relayPresent === null
+        && unmeasuredPayloadDoctor.payload.staged === 'none',
+        `stale=${JSON.stringify(unmeasuredPayloadDoctor.payload.stale)} guard=${JSON.stringify(unmeasuredPayloadDoctor.payload.guardHash)} guardPresent=${JSON.stringify(unmeasuredPayloadDoctor.payload.guardPresent)}`)
+
+      // V-D6b (PRE P0) — A CLIENT THAT CARRIES NO `stale` GETS `null`, WHATEVER
+      // THE HASHES SAY. This is the proof that the doctor stopped re-deriving: the
+      // relay hashes below DIFFER, so a local pair rule would answer `true`; the
+      // one owner is simply absent from this (older) client reading, and "this
+      // build cannot say" is the honest answer.
+      fake.setPayload({ measured: true, expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: LIVE_GUEST_RELAY, relayPresent: true, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: null, guardPresent: null })
+      const noOwnerDoctor = await doctorWith({ functional: false })
+      check('(V-D6b) no `stale` from the client ⇒ `null` even when the two relay hashes DIFFER (no local re-derivation survives in index.js)',
+        noOwnerDoctor.payload.stale === null
+        && noOwnerDoctor.payload.relayHash === LIVE_GUEST_RELAY
+        && noOwnerDoctor.payload.expectedRelayHash === LIVE_EXPECTED_RELAY
+        && noOwnerDoctor.payload.expectedGuardHash === LIVE_EXPECTED_GUARD,
+        `stale=${JSON.stringify(noOwnerDoctor.payload.stale)} relay=${noOwnerDoctor.payload.relayHash === LIVE_GUEST_RELAY} expected=${noOwnerDoctor.payload.expectedRelayHash === LIVE_EXPECTED_RELAY}`)
+
+      // D1 next: a forced repair whose record DID carry the staging half. This is
+      // the live shape (`staged:'staged'`, the guard measured) — and the lead
+      // defect was that `forcedRepair` dropped the whole sub-record.
+      fake.setPayload({ measured: true, expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: LIVE_GUEST_RELAY, relayPresent: true, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: LIVE_EXPECTED_GUARD, guardPresent: true, stale: realWinMcp.payloadStale({ expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: LIVE_GUEST_RELAY, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: LIVE_EXPECTED_GUARD }) })
+      fake.setRepairResult({
+        measured: true,
+        ok: false,
+        reason: 'relay-stopped',
+        payload: {
+          staged: 'staged',
+          guardHash: LIVE_EXPECTED_GUARD,
+          guardPresent: true,
+          relayHash: LIVE_GUEST_RELAY,
+          relayPresent: true,
+          writes: 8,
+          ms: 25800,
+          detail: ''
+        }
+      })
+      fake.advanceRepairWindow(60_000)
+      const repairedDoctor = await doctorWith({ repair: true, functional: false })
+      const repairedPayload = repairedDoctor.forcedRepair?.payload ?? {}
+      check('(V-D1) `forcedRepair.payload` carries the staging record (staged/guardHash/writes/ms/detail), and the TOP-LEVEL payload publishes the measured guard and the OWNER\'s `stale`',
+        repairedPayload.staged === 'staged'
+        && repairedPayload.guardHash === LIVE_EXPECTED_GUARD
+        && repairedPayload.guardPresent === true
+        && repairedPayload.writes === 8 && repairedPayload.ms === 25800
+        && repairedPayload.detail === ''
+        && repairedDoctor.payload.staged === 'staged'
+        && repairedDoctor.payload.guardHash === LIVE_EXPECTED_GUARD
+        && repairedDoctor.payload.guardPresent === true
+        && repairedDoctor.payload.measured === true
+        && repairedDoctor.payload.stale === true,
+        `forced=${JSON.stringify(repairedPayload).slice(0, 120)} top=${JSON.stringify({ staged: repairedDoctor.payload.staged, guard: repairedDoctor.payload.guardHash === LIVE_EXPECTED_GUARD, stale: repairedDoctor.payload.stale })}`)
+
+      // ---- V-D1b: `task` IS THE OTHER HALF OF "THE PAYLOAD REPAIR LANDED" ----
+      //
+      // The live guest proved the two come apart: the guard FILE landed
+      // (`staged:'staged'`) while the guard TASK was never created. A consumer
+      // reading only `staged` therefore reports a repaired lane that has no
+      // onstart task — so the register step's own measurement is published, and
+      // `guardPresent` keeps meaning "the FILE" (a `task:false` proves nothing
+      // about it).
+      fake.setRepairResult({
+        measured: true,
+        ok: false,
+        reason: 'relay-stopped',
+        payload: {
+          staged: 'staged',
+          task: false,
+          guardHash: LIVE_EXPECTED_GUARD,
+          guardPresent: true,
+          relayHash: LIVE_GUEST_RELAY,
+          relayPresent: true,
+          writes: 8,
+          ms: 25800,
+          detail: ''
+        }
+      })
+      fake.advanceRepairWindow(60_000)
+      const fileOnlyDoctor = await doctorWith({ repair: true, functional: false })
+      // …and the other arm: nothing measured the guard FILE, but the register
+      // step ran (`task:true`), which can only happen after its hash verified.
+      // The client read is reset to "nothing measured" so `guardPresent` can only
+      // come from the `task:true` last resort.
+      fake.setPayload({ measured: true, expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: null, relayPresent: null, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: null, guardPresent: null, stale: realWinMcp.payloadStale({ expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: null, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: null }) })
+      fake.setRepairResult({
+        measured: true,
+        ok: false,
+        reason: 'relay-stopped',
+        payload: { staged: 'current', task: true, writes: 0, ms: 2880, detail: '' }
+      })
+      fake.advanceRepairWindow(60_000)
+      const taskOnlyDoctor = await doctorWith({ repair: true, functional: false })
+      check('(V-D1b) `forcedRepair.payload.task` is re-emitted (file and task are separate facts), and the top-level `guardPresent` stays about the FILE — `task:true` is only a last-resort proof',
+        fileOnlyDoctor.forcedRepair?.payload?.task === false
+        && fileOnlyDoctor.forcedRepair?.payload?.staged === 'staged'
+        && fileOnlyDoctor.payload.task === false
+        && fileOnlyDoctor.payload.staged === 'staged'
+        && fileOnlyDoctor.payload.guardPresent === true
+        && taskOnlyDoctor.forcedRepair?.payload?.task === true
+        && taskOnlyDoctor.payload.task === true
+        && taskOnlyDoctor.payload.guardPresent === true
+        && taskOnlyDoctor.payload.guardHash === null,
+        `fileOnly={task:${JSON.stringify(fileOnlyDoctor.payload.task)},staged:${fileOnlyDoctor.payload.staged},guardPresent:${JSON.stringify(fileOnlyDoctor.payload.guardPresent)}} taskOnly={task:${JSON.stringify(taskOnlyDoctor.payload.task)},guardPresent:${JSON.stringify(taskOnlyDoctor.payload.guardPresent)},guardHash:${JSON.stringify(taskOnlyDoctor.payload.guardHash)}}`)
+      fake.setPayload(null)
+      fake.setRepairResult({ ok: false, reason: 'relay-stopped' })
+
+      // D7: the SAME guest, two adjacent calls — one that runs the probe and one
+      // that skips it. `probe-unsupported` is a payload fact, so both must agree
+      // on `ok`; the stale-payload instruction is still there for the model.
+      fake.setRepairResult({ ok: false, reason: 'relay-stopped' })
+      fake.setPayload({ measured: false, expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: null, relayPresent: null, skew: false })
+      fake.setRelayFunctional({
+        status: UNRESPONSIVE,
+        measured: false,
+        reason: 'probe-unsupported',
+        budgetMs: 5000,
+        elapsedMs: 3981,
+        exitCode: 3,
+        port: 47999,
+        evidence: { lastSuccessfulCallAgeMs: null, outstandingRequestAgeMs: null, childRestarts: 0, wedgeDeadlineMs: 20000 }
+      })
+      const probedCall = await doctorWith({ functional: true })
+      const skippedCall = await doctorWith({ functional: false })
+      check('(V-D7) a `probe-unsupported` guest does NOT flap: the probed and the skipped call agree on `ok`, `unresponsive:false`, and the stale-payload instruction is in the OK verdict',
+        probedCall.status === 'ok' && skippedCall.status === 'ok'
+        && probedCall.unresponsive === false && skippedCall.unresponsive === false
+        && probedCall.relayFunctional?.reason === 'probe-unsupported'
+        && /guest payload is stale/u.test(String(probedCall.verdict ?? ''))
+        && /re-create the computer/u.test(String(probedCall.verdict ?? ''))
+        && /re-register the relay task/u.test(String(probedCall.verdict ?? '')) === false
+        // C3: the functional reason is the third producer of `payload.skew`.
+        && probedCall.payload.skew === true,
+        `probed=${probedCall.status}/${probedCall.unresponsive} skipped=${skippedCall.status}/${skippedCall.unresponsive} skew=${probedCall.payload.skew}`)
+      fake.setRelayFunctional(null)
+      fake.setPayload(null)
+      fake.setRepairResult({ ok: false, reason: 'relay-stopped' })
+
+      // ---- JURY-34: K1..K4 (four defects, five pins) ----
+      //
+      // probe-5 (K1): a register starved by the budget reported `incomplete` over
+      // a guest whose guard FILE is current. probe-2 (K2/K3): an unrequested
+      // payload published `measured:true`, an empty reported hash shadowed the
+      // fresh repair hash, and an unknown `staged` word read as "not requested".
+      // K4: no caller budget ever reached the repair seam, so the 28 000 ceiling
+      // was unreachable and the doc's clamp claim was false.
+      const BUILD_GUARD = String(realWinMcp.expectedGuardHash() ?? '')
+      const OTHER_GUARD = 'f'.repeat(64)
+      const repairPayloadOf = async (payload) => {
+        fake.setRepairResult({ measured: true, ok: false, reason: 'relay-stopped', payload })
+        fake.advanceRepairWindow(60_000)
+        return (await doctorWith({ repair: true, functional: false })).forcedRepair?.payload ?? {}
+      }
+
+      // K1 RESIDUAL — THE PRODUCER OWNS THE FILE/TASK SPLIT, AND ITS WORD FLOWS
+      // VERBATIM. `runPayloadRepair` now keeps `staged:'current'` itself when the
+      // measure proved the file and the budget dies before `register`, with its
+      // reason in `detail`; index.js's compensating branch could never fire and
+      // is deleted. The arms below are the producer's REAL shapes (probe-5), and
+      // the assertion is pass-through: the same word, the same task, the same
+      // detail — and no local `taskDetail` field that the producer never sends.
+      const starvedProven = await repairPayloadOf({ staged: 'current', task: false, guardHash: BUILD_GUARD, writes: 0, ms: 0, detail: 'the payload budget ended mid-stage' })
+      // …and a run that never PROVED the file stays `incomplete`, verbatim: no
+      // local rule may upgrade it to `current` (that rule is gone).
+      const starvedUnproven = await repairPayloadOf({ staged: 'incomplete', task: false, guardHash: null, writes: 0, ms: 0, detail: 'the payload budget ended mid-stage' })
+      const starvedForeign = await repairPayloadOf({ staged: 'incomplete', task: false, guardHash: OTHER_GUARD, writes: 0, ms: 0, detail: 'the payload budget ended mid-stage' })
+      check('(J-K1) the producer\'s file/task split flows VERBATIM: proven-current + starved register publishes "current"/task:false/its own detail, an unproven run stays "incomplete", and no local `taskDetail` is invented',
+        starvedProven.staged === 'current' && starvedProven.task === false
+        && starvedProven.detail === 'the payload budget ended mid-stage'
+        && starvedProven.taskDetail === undefined
+        && starvedUnproven.staged === 'incomplete'
+        && starvedForeign.staged === 'incomplete'
+        && starvedForeign.detail === 'the payload budget ended mid-stage',
+        `proven=${starvedProven.staged}/task=${String(starvedProven.task)}/${JSON.stringify(String(starvedProven.detail))} unproven=${starvedUnproven.staged} foreign=${starvedForeign.staged}`)
+
+      // K2: a record that did NOT run is not a measurement.
+      fake.setPayload({ measured: false, expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: null, relayPresent: null, expectedGuardHash: BUILD_GUARD, guardHash: null, guardPresent: null })
+      // The record measured NOTHING (no relay line, no payload line): `staged:'none'`
+      // is the only thing it says, and `measured` must stay false.
+      fake.setRepairResult({ measured: false, unmeasured: 'no-record', payload: { staged: 'none', task: null, writes: 0, ms: 0, detail: '' } })
+      fake.advanceRepairWindow(60_000)
+      const notRequested = await doctorWith({ repair: true, functional: false })
+      check('(J-K2) a `staged:"none"` record (payload repair not requested) does NOT publish `measured:true` — `measured:false` keeps meaning "nobody looked"',
+        notRequested.payload.staged === 'none'
+        && notRequested.payload.measured === false
+        && notRequested.payload.guardHash === null,
+        `staged=${notRequested.payload.staged} measured=${notRequested.payload.measured} guard=${JSON.stringify(notRequested.payload.guardHash)}`)
+
+      // K3a: the fresh repair measurement outranks the stale reported one, and
+      // the client's own presence flag wins over a hash re-derivation.
+      fake.setPayload({ measured: true, expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: '', relayPresent: true, expectedGuardHash: BUILD_GUARD, guardHash: BUILD_GUARD, guardPresent: true, stale: true })
+      fake.setRepairResult({ measured: true, ok: false, reason: 'relay-stopped', payload: { staged: 'current', task: true, relayHash: LIVE_GUEST_RELAY, relayPresent: true, writes: 0, ms: 2880, detail: '' } })
+      fake.advanceRepairWindow(60_000)
+      const freshHash = await doctorWith({ repair: true, functional: false })
+      check('(J-K3a) a MEASURED-ABSENT reported hash ("") no longer shadows the repair\'s fresh relay hash, and the owner\'s `relayPresent:true` survives',
+        freshHash.payload.relayHash === LIVE_GUEST_RELAY
+        && freshHash.payload.relayPresent === true,
+        `relayHash=${String(freshHash.payload.relayHash).slice(0, 20)} relayPresent=${JSON.stringify(freshHash.payload.relayPresent)}`)
+
+      // K3b: an unknown `staged` word is `incomplete` ("try again"), never `none`.
+      const unknownWord = await repairPayloadOf({ staged: 'weird-word', task: null, guardHash: null, writes: 0, ms: 0, detail: '' })
+      check('(J-K3b) an UNKNOWN `staged` word maps to "incomplete" (the parser\'s closed set), never to "none" ("we did not ask")',
+        unknownWord.staged === 'incomplete',
+        `staged=${unknownWord.staged}`)
+
+      // K4: the doctor passes its own guard as the caller budget, and the seam's
+      // clamp is what makes the 28 000 wall real.
+      fake.setRepairResult({ measured: true, ok: false, reason: 'relay-stopped', payload: { staged: 'none', task: null, writes: 0, ms: 0, detail: '' } })
+      fake.advanceRepairWindow(60_000)
+      fake.REPAIR_CALLS.length = 0
+      await doctorWith({ repair: true, functional: false })
+      const forcedOptions = fake.REPAIR_CALLS.at(-1) ?? {}
+      check('(J-K4) the forced repair passes `timeoutMs` (the doctor\'s 30 000 guard, clamped by the seam to its 28 000 ceiling) instead of letting the 25 000 payload sub-cap bind',
+        Number(forcedOptions.timeoutMs) === 30000
+        && fake.REPAIR_CALLS.slice(-1).every((options) => options.payloadRepair === true && options.force === true)
+        && Number(realWinMcp.RELAY_REPAIR_TOTAL_MS) === 28000
+        && Number(realWinMcp.RELAY_REPAIR_TIMEOUT_MS) === 25000,
+        `options=${JSON.stringify(forcedOptions)} total=${realWinMcp.RELAY_REPAIR_TOTAL_MS} default=${realWinMcp.RELAY_REPAIR_TIMEOUT_MS}`)
+      fake.setPayload(null)
+      fake.setRepairResult({ ok: false, reason: 'relay-stopped' })
+
+      // ---- C-18: FACTS-FILE-ABSENT IS A CAUSE, NOT A RETRY (C4) ----
+      fake.setDesktopFacts({
+        measured: false,
+        errorCode: 'facts-file-absent',
+        error: 'Warning: Permanently added the ECDSA host key\r\nThe system cannot find the path specified.'
+      })
+      const absentDoctor = await doctor(agentA.agent)
+      const absentDesk = await desktop()
+      check('(CB-C-18) `errorCode: "facts-file-absent"` replaces the generic desktop sentence with ONE that names re-create, never "call windows_mcp_doctor"',
+        absentDesk.desktop?.errorCode === 'facts-file-absent'
+        && absentDesk.desktop?.measured === false
+        && typeof absentDesk.desktopWarning === 'string'
+        && /no desktop-facts file/u.test(absentDesk.desktopWarning)
+        && /re-create the computer/u.test(absentDesk.desktopWarning)
+        && /call windows_mcp_doctor before trusting/u.test(absentDesk.desktopWarning) === false
+        && /call windows_mcp_doctor before trusting/u.test(String(absentDesk.note ?? '')) === false
+        && absentDoctor.desktopWarning === absentDesk.desktopWarning,
+        `errorCode=${absentDesk.desktop?.errorCode} warning=${String(absentDesk.desktopWarning ?? '').slice(0, 96)}`)
+      fake.resetDesktopFacts()
+
+      // ---- C-20: OFFLINE, THE 19 NAMES ARE `leaks` (C5) ----
+      //
+      // The leak state is "prefixed schemas on the GLOBAL registry while the
+      // bridge is down". Teardown leaves zero names, so the 19 are registered
+      // directly on the host registry — exactly the condition the field is for —
+      // and disposed again before the computer comes back (a duplicate name is
+      // what the attach would reject).
+      rows.set('winbox3', { kind: 'windows', state: 'powered-off', ssh: true, sshPort: 47103 })
+      const offlineForLeak = await waitFor(async () => (await doctor(agentA.agent)).online === false, 8000)
+      const leakStubs = fake.GUEST_TOOLS.map((tool) => hostTools.register({
+        name: `${CUA2}${tool.name}`,
+        description: 'leaked stub (the offline residue this field exists for)',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => ({ text: '{}' })
+      }))
+      const leakDoctor = await doctor(agentA.agent)
+      check('(CB-C-20) OFFLINE the 19 prefixed names are `leaks` (status leaking) and `prefixSchemas` — the raw surface — holds the same 19',
+        offlineForLeak && leakDoctor.online === false && leakDoctor.status === 'leaking'
+        && leakDoctor.leaks.length === 19 && leakDoctor.prefixSchemas.length === 19,
+        `online=${leakDoctor.online} status=${leakDoctor.status} leaks=${leakDoctor.leaks.length} prefixSchemas=${leakDoctor.prefixSchemas.length}`)
+      for (const dispose of leakStubs) { try { dispose() } catch { /* already gone */ } }
+      rows.set('winbox3', { kind: 'windows', state: 'ready', ssh: true, sshPort: 47103 })
+      const backOnline = await waitFor(() => prefixed().length === 19, 12000)
+      liveLane({ ...LIVE_RELAY })
+
+      // ---- C-21: THE TWO PINNED EXPRESSIONS ARE UNTOUCHED (C5) ----
+      //
+      // The fix had to be reachable WITHOUT editing `leaking` or `status:` (both
+      // are pinned byte-for-byte by the repository gate and by modules-unit).
+      // Reading them back from the source is what makes the "cheap" alternative
+      // (`leaksScope`, a second list) fail here instead of passing quietly.
+      const pinnedSource = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'index.js'), 'utf8')
+      const leaksAssignAt = pinnedSource.indexOf('const leaks = online === true ? [] : prefixSchemas')
+      const leakingAt = pinnedSource.indexOf('const leaking = online !== true && leaks.length > 0')
+      const statusAt = pinnedSource.indexOf("status: online !== true && leaks.length > 0 ? 'leaking' : (blind === true ? 'blind' :")
+      check('(CB-C-21) the `leaks` assignment precedes the two pinned expressions, and `leaking` / the four-way `status:` are byte-identical',
+        backOnline && leaksAssignAt >= 0 && leakingAt > leaksAssignAt && statusAt > leakingAt
+        && pinnedSource.includes('const prefixSchemas = names.filter((name) => name.startsWith(TOOL_PREFIX))'),
+        `leaks@${leaksAssignAt} leaking@${leakingAt} status@${statusAt}`)
+
+      // ---- CB-C-22 (PRE P0): `payload.stale` AGREES WITH ITS ONE OWNER ----
+      //
+      // This row used to assert a truth table the DOCTOR computed. PRE proved that
+      // derivation disagreed with `payloadStale()` (win-mcp.js, the declared owner)
+      // on exactly the evidence a live guest produces — guard measured absent +
+      // current relay: the owner says `false`, the doctor said `true`; a plain call
+      // (the real client emits no `relayPresent`) with a differing measured relay
+      // hash: the owner said `true`, the doctor `null`, while the verdict in the
+      // SAME answer said "the guest payload is stale".
+      //
+      // The contract now: the doctor publishes the OWNER'S value verbatim. Each
+      // arm below asks the real owner, feeds its answer the way the client does,
+      // and requires the same value back — so a re-derivation in index.js fails
+      // here on the FIRST arm that disagrees with it.
+      const ownerStale = (inputs) => realWinMcp.payloadStale(inputs)
+      const staleArms = [
+        // guard measured ABSENT + a current relay → comparable pair agrees, absent guard is not a pair → false (the C5 repro)
+        { label: 'guard-absent', inputs: { expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: LIVE_EXPECTED_RELAY, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: null }, wire: { guardPresent: false } },
+        // a PLAIN call: measured, differing relay and NO `relayPresent` key → true (the C9 repro)
+        { label: 'plain-differing', inputs: { expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: LIVE_GUEST_RELAY, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: null } },
+        // nothing comparable → null (the C6/C7 repros)
+        { label: 'nothing', inputs: { expectedRelayHash: LIVE_EXPECTED_RELAY, relayHash: null, expectedGuardHash: LIVE_EXPECTED_GUARD, guardHash: null }, wire: { guardPresent: null } }
+      ]
+      const staleSeen = []
+      for (const arm of staleArms) {
+        const owner = ownerStale(arm.inputs)
+        fake.setPayload({ measured: true, ...arm.inputs, ...(arm.wire ?? {}), stale: owner })
+        staleSeen.push({ label: arm.label, owner, doctor: (await doctorWith({ functional: false })).payload.stale })
+      }
+      check('(CB-C-22) `payload.stale` is the ONE OWNER\'s value, published verbatim — false for a measured-absent guard, true for a differing plain-call relay pair, null when nothing is comparable',
+        staleSeen.length === 3
+        && staleSeen.every((arm) => arm.doctor === arm.owner)
+        && staleSeen[0].doctor === false && staleSeen[1].doctor === true && staleSeen[2].doctor === null,
+        staleSeen.map((arm) => `${arm.label}:doctor=${JSON.stringify(arm.doctor)}/owner=${JSON.stringify(arm.owner)}`).join(' '))
+      fake.setPayload(null)
+      fake.setBootRace(null)
+      fake.resetDesktopFacts()
+      liveLane({ ...LIVE_RELAY })
+      await waitFor(async () => (await doctor(agentA.agent)).desktop?.measured === true, 8000)
+    } finally {
+      fake.setBootRace(null)
+      fake.setPayload(null)
+      fake.setRelayFunctional(null)
       fake.resetDesktopFacts()
     }
   }
