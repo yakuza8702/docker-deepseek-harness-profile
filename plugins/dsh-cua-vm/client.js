@@ -231,13 +231,90 @@ window.__ModuleLoader__.load({
       return options
     }
 
-    async function api(path, body) {
-      const response = await fetch(`/cua/${path}`, body === undefined
-        ? { headers: { accept: 'application/json' } }
-        : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-      const payload = await response.json().catch(() => null)
-      if (payload?.ok !== true) throw new Error(payload?.error ?? `HTTP ${response.status}`)
-      return payload
+    /**
+     * C19 — THE CLIENT OUTLIVES THE ROUTE.
+     *
+     * The `/cua` routes carry their own budget (`ROUTE_TIMEOUTS`, WP-B) and
+     * answer a 504 with a sentence when the supervisor misses it. This table is
+     * that table **plus five seconds** (route budget + 5_000), so the panel is
+     * still listening when the route's own refusal arrives: the user reads the
+     * supervisor-shaped story ("did not answer start within 65 s … the computer
+     * did not stop working") instead of a blind client abort that would hide
+     * whether the supervisor ever saw the request.
+     *
+     *   state 15 s → 20 s      lifecycle (start/shutdown/suspend/stop/delete)
+     *   65 s → 70 s            create 1_805 s → 1_810 s
+     *   exec                   route `(timeout | 300) + 60 s` → that + 5 s, PER CALL (D1)
+     *
+     * Duplicated on purpose: the client half is a separate module bundle and
+     * cannot import the plugin's `index.js` at runtime. The ARITHMETIC is the
+     * contract; a table that drifts below route + 5 s re-opens defect R4 (the
+     * 30-minute wait) on the one surface the user actually watches.
+     */
+    const CLIENT_TIMEOUTS = Object.freeze({
+      state: 20_000, config: 20_000, doctor: 35_000, gc: 35_000, space: 35_000,
+      windowsStatus: 35_000, windowsFreeSpace: 35_000, windowsPassword: 20_000,
+      windowsClipboardSet: 35_000, windowsClipboardGet: 35_000,
+      start: 70_000, shutdown: 70_000, suspend: 70_000, stop: 70_000, delete: 70_000,
+      create: 1_810_000, ensure: 1_810_000, android: 3_370_000,
+      metrics: 35_000, view: 35_000, screenshot: 35_000, input: 35_000, gui: 125_000, pointer: 35_000,
+      // D1: `exec` is 0 — "ask the resolver", exactly as the route's own table
+      // says (`ROUTE_TIMEOUTS.exec === 0`). It was a frozen 180_000 (= 120 s +
+      // grace), which both CUT a legal long exec the route allows up to 3 660 s
+      // and, for the panel's own `timeout: 120` body, fired the AbortSignal at
+      // the same 180 s the route's 504 needs — the C18 sentence never rendered.
+      // The budget is now computed per call by `clientBudget('exec', body)`.
+      exec: 0
+    })
+    const CLIENT_TIMEOUT_FALLBACK_MS = 35_000
+    /** The route's `exec` grace (EXEC_ENVELOPE_GRACE_MS): `timeout + 60 s`. */
+    const CLIENT_EXEC_GRACE_MS = 60_000
+    /** C19's lead: the client outlives the route by five seconds. */
+    const CLIENT_LEAD_MS = 5_000
+    /**
+     * D1 — THE EXEC BUDGET IS PER CALL, because the route's is.
+     *
+     * Mirrors `PER_CALL_TIMEOUTS.cua_vm_exec` (`(timeout | 300)`, clamped to
+     * 1–3600 s, `+ 60 s`), then applies C19's `+ 5 s`. Duplicated arithmetic on
+     * purpose (the client bundle cannot import `index.js`); `tests/exec-budget.mjs`
+     * asserts the two agree, so the copy cannot drift.
+     */
+    const execRouteTimeoutMs = (body) => (Math.min(3600, Math.max(1, Number(body?.timeout) || 300)) * 1000) + CLIENT_EXEC_GRACE_MS
+    /** The budget for an action (C19: route + 5 s), or the route fallback + 5 s. */
+    const clientBudget = (action, body) => (action === 'exec'
+      ? execRouteTimeoutMs(body) + CLIENT_LEAD_MS
+      : (CLIENT_TIMEOUTS[action] ?? CLIENT_TIMEOUT_FALLBACK_MS))
+
+    /**
+     * C19 — the backstop, not the primary answer.
+     *
+     * `{ budgetMs }` puts `AbortSignal.timeout(budgetMs)` on the fetch, so a
+     * supervisor that never answers can no longer leave a button counting for
+     * ever. The abort is TRANSLATED: a silent `TimeoutError`/`AbortError`
+     * becomes the sentence below, while a real route refusal (a `504` carrying
+     * `code:'route-timeout'`) has already put its own, more truthful sentence in
+     * `payload.error` and is thrown untouched.
+     */
+    async function api(path, body, { budgetMs } = {}) {
+      const budget = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : null
+      try {
+        const response = await fetch(`/cua/${path}`, {
+          ...(body === undefined
+            ? { headers: { accept: 'application/json' } }
+            : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+          ...(budget === null ? {} : { signal: AbortSignal.timeout(budget) })
+        })
+        const payload = await response.json().catch(() => null)
+        if (payload?.ok !== true) throw new Error(payload?.error ?? `HTTP ${response.status}`)
+        return payload
+      } catch (error) {
+        // The computer did not stop working just because this page stopped
+        // waiting: say that, and point at the one action that re-reads the truth.
+        if (budget !== null && (error?.name === 'TimeoutError' || error?.name === 'AbortError')) {
+          throw new Error(`the panel stopped waiting after ${Math.round(budget / 1000)} s — the supervisor may still be finishing; hit Refresh`)
+        }
+        throw error
+      }
     }
 
     function Viewer({ name, hash, onClose }) {
@@ -255,9 +332,9 @@ window.__ModuleLoader__.load({
           // display. Typing and keys are position independent and stay on the
           // cheaper xdotool route.
           if (payload.kind === 'click') {
-            await api('gui', { name, action: 'click', x: payload.x, y: payload.y, smooth: false })
+            await api('gui', { name, action: 'click', x: payload.x, y: payload.y, smooth: false }, { budgetMs: clientBudget('gui') })
           } else {
-            await api('input', { name, ...payload })
+            await api('input', { name, ...payload }, { budgetMs: clientBudget('input') })
           }
           setFrameAt(Date.now())
         } catch (error) {
@@ -269,7 +346,7 @@ window.__ModuleLoader__.load({
         let alive = true
         const tick = async () => {
           try {
-            const payload = await api('screenshot', { name })
+            const payload = await api('screenshot', { name }, { budgetMs: clientBudget('screenshot') })
             if (alive) setPng(payload.png)
           } catch { /* the next tick retries */ }
         }
@@ -287,7 +364,7 @@ window.__ModuleLoader__.load({
         let alive = true
         const tick = async () => {
           try {
-            const p = await api('pointer', { name })
+            const p = await api('pointer', { name }, { budgetMs: clientBudget('pointer') })
             // Keep the last good position: a busy or briefly unavailable guest
             // answers with width 0, which used to make the drawn cursor vanish.
             if (alive && p !== null && p.width > 0 && p.height > 0) setPos(p)
@@ -427,7 +504,7 @@ window.__ModuleLoader__.load({
 
       const load = useCallback(async () => {
         try {
-          const payload = await api('state')
+          const payload = await api('state', undefined, { budgetMs: CLIENT_TIMEOUTS.state })
           setState(payload)
           setForm((current) => current ?? payload.config)
         } catch (error) {
@@ -477,7 +554,7 @@ window.__ModuleLoader__.load({
         const refresh = async () => {
           for (const name of installingKey.split(',')) {
             try {
-              const payload = await api('windowsStatus', { name, tail: 5 })
+              const payload = await api('windowsStatus', { name, tail: 5 }, { budgetMs: clientBudget('windowsStatus') })
               if (cancelled) return
               setInstallInfo((current) => ({ ...current, [name]: payload }))
             } catch {
@@ -512,7 +589,7 @@ window.__ModuleLoader__.load({
         const refresh = async () => {
           for (const name of freeKey.split(',')) {
             try {
-              const payload = await api('windowsFreeSpace', { name })
+              const payload = await api('windowsFreeSpace', { name }, { budgetMs: clientBudget('windowsFreeSpace') })
               if (cancelled) return
               setFreeSpace((current) => ({ ...current, [name]: payload }))
             } catch {
@@ -539,7 +616,7 @@ window.__ModuleLoader__.load({
         const entry = clip[name] ?? {}
         setClip((current) => ({ ...current, [name]: { ...entry, busy: 'set', out: '' } }))
         try {
-          const payload = await api('windowsClipboardSet', { name, text: entry.text ?? '' })
+          const payload = await api('windowsClipboardSet', { name, text: entry.text ?? '' }, { budgetMs: clientBudget('windowsClipboardSet') })
           setClip((current) => ({
             ...current,
             [name]: { ...(current[name] ?? {}), busy: null, out: payload.available === false
@@ -556,7 +633,7 @@ window.__ModuleLoader__.load({
         const entry = clip[name] ?? {}
         setClip((current) => ({ ...current, [name]: { ...entry, busy: 'get', out: '' } }))
         try {
-          const payload = await api('windowsClipboardGet', { name })
+          const payload = await api('windowsClipboardGet', { name }, { budgetMs: clientBudget('windowsClipboardGet') })
           setClip((current) => ({
             ...current,
             [name]: { ...(current[name] ?? {}), busy: null, out: payload.available === false
@@ -610,7 +687,7 @@ window.__ModuleLoader__.load({
         setPending({ name, action, at: Date.now() })
         setNote(label)
         try {
-          const payload = await api(action, body)
+          const payload = await api(action, body, { budgetMs: clientBudget(action) })
           await load()
           setNote(payload?.mayBeTorn === true
             ? clean(`${name}: ${payload?.detail ?? `${action} finished`} Its restore point is marked mayBeTorn, so the next Start boots the disk instead of trusting it.`)
@@ -662,7 +739,7 @@ window.__ModuleLoader__.load({
                 diskGb: draft.diskGb,
                 android: draft.android,
                 rea: draft.rea
-              })
+              }, { budgetMs: CLIENT_TIMEOUTS.create })
           setShowNew(false)
           setDraft({
             name: '', kind: 'linux', cpu: 2, memory: 4, image: 'linux', gpu: null, diskGb: 20,
@@ -689,7 +766,7 @@ window.__ModuleLoader__.load({
        */
       const revealPassword = async (name) => {
         try {
-          const payload = await api('windowsPassword', { name })
+          const payload = await api('windowsPassword', { name }, { budgetMs: clientBudget('windowsPassword') })
           setNote(clean(`${name}: password revealed below (user "${payload.username}"). It is stored 0600 in the VM store, never in the registry — Hide password removes it from this page.`))
           setSecret((current) => ({ ...current, [name]: payload.password }))
         } catch (error) {
@@ -718,7 +795,7 @@ window.__ModuleLoader__.load({
       /** The measured space, so the shown line is the tool's own line. */
       const showSpace = async (name) => {
         try {
-          const payload = await api('space', { name })
+          const payload = await api('space', { name }, { budgetMs: clientBudget('space') })
           setNote(clean(payload.warning ? `${payload.line} — ${payload.warning}` : payload.line))
         } catch (error) {
           setNote(clean(error?.message ?? error))
@@ -729,7 +806,7 @@ window.__ModuleLoader__.load({
       const cleanup = async () => {
         setPending({ name: '', action: 'gc' })
         try {
-          const payload = await api('gc', {})
+          const payload = await api('gc', {}, { budgetMs: CLIENT_TIMEOUTS.gc })
           await load()
           const reclaimed = (payload.orphans ?? []).filter((row) => row.action.startsWith('reclaim'))
           setNote(clean(payload.bytesFreed > 0 || reclaimed.length > 0
@@ -746,7 +823,11 @@ window.__ModuleLoader__.load({
         if (exec === null || exec.cmd.trim() === '') return
         setExec({ ...exec, busy: true, out: '' })
         try {
-          const payload = await api('exec', { name: exec.name, cmd: exec.cmd, timeout: 120 })
+          // D1: the body IS the budget. `timeout: 120` therefore gets route
+          // 180 s + C19's 5 s = 185 s, so the route's 504 (and C18's sentence)
+          // always lands before this AbortSignal.
+          const body = { name: exec.name, cmd: exec.cmd, timeout: 120 }
+          const payload = await api('exec', body, { budgetMs: clientBudget('exec', body) })
           setExec({ ...exec, busy: false, out: clean(`exit ${payload.exit}\n${payload.stdout}${payload.stderr ? `\n[stderr]\n${payload.stderr}` : ''}`) })
           await load()
         } catch (error) {
@@ -756,7 +837,7 @@ window.__ModuleLoader__.load({
 
       const showVm = async (name) => {
         try {
-          const payload = await api('view', { name })
+          const payload = await api('view', { name }, { budgetMs: clientBudget('view') })
           // A Windows computer has a console page, not a cua viewer: open it in a
           // tab (the relay serves a full page), and keep the frame viewer for the
           // Linux guests, where the input path is the cua one.
@@ -774,7 +855,7 @@ window.__ModuleLoader__.load({
 
       const metrics = async (name) => {
         try {
-          const m = await api('metrics', { name })
+          const m = await api('metrics', { name }, { budgetMs: clientBudget('metrics') })
           setMetricFor(name)
           setNote(`${name}: load ${m.load} · mem ${m.memUsedMb}/${m.memTotalMb} MB · disk ${m.diskUsed}/${m.diskSize} (${m.diskUsePct}) · ${m.cpus} vCPU`)
         } catch (error) {
@@ -784,7 +865,7 @@ window.__ModuleLoader__.load({
 
       const savePolicy = async () => {
         try {
-          const payload = await api('config', form)
+          const payload = await api('config', form, { budgetMs: CLIENT_TIMEOUTS.config })
           setForm(payload.config)
           setNote('Policy saved.')
           await load()
@@ -839,12 +920,18 @@ window.__ModuleLoader__.load({
             // crashed restore temps, screenshots past retention, stale rows. It
             // is a button because the alternative is a store that fills up and a
             // user who has to read the supervisor log to find out why.
-            h('button', { type: 'button', style: S.button, disabled: pending !== null, onClick: () => void cleanup() }, 'Clean up'),
+            // C20/C-4: NOT GATED ON `pending`. Clean up and Refresh are how a
+            // user escapes a wedged operation WITHOUT reloading the page; a
+            // wedged op is exactly when `pending` stays set, so disabling this
+            // button hid the remedy behind the defect. (It still sets `pending`
+            // itself while it runs — the row buttons read that — but a second
+            // click is a second gc the supervisor serialises, not a dead UI.)
+            h('button', { type: 'button', style: S.button, onClick: () => void cleanup() }, 'Clean up'),
             h('button', {
               type: 'button', style: S.button,
               onClick: async () => {
                 try {
-                  const payload = await api('doctor')
+                  const payload = await api('doctor', undefined, { budgetMs: CLIENT_TIMEOUTS.doctor })
                   const caps = payload.hostCaps ?? {}
                   // U5: the quota is half the fact. `doctor` sends it as
                   // `store.quotaBytes`; an older supervisor only has
@@ -967,7 +1054,11 @@ window.__ModuleLoader__.load({
             draft.rea === true && form.diskQuotaGb < Math.max(40, draft.diskGb) && h('div', { style: { ...S.muted, color: T.error } },
               `The VM store quota is ${form.diskQuotaGb} GB. The ${Math.max(40, draft.diskGb)} GB REA disk is created anyway (it is sparse), but the guest will hit the real disk ceiling — raise Store quota in the Policy tab first.`),
             h('div', { style: S.row },
-              h('button', { type: 'button', style: S.primary, disabled: pending !== null || draft.name.trim() === '', onClick: () => void create() }, pending?.action === 'create' ? 'Creating…' : 'Create computer')
+              // C20/C-4: only the EMPTY NAME disables Create. A wedged operation
+              // elsewhere in the panel used to disable this button too, which
+              // made "the panel is stuck" and "you cannot create anything" the
+              // same sentence. The label still follows the create itself.
+              h('button', { type: 'button', style: S.primary, disabled: draft.name.trim() === '', onClick: () => void create() }, pending?.action === 'create' ? 'Creating…' : 'Create computer')
             )
           ),
 
@@ -1019,6 +1110,56 @@ window.__ModuleLoader__.load({
                 : pending?.action === 'shutdown' ? withWait('Shutting down…')
                   : pending?.action === 'suspend' ? withWait('Suspending…')
                     : pending?.action === 'delete' ? withWait('Deleting…') : null
+              // C20 — RENDER, THEN DISABLE WITH A REASON.
+              //
+              // BOTH power buttons are rendered on EVERY row. HEAD hid them on
+              // every row that was not `ready` (or an installing Windows one),
+              // so a powered-off, erroring or wedged computer showed no power
+              // control at all — the reported "where did the buttons go" — and
+              // the fix belongs in the row, not in a wider show-condition. The
+              // HEAD expression is kept as a VALUE so the semantic stays
+              // greppable: what changed is that failing it DISABLES the button
+              // (with the reason as its title) instead of removing it.
+              const canPower = (ready || (windows && installing))
+              // C20 — THE REASON LADDER, IN THIS ORDER (first match wins): a
+              // pending action outranks a held lock, which outranks the row's
+              // state. The user is told the NEAREST cause, not the stale one
+              // underneath it. `lock` is the supervisor's lock snapshot for this
+              // computer (WP-A/B), so a wedged operation is NAMED here instead of
+              // presenting a button that silently refuses.
+              const lockHeldMs = Number(vm.lock?.heldMs) > 0 ? Number(vm.lock.heldMs) : 0
+              const powerReason = busy && pending !== null
+                ? `Waiting for ${pending.action}… ${waitedSec}s`
+                : lockHeldMs > 0
+                  ? `Another operation on ${name} has been running for ${Math.max(1, Math.round(lockHeldMs / 60000))} min (${vm.lock?.heldBy ?? 'unknown'}). If it does not settle, restart the supervisor.`
+                  : vm.state === 'powered-off'
+                    ? 'Powered off — Start boots it'
+                    : vm.state === 'suspended'
+                      ? 'Suspended — Start resumes it'
+                      : (vm.state === 'booting' || vm.state === 'installing') && !windows
+                        ? 'Booting — the power buttons work once it is ready'
+                        : failed ? 'Error — Start or delete first' : null
+              // C13/C20 — THE ROW CAN TELL THE TRUTH ABOUT A GUEST IT CANNOT
+              // REACH. `stateStale` is computed ON READ by the supervisor (C15:
+              // no watcher write is needed for a row to look stale), so a row
+              // whose corroboration timed out says so in the badge and in one
+              // line under the row, instead of showing a confident `ready` for
+              // a guest that is already gone. The age falls back to `stateSince`
+              // (C13's own formula) for a supervisor older than this page.
+              //
+              // D5: `stateSince` is an ISO STRING (the supervisor's own
+              // `stateStaleness` does `Date.parse(String(row.stateSince))`), so
+              // `Number(iso)` was NaN — and `Math.max(0, NaN)` is NaN, which
+              // rendered as "unconfirmed NaNm". Parse it the same way, and keep
+              // 0 as the honest "age unknown"; a `stateStale:true` row always
+              // carries `stateAgeMs`, so this is the older-supervisor path only.
+              const stateSinceMs = Date.parse(String(vm.stateSince ?? ''))
+              const stateAgeMs = Number.isFinite(Number(vm.stateAgeMs))
+                ? Number(vm.stateAgeMs)
+                : (Number.isFinite(stateSinceMs) ? Math.max(0, Date.now() - stateSinceMs) : 0)
+              const staleMin = vm.stateStale === true
+                ? Math.max(1, Math.round(stateAgeMs / 60000))
+                : null
               const stateBadge = failed
                 ? { ...S.badge(false), color: T.error, border: `1px solid ${T.line}`, background: 'rgba(242, 139, 130, .12)' }
                 : installing
@@ -1027,7 +1168,7 @@ window.__ModuleLoader__.load({
               return h('div', { key: name, style: S.card },
                 h('div', { style: S.row },
                   h('span', { style: { fontWeight: 600, fontSize: 13 } }, name),
-                  h('span', { style: stateBadge }, vm.state ?? 'unknown'),
+                  h('span', { style: stateBadge }, staleMin === null ? (vm.state ?? 'unknown') : `${vm.state ?? 'unknown'} (unconfirmed ${staleMin}m)`),
                   h('span', { style: { ...S.badge(false), color: T.caption } }, windows ? 'Windows' : 'Linux'),
                   vm.gpu === true && h('span', { style: { ...S.badge(false), color: T.info } }, 'GPU'),
                   vm.android === true && h('span', { style: { ...S.badge(false), color: T.success, border: `1px solid ${T.line}`, background: 'rgba(126, 231, 135, .14)' } }, 'Android'),
@@ -1045,17 +1186,19 @@ window.__ModuleLoader__.load({
                   // boots); suspend keeps the sandbox and resumes instantly. A
                   // A Windows computer only has the live view.
                   //
-                  // F4: AN INSTALLING WINDOWS ROW GETS BOTH BUTTONS, WITH A
-                  // CONFIRM THAT SAYS WHAT IT COSTS. Hiding them left the user
-                  // with no way out of a 40-minute install except Force delete,
-                  // and a silent "Shutting down…" hid that the supervisor was
-                  // waiting on this exact window. The confirm is the honest part:
-                  // there is no ACPI handler in Setup, so Shutdown aborts the
-                  // install (the backend sends a short powerdown window then
-                  // `quit` and marks the disk mayBeTorn); Suspend pauses the
-                  // machine and Start continues it.
-                  (ready || (windows && installing)) && h('button', {
-                    type: 'button', style: S.button, disabled: busy,
+                  // C20: BOTH ARE RENDERED HERE UNCONDITIONALLY — an installing
+                  // Windows row is the case that PROVES it, because hiding them
+                  // left the user with no way out of a 40-minute install except
+                  // Force delete. `canPower` is the old show-condition, now the
+                  // disable-condition, and `title` carries the reason ladder.
+                  //
+                  // The confirm still says what the action COSTS: there is no
+                  // ACPI handler in Setup, so Shutdown aborts the install (the
+                  // backend sends a short powerdown window then `quit` and marks
+                  // the disk mayBeTorn); Suspend pauses the machine and Start
+                  // continues it. It fires only when the button is enabled.
+                  h('button', {
+                    type: 'button', style: S.button, disabled: !canPower || busy, title: powerReason,
                     onClick: () => {
                       const question = windows && installing
                         ? `Shut ${name} down?\n\nTHIS ABORTS THE WINDOWS INSTALL. Setup has no ACPI handler, so it will be stopped (a short window, then a forced quit) and its half-written disk marked mayBeTorn — Start will NOT resume Setup, and you will have to create the computer again.`
@@ -1066,8 +1209,8 @@ window.__ModuleLoader__.load({
                   }, busy && busyLabel !== null ? busyLabel : 'Shutdown'),
                   // Both kinds can be suspended: `cua sb suspend` on Linux,
                   // QMP stop on Windows (the tool says which).
-                  (ready || (windows && installing)) && h('button', {
-                    type: 'button', style: S.button, disabled: busy,
+                  h('button', {
+                    type: 'button', style: S.button, disabled: !canPower || busy, title: powerReason,
                     onClick: () => {
                       if (windows && installing
                         && !window.confirm(`Suspend ${name}? Mid-install this PAUSES Windows Setup: the machine keeps its RAM and Start continues where it stopped, but the install does not finish while it is paused (the install deadline keeps running).`)) return
@@ -1114,7 +1257,7 @@ window.__ModuleLoader__.load({
                       if (!window.confirm(`Delete ${name}? Its disk, checkpoints, screenshots and port rows go with it.${windows ? ' A Windows computer also has a QEMU process and a TPM: if either still holds the disk, use Force delete.' : ''}`)) return
                       void (async () => {
                         try {
-                          const payload = await api('delete', { name })
+                          const payload = await api('delete', { name }, { budgetMs: clientBudget('delete') })
                           await load()
                           // A partial manifest is not a deletion: say which
                           // items survived (usually a disk kept because QEMU
@@ -1146,6 +1289,12 @@ window.__ModuleLoader__.load({
                     onClick: () => void forceDelete(name)
                   }, 'Force delete')
                 ),
+                // C20: ONE warning line under the row — not a colour, not a
+                // second badge. A `ready` row whose guest stopped answering is
+                // the stale-ready wedge this package exists for, so the remedy
+                // is spelled out where the buttons are.
+                staleMin !== null && h('div', { style: { ...S.muted, color: T.error } },
+                  `This row has not been confirmed by the computer for ${staleMin} min — the guest is probably gone. Try Start, then restart the supervisor if it does not settle.`),
                 secret[name] && h('div', { style: { ...S.muted, fontFamily: 'ui-monospace, monospace' } },
                   `user "cua" password "${secret[name]}" (also in $STORE/windows/${name}/credentials.json, mode 0600)`),
                 // U4: THE DISK IS NOT THE FREE SPACE. A below-floor number is
@@ -1304,7 +1453,10 @@ window.__ModuleLoader__.load({
     // stored-alias option without mounting the page.
     module.exports.__test = {
       hideSecretEntry, noteAfterHide, clean,
-      windowsCatalogRows, windowsVersionLabel, windowsVersionOptions, WINDOWS_CATALOG_FALLBACK, formatGb
+      windowsCatalogRows, windowsVersionLabel, windowsVersionOptions, WINDOWS_CATALOG_FALLBACK, formatGb,
+      // D1: the per-call client budget is ARITHMETIC, so `tests/exec-budget.mjs`
+      // can prove it against the route's own resolver without mounting a page.
+      clientBudget, CLIENT_TIMEOUTS, CLIENT_EXEC_GRACE_MS, CLIENT_LEAD_MS
     }
     return module.exports
   }

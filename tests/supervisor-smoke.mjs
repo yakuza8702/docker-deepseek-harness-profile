@@ -7,7 +7,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import net from 'node:net'
-import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync, rmSync, statSync, readdirSync, chmodSync, truncateSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync, rmSync, statfsSync, statSync, readdirSync, chmodSync, truncateSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import os from 'node:os'
@@ -16,7 +16,65 @@ import zlib from 'node:zlib'
 // Resolved from THIS file, so the suite runs from a checkout anywhere (CI,
 // a worktree, a reviewer's clone) — it used to hardcode the author's path.
 const REPO = process.env.REPO || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const STORE = path.join(os.tmpdir(), `cua-smoke-${process.pid}`)
+
+/**
+ * D-7 — THE STORE MUST LIVE ON A REAL FILESYSTEM, AND THE SUITE SAYS WHERE.
+ *
+ * The landed C22 pre-flight refuses a checkpoint when
+ * `bavail × bsize − CHECKPOINT_FREE_RESERVE_BYTES (2 GiB) < diskBytes`. That rule
+ * is CORRECT, and on a 2 GiB tmpfs (this sandbox's /tmp is exactly that) it
+ * refuses every capture — which would turn the suite's "the checkpoint landed"
+ * assertions into failures of the FIX rather than of the code under test.
+ *
+ * So the suite PICKS its temp root instead of inheriting one blindly:
+ *   1. `DSH_CUA_SMOKE_TMPDIR`, when set (a reviewer can force a location);
+ *   2. the inherited TMPDIR / os.tmpdir(), when it has room;
+ *   3. `../.cua-smoke-tmp` next to the checkout, then `~/.cua-smoke-tmp`.
+ * It prints the choice. When NONE of them has 3 GiB free, the checkpoint-SPACE
+ * cases are reported as an honest `NOT RUN` (with the measured free space) and
+ * are not counted as failures: a tiny filesystem is not a regression.
+ */
+const SMOKE_TMP = (() => {
+  const freeBytesOf = (dir) => {
+    try {
+      const stats = statfsSync(dir)
+      return Number(stats.bavail) * Number(stats.bsize)
+    } catch {
+      return 0
+    }
+  }
+  const NEED = 3 * 1024 ** 3
+  const candidates = [
+    process.env.DSH_CUA_SMOKE_TMPDIR,
+    process.env.TMPDIR,
+    os.tmpdir(),
+    path.join(path.dirname(REPO), '.cua-smoke-tmp'),
+    path.join(os.homedir(), '.cua-smoke-tmp')
+  ].filter((value) => typeof value === 'string' && value !== '')
+  for (const dir of candidates) {
+    try {
+      // Recorded BEFORE mkdir: a fallback root this suite invented is removed
+      // again at the end, so a checkout never accumulates `.cua-smoke-tmp/`.
+      const created = existsSync(dir) === false
+      mkdirSync(dir, { recursive: true })
+      const probe = path.join(dir, `.cua-smoke-write-${process.pid}`)
+      writeFileSync(probe, 'x')
+      rmSync(probe, { force: true })
+      if (freeBytesOf(dir) >= NEED) return { dir, free: freeBytesOf(dir), created }
+    } catch { /* not writable, or gone: try the next one */ }
+  }
+  const fallback = os.tmpdir()
+  return { dir: fallback, free: freeBytesOf(fallback), created: false }
+})()
+// `TMPDIR` is exported so every `mkdtempSync(os.tmpdir(), …)` below — and every
+// child supervisor this suite spawns — lands on the SAME filesystem.
+process.env.TMPDIR = SMOKE_TMP.dir
+const TMP_ROOT = SMOKE_TMP.dir
+const TMP_FREE_GB = (SMOKE_TMP.free / 1024 ** 3).toFixed(1)
+/** False only on a filesystem too small for the 2 GiB checkpoint reserve. */
+const TMP_FITS_CHECKPOINT = SMOKE_TMP.free >= 3 * 1024 ** 3
+
+const STORE = path.join(TMP_ROOT, `cua-smoke-${process.pid}`)
 const HOME = path.join(STORE, 'home')
 const SOCK = path.join(STORE, 'supervisor.sock')
 const STUB = path.join(STORE, 'bin', 'cua-stub')
@@ -29,6 +87,21 @@ const STRICT_CONTRACT = process.env.DSH_CUA_CONTRACT_STRICT === '1'
 const check = (label, ok, detail = '') => {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${detail ? ` — ${detail}` : ''}`)
   if (!ok) failures += 1
+}
+/**
+ * A check that needs a filesystem big enough for the C22 reserve.
+ *
+ * On a store with less than 3 GiB free the SPACE rule correctly refuses the
+ * capture, so "the checkpoint landed" cannot be asserted there. That is a
+ * property of the host, not of the code: reported as NOT RUN with the measured
+ * free space, never as a pass (and never as a failure of the fix).
+ */
+const checkCheckpoint = (label, ok, detail = '') => {
+  if (!TMP_FITS_CHECKPOINT) {
+    console.log(` NOT RUN  ${label} — the store is on ${TMP_ROOT} with ${TMP_FREE_GB} GB free (< 3 GiB), where the C22 space rule CORRECTLY refuses a checkpoint`)
+    return
+  }
+  check(label, ok, detail)
 }
 /**
  * WP-6.4 — A CHECK THAT CAN ONLY PASS ONCE THE PRODUCTION HALF EXISTS.
@@ -49,6 +122,7 @@ const checkContract = (label, landed, ok, detail = '', expected = '') => {
   console.log(` PEND  ${label} — awaiting the production change${expected ? ` (${expected})` : ''}${detail ? ` — ${detail}` : ''}`)
 }
 
+console.log(`  .. temp store root: ${TMP_ROOT} (${TMP_FREE_GB} GB free${TMP_FITS_CHECKPOINT ? '' : ' — too small for a checkpoint: the C22 space cases will be NOT RUN'})`)
 rmSync(STORE, { recursive: true, force: true })
 mkdirSync(path.join(STORE, 'bin'), { recursive: true })
 mkdirSync(HOME, { recursive: true })
@@ -510,6 +584,12 @@ const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervi
     // `windowsEarlyDeathWindowMs`; only the DURATION is overridden here.
     DSH_CUA_WINDOWS_BOOT_SETTLE_MS: '2000',
     DSH_CUA_WINDOWS_EARLY_CHECK_MS: '600',
+    // WP-D/D-7: THE WAITER BUDGET. The production deadline is 30 s; the R1
+    // re-pin measures a REFUSAL, and 1.5 s is long enough to be a real deadline
+    // and short enough to keep the suite honest about its own runtime. Nothing
+    // else in this suite queues on a contended lock, so this changes no other
+    // assertion.
+    DSH_CUA_VM_LOCK_WAIT_MS: '1500',
     // R1: the cdboot key schedule, shortened for the suite. The stub QEMU serves
     // no QMP, so the presses FAIL here — which is exactly the "failure to send is
     // non-fatal, log only" contract, and it still proves the schedule ran.
@@ -931,14 +1011,14 @@ try {
       } catch { return false }
     }, 5000, 200)
     const winRow = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms[winName]
-    check('the deferred checkpoint UPGRADES restoreFrom to $STORE/checkpoints/<name>.qcow2',
+    checkCheckpoint('the deferred checkpoint UPGRADES restoreFrom to $STORE/checkpoints/<name>.qcow2',
       upgraded === true && winRow?.restoreFrom?.file === winCheckpoint && existsSync(winCheckpoint),
       JSON.stringify({ upgraded, file: winRow?.restoreFrom?.file, exists: existsSync(winCheckpoint) }))
-    check('...the pending token is cleared and the outcome is recorded as saved',
+    checkCheckpoint('...the pending token is cleared and the outcome is recorded as saved',
       winRow?.checkpointPending === undefined && winRow?.lastShutdown?.checkpointStatus === 'saved'
         && winRow?.lastShutdown?.checkpointDeferred === undefined,
       JSON.stringify({ pending: winRow?.checkpointPending, shutdown: winRow?.lastShutdown }))
-    check('the Windows restore point is the Windows disk, not the Linux one', (() => {
+    checkCheckpoint('the Windows restore point is the Windows disk, not the Linux one', (() => {
       const before = statSync(winDisk).size
       const captured = existsSync(winCheckpoint) ? readFileSync(winCheckpoint, 'utf8') : ''
       // The stub qemu-img flattens by COPYING, so the checkpoint's bytes ARE the
@@ -1409,11 +1489,100 @@ try {
       return reg.vms[bootName]
     })()
     check('R1: the installed-disk fixture is in place', installedRow?.installComplete === true)
+    // ------------------------------------------------------------------
+    // R1 RE-PINNED (WP-D, D-7) — THE REFUSAL IS THE CORRECT ANSWER NOW.
+    //
+    // The shutdown HANDS THE REST OF ITS WORK TO A DETACHED STOP
+    // (`continueWindowsStopInBackground`), which takes `vm:<name>` and holds it
+    // for the configured `shutdownTimeoutSec` window. This fixture used to issue
+    // the Start below 0 ms later and pass ONLY because that Start queued behind
+    // the lock — the exact defect R1 describes (a queue where a refusal belongs,
+    // and on a wedged holder a queue that never ended).
+    //
+    // So the assertions are the NEW contract, in order:
+    //   1. the Start is REFUSED, with `code: 'lock-timeout'` and the holder
+    //      NAMED, inside the waiter budget;
+    //   2. the refusal changed nothing on the row (a refusal must be inert);
+    //   3. once the holder has finished (the lock is gone) the SAME Start goes
+    //      through and the boot reaches QEMU — which is what makes the
+    //      "no cdboot keys for an installed disk" assertion meaningful.
+    // The window is shortened to its FLOOR (10 s, the config clamp) so the suite
+    // proves the fact without paying the production 120 s; the deadline is
+    // shortened for the same reason (`DSH_CUA_VM_LOCK_WAIT_MS` in the child env).
+    // ------------------------------------------------------------------
+    const fixtureConfig = (await call({ op: 'configGet' })).config
+    await call({ op: 'configSet', config: { ...fixtureConfig, shutdownTimeoutSec: 10 } })
     await call({ op: 'vmShutdown', name: bootName })
+    const refusedAt = Date.now()
+    const refusedStart = await call({ op: 'vmStart', name: bootName })
+    const refusedWall = Date.now() - refusedAt
+    check("R1 (re-pinned): a Start issued while the shutdown's detached stop holds the lock is REFUSED — code 'lock-timeout', the holder named, inside the waiter budget",
+      refusedStart.ok === false && refusedStart.code === 'lock-timeout'
+      && refusedStart.lockHeldBy === 'shutdown-background'
+      && /another operation on/u.test(refusedStart.error ?? '')
+      && refusedWall <= 5000,
+      `${refusedWall} ms ${JSON.stringify(refusedStart).slice(0, 240)}`)
+    const refusalRow = (await call({ op: 'vmList' }))?.registry?.[bootName] ?? null
+    check('R1: ...and the refusal is INERT — no state transition in the answer, and the row is still powered-off',
+      refusedStart.state === undefined && refusalRow?.state === 'powered-off',
+      JSON.stringify({ answerState: refusedStart.state, row: refusalRow?.state }).slice(0, 200))
+    // The lock is PROCESS memory, so it is observed through `vmList` (the row's
+    // `lock`), never through the registry file.
+    let lockGone = false
+    const lockDeadline = Date.now() + 45_000
+    while (Date.now() < lockDeadline) {
+      const listed = (await call({ op: 'vmList' }))?.registry?.[bootName] ?? null
+      if ((listed?.lock ?? null) === null) { lockGone = true; break }
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+    check('R1: ...then the background stop SETTLES (its shortened window ends) and the lock is gone',
+      lockGone === true,
+      JSON.stringify((await call({ op: 'vmList' }))?.registry?.[bootName]?.lock ?? null))
+    // THE LEFT-OVER GUEST GOES. The fixture's QEMU is a bare `sleep 120` that
+    // answers neither ACPI nor QMP, so the abandoned stop deliberately LEFT IT
+    // RUNNING (that is the mayBeTorn branch). This fixture is about the NEXT
+    // start of an INSTALLED disk, so the process is removed the way a real
+    // power-off removes it — the PROCESS, then the row's state, exactly as the
+    // fixture above wrote it. Without this, the next Start ADOPTS the live QEMU
+    // (`QMP running, no endpoint answers yet`) and there is no new argv to read,
+    // which is what made the R4 post-install assertion measure the INSTALL boot.
+    // BOTH processes, because the abandoned stop returned before `stopSwtpm`:
+    // a live swtpm holds a LOCK on its state directory, and the next cold start
+    // then fails at "swtpm did not create its socket" — which is a property of
+    // this fixture's guest, not of the Start path under test.
+    const pidAliveFile = (pidPath) => {
+      try {
+        const pid = Number(readFileSync(pidPath, 'utf8').trim())
+        return pid > 0 && existsSync(`/proc/${pid}`)
+      } catch {
+        return false
+      }
+    }
+    const orphanPids = ['qemu.pid', 'swtpm.pid'].map((file) => path.join(STORE, 'windows', bootName, file))
+    for (const pidPath of orphanPids) {
+      try {
+        const pid = Number(readFileSync(pidPath, 'utf8').trim())
+        if (pid > 0) process.kill(pid, 'SIGKILL')
+      } catch { /* already gone is the good case */ }
+    }
+    await waitFor(() => orphanPids.every((pidPath) => pidAliveFile(pidPath) === false), 5000, 100)
+    const parked = JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8'))
+    parked.vms[bootName] = { ...parked.vms[bootName], installComplete: true, state: 'powered-off' }
+    writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(parked, null, 2)}\n`)
     const beforeInstalled = stderr.length
     const installedStart = await call({ op: 'vmStart', name: bootName })
-    await new Promise((resolve) => setTimeout(resolve, 900))
+    await new Promise((resolve) => setTimeout(resolve, 1200))
     const installedLog = stderr.slice(beforeInstalled)
+    // "ACCEPTED" HERE MEANS "NO LONGER REFUSED BY THE LOCK", and that distinction
+    // is the point of the re-pin: the fixture's stub QEMU answers no QMP, so a
+    // COLD start of this disk can only end in `did not start: … never answered
+    // QMP` — a GUEST failure, long after the door opened. What must be gone is
+    // the holder's refusal; the next check proves the boot really reached QEMU.
+    check('R1 (re-pinned): after the holder settles the SAME Start is ACCEPTED — no lock-timeout, no named holder, the answer is about the guest again',
+      installedStart.code !== 'lock-timeout'
+      && /another operation on/u.test(installedStart.error ?? '') === false
+      && (installedStart.ok === true || /did not start/u.test(installedStart.error ?? '')),
+      JSON.stringify(installedStart).slice(0, 220))
     // FOLLOW THE QEMU CHILD, NOT THE ANSWER: the stub serves no QMP, so a COLD
     // start's own `running` proof fails even though the process is healthy. What
     // this asserts is the KEY BEHAVIOUR — no presses for an installed disk — and
@@ -1423,6 +1592,8 @@ try {
       installedLog.split('\n').filter((line) => /press|qemu started/u.test(line)).join(' | ').slice(0, 200) || String(installedStart.error).slice(0, 160))
     check('R1: ...and that start really spawned QEMU (so the absence of keys is meaningful)',
       /qemu started/u.test(installedLog), installedLog.split('\n').filter((line) => /qemu started/u.test(line)).join(' | ').slice(0, 160))
+    // Put the policy back the way the rest of the suite expects to find it.
+    await call({ op: 'configSet', config: { ...(await call({ op: 'configGet' })).config, shutdownTimeoutSec: 120 } })
     // R4: and its argv boots the DISK first.
     const postLines = readFileSync(argvPath, 'utf8').trim().split('\n').filter((line) => line !== '')
     const postArgv = postLines.at(-1) ?? ''
@@ -2882,6 +3053,12 @@ exit 255
       }
     } finally { sup.close() }
   }
+}
+
+// The suite invented its filesystem root on a host whose /tmp is too small: take
+// the directory away again, so the checkout's parent stays clean.
+if (SMOKE_TMP.created === true) {
+  try { rmSync(TMP_ROOT, { recursive: true, force: true }) } catch {}
 }
 
 console.log(failures === 0 ? '\nsmoke: PASS' : `\nsmoke: ${failures} FAILURE(S)`)

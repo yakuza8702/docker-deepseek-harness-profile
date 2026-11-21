@@ -49,7 +49,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync
+  chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statfsSync, statSync, symlinkSync, unlinkSync, writeFileSync
 } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -84,6 +84,14 @@ import {
   windowsFirmwareProfile
 } from './cua-vm-windows-qemu.mjs'
 import { kvmDoctorFacts, kvmPreflightError, kvmStatus } from './cua-vm-kvm.mjs'
+// WP-A: THE WAITER HALF OF EVERY LOCK LIVES IN ITS OWN MODULE (§1.2).
+//
+// The queue, the deadline, the HELD map, poison-not-break and the order guard
+// are pure (timers + AsyncLocalStorage), so they can be unit-tested without a
+// supervisor and adopted here as thin adapters. Nothing below changes what a
+// Linux or Windows operation DOES; it changes what a WAITER does when the
+// operation in front of it never finishes.
+import * as VM_LOCK from './cua-vm-lock.mjs'
 
 const SOCK = process.env.CUA_SUPERVISOR_SOCK || '/tmp/cua-vm/supervisor.sock'
 const CUA_BIN = process.env.CUA_BIN || 'cua'
@@ -776,6 +784,96 @@ function mutateRegistryWith(mutator, { reason = 'registry' } = {}) {
 }
 
 /* ------------------------------------------------------------------ *
+ * A-6 / C12–C15: WHEN DID THE COMPUTER LAST CONFIRM ITS OWN STATE?
+ *
+ * `probe.stale` (the plugin's cached-probe timestamp) answered a different
+ * question — "is this ANSWER old?" — and a row could say `ready` for a week
+ * while `probe.stale` said false, because the probe had been re-taken seconds
+ * ago and answered from a row nobody had verified. The panel offered a desktop
+ * that did not exist and every power button was a coin flip.
+ *
+ * The missing fact is a CORROBORATION timestamp: the last moment the computer
+ * ITSELF proved it was alive (a QMP answer, a live qemu pid, an SSH banner).
+ * It is deliberately IN MEMORY:
+ *   * a registry write every 3 s (one per poll) is a worse defect than one
+ *     second of "unconfirmed" after a supervisor restart;
+ *   * nothing needs it to be durable, because absence means exactly what it
+ *     says — this process has not confirmed the row since it started.
+ * Staleness is then DERIVED on read (C13/C15), so a row becomes visibly stale
+ * with no write at all, even if the watcher is dead.
+ * ------------------------------------------------------------------ */
+const STATE_CONFIRMED = new Map()
+
+/**
+ * C13's window table: how long a LIVE state may go unconfirmed before the panel
+ * says so. `ready`/`running` are polled every 3 s and probed by every status
+ * call, so two minutes is already generous; `booting`/`installing` legitimately
+ * print nothing for minutes at a time (Setup), so they get five.
+ */
+const STATE_CONFIRM_WINDOW_MS = Object.freeze({
+  ready: 120_000,
+  running: 120_000,
+  booting: 300_000,
+  installing: 300_000
+})
+
+/** Record that the computer answered — the ONLY thing allowed to refresh it. */
+function confirmVmState(name, source) {
+  const key = String(name ?? '')
+  if (key === '') return
+  STATE_CONFIRMED.set(key, { at: Date.now(), source: String(source ?? 'unknown') })
+}
+
+/**
+ * C13 — STALENESS IS DERIVED, NEVER GUESSED.
+ *
+ *   stateAgeMs = now − (stateConfirmedAt ?? stateSince)
+ *   stateStale = kind === 'windows' && LIVE.has(state) && stateAgeMs > window(state)
+ *
+ * A Linux row answers `ageMs: null, stale: false` on purpose: `sb ls` is the
+ * authority there, and its absence means a dead supervisor, not a stale VM.
+ */
+function stateStaleness(name, row, now = Date.now()) {
+  const kind = String(row?.kind ?? 'linux')
+  if (kind !== 'windows') return { confirmedAt: null, source: null, ageMs: null, stale: false, windowMs: null }
+  const confirmed = STATE_CONFIRMED.get(String(name)) ?? null
+  const since = Date.parse(String(row?.stateSince ?? '')) || 0
+  const base = confirmed !== null ? confirmed.at : since
+  const ageMs = base > 0 ? Math.max(0, now - base) : null
+  const state = String(row?.state ?? '')
+  const windowMs = Object.prototype.hasOwnProperty.call(STATE_CONFIRM_WINDOW_MS, state) ? STATE_CONFIRM_WINDOW_MS[state] : null
+  return {
+    confirmedAt: confirmed !== null ? new Date(confirmed.at).toISOString() : null,
+    source: confirmed !== null ? confirmed.source : null,
+    ageMs,
+    stale: windowMs !== null && ageMs !== null && ageMs > windowMs,
+    windowMs
+  }
+}
+
+/**
+ * Decorate the rows a caller is about to read (`vmList`, `status`).
+ *
+ * COMPUTED FIELDS ONLY: this mutates the in-memory copy that `readRegistry`
+ * just built (the same object `vmList` already adjusts a Linux row's state in).
+ * Nothing here is ever written back — a `stateConfirmedAt` on disk would be a
+ * claim, and the whole point of C12 is that this is an observation.
+ */
+function decorateStateFacts(rows, now = Date.now()) {
+  for (const [name, row] of Object.entries(rows ?? {})) {
+    if (row === null || typeof row !== 'object') continue
+    const facts = stateStaleness(name, row, now)
+    row.stateConfirmedAt = facts.confirmedAt
+    row.stateConfirmedSource = facts.source
+    row.stateAgeMs = facts.ageMs
+    row.stateStale = facts.stale
+    // A-6: the lock, so the panel can name the holder instead of spinning.
+    row.lock = vmLockFacts(name)
+  }
+  return rows
+}
+
+/* ------------------------------------------------------------------ *
  * WP-4: THE STATE BUS (supervisor → plugin)
  *
  * The plugin used to learn a computer's state from a 5 s HTTP poll. That is a
@@ -882,7 +980,13 @@ function emitVmState(name, state, reason = '') {
   return true
 }
 
-/** A computer left the store. Emitted once per delete, never per retry. */
+/** A computer left the store. Emitted once per delete, never per retry.
+ *  J3: the removal prunes EVERY per-name map, not just this file's peer —
+ *  `STATE_CONFIRMED` (the corroboration timestamp) and the lock module's two
+ *  rate-limiter maps (via `VM_LOCK.pruneLockWarnings`) were left behind by the
+ *  first version of this function, one entry per deleted computer, for the life
+ *  of the process. `VM_REMOVED_AT` deliberately stays: it is the 5 s double
+ *  delete guard, and forgetting it would re-announce the same removal. */
 function emitVmRemoved(name, reason = '') {
   const key = String(name ?? '').trim()
   if (key === '') return false
@@ -891,6 +995,8 @@ function emitVmRemoved(name, reason = '') {
   if (at - previous < 5000) return false
   VM_REMOVED_AT.set(key, at)
   VM_STATE_LAST.delete(key)
+  STATE_CONFIRMED.delete(key)
+  VM_LOCK.pruneLockWarnings(key)
   broadcastVmEvent({ event: 'vm-removed', name: key, kind: 'windows', reason: String(reason ?? '') })
   return true
 }
@@ -1688,13 +1794,62 @@ async function guestExec(name, command, timeoutMs = 60000, attempts = 3) {
   return last
 }
 
-const CREATE_LOCK = new Map()
+/**
+ * THE LOCKS (C1–C7) — ADAPTERS OVER `./cua-vm-lock.mjs`.
+ *
+ * Four keys, one total order: `vm:<name>` → (`@ports` | `@store`) → `@registry`
+ * (a leaf). The queue, the per-waiter deadline, the holder map, the poison
+ * threshold and the order guard are the module's; this file only names the
+ * holders and classifies each call site (C6: user-facing ops throw, background
+ * loops skip).
+ *
+ * PINNED DECLARATIONS AND THE `arguments` HOLE — read this before changing a
+ * signature below. `function withVmLock(name, fn)` and
+ * `function scheduleDeferredWindowsCheckpoint(name, token, config)` are pinned
+ * literals in `tools/check-cua-vm.mjs`; a third/fourth PARAMETER in the
+ * declaration would stop the needle from matching. Their optional extras are
+ * therefore read from `arguments`, and every call site still passes them
+ * explicitly — the text at the call site is what a reviewer reads:
+ *
+ *   withVmLock(name, fn)                              the plain form
+ *   withVmLock(name, fn, { holder: 'vmStart' })       via withVmLockAs below
+ *   withVmLock(name, fn, { mode: 'try', waitMs: 5000 })   skip-and-say-so (C6)
+ *   scheduleDeferredWindowsCheckpoint(n, token, cfg, { origin: 'shutdown' })
+ */
 
+/**
+ * ONE CHAIN CONTEXT PER PROCESS.
+ *
+ * The module is told to use THIS store (`{ context: VM_LOCK_CONTEXT }`), so the
+ * re-entrancy set and the C7 order check see the same frames no matter which
+ * adapter acquired the outer key.
+ */
+const VM_LOCK_CONTEXT = new AsyncLocalStorage()
+
+// The module logs one line a minute when a holder is old; route it through the
+// supervisor's own log so the runbook sentence lands where the operator looks.
+VM_LOCK.useLockLogger((line) => log(line))
+
+/**
+ * `withLock(key, fn)` — the raw key form (`@registry`, `@store`, `@ports`,
+ * `@gc`). Options (holder, waitMs, mode) are an optional third argument; the
+ * existing two-argument call text is unchanged.
+ */
 function withLock(key, fn) {
-  const previous = CREATE_LOCK.get(key) || Promise.resolve()
-  const next = previous.then(fn, fn)
-  CREATE_LOCK.set(key, next.catch(() => {}))
-  return next
+  return VM_LOCK.withLock(lifecycleKey(key), fn, { ...(arguments[2] ?? {}), context: VM_LOCK_CONTEXT })
+}
+
+/**
+ * `@registry` is a lock; every other key is a COMPUTER NAME, and its key is
+ * `vm:<name>` (C1). Normalising here — not at twenty call sites — is what keeps
+ * `withLock(name, ...)` (the detached checkpoint, a background stop, ensure,
+ * create) serialised against `withVmLock(name, ...)` (the power ops). The two
+ * used to share the bare name; they must not drift apart, or a `qemu-img`
+ * convert would run while a Start boots the same disk.
+ */
+function lifecycleKey(key) {
+  const text = String(key ?? '')
+  return text.startsWith('@') ? text : `vm:${text}`
 }
 
 /**
@@ -1706,22 +1861,56 @@ function withLock(key, fn) {
  * a computer that a shutdown has just powered off (both then write the row).
  *
  * The lock is RE-ENTRANT within one async chain: `shutdown` may fall back to
- * `suspend`, `stop` delegates to `shutdown`, and both would otherwise wait for
- * the lock they already hold. AsyncLocalStorage carries "this chain already owns
- * name X" across every `await`, so the inner call runs immediately and a
- * DIFFERENT chain still queues behind `withLock`.
+ * `suspend`, `stop` delegates to `shutdown`, and `windowsStart` is reached from
+ * `vmStart` — all of them would otherwise wait for the lock they already hold.
+ * AsyncLocalStorage carries "this chain already owns `vm:<name>`" across every
+ * `await`, so the inner call runs immediately and a DIFFERENT chain still queues.
+ *
+ * The holder NAME travels through `withVmLockAs` (below) so this declaration
+ * keeps exactly two parameters, and a try-mode call site names its own mode:
+ * a background loop must SKIP, never throw (C6).
  */
-const VM_LOCK_CONTEXT = new AsyncLocalStorage()
-
 function withVmLock(name, fn) {
   assertVmName(name)
-  const held = VM_LOCK_CONTEXT.getStore()
-  if (held instanceof Set && held.has(name)) return fn()
-  return withLock(name, () => {
-    const next = new Set(held ?? [])
-    next.add(name)
-    return VM_LOCK_CONTEXT.run(next, fn)
-  })
+  const options = arguments[2] ?? {}
+  const shared = { ...options, context: VM_LOCK_CONTEXT }
+  if (options.mode === 'try') return VM_LOCK.tryVmLock(name, fn, shared)
+  return VM_LOCK.withVmLock(name, fn, shared)
+}
+
+/**
+ * The same acquire, with the operation named — the holder string a waiter reads
+ * in `another operation on <name> has been running for <N>s (<holder>)`, and
+ * the one `vmList` publishes as `lock.heldBy`.
+ */
+function withVmLockAs(name, holder, fn) {
+  assertVmName(name)
+  return VM_LOCK.withVmLock(name, fn, { holder, context: VM_LOCK_CONTEXT })
+}
+
+/**
+ * TRY MODE FOR THE LIFECYCLE KEY (C6) — `{ ran: true, value }` or
+ * `{ ran: false, holder, heldMs }`. Used by every background site: GC, the
+ * install watcher, the idle timer and the deferred checkpoint. It never throws
+ * because of a busy lock, so it can never end a loop (that is exactly R2, one
+ * loop removed).
+ */
+function tryVmLock(name, fn, options) {
+  assertVmName(name)
+  return VM_LOCK.tryVmLock(name, fn, { ...(options ?? {}), context: VM_LOCK_CONTEXT })
+}
+
+/**
+ * THE LOCK FACTS ON A ROW / IN THE DOCTOR (A-6).
+ *
+ * `{ heldBy, heldMs, poisoned }` for one computer, or null. Derived from the
+ * live snapshot, never stored: the lock lives in process memory, so a row that
+ * claims a lock is a row that lies after a restart.
+ */
+function vmLockFacts(name) {
+  const held = VM_LOCK.lockSnapshot()[`vm:${name}`]
+  if (held === undefined) return null
+  return { heldBy: held.holder, heldMs: held.heldMs, poisoned: held.poisoned === true }
 }
 
 async function listSandboxes() {
@@ -2650,7 +2839,7 @@ function shotFilesFor(name) {
  * stops the rest: a wedged `sb rm` must not keep the 6 GB checkpoint alive.
  */
 async function destroyVm(name, { reason = 'delete', deleteContainer = true, force = false } = {}) {
-  return withVmLock(name, () => destroyVmLocked(name, { reason, deleteContainer, force }))
+  return withVmLockAs(name, 'vmDestroy', () => destroyVmLocked(name, { reason, deleteContainer, force }))
 }
 
 /** Caller already holds the computer's lifecycle lock. */
@@ -2972,6 +3161,15 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
  *   views           rows for computers that are gone, or past their expiry.
  *   ports           rows whose local port is not listening any more.
  */
+/** C6: a GC group that is BUSY is skipped, not queued — the 30 s tool budget
+ *  must not be spent waiting, and a sweep is never an error. */
+const GC_LOCK_WAIT_MS = 5000
+/** C6: the install watcher SKIPS while a power op runs; its `catch` ends the
+ *  watch, so a throw here is R2 in another loop. */
+const INSTALL_WATCH_LOCK_WAIT_MS = 2000
+/** C6: the idle timer already logs once a minute; it must not queue 40 deep. */
+const IDLE_LOCK_WAIT_MS = 1000
+
 async function collectGarbage({ dryRun = false } = {}) {
   // ONE GC AT A TIME, AND ONE COMPUTER AT A TIME INSIDE IT.
   //
@@ -2985,7 +3183,10 @@ async function collectGarbage({ dryRun = false } = {}) {
   return withLock('@gc', async () => {
     const config = readConfig()
     let registry = readRegistry()
-    const report = { checkpoints: [], shots: [], views: [], ports: [], orphans: [], isos: [], sandboxes: [], bytesFreed: 0, errors: [] }
+    // `skipped` is C6's honesty: a GC group whose computer is BUSY is skipped
+    // and SAID SO, instead of throwing out of the sweep (the 30 s tool budget is
+    // not a queue) and instead of deleting a checkpoint under a live convert.
+    const report = { checkpoints: [], shots: [], views: [], ports: [], orphans: [], isos: [], sandboxes: [], skipped: [], bytesFreed: 0, errors: [] }
     const remove = (file, bytes) => {
       if (!dryRun) {
         try { unlinkSync(file) } catch (error) { report.errors.push(`${file}: ${error.message}`); return }
@@ -3005,7 +3206,8 @@ async function collectGarbage({ dryRun = false } = {}) {
       const { parsed } = await listSandboxes()
       const listed = new Set((Array.isArray(parsed) ? parsed : []).map((row) => row?.name ?? row?.id ?? ''))
       for (const [name] of orphans) {
-        await withVmLock(name, async () => {
+        // TRY (C6): a sweep that throws is a GC nobody can run again.
+        const guarded = await withVmLock(name, async () => {
           const stillThere = listed.has(name)
           if (stillThere) {
             report.orphans.push({ name, sandbox: 'still listed by cua', action: 'kept' })
@@ -3027,28 +3229,35 @@ async function collectGarbage({ dryRun = false } = {}) {
             report.orphans.push({ name, sandbox: 'gone from cua', action: 'would reclaim the kept disk and drop the row' })
             return
           }
-          await withVmLock(name, async () => {
-            const vmDir = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name)
-            if (existsSync(vmDir)) {
-              try { rmSync(vmDir, { recursive: true, force: true }); reclaimed.push(vmDir) } catch (error) { report.errors.push(`${vmDir}: ${error.message}`) }
-            }
-            for (const file of checkpointFilesFor(name)) {
-              try { unlinkSync(file); reclaimed.push(file) } catch (error) { report.errors.push(`${file}: ${error.message}`) }
-            }
-            for (const file of shotFilesFor(name)) {
-              try { unlinkSync(file); reclaimed.push(file) } catch (error) { report.errors.push(`${file}: ${error.message}`) }
-            }
-            const views = readViews()
-            if (views[name]) {
-              delete views[name]
-              try { writeViews(views) } catch (error) { report.errors.push(`views.json: ${error.message}`) }
-            }
-            closePorts(name)
-            await mutateRegistry((fresh) => { delete fresh.vms[name] })
-          })
+          // NO SECOND ACQUIRE: this whole block runs INSIDE the sweep's guard
+          // above, on the same key. At HEAD the nested acquire was a no-op
+          // because the lifecycle lock re-entered; the try form does NOT
+          // re-enter (C23 — a detached task must not inherit an outer hold), so
+          // a nested try would queue behind ITS OWN holder for the whole budget
+          // and skip the reclaim. One guard, one holder.
+          const vmDir = path.join(CUA_HOME, '.cua', 'vmm', 'qemu', name)
+          if (existsSync(vmDir)) {
+            try { rmSync(vmDir, { recursive: true, force: true }); reclaimed.push(vmDir) } catch (error) { report.errors.push(`${vmDir}: ${error.message}`) }
+          }
+          for (const file of checkpointFilesFor(name)) {
+            try { unlinkSync(file); reclaimed.push(file) } catch (error) { report.errors.push(`${file}: ${error.message}`) }
+          }
+          for (const file of shotFilesFor(name)) {
+            try { unlinkSync(file); reclaimed.push(file) } catch (error) { report.errors.push(`${file}: ${error.message}`) }
+          }
+          const views = readViews()
+          if (views[name]) {
+            delete views[name]
+            try { writeViews(views) } catch (error) { report.errors.push(`views.json: ${error.message}`) }
+          }
+          closePorts(name)
+          await mutateRegistry((fresh) => { delete fresh.vms[name] })
           report.orphans.push({ name, sandbox: 'gone from cua', action: 'reclaimed the kept disk and dropped the row', reclaimed })
           registry = readRegistry()
-        })
+        }, { mode: 'try', waitMs: GC_LOCK_WAIT_MS, holder: `gc:${name}` })
+        if (guarded?.ran === false) {
+          report.skipped.push({ name, holder: guarded.holder, heldMs: guarded.heldMs, why: 'orphan reclaim' })
+        }
       }
       // A sandbox cua lists with NO row is not ours to delete (it may belong to
       // another workspace or a previous install); report it so the cause is
@@ -3167,11 +3376,14 @@ async function collectGarbage({ dryRun = false } = {}) {
           }
         }
       }
-      return safely ? withVmLock(groupName, run) : run()
+      // TRY (C6): the group guard the header promised — a busy computer is
+      // skipped and reported, never a throw that spends the GC tool's budget.
+      return safely ? withVmLock(groupName, run, { mode: 'try', waitMs: GC_LOCK_WAIT_MS, holder: `gc:${groupName}` }) : run()
     }
 
     for (const [groupName, files] of groups) {
-      await collectFor(groupName, files)
+      const outcome = await collectFor(groupName, files)
+      if (outcome?.ran === false) report.skipped.push({ name: groupName, holder: outcome.holder, heldMs: outcome.heldMs, why: 'checkpoints' })
     }
     // Restore temps: `start` deletes its own, so a survivor is from a crash —
     // unless a start is running right now, which the lock decides.
@@ -3183,7 +3395,8 @@ async function collectGarbage({ dryRun = false } = {}) {
           remove(entry.file, sizeOf(entry.file))
         }
       }
-      await (safely ? withVmLock(groupName, run) : run())
+      const outcome = await (safely ? withVmLock(groupName, run, { mode: 'try', waitMs: GC_LOCK_WAIT_MS, holder: `gc:${groupName}` }) : run())
+      if (outcome?.ran === false) report.skipped.push({ name: groupName, holder: outcome.holder, heldMs: outcome.heldMs, why: 'restore temps' })
     }
 
     // Screenshots past the retention window.
@@ -3484,7 +3697,7 @@ async function waitForPowerDown(name, target, timeoutMs) {
 
 /** Suspend: pause the sandbox, keep the disk. Unchanged behaviour. */
 async function suspendVm(name) {
-  return withVmLock(name, () => suspendVmLocked(name))
+  return withVmLockAs(name, 'vmSuspend', () => suspendVmLocked(name))
 }
 
 /** Caller already holds the computer's lifecycle lock. */
@@ -3543,7 +3756,7 @@ async function suspendVmLocked(name) {
 }
 
 async function resumeVm(name) {
-  return withVmLock(name, () => resumeVmLocked(name))
+  return withVmLockAs(name, 'vmResume', () => resumeVmLocked(name))
 }
 
 async function resumeVmLocked(name) {
@@ -3596,7 +3809,7 @@ async function resumeVmLocked(name) {
  * `stop` is this function (DSH_CUA_VM_LEGACY_STOP=1 restores the old alias).
  */
 async function shutdownVm(name, { reason = 'shutdown' } = {}) {
-  return withVmLock(name, () => shutdownVmLocked(name, { reason }))
+  return withVmLockAs(name, 'vmShutdown', () => shutdownVmLocked(name, { reason }))
 }
 
 /** Caller already holds the computer's lifecycle lock. */
@@ -4406,12 +4619,36 @@ function qmpStatePollMs() {
   return Math.round(Math.min(QMP_STATE_POLL_MAX_S, Math.max(QMP_STATE_POLL_MIN_S, seconds)) * 1000)
 }
 
+/**
+ * C8.3 — HOW LONG A TICK MAY RUN BEFORE IT IS ABANDONED.
+ *
+ * Three intervals, floor 10 s: a `query-status` that takes longer than that is
+ * not a slow poll, it is a monitor that will not answer, and waiting for it is
+ * exactly how the poll DIED (one parked promise, no further ticks, the guest's
+ * shutdown invisible for the rest of the session).
+ */
+const TICK_BUDGET_MS = 10_000
+
+function tickBudgetMs() {
+  return Math.max(TICK_BUDGET_MS, 3 * qmpStatePollMs())
+}
+
 function startQmpStatePoll(name) {
   const intervalMs = qmpStatePollMs()
   let stopped = false
   let timer = null
-  let ticking = false
+  /**
+   * C8 — ONE TICK AT A TIME, AND NEVER A DEAD LOOP.
+   *
+   * `ticking` was a boolean: a tick that parked (on the lifecycle lock, on a
+   * monitor that stopped answering) left it `true` for ever, and the busy branch
+   * below returned WITHOUT scheduling — the poll was dead and the process did
+   * not know. `running` carries WHEN the tick started, so a tick can be called
+   * too slow and ABANDONED while the loop keeps its cadence.
+   */
+  let running = null
   let misses = 0
+  let lastAbandonLogAt = 0
   let lastFailureLogAt = 0
   /**
    * UNKILLABLE BY DESIGN.
@@ -4440,6 +4677,9 @@ function startQmpStatePoll(name) {
   }
   const schedule = (delay = intervalMs) => {
     if (stopped) return
+    // ONE pending poll, always: an abandoned tick's `finally` re-arms too, and a
+    // second timer would double the tick rate for the rest of the session.
+    if (timer !== null) clearTimeout(timer)
     timer = setTimeout(tick, delay)
     timer.unref?.()
   }
@@ -4455,8 +4695,24 @@ function startQmpStatePoll(name) {
   }
   const tick = async () => {
     timer = null
-    if (stopped || ticking) return
-    ticking = true
+    if (stopped) return
+    // C8: a tick that STARTED within the budget is still the one in flight.
+    const busy = running !== null && Date.now() - running.at < tickBudgetMs()
+    if (busy) { schedule(); return }   // C8.2: a busy tick still re-arms the poll
+    if (running !== null) {
+      // C8.3: ABANDON IT. The promise is NOT cancelled (nothing here may kill an
+      // in-flight QMP read), it simply stops being the current tick: a LATE
+      // verdict can only be REFUSED by the CAS in `finaliseGuestShutdown`, never
+      // clobber a state that moved on. One line a minute, like every other
+      // failure in this loop.
+      const at = Date.now()
+      if (at - lastAbandonLogAt >= STATE_POLL_ERROR_LOG_MS) {
+        lastAbandonLogAt = at
+        log(`windows: ${name} state poll tick still running after ${Math.round((at - running.at) / 1000)} s — the next tick starts anyway; a late verdict is CAS-guarded and can only be refused`)
+      }
+    }
+    const marker = { at: Date.now() }
+    running = marker
     try {
       const row = liveRow()
       if (row === null) { stop(); return }
@@ -4464,6 +4720,9 @@ function startQmpStatePoll(name) {
       if (stopped) return
       if (verdict.answered === true) {
         misses = 0
+        // C12: a QMP ANSWER is the strongest corroboration there is — the
+        // monitor replied, so the row is not stale no matter what it says.
+        confirmVmState(name, 'qmp-poll')
         if (verdict.status === 'shutdown') {
           // THE CLEAN CASE: the guest asked QEMU to power off.
           await finaliseGuestShutdown(name, { status: verdict.status, clean: true })
@@ -4502,7 +4761,10 @@ function startQmpStatePoll(name) {
       // a persistent failure costs is one log line a minute.
       noteTickFailure(error)
     } finally {
-      ticking = false
+      // C8.1: the `finally` re-arms the poll, unconditionally. An ABANDONED tick
+      // that lands later must not clear a NEWER tick's marker — clearing it
+      // would make the loop think it is idle while another tick is in flight.
+      if (running === marker) running = null
       schedule()
     }
   }
@@ -4750,7 +5012,10 @@ function watchWindowsInstall(name) {
         // it and clobber `powered-off` with `installing` (and the same for
         // suspend). Inside the lock, and guarded on the CURRENT state, a tick can
         // only touch a computer that is still installing.
-        const decision = await withVmLock(name, async () => {
+        // C6: TRY. A busy computer means this TICK is skipped, never that the
+        // install watch ends: the `catch` below is fatal to the watch, and an
+        // ended watch is how a finished install stops being observed (R2).
+        const outcome = await withVmLock(name, async () => {
           const meta = readRegistry().vms[name]
           if (!meta || meta.kind !== 'windows') return { stop: true }
           if (meta.state !== 'installing' && meta.state !== 'booting') return { stop: true, reason: `state is ${meta.state}` }
@@ -4923,7 +5188,16 @@ function watchWindowsInstall(name) {
             row.readiness = windowsReadinessSignals(name)
           })
           return { stop: false }
-        })
+        }, { mode: 'try', waitMs: INSTALL_WATCH_LOCK_WAIT_MS, holder: 'install-watch' })
+        if (outcome?.ran !== true) {
+          // SKIP-AND-SAY-SO: the row is not touched by this tick, the loop
+          // re-arms, and the log names who was in the way.
+          log(`windows: ${name} install watch skipped a tick (${outcome?.holder || 'another operation'} held the lock for ${Math.round((outcome?.heldMs ?? 0) / 1000)} s)`)
+          continue
+        }
+        const decision = outcome.value
+        // C12: a live process observed by the watcher IS corroboration.
+        confirmVmState(name, 'install-watch')
         if (decision.stop) {
           if (decision.ready) await ensureWindowsConsoleRelay(name)
           // A computer that became ready through the CREATE path (not through
@@ -6141,7 +6415,7 @@ async function windowsStart(name, meta) {
   // THE SAME LOCK AS EVERY OTHER LIFECYCLE OP. Without it two concurrent Starts
   // both saw a dead QEMU, both spawned one, and the second `-pidfile` write left
   // the first process unkillable by name.
-  return withVmLock(name, async () => {
+  return withVmLockAs(name, 'vmStart', async () => {
     const current = readRegistry().vms[name]
     if (!current) return fail(`no computer named "${name}"`)
     const verdict = await windowsBackend.probe(current)
@@ -6353,14 +6627,53 @@ const WINDOWS_STOP_BUDGET_MS = 8000
 const WINDOWS_STOP_QMP_MS = 5000
 
 /**
+ * C22 — THE CHECKPOINT'S FREE SPACE FLOOR.
+ *
+ * 2 GiB that the convert may never touch: the store also holds ISO downloads,
+ * other computers' disks and the supervisor's own writes, and a convert that
+ * fills the volume takes the WHOLE supervisor down with ENOSPC on a registry
+ * write. The check is against the FILESYSTEM, not the quota: the live host had
+ * 3.3 GB free on a 9.1 GiB disk with the quota far from full.
+ */
+const CHECKPOINT_FREE_RESERVE_BYTES = 2 * 1024 ** 3
+/** C23: how long the deferred capture may queue for a busy computer before it
+ *  records `lock-busy` and leaves `restoreFrom: { kind: 'image' }` in place. */
+const CHECKPOINT_LOCK_WAIT_MS = 30_000
+
+/**
+ * C22 — THE SECOND PRE-FLIGHT FACT: does the FILESYSTEM have room?
+ *
+ * Returns `null` when the convert fits, or the sentence that becomes the
+ * `space` skip record. A measurement that throws is NOT a green light: an
+ * unmeasurable store is exactly the case where writing is most dangerous.
+ */
+async function checkpointSpaceShortfall(diskBytes) {
+  const needed = Math.max(0, Number(diskBytes) || 0)
+  let available = 0
+  try {
+    const stats = statfsSync(STORE)
+    available = Math.max(0, Number(stats.bavail) * Number(stats.bsize))
+  } catch (error) {
+    return `the store's free space could not be measured (${error?.message ?? error})`
+  }
+  const usable = available - CHECKPOINT_FREE_RESERVE_BYTES
+  if (usable >= needed) return null
+  return `the store has ${(Math.max(0, usable) / 1024 ** 3).toFixed(1)} GB usable (${(available / 1024 ** 3).toFixed(1)} GB free − ${Math.round(CHECKPOINT_FREE_RESERVE_BYTES / 1024 ** 3)} GB reserve) and this disk needs ${(needed / 1024 ** 3).toFixed(1)} GB`
+}
+
+/**
  * THE CHECKPOINT A STOPPED WINDOWS COMPUTER SHOULD GET.
  *
- * One DECISION function, two capture planners (the synchronous one the
- * guest-shutdown watcher uses, the deferred one the shutdown op uses), so
- * `checkpointPolicy`, the store quota and the "no disk" case can never mean two
- * different things depending on WHO noticed that the guest was gone.
- * Returns the path (or null), the human sentence and the structured skip record
- * the row stores.
+ * ONE decision function and ONE capture lane (`windowsCheckpointPlanDeferred`,
+ * which AWAITS its `qemu-img` child). The synchronous planner is gone (C21):
+ * `execFileSync` blocked every status beat, every state event and every other
+ * computer's poll for the whole convert, and it existed only because the guest
+ * watcher used to capture inside its own tick — it no longer does.
+ *
+ * The decision is the same for EVERY observer of a stopped computer (the panel
+ * shutdown, the guest watcher, a handed-off stop), so `checkpointPolicy`, the
+ * quota, the filesystem and the "no disk" case cannot mean two different things
+ * depending on WHO noticed the guest was gone.
  */
 async function windowsCheckpointDecision(name, config) {
   if (config.checkpointPolicy === 'never') {
@@ -6369,39 +6682,36 @@ async function windowsCheckpointDecision(name, config) {
   const paths = windowsPaths(STORE, name)
   const diskBytes = (() => { try { return statSync(paths.disk).size } catch { return 0 } })()
   const existing = (() => { try { return statSync(path.join(CHECKPOINT_DIR, `${name}.qcow2`)).size } catch { return 0 } })()
+  // FACT 1 (exists): the POLICY quota, counting the checkpoint this one replaces.
   const over = await refuseOverQuota(config, Math.max(0, diskBytes - existing))
   if (over !== null) {
     const sentence = 'the checkpoint does not fit the store quota'
     return { skip: sentence, record: checkpointSkipRecord('quota', `${sentence} (${over})`) }
   }
-  return { disk: paths.disk }
-}
-
-async function windowsCheckpointPlan(name, config) {
-  let checkpoint = null
-  let checkpointSkipped = ''
-  let checkpointSkippedRecord = null
-  const decision = await windowsCheckpointDecision(name, config)
-  if (decision.skip !== undefined) {
-    return { checkpoint, checkpointSkipped: decision.skip, checkpointSkippedRecord: decision.record }
-  }
-  // WINDOWS: its disk is under $STORE/windows/<name>/, not the cua vmm tree.
-  const captured = checkpointDiskFile(name, windowsPaths(STORE, name).disk)
-  checkpoint = checkpointPathOf(captured)
-  if (checkpoint === null) {
-    checkpointSkipped = 'no disk to checkpoint'
-    checkpointSkippedRecord = checkpointSkipRecord(captured?.reason ?? 'no-disk', captured?.detail ?? '')
-  }
-  return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+  // FACT 2 (new): the FILESYSTEM — the quota being satisfied says nothing about
+  // whether the volume can take the bytes.
+  const shortfall = await checkpointSpaceShortfall(diskBytes)
+  if (shortfall !== null) return { skip: shortfall, record: checkpointSkipRecord('space', shortfall) }
+  return { disk: paths.disk, diskBytes }
 }
 
 /**
- * THE SAME PLAN, CAPTURED WITHOUT BLOCKING THE PROCESS THAT ANSWERS.
+ * THE ONE CAPTURE LANE (C21–C23) — pre-flight, claim, then AWAIT the convert.
  *
- * Identical decisions (the same `windowsCheckpointDecision`, the same records,
- * the same flatten step) — only the `qemu-img` child is awaited instead of
- * blocking this event loop for the whole convert. That is what lets the shutdown
- * op answer while the disk is still being copied.
+ * Three facts before a byte is written, in this order:
+ *   quota  the policy quota, counting the checkpoint this one replaces (exists)
+ *   space  the FILESYSTEM can take it with `CHECKPOINT_FREE_RESERVE_BYTES` left
+ *          over (new — the quota being satisfied says nothing about the volume)
+ *   claim  `reserveStoreBytes` — check-then-act is not a check: two captures
+ *          that both pass the quota check would both write, and the second one
+ *          would die at ENOSPC halfway through a `qemu-img` convert
+ *
+ * The claim is released in a `finally`, success or failure: it exists to make
+ * the boundary serialised for the DURATION of the write, not to leak.
+ *
+ * The `qemu-img` child is AWAITED (`checkpointDiskFileAsync`), never
+ * `execFileSync`: blocking this event loop froze every status beat, the state
+ * stream and every other computer's poll for the whole convert.
  */
 async function windowsCheckpointPlanDeferred(name, config) {
   let checkpoint = null
@@ -6411,13 +6721,56 @@ async function windowsCheckpointPlanDeferred(name, config) {
   if (decision.skip !== undefined) {
     return { checkpoint, checkpointSkipped: decision.skip, checkpointSkippedRecord: decision.record }
   }
-  const captured = await checkpointDiskFileAsync(name, windowsPaths(STORE, name).disk)
-  checkpoint = checkpointPathOf(captured)
-  if (checkpoint === null) {
-    checkpointSkipped = 'no disk to checkpoint'
-    checkpointSkippedRecord = checkpointSkipRecord(captured?.reason ?? 'no-disk', captured?.detail ?? '')
+  const diskBytes = Math.max(0, Number(decision.diskBytes) || 0)
+  let claimed = false
+  try {
+    const claim = await reserveStoreBytes('checkpoint:' + name, diskBytes)
+    if (claim !== null) {
+      const sentence = 'the checkpoint does not fit the store quota'
+      return { checkpoint: null, checkpointSkipped: sentence, checkpointSkippedRecord: checkpointSkipRecord('quota', `${sentence} (${claim})`) }
+    }
+    claimed = true
+    const captured = await checkpointDiskFileAsync(name, windowsPaths(STORE, name).disk)
+    checkpoint = checkpointPathOf(captured)
+    if (checkpoint === null) {
+      checkpointSkipped = 'no disk to checkpoint'
+      checkpointSkippedRecord = checkpointSkipRecord(captured?.reason ?? 'no-disk', captured?.detail ?? '')
+    }
+    return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+  } finally {
+    if (claimed) releaseStoreBytes('checkpoint:' + name)
   }
-  return { checkpoint, checkpointSkipped, checkpointSkippedRecord }
+}
+
+/**
+ * C23 — RECORD A CAPTURE THAT NEVER STARTED.
+ *
+ * The lifecycle lock was busy past `CHECKPOINT_LOCK_WAIT_MS`. That is not a
+ * failure of the shutdown (the row already says `powered-off`) and it is not
+ * silence either: the row keeps `restoreFrom: { kind: 'image' }` — a REAL
+ * restore source — and gains the closed-set record `lock-busy` with the holder
+ * and how long it had been there. TOKEN-GUARDED like every other checkpoint
+ * write, so a computer started again while this was in flight is untouched.
+ */
+async function recordCheckpointSkip(name, token, record, origin = 'shutdown') {
+  try {
+    await mutateRegistryWith((registry) => {
+      const row = registry.vms[name]
+      if (!row) return
+      if (row.checkpointPending?.token !== token) return
+      delete row.checkpointPending
+      if (row.state !== 'powered-off') return
+      row.restoreFrom = { kind: 'image', image: 'windows' }
+      row.checkpointSkipped = record
+      if (row.lastShutdown) {
+        row.lastShutdown.checkpointStatus = `skipped:${record.reason}`
+        row.lastShutdown.checkpointSkipped = record.detail
+        delete row.lastShutdown.checkpointDeferred
+      }
+    }, { reason: `checkpoint-skipped-${origin}` })
+  } catch (error) {
+    log(`windows: ${name} could not record its skipped checkpoint (${error?.message ?? error}); the powered-off row stands and Start boots the existing disk`)
+  }
 }
 
 /**
@@ -6430,13 +6783,22 @@ async function windowsCheckpointPlanDeferred(name, config) {
  * again while the convert ran, the row no longer belongs to this shutdown and
  * the result is dropped instead of resurrecting `restoreFrom` over a live row.
  *
- * The whole task runs on the computer's lifecycle lock (`withLock`, not
- * `withVmLock`: this chain may still be inside the shutdown op's ALS context,
- * and the re-entrant path would skip the lock it needs). That is what keeps a
- * Start — or a GC sweep — off a disk that is being converted.
+ * The whole task runs on the computer's lifecycle key in TRY mode (C23):
+ *   * `tryVmLock` never re-enters, so a capture armed from INSIDE a power op
+ *     queues behind that op and takes the disk only once it has let go (a
+ *     re-entrant acquire would run `qemu-img` while the op still held the disk);
+ *   * it is BOUNDED (`CHECKPOINT_LOCK_WAIT_MS`), and `ran:false` is not an
+ *     error: the row records `checkpointSkipped: { reason: 'lock-busy' }` and
+ *     keeps `restoreFrom: { kind: 'image' }`, which Start already boots.
+ *
+ * The origin (`{ origin: 'shutdown' | 'guest-shutdown' }`) is the FOURTH
+ * argument, read from `arguments` — see the pinned-declaration note at the top
+ * of the lock adapters: this declaration's three parameters are a gate literal,
+ * and the call sites still say exactly where the capture came from.
  */
 function scheduleDeferredWindowsCheckpoint(name, token, config) {
-  const task = withLock(name, async () => {
+  const origin = String(arguments[3]?.origin ?? 'shutdown')
+  const task = tryVmLock(name, async () => {
     // LET THE ANSWER LEAVE FIRST. The op returns in this tick; the convert's
     // first byte must not be written before the caller has its JSON line.
     await new Promise((resolve) => setImmediate(resolve))
@@ -6463,7 +6825,17 @@ function scheduleDeferredWindowsCheckpoint(name, token, config) {
         // whatever the start wrote, and this result must not overrule it.
         if (row.state !== 'powered-off') return
         if (checkpoint !== null && existsSync(checkpoint)) {
-          row.restoreFrom = { kind: 'checkpoint', file: checkpoint }
+          row.restoreFrom = {
+            kind: 'checkpoint',
+            file: checkpoint,
+            // A checkpoint from a QEMU that vanished WITHOUT a clean `shutdown`
+            // status may be torn. The row already says so (`mayBeTorn`, set by
+            // the state write), and Start must boot the existing disk instead of
+            // trusting an image taken from a killed process. This is the rule the
+            // guest-shutdown path used to apply inline, now in the ONE lane that
+            // produces checkpoints.
+            ...(row.mayBeTorn === true ? { stale: true, staleReason: 'QEMU disappeared without a clean QMP shutdown status' } : {})
+          }
           delete row.checkpointSkipped
           if (row.lastShutdown) {
             row.lastShutdown.checkpointStatus = 'saved'
@@ -6483,11 +6855,20 @@ function scheduleDeferredWindowsCheckpoint(name, token, config) {
     } catch (error) {
       log(`windows: ${name} could not record its deferred checkpoint outcome (${error?.message ?? error}); the powered-off row stands and Start boots the existing disk`)
     }
-    log(`windows: ${name} deferred checkpoint ${checkpoint !== null ? `saved (${path.basename(checkpoint)})` : `skipped: ${checkpointSkipped}`}`)
-  })
+    log(`windows: ${name} deferred checkpoint ${checkpoint !== null ? `saved (${path.basename(checkpoint)})` : `skipped: ${checkpointSkipped}`} (origin ${origin})`)
+  }, { waitMs: CHECKPOINT_LOCK_WAIT_MS, holder: `checkpoint:${name}` })
   // `void` is the contract: nothing awaits this, and an unhandled rejection here
   // would take the supervisor down for a bookkeeping failure.
-  void task.catch((error) => log(`windows: ${name} deferred checkpoint task failed: ${error?.message ?? error}`))
+  void task
+    .then((outcome) => {
+      if (outcome?.ran !== false) return null
+      // C23 — LOCK-BUSY IS A RECORD, NOT A FAILURE. The row keeps the restore
+      // source the state write gave it and says who was in the way.
+      const record = checkpointSkipRecord('lock-busy', `${outcome.holder || 'another operation'} held ${name} for ${Math.round((outcome.heldMs ?? 0) / 1000)}s`)
+      log(`windows: ${name} deferred checkpoint skipped: ${record.detail}`)
+      return recordCheckpointSkip(name, token, record, origin)
+    })
+    .catch((error) => log(`windows: ${name} deferred checkpoint task failed: ${error?.message ?? error}`))
 }
 
 /**
@@ -6513,111 +6894,110 @@ function scheduleDeferredWindowsCheckpoint(name, token, config) {
  *     existing disk instead of trusting an image taken from a killed QEMU.
  */
 async function finaliseGuestShutdown(name, { status = '', clean = false } = {}) {
-  return withVmLock(name, async () => {
-    const meta = readRegistry().vms[name]
-    if (!meta || meta.kind !== 'windows') return false
-    // ALREADY RECORDED, BY US OR BY THE SHUTDOWN OP: one write is the contract.
-    if (meta.state === 'powered-off') return false
-    const config = readConfig()
-    // The console and every forwarded port died with the guest. Closing them
-    // here is what stops /vm/port/<name>/ pointing at a dead VNC socket.
-    closePorts(name)
-    stopLiveView(name)
-    const abrupt = clean !== true
-    const at = new Date().toISOString()
-    const sentence = 'the guest shut itself down (QMP query-status)'
-    /**
-     * 1. THE STATE, FIRST AND UNCONDITIONALLY.
-     *
-     * This write used to come AFTER the checkpoint, in the same mutate. When the
-     * checkpoint threw — the live case was `checkpointSkipped` "the checkpoint
-     * does not fit the store quota" (a 9.9 GB disk + an 11.5 GB Linux checkpoint
-     * + a 3.6 GB ISO on a 20 GB store) — the throw escaped BEFORE the row was
-     * touched, so the supervisor never recorded a guest-initiated power-off at
-     * all: the row stayed `ready`, the panel kept offering a desktop that was
-     * gone, and the later panel shutdown answered `already-off`. Nothing a
-     * checkpoint does may decide whether the state is recorded.
-     *
-     * `restoreFrom` is written here too, in the shape Start already understands
-     * (`kind: 'image'` = cold-boot the disk it has); step 2 upgrades it to
-     * `kind: 'checkpoint'` when the capture succeeds.
-     */
-    const recorded = await mutateRegistryWith((registry) => {
-      const row = registry.vms[name]
-      if (!row || row.kind !== 'windows' || row.state === 'powered-off') return false
-      row.state = 'powered-off'
-      row.stateFrom = 'qmp-poll'
-      row.lastUsed = at
-      row.lastShutdown = {
-        at,
-        method: 'guest-shutdown',
-        reason: sentence,
-        ...(status === '' ? {} : { qmpStatus: status }),
-        ...(abrupt ? { unconfirmed: true } : {})
-      }
-      row.restoreFrom = { kind: 'image', image: 'windows' }
-      if (abrupt) row.mayBeTorn = true
-      else delete row.mayBeTorn
-      // A finished computer has no install stage to describe any more.
-      delete row.installStage
-      delete row.bootedAt
-      return true
-    }, { reason: 'guest-shutdown' })
-    emitVmState(name, 'powered-off', sentence)
-    if (recorded !== true) return false
-    /**
-     * 2. THE CHECKPOINT, IN ITS OWN TRY/CATCH.
-     *
-     * Whatever goes wrong here is BOOKKEEPING: a skip record on the row and a
-     * `restoreFrom` that still points at the disk. The powered-off state is
-     * already durable, so the poll loop is free to stop and the panel is right.
-     */
-    let checkpoint = null
-    let checkpointSkipped = ''
-    let checkpointSkippedRecord = null
-    try {
-      const plan = await windowsCheckpointPlan(name, config)
-      checkpoint = plan.checkpoint
-      checkpointSkipped = plan.checkpointSkipped
-      checkpointSkippedRecord = plan.checkpointSkippedRecord
-    } catch (error) {
-      checkpointSkipped = `the checkpoint failed (${error?.message ?? error})`
-      checkpointSkippedRecord = checkpointSkipRecord('checkpoint-failed', String(error?.message ?? error).slice(-600))
-      log(`windows: ${name} guest-shutdown checkpoint threw: ${error?.stack ?? error}`)
+  // C9/W1 — A FACT NEEDS NO ACTION LOCK.
+  //
+  // This function used to run inside the computer's lifecycle lock. That made
+  // the ONE
+  // observer of a guest power-off queue behind whatever held the lifecycle lock:
+  // a 20-minute provisioning run, a `qemu-img` convert, a wedged ACPI stop. The
+  // row stayed `ready`, the panel offered a desktop that no longer existed, and
+  // the shutdown that followed answered `already-off`. The state is an
+  // EXTERNALLY OBSERVED EVENT, so it is written under `@registry` only, guarded
+  // by a compare-and-swap on `(state, stateSince)` — if the row moved on, the
+  // write is REFUSED (`superseded`) instead of resurrecting a stale state.
+  const meta = readRegistry().vms[name]
+  if (!meta || meta.kind !== 'windows') return false
+  // ALREADY RECORDED, BY US OR BY THE SHUTDOWN OP: one write is the contract.
+  if (meta.state === 'powered-off') return false
+  // THE CAS TOKEN (W3): captured from the row the verdict was formed against.
+  // `stateSince` moves on every transition (`mutateRegistryWith`), so a Start
+  // that lands between this read and the write below wins, and this write is
+  // dropped. No token, no write.
+  const expect = { state: meta.state, stateSince: meta.stateSince }
+  const config = readConfig()
+  const abrupt = clean !== true
+  const at = new Date().toISOString()
+  // The checkpoint token is the TOKEN-GUARDED handshake between this write and
+  // the detached lane below (C23/C24): a row started again while the convert
+  // runs no longer carries it, so the result is dropped instead of resurrecting
+  // `restoreFrom` over a live computer.
+  const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const sentence = 'the guest shut itself down (QMP query-status)'
+  /**
+   * 1. THE STATE, FIRST AND UNCONDITIONALLY.
+   *
+   * This write used to come AFTER the checkpoint, in the same mutate. When the
+   * checkpoint threw — the live case was `checkpointSkipped` "the checkpoint
+   * does not fit the store quota" (a 9.9 GB disk + an 11.5 GB Linux checkpoint
+   * + a 3.6 GB ISO on a 20 GB store) — the throw escaped BEFORE the row was
+   * touched, so the supervisor never recorded a guest-initiated power-off at
+   * all: the row stayed `ready`, the panel kept offering a desktop that was
+   * gone, and the later panel shutdown answered `already-off`. Nothing a
+   * checkpoint does may decide whether the state is recorded.
+   *
+   * `restoreFrom` is written here too, in the shape Start already understands
+   * (`kind: 'image'` = cold-boot the disk it has); the deferred checkpoint
+   * upgrades it to `kind: 'checkpoint'` when the capture succeeds.
+   */
+  const recorded = await mutateRegistryWith((registry) => {
+    const row = registry.vms[name]
+    if (!row || row.kind !== 'windows' || row.state === 'powered-off') return false
+    // W3: the CAS. A refused write is logged as `superseded` — never silently
+    // treated as "already recorded".
+    if (row.state !== expect.state || row.stateSince !== expect.stateSince) return false
+    row.state = 'powered-off'
+    row.stateFrom = 'qmp-poll'
+    row.lastUsed = at
+    row.lastShutdown = {
+      at,
+      method: 'guest-shutdown',
+      reason: sentence,
+      ...(status === '' ? {} : { qmpStatus: status }),
+      ...(abrupt ? { unconfirmed: true } : {}),
+      // C10: the row says WHERE the capture will come from, so the panel and the
+      // log can name the same origin the deferral below uses.
+      checkpointDeferred: true
     }
-    try {
-      await mutateRegistryWith((registry) => {
-        const row = registry.vms[name]
-        if (!row || row.kind !== 'windows' || row.state !== 'powered-off') return
-        if (checkpoint !== null && existsSync(checkpoint)) {
-          row.restoreFrom = {
-            kind: 'checkpoint',
-            file: checkpoint,
-            // A checkpoint from a QEMU that vanished without saying `shutdown`
-            // may be torn; Start must boot the existing disk instead of it.
-            ...(abrupt ? { stale: true, staleReason: 'QEMU disappeared without a clean QMP shutdown status' } : {})
-          }
-          delete row.checkpointSkipped
-          if (row.lastShutdown) {
-            row.lastShutdown.checkpointStatus = 'saved'
-            delete row.lastShutdown.checkpointSkipped
-          }
-        } else {
-          row.restoreFrom = { kind: 'image', image: 'windows' }
-          if (checkpointSkippedRecord !== null) row.checkpointSkipped = checkpointSkippedRecord
-          if (row.lastShutdown) {
-            row.lastShutdown.checkpointStatus = `skipped:${checkpointSkippedRecord?.reason ?? 'unknown'}`
-            if (checkpointSkipped !== '') row.lastShutdown.checkpointSkipped = checkpointSkipped
-          }
-        }
-      }, { reason: 'guest-shutdown-checkpoint' })
-    } catch (error) {
-      // The state is recorded; this line is the only thing the failure costs.
-      log(`windows: ${name} could not record its guest-shutdown checkpoint outcome (${error?.message ?? error}); the powered-off row stands and Start boots the existing disk`)
-    }
-    log(`windows: ${name} powered itself off (${status === '' ? 'QEMU disappeared' : `QMP ${status}`})${abrupt ? ', unconfirmed' : ', clean'}: ${checkpoint !== null ? 'checkpoint captured' : `no checkpoint (${checkpointSkipped || 'unknown'})`} — Start cold-boots from it`)
+    row.restoreFrom = { kind: 'image', image: 'windows' }
+    // C24: the restore source and the state land TOGETHER. The checkpoint may
+    // only upgrade this later; it can never be the reason the state is missing.
+    row.checkpointPending = { token, at }
+    if (abrupt) row.mayBeTorn = true
+    else delete row.mayBeTorn
+    // A finished computer has no install stage to describe any more.
+    delete row.installStage
+    delete row.bootedAt
     return true
-  })
+  }, { reason: 'guest-shutdown' })
+  if (recorded !== true) {
+    // A REFUSED WRITE IS NOT A FAILURE — something moved the row on (a Start
+    // that already bumped `stateSince`, or another observer that wrote first).
+    // Tearing down previews here would kill a live view of a computer that is
+    // running, which is why the ports close only after a SUCCESSFUL CAS.
+    log(`windows: ${name} guest-shutdown write refused (superseded): the row is now ${readRegistry().vms[name]?.state ?? 'gone'}, not ${expect.state}`)
+    return false
+  }
+  /**
+   * 2. THE PREVIEWS CLOSE — AFTER the write, never before it.
+   *
+   * The console and every forwarded port died with the guest. Closing them here
+   * (and not at the top) is what stops a REFUSED write from tearing down the
+   * live view of a computer that is still running.
+   */
+  closePorts(name)
+  stopLiveView(name)
+  emitVmState(name, 'powered-off', sentence)
+  /**
+   * 3. THE CHECKPOINT IS NOT THIS TICK'S JOB (C10).
+   *
+   * The capture goes to the SAME deferred lane the shutdown op uses, with its
+   * origin named so the row and the log say `guest-shutdown`. The lane is
+   * try-mode and bounded (C23): a busy computer records `lock-busy` and keeps
+   * `restoreFrom: { kind: 'image' }`, which Start already knows how to boot.
+   */
+  scheduleDeferredWindowsCheckpoint(name, token, config, { origin: 'guest-shutdown' })
+  log(`windows: ${name} powered itself off (${status === '' ? 'QEMU disappeared' : `QMP ${status}`})${abrupt ? ', unconfirmed' : ', clean'}: the checkpoint is deferred — Start cold-boots the existing disk until it lands`)
+  return true
 }
 
 /**
@@ -6740,6 +7120,9 @@ async function windowsStopPhase(meta) {
  *   * threw     → the same abandoned marking, with the error in the log.
  */
 function continueWindowsStopInBackground(name, meta, config, method) {
+  // A detached stop may queue behind another operation for as long as its OWN
+  // window (the configured `shutdownTimeoutSec`) — a refusal here would drop the
+  // `powered-off` row this task exists to write, which is R2 by another route.
   const task = withLock(name, async () => {
     let outcome = null
     try {
@@ -6765,7 +7148,7 @@ function continueWindowsStopInBackground(name, meta, config, method) {
       forced: outcome.forced === true,
       installInProgress: outcome.installInProgress === true
     })
-  })
+  }, { holder: 'shutdown-background', waitMs: Math.max(VM_LOCK.LOCK_WAIT_MS, config.shutdownTimeoutSec * 1000) })
   void task.catch((error) => log(`shutdown ${name}: the background stop failed (${error?.message ?? error})`))
 }
 
@@ -6826,7 +7209,7 @@ async function recordWindowsPoweredOff(name, { method, config, forced = false, i
   })
   emitVmState(name, 'powered-off', 'windows-shutdown')
   const status = policySkip === null ? 'deferred' : `skipped:${policySkip.record.reason}`
-  if (policySkip === null) scheduleDeferredWindowsCheckpoint(name, token, config)
+  if (policySkip === null) scheduleDeferredWindowsCheckpoint(name, token, config, { origin: 'shutdown' })
   log(`shutdown ${name} (${method}${forced ? ', forced' : ''}): answered now — ${status === 'deferred' ? 'the disk checkpoint runs in the background' : 'no checkpoint (checkpointPolicy=never)'}`)
   return ok({
     name,
@@ -7059,6 +7442,15 @@ async function doctorReport() {
       quotaBytes: config.diskQuotaGb * 1024 ** 3,
       paths: usage.paths
     },
+    // A-6: every held lock, by key, with the holder that named it. `state{}` is
+    // the plugin's half (WP-B); this is the supervisor's own evidence.
+    locks: Object.entries(VM_LOCK.lockSnapshot()).map(([key, held]) => ({
+      key,
+      heldBy: held.holder,
+      heldMs: held.heldMs,
+      waiters: held.waiters,
+      poisoned: held.poisoned === true
+    })),
     vms: Object.keys(readRegistry().vms).length,
     sandboxes: Array.isArray(sandboxList.parsed) ? sandboxList.parsed.length : null,
     checkpointPolicy: config.checkpointPolicy,
@@ -7103,7 +7495,8 @@ const handlers = {
     // WP-9.3 / WP-9.4: a degraded GPU or a boot without the 9p share is a fact
     // about a computer that is otherwise "ready", so it cannot live only in the
     // row: it is summed here, where every status caller looks.
-    return ok({ registry: registry.vms, listed: parsed ?? raw, degraded: degradedSummary(registry.vms) })
+    // A-6/C13: the derived staleness + lock facts travel with the rows.
+    return ok({ registry: decorateStateFacts(registry.vms), listed: parsed ?? raw, degraded: degradedSummary(registry.vms) })
   },
 
   /**
@@ -7226,7 +7619,7 @@ const handlers = {
       }
 
       return createManaged({ ...spec, name })
-    })
+    }, { holder: 'ensure' })
   },
 
   /**
@@ -7240,7 +7633,7 @@ const handlers = {
    * from its checkpoint and never asks cua to resume anything.
    */
   async vmStart({ name }) {
-    return withVmLock(name, async () => {
+    return withVmLockAs(name, 'vmStart', async () => {
       const registry = readRegistry()
       const meta = registry.vms[name]
       if (!meta) throw new Error(`no computer named "${name}"`)
@@ -7328,7 +7721,7 @@ const handlers = {
     spec.diskGiven = Number(input.diskGb) > 0
     spec.memoryGiven = Number(input.memory) > 0
     spec.cpuGiven = Number(input.cpu) > 0
-    return withLock(spec.name, () => createManaged(spec))
+    return withLock(spec.name, () => createManaged(spec), { holder: 'vmCreate' })
   },
 
   async exec({ name, cmd, cwd, timeout = 300 }) {
@@ -7565,7 +7958,9 @@ const handlers = {
       }
     }
     return ok({
-      registry: registry.vms,
+      // A-6/C13: `stateConfirmedAt`/`stateAgeMs`/`stateStale` and the per-row
+      // `lock` are computed here, on the copy this answer owns.
+      registry: decorateStateFacts(registry.vms),
       listed: parsed ?? raw,
       degraded: degradedSummary(registry.vms),
       windows: {
@@ -7603,7 +7998,7 @@ const handlers = {
    * desktop but silently drops the RE kit would be the worst of both.
    */
   async provision({ name }) {
-    return withVmLock(name, async () => {
+    return withVmLockAs(name, 'provision', async () => {
       const registry = readRegistry()
       const meta = registry.vms[name]
       if (!meta) return fail(`no computer named "${name}"`)
@@ -7683,7 +8078,7 @@ const handlers = {
     spec.diskGiven = Number(input.diskGb) > 0
     spec.memoryGiven = Number(input.memory) > 0
     spec.cpuGiven = Number(input.cpu) > 0
-    return withLock(spec.name, () => windowsCreateManaged(spec))
+    return withLock(spec.name, () => windowsCreateManaged(spec), { holder: 'vmWindowsCreate' })
   },
 
   async vmWindowsStatus({ name, tail = 20 } = {}) {
@@ -7717,6 +8112,11 @@ const handlers = {
     const ready = verdict.alive && verdict.status === 'running'
       ? await windowsBackend.ready(meta, { ssh: meta.ssh !== false, ...(installPhase ? { phase: 'install' } : {}) })
       : { ready: false, endpoint: 'none' }
+    // C12: a live process (and, when it answered, an SSH banner) corroborates
+    // the row. This is the call the panel makes every 5 s, so it is also the
+    // cheapest honest place to refresh the fact — the ANSWER came from the
+    // computer, not from the registry.
+    if (verdict.alive === true) confirmVmState(name, ready.ready === true ? 'ssh' : 'windows-status')
     const state = !verdict.alive
       // A row that says `installing` with no process is STUCK, not "stopped":
       // the install never finished. Leaving the state as `stopped` hid the row a
@@ -8084,6 +8484,19 @@ const handlers = {
       })
     }
     const online = (state === 'ready' || state === 'running') && ssh === true && sshPort > 0
+    // C12 names this op as a stamp site, and it is the CHEAP read. Its only
+    // admissible evidence is the one fact that costs nothing and cannot lie: a
+    // LIVE qemu pid. Stamping on the registry answer alone would keep a dead
+    // guest "confirmed" for ever — the bridge polls this every 10 s, which is R3
+    // wearing a new field.
+    if (online && meta.kind === 'windows') {
+      try {
+        const pid = windowsBackend.qemuPid(wanted)
+        if (pid > 0 && windowsBackend.pidAlive(pid) === true) confirmVmState(wanted, 'windows-mcp-state')
+      } catch {
+        // A missing pidfile is not evidence either way.
+      }
+    }
     return ok({
       name: wanted,
       kind: meta.kind ?? 'linux',
@@ -8785,7 +9198,7 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
 
   /** Grow the disk of a running computer; the filesystem grows online. */
   async vmDisk({ name, sizeGb }) {
-    return withVmLock(name, async () => {
+    return withVmLockAs(name, 'vmDisk', async () => {
       const registry = readRegistry()
       if (!registry.vms[name]) return fail(`no computer named "${name}"`)
       if (registry.vms[name].kind === 'windows') {
@@ -8821,7 +9234,7 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
   },
   /** Install the Android SDK + an AVD inside the guest (several GB, one-off). */
   async vmAndroid({ name, api = 35, variant = 'google_apis', arch = 'x86_64', avd = 'cua' }) {
-    return withVmLock(name, async () => {
+    return withVmLockAs(name, 'vmAndroid', async () => {
       const registry = readRegistry()
       if (!registry.vms[name]) return fail(`no computer named "${name}"`)
       if (registry.vms[name].kind === 'windows') {
@@ -8926,6 +9339,43 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
   }
 }
 
+/**
+ * C4 — A LOCK REFUSAL MUST REACH THE CALLER AS A CODE, NOT AS PROSE.
+ *
+ * The supervisor throws; the socket answers one line. `fail(error)` alone threw
+ * away `code`/`lockHeldBy`/`lockHeldMs`, so the plugin could only pattern-match
+ * a sentence to know that the computer was BUSY rather than broken. This maps
+ * the two typed lock errors and leaves every other throw exactly as it was.
+ */
+function lockAwareFail(error) {
+  if (error instanceof VM_LOCK.LockOrderError) {
+    log(`lock-order-violation: ${error.message}`)
+    return fail(error.message, { code: 'lock-order-violation', lockHeldBy: error.lockHeldBy, lockKey: error.lockKey })
+  }
+  if (error instanceof VM_LOCK.LockTimeoutError) {
+    const state = (() => {
+      try {
+        return String(readRegistry().vms[error.lockName]?.state ?? 'unknown')
+      } catch {
+        return 'unknown'
+      }
+    })()
+    // The frozen sentence (C4), rendered where the state is known:
+    //   another operation on <name> has been running for <N>s (<holder>);
+    //   the panel still shows <state>
+    // plus the C5 runbook when the key is poisoned.
+    return fail(VM_LOCK.lockTimeoutSentence(error, { state }), {
+      code: 'lock-timeout',
+      name: error.lockName,
+      lockHeldBy: error.lockHeldBy,
+      lockHeldMs: error.lockHeldMs,
+      waitedMs: error.waitedMs,
+      poisoned: error.poisoned === true || undefined
+    })
+  }
+  return fail(error)
+}
+
 const server = createServer((socket) => {
   let buffer = ''
   let handled = false
@@ -8970,7 +9420,7 @@ const server = createServer((socket) => {
       if (!handler) throw new Error(`unknown op: ${request.op}`)
       response = await handler(request)
     } catch (error) {
-      response = fail(error)
+      response = lockAwareFail(error)
     }
     socket.end(`${JSON.stringify(response)}\n`)
   })
@@ -9006,7 +9456,15 @@ setInterval(() => {
     // read as "idle since the epoch".
     if (last === 0 || now - last < config.idleSuspendMinutes * 60000) continue
     log(`idle: suspending ${name} after ${config.idleSuspendMinutes} min without use`)
-    handlers.suspend({ name }).catch((error) => log(`idle suspend failed for ${name}: ${error.message}`))
+    // C6: TRY (1 s). The idle timer already logs once a minute; it must not
+    // queue forty deep behind a wedged operation, and it must never throw (a
+    // throw in a timer callback ends the process).
+    void tryVmLock(name, () => suspendVmLocked(name), { waitMs: IDLE_LOCK_WAIT_MS, holder: 'idle-suspend' })
+      .then((outcome) => {
+        if (outcome.ran === true) return
+        log(`idle: skipped suspending ${name} (${outcome.holder || 'another operation'} held the lock for ${Math.round((outcome.heldMs ?? 0) / 1000)} s)`)
+      })
+      .catch((error) => log(`idle suspend failed for ${name}: ${error.message}`))
   }
 }, 60000).unref?.()
 

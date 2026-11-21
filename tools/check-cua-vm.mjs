@@ -44,7 +44,7 @@ const { values } = parseArgs({
     root: { type: 'string', default: path.resolve(import.meta.dirname, '..') },
     quiet: { type: 'boolean', default: false },
     // E-4 (R10/C15): the mutation harness. A SEPARATE invocation, never part of
-    // the default run — it copies the tree and spawns this very file 29 times.
+    // the default run — it copies the tree and spawns this very file 36 times.
     mutations: { type: 'boolean', default: false }
   }
 })
@@ -73,7 +73,7 @@ function pickIn(rootDir, name) {
 }
 
 /* ====================================================================== *
- * E-4 / C15 — THE MUTATION TABLE: TWENTY REVERTS, EACH ONE JUDGED.
+ * E-4 / C15 — THE MUTATION TABLE: THIRTY-SIX REVERTS, EACH ONE JUDGED.
  * ====================================================================== *
  *
  * R10's second half. A needle proves a line is PRESENT; it does not prove the
@@ -86,9 +86,10 @@ function pickIn(rootDir, name) {
  *   red  + some other failure                                     => FALSE GREEN (fails the run)
  *   exit 0                                                        => FALSE GREEN (fails the run)
  *
- * THE TABLE IS FROZEN IN SIZE (29 rows: §7.3's 20, JE1's M-21/M-22, the
- * cold-boot round's M-23..M-28, and M-29 from the PRE review — the staged-side
- * measure that had no row at all).
+ * THE TABLE IS FROZEN IN SIZE (36 rows: §7.3's 20, JE1's M-21/M-22, the
+ * cold-boot round's M-23..M-28, M-29 from the PRE review — the staged-side
+ * measure that had no row at all — and M-30..M-36 from the power-buttons round,
+ * one revert per L-block contract).
  *
  * THIRTEEN ROWS CARRY `all: true` (replace every occurrence, require at least
  * one), and the reasons are two kinds, not one:
@@ -121,7 +122,7 @@ function pickIn(rootDir, name) {
  * check has one answer, not a choice between a line and its echo.
  *
  * THE RUNNER IS NEVER A MUTATION TARGET. A mutated runner would be the process
- * judging its own mutation, so every one of the twenty-nine rows mutates a
+ * judging its own mutation, so every one of the thirty-six rows mutates a
  * PACKAGE file and spawns an UNMUTATED judge from the copy: each verdict comes
  * from the same gate CI runs, and no pair can pass by breaking its own judge.
  */
@@ -412,7 +413,80 @@ const MUTATIONS = Object.freeze([
     find: '$stagedHash = (Get-FileHash -LiteralPath $guardScript -Algorithm SHA256).Hash.ToLowerInvariant()',
     replace: "$stagedHash = ''",
     expect: '× $stagedHash = (Get-FileHash',
-    why: 'without the staged-side measure the guard is re-copied on every pass (-not $stagedHash always true) — the WP-1A defect, invisible to every row before M-29'
+    why: 'a blanked measure makes the pin vacuous again: -not $stagedHash always holds, so E2 loses its literal and D12/S12 lose measure-then-write — the WP-1A write-always copy returns'
+  },
+  /* ------------------------------------------------------------------ *
+   * THE POWER-BUTTONS ROUND (§WP-D D-6): M-30..M-36 — one revert per
+   * L-block contract. Each `find` is a literal that is UNIQUE on this tree
+   * (E2 asserts that on every gate run), and each `expect` is the L-block
+   * whose failure message names the revert, so a red that says something
+   * else is still a FALSE GREEN.
+   * ------------------------------------------------------------------ */
+  {
+    // The whole refusal hinges on the deadline being FINITE: 0 is the legacy
+    // "wait for ever" knob, i.e. exactly the HEAD behaviour this round removed.
+    id: 'M-30',
+    file: 'cua-vm-lock.mjs',
+    find: 'export const LOCK_WAIT_MS = 30_000',
+    replace: 'export const LOCK_WAIT_MS = 0',
+    expect: 'L1',
+    why: 'no finite deadline ⇒ a wedged holder silences every power op again, with no refusal to read (R1/C3)'
+  },
+  {
+    // The CAS is the ONLY thing between a late verdict and a row that moved on.
+    id: 'M-31',
+    file: 'cua-vm-supervisor.mjs',
+    find: 'if (row.state !== expect.state || row.stateSince !== expect.stateSince) return false',
+    replace: 'if (false) return false',
+    expect: 'L2',
+    why: 'without the CAS a QMP verdict formed minutes ago clobbers a Start that landed in between (W3)'
+  },
+  {
+    // C8.2 spelled: the busy branch must STILL schedule.
+    id: 'M-32',
+    file: 'cua-vm-supervisor.mjs',
+    find: 'if (busy) { schedule(); return }   // C8.2',
+    replace: 'if (busy) { return }   // C8.2',
+    expect: 'L3',
+    why: 'a busy tick that returns without scheduling is the death of the poll: one parked tick and the guest is invisible for the life of the process (R2)'
+  },
+  {
+    // THE ORDER, not the presence: a deferral injected BEFORE the state write is
+    // a capture that can fail before the fact is recorded.
+    id: 'M-33',
+    file: 'cua-vm-supervisor.mjs',
+    find: 'const recorded = await mutateRegistryWith((registry) => {',
+    replace: "await scheduleDeferredWindowsCheckpoint(name, token, config, { origin: 'guest-shutdown' })\n  const recorded = await mutateRegistryWith((registry) => {",
+    expect: 'L2',
+    why: 'a capture before the state write is the pre-fix finaliseGuestShutdown: one quota refusal and the powered-off row never lands (P4/D1)'
+  },
+  {
+    // The 30-minute socket default, back on the one route the page polls.
+    id: 'M-34',
+    file: 'index.js',
+    find: 'state: 15_000',
+    replace: 'state: TOOL_TIMEOUT_MS',
+    expect: 'L5',
+    why: "the page's own beat inheriting the 30-minute socket default is defect R4 in one line"
+  },
+  {
+    // The hidden-button symptom, restored: the buttons become a show-condition.
+    id: 'M-35',
+    file: 'client.js',
+    find: 'disabled: !canPower || busy',
+    replace: "canPower && h('button'",
+    all: true,
+    expect: 'L6',
+    why: 'a button that is HIDDEN on a powered-off row is the reported symptom, and it leaves the user no exit from a wedge (C20)'
+  },
+  {
+    // The space half of the pre-flight, disabled: a convert that cannot fit.
+    id: 'M-36',
+    file: 'cua-vm-supervisor.mjs',
+    find: 'const shortfall = await checkpointSpaceShortfall(diskBytes)',
+    replace: 'const shortfall = null',
+    expect: 'L7',
+    why: 'without the filesystem fact a 9.1 GiB disk is checkpointed onto 3.3 GB free — the live trigger that wedged the shutdown (C22)'
   }
 ])
 
@@ -738,7 +812,12 @@ const NEEDLES = {
     // S1: GC is serialised against the lifecycle lock it shares with a convert
     // or a boot, so it cannot delete a `.tmp` or a restore temp mid-flight.
     ["return withLock('@gc'", 1],
-    ['withVmLock(groupName, run)', 1],
+    // A-2/C6: the GC group takes the SAME adapter with a THIRD argument —
+    // `{ mode: 'try', waitMs: GC_LOCK_WAIT_MS }` is the skip-and-say-so
+    // classification, so a busy group is REPORTED in the GC answer instead of
+    // spending the tool budget queueing. The options are an argument, never a
+    // rename, because `function withVmLock(name, fn)` is itself pinned above.
+    ["withVmLock(groupName, run, { mode: 'try', waitMs: GC_LOCK_WAIT_MS", 1],
     // S5/S15: a failed `sb rm` keeps the row (marked orphaned) and the delete
     // reports itself as partial.
     ['row.orphaned = true', 1],
@@ -791,7 +870,11 @@ const NEEDLES = {
     // on purpose: swapping them (which happened) makes both platforms silently
     // skip their checkpoint.
     ['function checkpointDiskFile(name, disk)', 1],
-    ['checkpointDiskFile(name, windowsPaths(STORE, name).disk)', 1],
+    // C21: the WINDOWS capture awaits its child (`checkpointDiskFileAsync`,
+    // `runCaptureCommand`), so `execFileSync` cannot block the event loop for a
+    // 10 GB convert. `checkpointDiskFile` (sync) survives ONLY for the Linux
+    // suspend/shutdown path, which is the needle directly above.
+    ['await checkpointDiskFileAsync(name, windowsPaths(STORE, name).disk)', 1],
     ['checkpoint = checkpointSandbox(name)', 2],
     // B2: Start restores a Windows checkpoint over the disk.
     ['restored from its checkpoint', 1],
@@ -1038,7 +1121,10 @@ const NEEDLES = {
     ['DSH_CUA_VM_STATE_POLL_S', 1],
     ['function startQmpStatePoll(name)', 1],
     ['const watcher = startQmpStatePoll(name)', 1],
-    ['async function windowsCheckpointPlan(name, config)', 1],
+    // C21/A-5: ONE Windows capture lane. The sync `windowsCheckpointPlan` is
+    // DELETED (a needle satisfied by a corpse is a false green); the deferred
+    // planner is the only planner, and it awaits its child.
+    ['async function windowsCheckpointPlanDeferred(name, config)', 1],
     ['async function finaliseGuestShutdown(name, { status = \'\', clean = false } = {})', 1],
     ['async function finaliseGuestPause(name, status)', 1],
     ['method: \'guest-shutdown\'', 1],
@@ -2787,7 +2873,20 @@ const NEEDLES = {
     // * Shutdown/Suspend are offered for an INSTALLING Windows row too — with a
     //   confirm that says it aborts the install (hiding them left Force delete
     //   as the only way out of a 40-minute install).
-    ['(ready || (windows && installing)) && h(\'button\'', 2],
+    // C20: RENDER, THEN DISABLE WITH A REASON. `canPower` is the HEAD
+    // expression kept as a greppable VALUE (it decides the title's reason), and
+    // BOTH buttons are always rendered — `disabled: !canPower || busy` — so a
+    // powered-off/suspended row still shows Start, Suspend and Shutdown.
+    ['const canPower = (ready || (windows && installing))', 1],
+    // The disable half (`disabled: !canPower || busy`, BOTH buttons) is asserted
+    // by the L6 block below, which counts the two occurrences — one assertion,
+    // not a needle row. The table's arithmetic, D6-corrected and then
+    // J1-corrected (it read `1338 + 1 + 7 = 1345`, which is 1346 — and then
+    // claimed the split-button needle left while flatRequired arrived, which
+    // would net out): the split-button needle was REPLACED one-for-one (the row
+    // count is identical) and flatRequired is ONE assertion for the whole list
+    // (it adds no row), so the true derivation is:
+    //   1338 + 7 (L1..L7) = 1345
     ['THIS ABORTS THE WINDOWS INSTALL', 1],
     ['Mid-install this PAUSES Windows Setup', 1],
     // * The wait is VISIBLE: a one-second ticker plus the row's own state, so a
@@ -2888,7 +2987,9 @@ const NEEDLES = {
     // `default` and answered 404 "unknown action: suspend" — a plugin-dispatch
     // gap the tool (`cua_vm_suspend`) never hit because it calls the supervisor
     // directly. The case must send the SAME op name the tool does.
-    ["case 'suspend': return send(200, { ok: true, ...(await call({ op: 'suspend', ...(await body()) })) })", 1],
+    // ...and C17: the case passes its OWN budget, so the route can never inherit
+    // the 30-minute socket default (R4).
+    ["case 'suspend': return send(200, { ok: true, ...(await call({ op: 'suspend', ...(await body()) }, routeTimeoutMs('suspend'))) })", 1],
     ["const result = await call({ op: 'suspend', name: args.name })", 1],
     // R1: a partial delete prints what failed AND what was kept on purpose.
     ['- KEPT ${item.target}: ${item.reason}', 1],
@@ -3674,9 +3775,18 @@ function sourceOf(label, name) {
       const phaseFirst = shutdown.indexOf('await windowsStopPhase(meta)')
       const recordAfter = shutdown.indexOf('recordWindowsPoweredOff(name, {')
       const stateWrite = record.search(/row\.state = 'powered-off'/u)
-      const deferred = record.indexOf('scheduleDeferredWindowsCheckpoint(name, token, config)')
+      // A-7: the shutdown op's own origin is 'shutdown'. Pinned WITH the origin
+      // (not a prefix) so the guest path's 'guest-shutdown' cannot satisfy this
+      // slice and the row/log keeps naming where the capture came from.
+      const deferred = record.indexOf("scheduleDeferredWindowsCheckpoint(name, token, config, { origin: 'shutdown' })")
       const guestState = finalise.search(/row\.state = 'powered-off'/u)
-      const guestPlan = finalise.indexOf('await windowsCheckpointPlan(name, config)')
+      // C9/C10: the tick writes the FACT and then HANDS THE CAPTURE to the same
+      // deferred lane the shutdown op uses — with its origin named — instead of
+      // running a convert inline. And the slice takes NO lifecycle lock: that
+      // wrapper is exactly what parked the tick behind a wedged operation and
+      // killed the poll for the life of the process (R2).
+      const guestDefer = finalise.indexOf("scheduleDeferredWindowsCheckpoint(name, token, config, { origin: 'guest-shutdown' })")
+      const guestLockFree = finalise.includes('withVmLock(') === false
       // The answer is a WORD, never a path (`checkpoint: status` +
       // `checkpointDeferred`), because a path in the answer can only be a lie
       // (the file does not exist yet) or a minutes-long wait (the defect).
@@ -3684,13 +3794,14 @@ function sourceOf(label, name) {
       const ok = shutdown !== '' && record !== '' && finalise !== ''
         && phaseFirst !== -1 && recordAfter !== -1 && phaseFirst < recordAfter
         && stateWrite !== -1 && deferred !== -1 && stateWrite < deferred
-        && guestState !== -1 && guestPlan !== -1 && guestState < guestPlan
+        && guestState !== -1 && guestDefer !== -1 && guestState < guestDefer
+        && guestLockFree
         && wordAnswer
       if (ok) {
         if (!quietMode) console.log('  ok   P5 the shutdown is answer-first: bounded QMP phase → powered-off row → deferred checkpoint (both paths state-first)')
       } else {
         failures += 1
-        missing.push(`docker/cua-vm-supervisor.mjs: the shutdown must ANSWER-FIRST — windowsStopPhase before recordWindowsPoweredOff in windowsShutdown, powered-off before scheduleDeferredWindowsCheckpoint in recordWindowsPoweredOff, powered-off before windowsCheckpointPlan in finaliseGuestShutdown, and the answer must carry checkpoint: status + checkpointDeferred (phase=${phaseFirst}, record=${recordAfter}, state=${stateWrite}, deferred=${deferred}, guestState=${guestState}, guestPlan=${guestPlan}, word=${wordAnswer}); otherwise either the panel's button blocks on a 10 GB qemu-img convert again, or a quota-refused checkpoint deletes the only observer of a guest power-off`)
+        missing.push(`docker/cua-vm-supervisor.mjs: the shutdown must ANSWER-FIRST — windowsStopPhase before recordWindowsPoweredOff in windowsShutdown, powered-off before scheduleDeferredWindowsCheckpoint in recordWindowsPoweredOff, powered-off before the guest's deferred capture (origin 'guest-shutdown') in finaliseGuestShutdown, NO withVmLock( in that slice (C9: the tick must never queue on the lifecycle lock), and the answer must carry checkpoint: status + checkpointDeferred (phase=${phaseFirst}, record=${recordAfter}, state=${stateWrite}, deferred=${deferred}, guestState=${guestState}, guestDefer=${guestDefer}, lockFree=${guestLockFree}, word=${wordAnswer}); otherwise either the panel's button blocks on a 10 GB qemu-img convert again, or a quota-refused checkpoint deletes the only observer of a guest power-off`)
         console.log('  FAIL P5 answer-first shutdown ordering')
       }
     }
@@ -3854,7 +3965,13 @@ function sourceOf(label, name) {
   // is out of scope and says so out loud — it is never silently dropped.
   // F1/F2/F3/F4: the boot path has its own suite now (stub QEMU: a dead init, an
   // EGL failure that must degrade once, the watchdog and the sentence).
-  const suite = ['supervisor-smoke.mjs', 'modules-unit.mjs', 'qmp-shutdown.mjs', 'windows-boot.mjs', 'windows-mcp-gate.mjs']
+  // WP-D: the power-buttons round's three behavioural suites are part of that
+  // same claim — the deadline (T1–T12), the wedged watcher (W1–W9) and the route
+  // budgets (14 checks). A suite nobody committed is a claim nobody can run.
+  const suite = [
+    'supervisor-smoke.mjs', 'modules-unit.mjs', 'qmp-shutdown.mjs', 'windows-boot.mjs', 'windows-mcp-gate.mjs',
+    'lock-deadline.mjs', 'watcher-wedge.mjs', 'route-budget.mjs'
+  ]
   if (!REPO_LAYOUT) {
     if (!quietMode) console.log('  n/a  L5 the runtime suite lives in the checkout, not in the flat image check tree')
   } else {
@@ -4023,6 +4140,11 @@ function sourceOf(label, name) {
   // the doc J1-6 enforces. `windows-iso-sources.md` is the entry CI was missing.
   const flatRequired = [
     'cua-vm-supervisor.mjs', 'cua-vm-space.mjs', 'cua-vm-kvm.mjs', 'cua-vm-windows-qemu.mjs',
+    // WP-A: the supervisor imports the power-op lock by RELATIVE PATH
+    // (`import * as VM_LOCK from './cua-vm-lock.mjs'`), so a flat tree without it
+    // is not a weaker check — L1 reports it missing and the supervisor itself
+    // cannot load. Resolved from the supervisor's own directory, like space/kvm.
+    'cua-vm-lock.mjs',
     'cua-vnc-clip.mjs', 'win-mcp.js', 'client.js', 'index.js',
     'Autounattend.xml', 'setupcomplete.cmd', 'cua-firstboot.ps1', 'Unattend.vbs', 'cua-clip-agent.ps1',
     // J22-14: this gate reads the relay by NAME (NEEDLES.relay), so the flat tree
@@ -4863,6 +4985,331 @@ function frozenListOf(source, name) {
   }
 }
 
+/* ====================================================================== *
+ * WP-D (§D-4) — THE SEVEN LOCK/STATE/BUDGET BLOCKS, L1..L7.
+ *
+ * The round's contracts are ORDER, ARITHMETIC and CLASSIFICATION, and none of
+ * those is expression-able as a needle: "the state is written before the thing
+ * that can fail", "the busy branch re-arms the poll", "a waiter expires instead
+ * of running". Every block below therefore reads STRUCTURE — slices, indices,
+ * counted literals — and calls `stripJsComments` first, because each of these
+ * files documents the very defect it must no longer contain, and a raw index()
+ * would find the prose and pass on a reverted file (the exact failure that made
+ * two earlier needles vacuous).
+ *
+ * ONE MUTATION PER CONTRACT (§D-6): M-30→L1, M-31/M-33→L2, M-32→L3,
+ * M-34→L5, M-35→L6, M-36→L7. L4 (staleness) has no row of its own: it is proved
+ * by construction, because every field it reads is produced by the code the
+ * other six rows mutate.
+ * ====================================================================== */
+
+/** A slice of one file, comments stripped, '' when the anchors moved. */
+function lSlice(source, from, to) {
+  if (source === '') return ''
+  const start = source.indexOf(from)
+  if (start === -1) return ''
+  const end = source.indexOf(to, start)
+  return source.slice(start, end === -1 ? source.length : end)
+}
+
+/**
+ * L1 — THE LOCK IS A DEADLINE, NOT A QUEUE (C2–C7).
+ *
+ * The module must carry the deadline, the poison threshold, the legacy `0 ⇒
+ * Infinity` knob, the typed refusal with its three FIELDS, the snapshot and the
+ * `try*` pair; the supervisor must ADOPT it through adapters (`withVmLock` stays
+ * two-parameter — the needle above pins that), and the classification table must
+ * be visible: user-facing ops through `withVmLockAs(`, background loops through
+ * `mode: 'try'` (C6). A `withVmLock` that is a bare chain again fails here.
+ */
+{
+  total += 1
+  const supervisorFile = pick('cua-vm-supervisor.mjs')
+  const lockFile = supervisorFile === null ? null : path.join(path.dirname(supervisorFile), 'cua-vm-lock.mjs')
+  const lock = lockFile !== null && existsSync(lockFile) ? stripJsComments(readFileSync(lockFile, 'utf8')) : ''
+  const supervisor = stripJsComments(textOf('cua-vm-supervisor.mjs'))
+  const has = (text, needle) => text.includes(needle)
+  const moduleFacts = lock !== '' && [
+    has(lock, 'export const LOCK_WAIT_MS = 30_000'),
+    has(lock, 'export const LOCK_POISON_MS = 1_800_000'),
+    has(lock, 'zeroMeansInfinity: true'),
+    has(lock, "this.code = 'lock-timeout'"),
+    has(lock, 'this.lockHeldBy = holder'),
+    has(lock, 'this.lockHeldMs = heldMs'),
+    has(lock, 'this.waitedMs ='),
+    has(lock, 'export class LockTimeoutError extends Error'),
+    has(lock, 'export function lockSnapshot()'),
+    has(lock, 'export async function tryLock('),
+    has(lock, 'export async function tryVmLock('),
+    has(lock, 'export function lockTimeoutSentence('),
+    // J3: the removal path prunes the two rate-limiter maps by NAME, and the
+    // supervisor calls it where it prunes its own VM_STATE_LAST. A delete that
+    // leaves a cadence entry behind is the leak this pair exists to stop.
+    has(lock, 'export function pruneLockWarnings(vmName)'),
+    has(lock, "this.code = 'lock-order-violation'"),
+    has(lock, 'options.reentrant !== false'),
+    has(lock, 'reentrant: false')
+  ].every(Boolean)
+  const adapters = [
+    has(supervisor, "import * as VM_LOCK from './cua-vm-lock.mjs'"),
+    has(supervisor, 'const VM_LOCK_CONTEXT = new AsyncLocalStorage()'),
+    has(supervisor, 'VM_LOCK.useLockLogger('),
+    has(supervisor, 'function withLock(key, fn) {'),
+    has(supervisor, 'VM_LOCK.withLock(lifecycleKey(key)'),
+    has(supervisor, 'function withVmLock(name, fn) {'),
+    has(supervisor, 'function withVmLockAs(name, holder, fn)'),
+    has(supervisor, "if (options.mode === 'try') return VM_LOCK.tryVmLock(name, fn, shared)"),
+    has(supervisor, 'VM_LOCK.lockSnapshot()'),
+    has(supervisor, 'error instanceof VM_LOCK.LockTimeoutError'),
+    has(supervisor, 'VM_LOCK.lockTimeoutSentence(error, { state })'),
+    has(supervisor, 'VM_LOCK.pruneLockWarnings(key)')
+  ].every(Boolean)
+  // C6: user-facing ops THROW (they name a holder through the sibling), and the
+  // background loops (gc, install watch, idle, checkpoint) SKIP.
+  const throwSites = (supervisor.match(/withVmLockAs\(/gu) ?? []).length
+  const trySites = (supervisor.match(/mode: 'try'/gu) ?? []).length
+  const ok = moduleFacts && adapters && throwSites >= 6 && trySites >= 3
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   L1 a waiter DEADLINE, a named holder, a snapshot, try-modes and the order guard live in docker/cua-vm-lock.mjs; the supervisor adopts them through adapters (${throwSites} throwing sites, ${trySites} try sites) (C2–C7)`)
+  } else {
+    failures += 1
+    missing.push(`L1: the lock contract is broken — docker/cua-vm-lock.mjs ${lock === '' ? `is MISSING next to the supervisor (${lockFile ?? 'no supervisor'})` : 'is present but incomplete'} (moduleFacts=${moduleFacts}); the supervisor adapters=${adapters}; user-facing withVmLockAs( sites=${throwSites} (≥6: destroy/suspend/resume/shutdown/start/provision); mode:'try' sites=${trySites} (≥3: gc, install-watch, idle/checkpoint) — a deadline-less withVmLock is R1 again, and a background loop that throws instead of skipping is R2 (C3/C5/C6)`)
+    console.log('  FAIL L1 lock deadline / holder / try-modes')
+  }
+}
+
+/**
+ * L2 — THE FACT IS WRITTEN UNDER `@registry` ONLY, AND THE TICK TAKES NO LOCK (W1, C9/C10/C24).
+ *
+ * Inside `finaliseGuestShutdown`: the CAS token is captured BEFORE the mutate,
+ * the CAS comparison is the only thing standing between a stale verdict and a
+ * live row, the state + `restoreFrom:{kind:'image'}` + the pending token land in
+ * ONE mutate, and the capture is DEFERRED with its origin named — never inline,
+ * and never inside `withVmLock` (that wrapper is what parked the tick and killed
+ * the poll for the life of the process).
+ */
+{
+  total += 1
+  const supervisor = stripJsComments(textOf('cua-vm-supervisor.mjs'))
+  const finalise = lSlice(supervisor, 'async function finaliseGuestShutdown(name, {', 'async function finaliseGuestPause(name, status)')
+  const record = lSlice(supervisor, 'async function recordWindowsPoweredOff(name, {', 'async function windowsShutdown(name, meta) {')
+  const guestState = finalise.search(/row\.state = 'powered-off'/u)
+  const guestDefer = finalise.indexOf("scheduleDeferredWindowsCheckpoint(name, token, config, { origin: 'guest-shutdown' })")
+  const guestLockFree = finalise !== '' && finalise.includes('withVmLock(') === false
+  const expectToken = finalise.indexOf('const expect = { state: meta.state, stateSince: meta.stateSince }')
+  const mutateAt = finalise.indexOf('mutateRegistryWith((')
+  const casAt = finalise.indexOf('if (row.state !== expect.state || row.stateSince !== expect.stateSince) return false')
+  const factShape = /row\.restoreFrom = \{ kind: 'image', image: 'windows' \}/u.test(finalise)
+    && finalise.includes('row.checkpointPending = { token, at }')
+    && finalise.includes("method: 'guest-shutdown'")
+  const noInlineConvert = finalise !== ''
+    && finalise.includes('runCaptureCommand(') === false
+    && finalise.includes('checkpointDiskFile(') === false
+  const refused = finalise.includes('superseded')
+  const recordState = record.search(/row\.state = 'powered-off'/u)
+  const recordDefer = record.indexOf('scheduleDeferredWindowsCheckpoint(name, token, config,')
+  const recordWord = /checkpoint: status,/u.test(record) && /checkpointDeferred: status === 'deferred'/u.test(record)
+  const ok = finalise !== '' && record !== ''
+    && expectToken !== -1 && mutateAt !== -1 && expectToken < mutateAt
+    && casAt !== -1
+    && guestState !== -1 && guestDefer !== -1 && guestState < guestDefer
+    && guestLockFree && factShape && noInlineConvert && refused
+    && recordState !== -1 && recordDefer !== -1 && recordState < recordDefer && recordWord
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   L2 the guest power-off is ONE @registry mutate: CAS token captured first, state + restoreFrom + pending token together, previews after, and the capture DEFERRED with origin \'guest-shutdown\' — the slice takes no lifecycle lock (C9/C10/C24)')
+  } else {
+    failures += 1
+    missing.push(`L2: finaliseGuestShutdown must write the FACT without the lifecycle lock — expect-token (${expectToken}) BEFORE the mutate (${mutateAt}), the CAS comparison present (${casAt}), state (${guestState}) BEFORE the deferred capture (${guestDefer}), NO withVmLock( in the slice (${guestLockFree}), restoreFrom/pending/method together (${factShape}), no inline capture (${noInlineConvert}), a refused write logged as superseded (${refused}); and recordWindowsPoweredOff must write powered-off (${recordState}) BEFORE its deferral (${recordDefer}) with the word answer (${recordWord}) — otherwise a stale verdict clobbers a live row, or the tick parks on the mutex and the poll dies (W1/W3/C9/C10)`)
+    console.log('  FAIL L2 guest-shutdown fact order / CAS')
+  }
+}
+
+/**
+ * L3 — THE TICK ALWAYS RE-ARMS, AND IT IS ABANDONED, NOT WAITED FOR (C8).
+ *
+ * Three independent guarantees, because one was not enough: the busy branch
+ * still calls `schedule()` (HEAD returned without it — that WAS the death), the
+ * `finally` re-arms, and a tick older than `tickBudgetMs()` is abandoned with one
+ * log line a minute while the loop keeps its cadence. The tick also takes no
+ * lifecycle lock: a verdict is a FACT (W1), not an action.
+ */
+{
+  total += 1
+  const supervisor = stripJsComments(textOf('cua-vm-supervisor.mjs'))
+  const budget = supervisor.includes('const TICK_BUDGET_MS = 10_000')
+    && supervisor.includes('function tickBudgetMs() {')
+    && /return Math\.max\(TICK_BUDGET_MS, 3 \* qmpStatePollMs\(\)\)/u.test(supervisor)
+  const busyShape = supervisor.includes('const busy = running !== null && Date.now() - running.at < tickBudgetMs()')
+    && supervisor.includes('if (busy) { schedule(); return }')
+  const abandon = supervisor.includes('state poll tick still running after')
+  const tick = lSlice(supervisor, 'const tick = async () => {', 'function installQmpStateWatcher(')
+  const rearms = tick !== ''
+    && tick.includes('if (running === marker) running = null')
+    && /finally \{\s*if \(running === marker\) running = null\s*schedule\(\)/u.test(tick)
+  const lockFree = tick !== '' && tick.includes('withVmLock(') === false
+  const watcher = supervisor.includes('function startQmpStatePoll(name)') && supervisor.includes('installQmpStateWatcher(name)')
+  const ok = budget && busyShape && abandon && rearms && lockFree && watcher
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   L3 the QMP tick RE-ARMS in the busy branch and in the finally, is ABANDONED past tickBudgetMs() with one line a minute, and takes no lifecycle lock (C8)')
+  } else {
+    failures += 1
+    missing.push(`L3: the QMP poll must survive a slow tick — TICK_BUDGET_MS/tickBudgetMs() (${budget}), the busy branch that still re-arms (${busyShape}), the abandon log line (${abandon}), the finally that clears the marker and schedules (${rearms}), no withVmLock( in the tick (${lockFree}), the watcher present (${watcher}) — a busy tick that returns without scheduling is the DEATH of the poll (R2/C8)`)
+    console.log('  FAIL L3 watcher re-arm / abandon')
+  }
+}
+
+/**
+ * L4 — STALENESS IS DERIVED ON READ (C12–C15).
+ *
+ * A corroboration timestamp that survives no restart, a window table with the
+ * four live states, the exact derivation (Windows-only, age compared to the
+ * state's OWN window, `null`/`false` for Linux), the four row fields, and the
+ * plugin's TOP-LEVEL `state{}` block — while `probe.stale` keeps its one old
+ * meaning (`probeStale` still computed from the probe's own age).
+ */
+{
+  total += 1
+  const supervisor = stripJsComments(textOf('cua-vm-supervisor.mjs'))
+  const indexText = stripJsComments(textOf('index.js'))
+  const map = supervisor.includes('const STATE_CONFIRMED = new Map()')
+    && supervisor.includes('function confirmVmState(name, source)')
+    // J3: the map is PRUNED on removal, in the same block that prunes the state
+    // bus's own VM_STATE_LAST. A corroboration timestamp for a computer that no
+    // longer exists is a stale fact waiting to be read by a recreated name.
+    && supervisor.includes('STATE_CONFIRMED.delete(key)')
+  const windows = /const STATE_CONFIRM_WINDOW_MS = Object\.freeze\(\{\s*ready: 120_000,\s*running: 120_000,\s*booting: 300_000,\s*installing: 300_000/u.test(supervisor)
+  const derived = supervisor.includes('function stateStaleness(name, row, now = Date.now())')
+    && /stale: windowMs !== null && ageMs !== null && ageMs > windowMs/u.test(supervisor)
+    && /if \(kind !== 'windows'\) return \{ confirmedAt: null, source: null, ageMs: null, stale: false, windowMs: null \}/u.test(supervisor)
+  const rowFields = supervisor.includes('function decorateStateFacts(rows, now = Date.now())')
+    && ['row.stateConfirmedAt = facts.confirmedAt', 'row.stateConfirmedSource = facts.source', 'row.stateAgeMs = facts.ageMs', 'row.stateStale = facts.stale', 'row.lock = vmLockFacts(name)'].every((needle) => supervisor.includes(needle))
+  const doctorLocks = supervisor.includes('locks: Object.entries(VM_LOCK.lockSnapshot())')
+  const pluginBlock = indexText.includes('export function windowsStateFacts(')
+    && indexText.includes('state: stateFacts,')
+    && indexText.includes('lastEventAgeMs:')
+    && indexText.includes("'plugin-derived'")
+  const probeUntouched = indexText.includes('const probeStale = online !== true && probeAgeMs !== null && probeAgeMs > WIN_MCP_PROBE_STALE_MS')
+    && indexText.includes('stale: probeStale,')
+  const ok = map && windows && derived && rowFields && doctorLocks && pluginBlock && probeUntouched
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   L4 STATE_CONFIRMED + a four-state window table derive stateStale on every read, the row carries the four fields plus the lock, the doctor carries state{} and locks[], and probe.stale keeps its old meaning (C12–C15)')
+  } else {
+    failures += 1
+    missing.push(`L4: staleness is derived, not guessed — STATE_CONFIRMED/confirmVmState (${map}), the ready/running=120 s · booting/installing=300 s window table (${windows}), the derivation and the Linux null/false branch (${derived}), the four row fields + lock (${rowFields}), the doctor's locks[] (${doctorLocks}), the plugin's top-level state{} with source plugin-derived and lastEventAgeMs (${pluginBlock}), and probe.stale UNTOUCHED (${probeUntouched}) — overloading probe.stale resurrects the contradiction R3 describes (C12–C15)`)
+    console.log('  FAIL L4 staleness facts')
+  }
+}
+
+/**
+ * L5 — EVERY ROUTE HAS A BUDGET (C16–C18).
+ *
+ * One frozen table, a fallback that is not the socket default, `exec` computed
+ * per call through the TOOL's resolver, and the 504 mapping: only a
+ * `socket-timeout` becomes `route-timeout`; every other failure keeps its 503.
+ * A route that calls `call(payload)` with one argument inherits thirty minutes,
+ * which is defect R4.
+ */
+{
+  total += 1
+  const indexText = stripJsComments(textOf('index.js'))
+  const table = indexText.includes('export const ROUTE_TIMEOUTS = Object.freeze({')
+    && indexText.includes('state: 15_000,')
+    && indexText.includes('start: 65_000,')
+    && indexText.includes('exec: 0')
+  const resolver = indexText.includes('export function routeTimeoutMs(action, body = {})')
+    && indexText.includes("if (action === 'exec') return PER_CALL_TIMEOUTS.cua_vm_exec(body)")
+    && indexText.includes('export const ROUTE_TIMEOUT_FALLBACK_MS = 30_000')
+  const mapped = indexText.includes("error.code = 'socket-timeout'")
+    && indexText.includes("if (error?.code === 'socket-timeout')")
+    && indexText.includes("code: 'route-timeout',")
+    && indexText.includes('the panel stopped waiting, the computer did not stop working')
+    && /return send\(503, \{ ok: false, error: String\(error\?\.message \?\? error\) \}\)/u.test(indexText)
+  const switchStart = indexText.indexOf('switch (action) {')
+  const switchText = switchStart === -1 ? '' : indexText.slice(switchStart)
+  const budgeted = (switchText.match(/routeTimeoutMs\(/gu) ?? []).length
+  const ok = table && resolver && mapped && budgeted >= 20
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   L5 one FROZEN ROUTE_TIMEOUTS table (state 15 s, lifecycle 65 s, exec per call), a 30 s fallback, ${budgeted} budgeted route calls, and socket-timeout → 504 route-timeout with every other failure keeping its 503 (C16–C18)`)
+  } else {
+    failures += 1
+    missing.push(`L5: the route budget contract is broken — the frozen table with state:15_000/start:65_000/exec:0 (${table}), routeTimeoutMs + PER_CALL_TIMEOUTS.cua_vm_exec + the 30 s fallback (${resolver}), the socket-timeout→504 route-timeout mapping with C18's sentence and the surviving 503 (${mapped}), budgeted route calls=${budgeted} (≥20) — an unbudgeted route inherits the thirty-minute socket default, which is R4 (C16–C18)`)
+    console.log('  FAIL L5 route budgets')
+  }
+}
+
+/**
+ * L6 — THE PANEL RENDERS BOTH BUTTONS AND DISABLES WITH A REASON (C19/C20).
+ *
+ * `canPower` stays the HEAD expression AS A VALUE (so the semantic is
+ * greppable), BOTH power buttons are rendered unconditionally with
+ * `disabled: !canPower || busy`, the title carries the reason ladder (pending →
+ * lock → state), the client budget is the route's plus 5 s on an `AbortSignal`,
+ * and `Clean up`/`Create` are no longer gated on `pending` — that gate is how a
+ * user was left with NO way out of a wedged operation.
+ */
+{
+  total += 1
+  const client = stripJsComments(textOf('client.js'))
+  const canPower = client.includes('const canPower = (ready || (windows && installing))')
+  const disabledCount = (client.match(/disabled: !canPower \|\| busy/gu) ?? []).length
+  const hiddenForm = client.includes('canPower && h(')
+  const reasons = ['Powered off — Start boots it', 'Suspended — Start resumes it',
+    'Booting — the power buttons work once it is ready', 'Error — Start or delete first',
+    'Another operation on', 'restart the supervisor']
+    .filter((needle) => client.includes(needle)).length
+  const budgets = client.includes('const CLIENT_TIMEOUTS = Object.freeze({')
+    && /state: 20_000,\s*config: 20_000,/u.test(client.replace(/\n/gu, ' '))
+    && client.includes('start: 70_000,')
+    && client.includes('create: 1_810_000,')
+    && client.includes('AbortSignal.timeout(budget)')
+  const notGated = client.includes("onClick: () => void cleanup() }, 'Clean up')")
+    && client.includes("'Create computer'")
+    && client.includes('disabled: pending') === false
+  const ok = canPower && disabledCount === 2 && hiddenForm === false && reasons === 6 && budgets && notGated
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   L6 both power buttons are RENDERED and DISABLED with a six-rung reason ladder, the client budget is route+5 s on an AbortSignal, and Clean up/Create are not gated on pending (C19/C20)')
+  } else {
+    failures += 1
+    missing.push(`L6: the panel's button contract is broken — canPower as a value (${canPower}), disabled: !canPower || busy ×${disabledCount} (must be 2), the hidden form gone (${hiddenForm === false}), the reason ladder rungs=${reasons}/6, CLIENT_TIMEOUTS at route+5 s with AbortSignal.timeout (${budgets}), Clean up/Create un-gated (${notGated}) — a hidden button is the reported symptom, and a pending gate on Clean up is how a wedge became a page reload (C19/C20)`)
+    console.log('  FAIL L6 panel buttons / client budget')
+  }
+}
+
+/**
+ * L7 — THE CHECKPOINT IS PRE-FLIGHTED, RESERVED AND ASYNC (C21–C24).
+ *
+ * `quota` AND `statfs` (with the 2 GiB reserve) before a byte is written, a
+ * store RESERVATION that is always released, the `lock-busy` record for a busy
+ * computer, and an AWAITED child — while the sync `checkpointDiskFile` survives
+ * only on the Linux path (the needle above pins the Windows lane's await).
+ */
+{
+  total += 1
+  const supervisor = stripJsComments(textOf('cua-vm-supervisor.mjs'))
+  const importStatfs = supervisor.includes('statfsSync')
+  const space = supervisor.includes('const CHECKPOINT_FREE_RESERVE_BYTES = 2 * 1024 ** 3')
+    && supervisor.includes('async function checkpointSpaceShortfall(diskBytes)')
+    && supervisor.includes('statfsSync(STORE)')
+    && supervisor.includes('const shortfall = await checkpointSpaceShortfall(diskBytes)')
+    && supervisor.includes("checkpointSkipRecord('space', shortfall)")
+  const claim = supervisor.includes("reserveStoreBytes('checkpoint:' + name, diskBytes)")
+    && supervisor.includes("releaseStoreBytes('checkpoint:' + name)")
+  const busy = supervisor.includes("checkpointSkipRecord('lock-busy'")
+    && supervisor.includes('CHECKPOINT_LOCK_WAIT_MS')
+  const lane = supervisor.includes('async function windowsCheckpointPlanDeferred(name, config)')
+    && supervisor.includes('await checkpointDiskFileAsync(name, ')
+  const deferredPlan = lSlice(supervisor, 'async function windowsCheckpointPlanDeferred(name, config)', 'function scheduleDeferredWindowsCheckpoint(')
+  const syncOnWindows = deferredPlan !== '' && deferredPlan.includes('execFileSync(')
+  const ok = importStatfs && space && claim && busy && lane && syncOnWindows === false
+  if (ok) {
+    if (!process.argv.includes('--quiet')) console.log('  ok   L7 the checkpoint pre-flights quota AND filesystem space (2 GiB reserve), reserves/releases store bytes, records lock-busy, and captures through the ASYNC lane only (C21–C24)')
+  } else {
+    failures += 1
+    missing.push(`L7: the checkpoint contract is broken — statfs imported (${importStatfs}), the space shortfall with the 2 GiB reserve wired into the decision (${space}), the reservation claimed and released in a finally (${claim}), the lock-busy record with its bounded wait (${busy}), the single deferred lane awaiting its child (${lane}), and NO execFileSync in that lane (${syncOnWindows === false}) — an unmeasured convert on a full store is the wedged-shutdown defect, and a sync one blocks the loop for 300 s (C21–C24)`)
+    console.log('  FAIL L7 checkpoint space / async lane')
+  }
+}
+
 /**
  * E1 — THE MUTATION MODE IS PRESENT, AND IT IS THIS FILE'S OWN.
  *
@@ -4890,11 +5337,12 @@ function frozenListOf(source, name) {
  * E2 — THE MUTATION TABLE IS FROZEN AND ITS TARGETS HAVE NOT DRIFTED.
  *
  * This is the cheap half of `--mutations`: it runs on EVERY gate invocation and
- * costs 29 in-memory searches instead of 29 subprocesses. It catches the two
+ * costs 36 in-memory searches instead of 36 subprocesses. It catches the two
  * failures that make a mutation table rot silently — a row dropped from the
- * table (the count is the contract: 29 — 20 from §7.3, two from JE1's marker pair
- * (M-21/M-22), six from the cold-boot round (M-23..M-28) and one from the PRE
- * review (M-29, the staged-side measure that had no row)) and a `find` literal that no longer
+ * table (the count is the contract: 36 — 20 from §7.3, two from JE1's marker pair
+ * (M-21/M-22), six from the cold-boot round (M-23..M-28), one from the PRE review
+ * (M-29, the staged-side measure that had no row) and seven from the
+ * power-buttons round (M-30..M-36, one per L-block contract)) and a `find` literal that no longer
  * occurs because the line it targeted was reworded (the pair then "passes" by
  * mutating nothing, which is the false-green the runner would report only if
  * someone ran it).
@@ -4902,7 +5350,7 @@ function frozenListOf(source, name) {
 {
   total += 1
   const ids = MUTATIONS.map((row) => row.id)
-  const uniqueIds = new Set(ids).size === ids.length && ids.length === 29
+  const uniqueIds = new Set(ids).size === ids.length && ids.length === 36
   const drift = []
   for (const row of MUTATIONS) {
     const file = pick(row.file)
@@ -4915,7 +5363,7 @@ function frozenListOf(source, name) {
     if (!process.argv.includes('--quiet')) console.log(`  ok   E2 the mutation table carries ${MUTATIONS.length} unique pairs and every find literal still occurs exactly where it should (E-4)`)
   } else {
     failures += 1
-    missing.push(`E2: the mutation table must carry 29 unique pairs whose find literals still occur (ids=${ids.length}/${new Set(ids).size} unique; drift: ${drift.length === 0 ? 'none' : drift.join('; ')}) — a drifted literal mutates nothing and the pair goes quiet (E-4)`)
+    missing.push(`E2: the mutation table must carry 36 unique pairs whose find literals still occur (ids=${ids.length}/${new Set(ids).size} unique; drift: ${drift.length === 0 ? 'none' : drift.join('; ')}) — a drifted literal mutates nothing and the pair goes quiet (E-4)`)
     console.log('  FAIL E2 mutation table drift')
   }
 }

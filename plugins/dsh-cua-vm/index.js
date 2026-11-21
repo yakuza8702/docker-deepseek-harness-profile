@@ -212,6 +212,81 @@ const PER_CALL_TIMEOUTS = Object.freeze({
   cua_vm_create: (args) => (args?.kind === 'windows' ? 60_000 : TOOL_TIMEOUTS.cua_vm_create)
 })
 
+/* ==================================================================== *
+ * THE ROUTE-LEVEL TIMEOUT BUDGET (WP-B / defect R4, contract C16-C18)
+ * ==================================================================== *
+ *
+ * THE DEFECT. Every `case` of the `/cua/*` switch called the supervisor with the
+ * SOCKET default (`TOOL_TIMEOUT_MS`, thirty minutes) because `call()` had no
+ * second argument. The panel's own request had no deadline either, so a wedged
+ * supervisor produced a page that spun for half an hour and a "Suspend" button
+ * that never settled — while the TOOL with the same name (`cua_vm_suspend`, 60 s)
+ * was failing honestly in a minute. One computer, two stories.
+ *
+ * THE FIX, ONE NUMBER PER ROUTE. These budgets MIRROR the tool envelopes in
+ * `TOOL_TIMEOUTS` above, plus a five-second lead on the lifecycle ops, and the
+ * lead is the whole point of keeping them as a separate table: the supervisor's
+ * own waiter deadline is 30 s (`LOCK_WAIT_MS`), and its typed `lock-timeout`
+ * answer must reach BOTH surfaces before either surface gives up. A 60 s route
+ * would race that answer; 65 s cannot. A `create`/`ensure` is a synchronous
+ * multi-minute supervisor op, so it keeps the tool's 30 min plus the same 5 s.
+ *
+ * EVERY CASE IN THE SWITCH PASSES ONE (C17): `call(payload, budgetMs)`. The
+ * fallback is for an action this table has never heard of, so a new `case` that
+ * forgets its entry still gets a bounded answer instead of the socket default.
+ */
+export const ROUTE_TIMEOUTS = Object.freeze({
+  // one supervisor round trip, no guest work (state polls are the page's beat)
+  state: 15_000,
+  config: 15_000,
+  doctor: 30_000,
+  gc: 30_000,
+  space: 30_000,
+  windowsStatus: 30_000,
+  windowsFreeSpace: 30_000,
+  windowsPassword: 15_000,
+  windowsClipboardSet: 30_000,
+  windowsClipboardGet: 30_000,
+  // lifecycle: tool (60 s) + 5 s, so the supervisor's 30 s `lock-timeout` wins
+  start: 65_000,
+  shutdown: 65_000,
+  suspend: 65_000,
+  stop: 65_000,
+  delete: 65_000,
+  // synchronous multi-minute supervisor ops (tool ceiling + the same 5 s lead)
+  create: 1_805_000,
+  ensure: 1_805_000,
+  android: 3_365_000,
+  // desktop driving, mirroring the tool envelopes
+  metrics: 30_000,
+  view: 30_000,
+  screenshot: 30_000,
+  input: 30_000,
+  gui: 120_000,
+  pointer: 30_000,
+  // COMPUTED PER CALL, never a constant: `(body.timeout | 300) + grace`, the
+  // same resolver `cua_vm_exec` uses (`PER_CALL_TIMEOUTS`), so the route and the
+  // tool can never disagree about a legal long exec. 0 means "ask the resolver".
+  exec: 0
+})
+
+/**
+ * What an action this table does not name gets. NOT the socket default: a route
+ * with no budget is the R4 defect, and 30 s is already twenty times a healthy
+ * round trip.
+ */
+export const ROUTE_TIMEOUT_FALLBACK_MS = 30_000
+
+/**
+ * The live budget of one route call. `exec` is the only argument-dependent one,
+ * and it delegates to the tool's own resolver instead of re-deriving the clamp.
+ */
+export function routeTimeoutMs(action, body = {}) {
+  if (action === 'exec') return PER_CALL_TIMEOUTS.cua_vm_exec(body)
+  const budget = ROUTE_TIMEOUTS[action]
+  return typeof budget === 'number' && budget > 0 ? budget : ROUTE_TIMEOUT_FALLBACK_MS
+}
+
 /** `seconds` as a short human number: `60000` → `60`, `360000` → `360`. */
 function timeoutLabel(timeoutMs) {
   return Number.isInteger(timeoutMs / 1000) ? String(timeoutMs / 1000) : `${timeoutMs / 1000}`
@@ -271,7 +346,20 @@ function request(socketPath, payload, timeoutMs = TOOL_TIMEOUT_MS) {
       socket.destroy()
       fn(value)
     }
-    const timer = setTimeout(() => finish(reject, new Error(`cua-vm supervisor did not answer within ${timeoutMs} ms`)), timeoutMs)
+    // C17 (WP-B): the budget expiring is a DIFFERENT fact from the supervisor
+    // refusing, and the route has to be able to tell them apart — so this one
+    // error carries `code: 'socket-timeout'`. THE MESSAGE TEXT IS UNCHANGED: it
+    // is the only place in this file that says "the supervisor never answered",
+    // and rewording it would blur that with the unrelated tool-budget sentence
+    // (`toolTimeoutError`). `timeoutMs` rides along so the 504 can say `N s`
+    // without re-deriving the budget the call actually used (which is per call
+    // for `exec`).
+    const timer = setTimeout(() => {
+      const error = new Error(`cua-vm supervisor did not answer within ${timeoutMs} ms`)
+      error.code = 'socket-timeout'
+      error.timeoutMs = timeoutMs
+      finish(reject, error)
+    }, timeoutMs)
     timer.unref?.()
 
     socket.setEncoding('utf8')
@@ -4154,6 +4242,128 @@ function windowsFunctionalUnprovenSentence({ reason = '', evidence = null, watch
   return `the functional probe could NOT prove the child on this call (busy lane: ${reason === '' ? 'session-busy' : reason}); no stuck request is visible (outstandingRequestAgeMs=${say(evidence?.outstandingRequestAgeMs)}, childRestarts=${say(evidence?.childRestarts)}) - re-run windows_mcp_doctor when the lane is idle.${off}`
 }
 
+/* ==================================================================== *
+ * STATE AGE — THE FACT `probe.stale` COULD NEVER CARRY (C12-C15, WP-B)
+ * ==================================================================== *
+ *
+ * THE DEFECT (R3). `probe.stale` means "the cached PROBE ANSWER is too old to
+ * trust" — it measures the probe's own latency against
+ * `WIN_MCP_PROBE_STALE_MS`, and it is false on a computer that has not answered
+ * for ten minutes, because the probe itself was fresh. So the doctor could say
+ * `probe.stale: false` beside a row whose guest was long gone, and there was no
+ * field anywhere that answered "how long since the computer last confirmed this
+ * state". C14 keeps `probe.stale` exactly as it is; the new fact travels as
+ * `state.stale` (here) and `stateStale` (the supervisor's rows).
+ *
+ * THE WINDOWS. Per C13, and they are per-state on purpose: `ready` is a claim
+ * about a running guest (two minutes without an answer is a lie), `booting` and
+ * `installing` legitimately go quiet for minutes at a time. A state that is not
+ * in this table cannot be stale — `powered-off` has nothing to confirm.
+ */
+const STATE_STALE_WINDOWS_MS = Object.freeze({
+  ready: 120_000,
+  running: 120_000,
+  booting: 300_000,
+  installing: 300_000
+})
+
+/** A stamp as epoch ms: the supervisor writes ISO strings (`stateSince`) and
+ * in-memory epochs (`STATE_CONFIRMED`) depending on the field, so both are
+ * accepted and anything else is `null` (unknown, never zero — zero would read as
+ * 1970 and make every row look infinitely stale). */
+function epochStamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value !== '') {
+    const parsed = Date.parse(value)
+    return Number.isNaN(parsed) ? null : parsed
+  }
+  return null
+}
+
+/**
+ * C13'S DERIVATION, IN ONE PLACE.
+ *
+ *   `ageMs = now − (stateConfirmedAt ?? newest corroboration)`
+ *
+ * A supervisor that carries C13 answers with `stateAgeMs`/`stateConfirmedAt` and
+ * this function passes them through (`source: 'supervisor'` — it measured them).
+ * An older supervisor carries neither, and that is the documented fallback: the
+ * plugin derives the age itself (`source: 'plugin-derived'`) from `stateSince`
+ * and the newest `vm-state` event the supervisor ANNOUNCED on the stream — the
+ * two clocks the plugin is already allowed to read.
+ *
+ * `since`/`confirmedAt` are the supervisor's own stamps, VERBATIM: this block
+ * reports what the row said (an ISO string at HEAD) and puts the number every
+ * consumer should do arithmetic with in `ageMs`.
+ */
+export function windowsStateFacts({ state = '', name = '', row = null, stream = null, now = Date.now() } = {}) {
+  const named = String(state ?? '')
+  const windowMs = STATE_STALE_WINDOWS_MS[named.toLowerCase()] ?? 0
+  const since = epochStamp(row?.stateSince)
+  const confirmedAt = epochStamp(row?.stateConfirmedAt)
+  const measuredAge = typeof row?.stateAgeMs === 'number' && Number.isFinite(row.stateAgeMs)
+    ? Math.max(0, row.stateAgeMs)
+    : null
+  const streamAt = stream === null || stream === undefined ? 0 : epochStamp(stream.at) ?? 0
+  // The event only corroborates THIS row's state: a `vm-state` for another
+  // computer (or another state) says nothing about this one.
+  const streamAgrees = stream !== null && stream !== undefined
+    && String(stream.state ?? '') === named
+    && (String(stream.name ?? '') === '' || name === '' || String(stream.name) === String(name))
+  const newest = Math.max(streamAgrees ? streamAt : 0, since === null ? 0 : since)
+  const base = confirmedAt ?? (newest > 0 ? newest : null)
+  const ageMs = measuredAge ?? (base === null ? null : Math.max(0, now - base))
+  const source = measuredAge !== null || confirmedAt !== null
+    ? 'supervisor'
+    : (ageMs === null ? 'none' : 'plugin-derived')
+  // The supervisor's own verdict wins when the row carries one (C13 already
+  // applies the Windows-only rule there); otherwise the same rule is applied to
+  // the age derived above.
+  const stale = typeof row?.stateStale === 'boolean'
+    ? row.stateStale
+    : (windowMs > 0 && ageMs !== null && ageMs > windowMs)
+  return {
+    state: named,
+    since: row?.stateSince ?? null,
+    confirmedAt: row?.stateConfirmedAt ?? null,
+    ageMs,
+    stale,
+    source,
+    windowMs
+  }
+}
+
+/** The row the doctor's state block is about. Best-effort by construction: a
+ * supervisor that is down must cost the doctor ONE bounded read, never the
+ * doctor. */
+async function windowsStateRow(name) {
+  const call = WIN_MCP_AUX.supervisorCall
+  const wanted = String(name ?? '')
+  if (typeof call !== 'function' || wanted === '') return null
+  try {
+    const answer = await call({ op: 'vmList' }, ROUTE_TIMEOUTS.doctor)
+    const registry = answer?.registry
+    if (registry === null || typeof registry !== 'object') return null
+    return registry[wanted] ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * B-4/C15 — the ONE clause `cua_vm_status` adds to a row the computer has not
+ * confirmed. It rides on the row's own line (no new line per row), it appears
+ * only when the row already says `stateStale: true`, and it says how long in
+ * minutes, because that is the number a human acts on.
+ */
+function unconfirmedStateClause(row) {
+  if (row?.stateStale !== true) return null
+  const ageMs = typeof row?.stateAgeMs === 'number' && Number.isFinite(row.stateAgeMs) && row.stateAgeMs > 0
+    ? row.stateAgeMs
+    : 0
+  return `unconfirmed ${Math.max(1, Math.round(ageMs / 60_000))}m (no answer from the computer)`
+}
+
 /**
  * THE DOCTOR. It answers two questions. Are any `mcp__windows__*` schemas still
  * on the global registry while the bridge is down? Offline, `leaks` MUST be
@@ -4271,6 +4481,35 @@ async function windowsMcpDoctor(execAgent, options = {}) {
   const state = online !== true
     ? offlineState
     : (streamState !== null && String(streamState.state) !== '' ? String(streamState.state) : (target?.state ?? 'unknown'))
+  // ---- C12/C13: HOW LONG SINCE THE COMPUTER LAST CONFIRMED THIS STATE ----
+  //
+  // The row is the authority (the supervisor measured `stateConfirmedAt`), and
+  // it is read HERE — after the verdict, before the payload — because the block
+  // describes the computer the verdict is about. One bounded `vmList` probe: if
+  // the supervisor is down or wedged, `windowsStateRow` answers `null` and the
+  // block falls back to the stream clock (`source: 'plugin-derived'`), which is
+  // exactly the older-supervisor case C13 documents.
+  //
+  // `probe.stale` IS NOT TOUCHED (C14): that field keeps its one meaning — the
+  // cached PROBE ANSWER is too old — and the new fact travels beside it.
+  const stateName = WIN_MCP.name !== '' ? String(WIN_MCP.name) : String(target?.name ?? '')
+  const stateRow = await windowsStateRow(stateName)
+  const stateFactsAt = Date.now()
+  const stateFacts = windowsStateFacts({
+    state,
+    name: stateName,
+    row: stateRow,
+    stream: {
+      name: streamState === null ? '' : String(streamState.name ?? ''),
+      state: streamState === null ? '' : String(streamState.state ?? ''),
+      // The newest `vm-state` event FOR THIS COMPUTER — which is `stream.
+      // lastEventAt` whenever one computer is bound, and never another row's
+      // event when several are (a different guest's beat must not refresh this
+      // one's age).
+      at: streamState === null ? WIN_MCP_STREAM.lastEventAt : Number(streamState.at) || 0
+    },
+    now: stateFactsAt
+  })
   // THE LANE THIS PROCESS ACTUALLY TOOK — AND NEVER A SECOND SSH SESSION FOR IT.
   // `doctorFacts()` is the client's own synchronous, side-effect-free answer;
   // the doctor reports the transport that really ran instead of dialling the
@@ -4446,7 +4685,12 @@ async function windowsMcpDoctor(execAgent, options = {}) {
     // THE VERDICT, from the plugin's own state (see the block above) — a probe
     // may never raise it back to true during a power-off.
     online,
-    state,
+    // C13/C15 (WP-B B-3): THE STATE BLOCK, TOP LEVEL AND NEVER INSIDE `probe`
+    // (C14 — `probe.stale` has its own, different meaning and its own one
+    // owner). `state.state` is the same string this key used to carry, so
+    // nothing is lost by the block replacing it, and the age travels with it:
+    //   { state, since, confirmedAt, ageMs, stale, source, windowMs }
+    state: stateFacts,
     // WHICH SOURCE DECIDED IT: `stream:<state>`, `plugin`, `plugin+probe`, or
     // `offline`. Absent from this list on purpose: a bare `probe`, because a
     // probe cannot be the only thing keeping a dead bridge "online".
@@ -4571,6 +4815,10 @@ async function windowsMcpDoctor(execAgent, options = {}) {
       events: WIN_MCP_STREAM.events,
       lastEvent: WIN_MCP_STREAM.lastEvent,
       lastEventAt: WIN_MCP_STREAM.lastEventAt,
+      // B-3: how long the BUS has been quiet, on the same clock as
+      // `state.ageMs`, so "the row says 9 min and the bus says 9 min too" is a
+      // comparison a consumer can make without reading two wall clocks.
+      lastEventAgeMs: WIN_MCP_STREAM.lastEventAt > 0 ? Math.max(0, stateFactsAt - WIN_MCP_STREAM.lastEventAt) : null,
       readyAt: WIN_MCP_STREAM.readyAt,
       retryMs: WIN_MCP_STREAM.retryMs,
       error: WIN_MCP_STREAM.error,
@@ -4643,7 +4891,10 @@ export function apply(ctx, config = {}) {
   const defaultMemory = config.defaultMemory ?? 4
   const maxOutputChars = config.maxOutputChars ?? 8000
 
-  const call = (payload) => request(socketPath, payload)
+  // C17: `budgetMs` is how a ROUTE bounds its own request. A tool leaves it
+  // undefined on purpose — its envelope is `boundedExecute`'s, and the socket
+  // default below is only the transport backstop there.
+  const call = (payload, budgetMs) => request(socketPath, payload, budgetMs)
 
   /**
    * REA AWARENESS IS GATED, NOT FREE.
@@ -4728,8 +4979,15 @@ export function apply(ctx, config = {}) {
       }
       try {
         switch (action) {
+          // C17: EVERY case below passes its own budget (`routeTimeoutMs`), and
+          // the numbers live in ONE frozen table (`ROUTE_TIMEOUTS`). A case that
+          // called `call(payload)` with one argument would inherit the thirty-
+          // minute socket default, which IS defect R4.
           case 'state': {
-            const [config, list] = await Promise.all([call({ op: 'configGet' }), call({ op: 'vmList' })])
+            const [config, list] = await Promise.all([
+              call({ op: 'configGet' }, routeTimeoutMs('state')),
+              call({ op: 'vmList' }, routeTimeoutMs('state'))
+            ])
             // The page polls this every few seconds while a machine starts, so
             // it is also the cheapest place to keep the REA cache warm.
             rememberRea(list.registry)
@@ -4743,9 +5001,9 @@ export function apply(ctx, config = {}) {
               windows: list.windows ?? { ok: false, reason: 'the supervisor is older than this plugin' }
             })
           }
-          case 'config': return send(200, { ok: true, ...(await call({ op: 'configSet', config: await body() })) })
+          case 'config': return send(200, { ok: true, ...(await call({ op: 'configSet', config: await body() }, routeTimeoutMs('config'))) })
           case 'create': {
-            const answer = await call({ op: 'vmCreate', ...(await body()) })
+            const answer = await call({ op: 'vmCreate', ...(await body()) }, routeTimeoutMs('create'))
             // A computer created with `rea: true` is provisioned by the time
             // this answers, so the awareness paragraph can appear at once
             // instead of up to 30 s later.
@@ -4753,12 +5011,12 @@ export function apply(ctx, config = {}) {
             return send(200, { ok: true, ...answer })
           }
           case 'start': {
-            const answer = await call({ op: 'vmStart', ...(await body()) })
+            const answer = await call({ op: 'vmStart', ...(await body()) }, routeTimeoutMs('start'))
             void refreshReaCache()
             return send(200, { ok: true, ...answer })
           }
           case 'shutdown': {
-            const answer = await call({ op: 'vmShutdown', ...(await body()) })
+            const answer = await call({ op: 'vmShutdown', ...(await body()) }, routeTimeoutMs('shutdown'))
             return send(200, { ok: true, ...answer })
           }
           // F1: THE PANEL'S SUSPEND BUTTON HAD NO ROUTE. `shutdown` powers off
@@ -4770,28 +5028,28 @@ export function apply(ctx, config = {}) {
           // cannot drift. `stop` keeps its legacy meaning and
           // DSH_CUA_VM_LEGACY_STOP still aliases it to suspend at the
           // supervisor, unchanged.
-          case 'suspend': return send(200, { ok: true, ...(await call({ op: 'suspend', ...(await body()) })) })
-          case 'gc': return send(200, { ok: true, ...(await call({ op: 'vmGc', ...(await body()) })) })
-          case 'doctor': return send(200, { ok: true, ...(await call({ op: 'vmDoctor' })) })
-          case 'space': return send(200, { ok: true, ...(await call({ op: 'vmSpace', ...(await body()) })) })
-          case 'windowsStatus': return send(200, { ok: true, ...(await call({ op: 'vmWindowsStatus', ...(await body()) })) })
+          case 'suspend': return send(200, { ok: true, ...(await call({ op: 'suspend', ...(await body()) }, routeTimeoutMs('suspend'))) })
+          case 'gc': return send(200, { ok: true, ...(await call({ op: 'vmGc', ...(await body()) }, routeTimeoutMs('gc'))) })
+          case 'doctor': return send(200, { ok: true, ...(await call({ op: 'vmDoctor' }, routeTimeoutMs('doctor'))) })
+          case 'space': return send(200, { ok: true, ...(await call({ op: 'vmSpace', ...(await body()) }, routeTimeoutMs('space'))) })
+          case 'windowsStatus': return send(200, { ok: true, ...(await call({ op: 'vmWindowsStatus', ...(await body()) }, routeTimeoutMs('windowsStatus'))) })
           // The generated Windows password, on demand only: the row carries a
           // `credentials: true` flag, the secret stays in the 0600 file.
-          case 'windowsPassword': return send(200, { ok: true, ...(await call({ op: 'vmWindowsPassword', ...(await body()) })) })
+          case 'windowsPassword': return send(200, { ok: true, ...(await call({ op: 'vmWindowsPassword', ...(await body()) }, routeTimeoutMs('windowsPassword'))) })
           // U2: THE CLIPBOARD, THROUGH THE GUEST'S INTERACTIVE SESSION. The
           // supervisor drives the two on-demand tasks (cua-clip-set /
           // cua-clip-get) over the SSH channel it already has; the /cua switch
           // only forwards, so the panel and the model cannot drift. A computer
           // that is not ready answers `available: false` with the reason, which
           // is what the panel renders as the DISABLED section.
-          case 'windowsClipboardSet': return send(200, { ok: true, ...(await call({ op: 'vmWindowsClipboardSet', ...(await body()) })) })
-          case 'windowsClipboardGet': return send(200, { ok: true, ...(await call({ op: 'vmWindowsClipboardGet', ...(await body()) })) })
+          case 'windowsClipboardSet': return send(200, { ok: true, ...(await call({ op: 'vmWindowsClipboardSet', ...(await body()) }, routeTimeoutMs('windowsClipboardSet'))) })
+          case 'windowsClipboardGet': return send(200, { ok: true, ...(await call({ op: 'vmWindowsClipboardGet', ...(await body()) }, routeTimeoutMs('windowsClipboardGet'))) })
           // U4: the measured C: free space (throttled 60 s at the supervisor).
-          case 'windowsFreeSpace': return send(200, { ok: true, ...(await call({ op: 'vmWindowsFreeSpace', ...(await body()) })) })
-          case 'stop': return send(200, { ok: true, ...(await call({ op: 'stop', ...(await body()) })) })
+          case 'windowsFreeSpace': return send(200, { ok: true, ...(await call({ op: 'vmWindowsFreeSpace', ...(await body()) }, routeTimeoutMs('windowsFreeSpace'))) })
+          case 'stop': return send(200, { ok: true, ...(await call({ op: 'stop', ...(await body()) }, routeTimeoutMs('stop'))) })
           case 'delete': {
             const request = await body()
-            const answer = await call({ op: 'vmDelete', ...request })
+            const answer = await call({ op: 'vmDelete', ...request }, routeTimeoutMs('delete'))
             // Deleting the last REA computer has to take the paragraph with it.
             void refreshReaCache()
             // WP-5: A DELETE FROM THE PANEL IS THE REPORTED LEAK. The guest MCP
@@ -4800,16 +5058,43 @@ export function apply(ctx, config = {}) {
             forgetSessionTarget(request.name)
             return send(200, { ok: true, ...answer })
           }
-          case 'exec': return send(200, { ok: true, ...(await call({ op: 'exec', ...(await body()) })) })
-          case 'metrics': return send(200, { ok: true, ...(await call({ op: 'vmMetrics', ...(await body()) })) })
-          case 'view': return send(200, { ok: true, ...(await call({ op: 'view', ...(await body()) })) })
-          case 'screenshot': return send(200, { ok: true, ...(await call({ op: 'screenshot', ...(await body()) })) })
-          case 'input': return send(200, { ok: true, ...(await call({ op: 'input', ...(await body()) })) })
-          case 'gui': return send(200, { ok: true, ...(await call({ op: 'gui', ...(await body()) })) })
-          case 'pointer': return send(200, { ok: true, ...(await call({ op: 'pointer', ...(await body()) })) })
+          // `exec` is the ONE argument-dependent route: the budget is the
+          // caller's own `timeout` (seconds) plus the same grace the tool takes,
+          // so a legal 3600 s command is never cut by the route. The body is
+          // parsed FIRST for that reason — `routeTimeoutMs('exec', request)`
+          // needs `request.timeout`.
+          case 'exec': {
+            const request = await body()
+            return send(200, { ok: true, ...(await call({ op: 'exec', ...request }, routeTimeoutMs('exec', request))) })
+          }
+          case 'metrics': return send(200, { ok: true, ...(await call({ op: 'vmMetrics', ...(await body()) }, routeTimeoutMs('metrics'))) })
+          case 'view': return send(200, { ok: true, ...(await call({ op: 'view', ...(await body()) }, routeTimeoutMs('view'))) })
+          case 'screenshot': return send(200, { ok: true, ...(await call({ op: 'screenshot', ...(await body()) }, routeTimeoutMs('screenshot'))) })
+          case 'input': return send(200, { ok: true, ...(await call({ op: 'input', ...(await body()) }, routeTimeoutMs('input'))) })
+          case 'gui': return send(200, { ok: true, ...(await call({ op: 'gui', ...(await body()) }, routeTimeoutMs('gui'))) })
+          case 'pointer': return send(200, { ok: true, ...(await call({ op: 'pointer', ...(await body()) }, routeTimeoutMs('pointer'))) })
           default: return send(404, { ok: false, error: `unknown action: ${action}` })
         }
       } catch (error) {
+        // C18 (WP-B): A TIMEOUT IS A RENDERED SENTENCE, NOT A SPINNER.
+        //
+        // Only ONE failure gets this treatment: the supervisor's own socket
+        // budget expiring, which `request` tags `code: 'socket-timeout'`. It is
+        // a 504 because the panel DID get an answer — from the transport, not
+        // from the computer — and `route-timeout` is the code the panel keys its
+        // "stopped waiting" note on. Every other failure keeps the 503 it always
+        // had (a refusal, a dead socket, a bad body): those are answers.
+        //
+        // The sentence names the action and the SECONDS the budget really was,
+        // taken from the error itself, because `exec` has no fixed budget.
+        if (error?.code === 'socket-timeout') {
+          const waitedSeconds = Math.round((Number(error.timeoutMs) > 0 ? Number(error.timeoutMs) : routeTimeoutMs(action)) / 1000)
+          return send(504, {
+            ok: false,
+            code: 'route-timeout',
+            error: `the supervisor did not answer ${action} within ${waitedSeconds} s; the operation may still be running — the panel stopped waiting, the computer did not stop working`
+          })
+        }
         return send(503, { ok: false, error: String(error?.message ?? error) })
       }
     }
@@ -5011,7 +5296,7 @@ export function apply(ctx, config = {}) {
         }
       }
     },
-    output: textOutput('One JSON object: status (ok|blind|unresponsive|leaking), blind, blindReason, verdict, relayFunctional, desktopWarning, laneUpgrading, pluginVersion, target, online, transport (+ the documented `command`/`reason` aliases of transportCommand/transportReason; the plugin\'s own sentence is `stateReason`), registered, schemas, leaks, grants, payload (measured, expectedRelayHash, relayHash, relayPresent, skew, port, portMeasured, portMismatch), repair, forcedRepair, keepalive, gate (+ gateDetail when only part of the gate is armed).'),
+    output: textOutput('One JSON object: status (ok|blind|unresponsive|leaking), blind, blindReason, verdict, relayFunctional, desktopWarning, laneUpgrading, state (state, since, confirmedAt, ageMs, stale, source, windowMs — the state AGE, distinct from probe.stale), pluginVersion, target, online, transport (+ the documented `command`/`reason` aliases of transportCommand/transportReason; the plugin\'s own sentence is `stateReason`), registered, schemas, leaks, grants, payload (measured, expectedRelayHash, relayHash, relayPresent, skew, port, portMeasured, portMismatch), repair, forcedRepair, keepalive, stream (live, events, lastEvent, lastEventAt, lastEventAgeMs, …), gate (+ gateDetail when only part of the gate is armed).'),
     async execute(args = {}, exec) {
       // WP-3.6: forcing ONE attempt is a doctor argument, not a second tool. The
       // attempt is bounded (WIN_MCP_FORCE_REPAIR_MS) and never throws; a success
@@ -5067,7 +5352,12 @@ export function apply(ctx, config = {}) {
           vm.kind === 'windows' && Array.isArray(info?.serialTail) && info.serialTail.length > 0
             ? `serial (last ${info.serialTail.length}): ${info.serialTail.join(' | ')}`
             : null,
-          vm.kind === 'windows' && info?.operationalNote ? info.operationalNote : null
+          vm.kind === 'windows' && info?.operationalNote ? info.operationalNote : null,
+          // B-4/C15: ONE clause, appended to the row's own line, and only when
+          // the row itself says the state is unconfirmed. A state printed as
+          // `ready` beside "no answer for 9 m" is the whole R3 defect; without
+          // this clause the text would keep repeating the row's claim.
+          unconfirmedStateClause(vm)
         ].filter(Boolean).join(' · ')
       })
       return { text: lines.join('\n') }
