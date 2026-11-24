@@ -909,7 +909,19 @@ RUN node /opt/ocr-tools/check.mjs
 #
 # SIZE: ~45 MB compressed for the CLI binary; QEMU ~200 MB in the volume, once.
 # ---------------------------------------------------------------------
-ARG CUA_CLI_VERSION=0.7.0
+# ---------------------------------------------------------------------
+# WHICH RELEASE. `latest` (the default) is resolved at BUILD time: the newest
+# `cua-sdk-v*` tag is taken from the GitHub releases API and the tarball is
+# fetched from that tag. The API lists releases newest-first, so the first
+# matching tag is the newest release; the `cua-sdk-v` prefix is stripped and
+# the remainder is the version the asset names use. Any other value is used
+# verbatim, which is what a reproducible or air-gapped build passes:
+#     docker build --build-arg CUA_CLI_VERSION=0.7.0 .
+# Resolution FAILS the build when the API does not answer or carries no
+# `cua-sdk-v*` tag: silently falling back to a frozen version is how an image
+# says "latest" while shipping a year-old CLI.
+# ---------------------------------------------------------------------
+ARG CUA_CLI_VERSION=latest
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
@@ -917,7 +929,15 @@ RUN set -eux; \
       arm64) cua_asset="arm64" ;; \
       *) echo "cua: unsupported architecture $arch"; exit 1 ;; \
     esac; \
-    url="https://github.com/trycua/cua/releases/download/cua-sdk-v${CUA_CLI_VERSION}/cua-cli-${CUA_CLI_VERSION}-linux-${cua_asset}.tar.gz"; \
+    cua_version="${CUA_CLI_VERSION}"; \
+    if [ "$cua_version" = "latest" ]; then \
+      cua_api="$(curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' 'https://api.github.com/repos/trycua/cua/releases?per_page=100')" || { echo "cua: the GitHub releases API did not answer; pass --build-arg CUA_CLI_VERSION=<version> to build without it"; exit 1; }; \
+      cua_version="$(printf '%s\n' "$cua_api" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"cua-sdk-v[^"]*"' | head -n 1 | sed -e 's/.*"cua-sdk-v//' -e 's/"$//')"; \
+      [ -n "$cua_version" ] || { echo "cua: no cua-sdk-v* release in the GitHub releases API response (has the tag scheme changed?)"; exit 1; }; \
+      echo "cua: CUA_CLI_VERSION=latest resolved to ${cua_version}"; \
+    fi; \
+    url="https://github.com/trycua/cua/releases/download/cua-sdk-v${cua_version}/cua-cli-${cua_version}-linux-${cua_asset}.tar.gz"; \
+    echo "cua: fetching ${url}"; \
     curl -fsSL --retry 3 -o /tmp/cua.tgz "$url"; \
     tar -xzf /tmp/cua.tgz -C /usr/local/bin cua; \
     chmod 0755 /usr/local/bin/cua; \

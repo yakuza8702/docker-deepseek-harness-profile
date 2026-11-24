@@ -280,8 +280,12 @@ jobs:
           # virgl/Mesa. ON here (env DSH_WITH_VIRGL_QEMU=1) on every push and
           # tag, so the GPU path is actually exercised instead of only when
           # somebody remembers the toggle; a dispatch run may turn it off.
+          # CUA_CLI_VERSION: the cua CLI's release, same shape as DSH_VERSION
+          # above — "latest" lets the Dockerfile resolve the newest cua-sdk-v*
+          # release at build time; a repo variable of the same name pins one.
           build-args: |
             DSH_VERSION=${{ github.event.inputs.dsh_version || 'latest' }}
+            CUA_CLI_VERSION=${{ vars.CUA_CLI_VERSION || 'latest' }}
             WITH_VIRGL_QEMU=${{ github.event.inputs.virgl == 'false' && '0' || env.DSH_WITH_VIRGL_QEMU }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.tags.outputs.ref_tag }}

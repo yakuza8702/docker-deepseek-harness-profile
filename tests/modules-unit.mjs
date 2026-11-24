@@ -72,6 +72,12 @@ import {
  * missing contract as PENDING instead of an unhandled link error.
  */
 import * as winMcpApi from '../plugins/dsh-cua-vm/win-mcp.js'
+// CUA-CLI: the Dockerfile's own `latest` resolution, run against a fixture. The
+// import is the tool's pure half — its `--check` main is skipped because argv[1]
+// is this file.
+import {
+  simulateResolution, readRunBlock, extractResolveFragment, cuaCliAssetUrl, RELEASES_API_URL
+} from '../tools/cua-cli-version.mjs'
 
 /** The checkout root — the source of `docker/windows-oem/` in these tests. */
 const REPO = path.resolve(import.meta.dirname, '..')
@@ -5435,6 +5441,76 @@ check('C19: the static API the quota/cache probe uses is unchanged (entry.url is
   check('C4: BOTH suspend branches (Windows and Linux) say memory and the process are kept',
     (indexText.split('Memory and the QEMU process are kept; resume is instant.').length - 1) === 2,
     `${indexText.split(suspend).length - 1} occurrence(s)`)
+}
+
+// (6) CUA-CLI: THE DOCKERFILE RESOLVES THE NEWEST cua-sdk RELEASE AT BUILD TIME.
+//
+// `ARG CUA_CLI_VERSION=0.7.0` baked one release into every image, so "the image
+// has the current CLI" was only true on the day the line was written. The default
+// is now `latest` and the RUN resolves it from the releases API — which no unit
+// test can prove by reading a string, because the bug lives in the shell (a grep
+// that stops matching, a prefix strip that eats a digit, a failure swallowed by
+// `|| true`).
+//
+// So the Dockerfile's RUN fragment is EXTRACTED and EXECUTED under `sh` with a stub
+// `curl`. The payload below is the fixture; it is deliberate about the three
+// things a naive implementation gets wrong — another package's tag comes first,
+// an OLDER cua-sdk tag follows the newest, and a draft/prerelease entry is in
+// between (the API's order is "newest first", which is what "first match" means).
+{
+  const dockerfileText = readFileSync(path.join(REPO, 'Dockerfile'), 'utf8')
+  const RELEASES = JSON.stringify([
+    { tag_name: 'cua-computer-v1.4.0', name: 'cua-computer 1.4.0', draft: false, prerelease: false, published_at: '2026-11-20T10:00:00Z' },
+    { tag_name: 'cua-sdk-v0.9.4', name: 'cua-sdk 0.9.4', draft: false, prerelease: false, published_at: '2026-11-18T10:00:00Z' },
+    { tag_name: 'cua-sdk-v0.10.0-rc.1', name: 'cua-sdk 0.10.0-rc.1', draft: true, prerelease: true, published_at: '2026-11-19T10:00:00Z' },
+    { tag_name: 'cua-sdk-v0.9.3', name: 'cua-sdk 0.9.3', draft: false, prerelease: false, published_at: '2026-11-01T10:00:00Z' }
+  ], null, 2)
+
+  // The fragment is the RUN's own text, not a copy: this assertion is what makes
+  // the two below honest when someone rewrites the step.
+  let fragment = ''
+  let parseError = ''
+  try {
+    fragment = extractResolveFragment(readRunBlock(dockerfileText))
+  } catch (error) {
+    parseError = String(error?.message ?? error)
+  }
+  check('CUA-CLI-1: the Dockerfile still carries the ARG + RUN fragment this test extracts',
+    parseError === '' && /CUA_CLI_VERSION/u.test(fragment) && /cua-sdk-v/u.test(fragment),
+    parseError || `${fragment.split('\n').length} shell line(s) from the RUN block`)
+
+  const latest = simulateResolution({ dockerfileText, requested: 'latest', apiJson: RELEASES })
+  check('CUA-CLI-2: latest takes the FIRST cua-sdk-v* tag (API order = newest) and strips the prefix',
+    latest.status === 0 && latest.version === '0.9.4' && latest.curlCalled === true,
+    `status ${latest.status}, version ${JSON.stringify(latest.version)}`)
+
+  // The resolved version is what the URL spends — resolving 0.9.4 and fetching
+  // 0.7.0 would be the exact defect the template needle guards.
+  check('CUA-CLI-3: the asset URL is built from the RESOLVED version, per architecture',
+    latest.version !== null
+      && cuaCliAssetUrl(latest.version, 'x64') === 'https://github.com/trycua/cua/releases/download/cua-sdk-v0.9.4/cua-cli-0.9.4-linux-x64.tar.gz'
+      && cuaCliAssetUrl(latest.version, 'arm64').endsWith('/cua-cli-0.9.4-linux-arm64.tar.gz'),
+    cuaCliAssetUrl(latest.version ?? '?', 'x64'))
+
+  const pinned = simulateResolution({ dockerfileText, requested: '0.7.0', apiJson: RELEASES })
+  check('CUA-CLI-4: a non-latest CUA_CLI_VERSION is used verbatim, and the API is never called',
+    pinned.status === 0 && pinned.version === '0.7.0' && pinned.curlCalled === false,
+    `status ${pinned.status}, version ${JSON.stringify(pinned.version)}, curl ${pinned.curlCalled}`)
+
+  const noTag = simulateResolution({
+    dockerfileText, requested: 'latest', apiJson: JSON.stringify([{ tag_name: 'cua-computer-v1.4.0' }])
+  })
+  check('CUA-CLI-5: a response with no cua-sdk-v* tag FAILS instead of falling back to a frozen release',
+    noTag.status !== 0 && noTag.version === null && /no cua-sdk-v\*/u.test(noTag.output),
+    `status ${noTag.status}: ${noTag.output.trim().split('\n').at(-1) ?? ''}`)
+
+  const apiDown = simulateResolution({ dockerfileText, requested: 'latest', apiFails: true })
+  check('CUA-CLI-6: an unreachable releases API FAILS the build (curl exit 22 is not swallowed)',
+    apiDown.status !== 0 && apiDown.version === null && /GitHub releases API did not answer/u.test(apiDown.output),
+    `status ${apiDown.status}: ${apiDown.output.trim().split('\n').at(-1) ?? ''}`)
+
+  check('CUA-CLI-7: the RUN queries the documented releases endpoint, not a cached or proxy URL',
+    readRunBlock(dockerfileText).includes(RELEASES_API_URL), RELEASES_API_URL)
 }
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)

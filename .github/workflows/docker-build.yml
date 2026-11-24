@@ -95,6 +95,13 @@ env:
   # the Dockerfile), so a core release with no matching browser-use release yet
   # falls back to that package's `next` tag and says so in the build log.
   DSH_VERSION_PIN: ""
+  # The cua CLI baked into the image — the Dockerfile's CUA_CLI_VERSION ARG.
+  # "latest" (default) resolves the newest cua-sdk-v* release from the GitHub
+  # releases API at BUILD time; the build FAILS if that lookup fails, so an
+  # image can never say "latest" and carry an old CLI. Set a version to pin.
+  # Same shape as DSH_VERSION_PIN: an env here (or a repo variable of the same
+  # name) is the only place the value lives.
+  CUA_CLI_VERSION: "latest"
 
 jobs:
   check:
@@ -314,6 +321,7 @@ jobs:
           build-args: |
             DSH_VERSION=${{ needs.check.outputs.dsh_version }}
             DSH_SOURCE_REF=${{ needs.check.outputs.source_ref }}
+            CUA_CLI_VERSION=${{ vars.CUA_CLI_VERSION || env.CUA_CLI_VERSION }}
             # Opt-in GPU support: the distro QEMU plus qemu-system-modules-opengl
             # (the package that carries virtio-gpu-gl-pci) and virgl/Mesa.
             # DSH_CUA_VM_GPU=virgl at runtime then switches cua onto it.

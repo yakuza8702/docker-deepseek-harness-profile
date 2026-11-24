@@ -1893,6 +1893,10 @@ differently after a rebuild as an image change first, and check
   The browser-use packages follow whatever version is resolved — if upstream ever
   publishes a core release before the matching browser-use release, the build
   falls back to that package's `next` tag and says so in the log
+- **the cua CLI is `latest` unless you pin it**: each build resolves the newest
+  `cua-sdk-v*` release from the GitHub API and fails rather than falling back;
+  set `CUA_CLI_VERSION` (workflow env / repo variable, or
+  `--build-arg CUA_CLI_VERSION=0.7.0`) to pin one
 - build key = `dsh <version>` + this repo's commit SHA → rebuilds only when **either** upstream releases a new version **or** this repo's Dockerfile changes
 - pushes `linux/amd64` (default; arm64 opt-in via workflow input or `vars.DSH_PLATFORMS`) to `ghcr.io/<owner>/<repo>` with tags `latest`, `dsh-<version>`, `build-<version>-<sha8>`
 - manual **Run workflow** button always available (`force_build` to bypass the skip check)

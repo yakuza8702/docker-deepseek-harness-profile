@@ -2840,7 +2840,31 @@ const NEEDLES = {
     // ...and the FLAT gate tree carries it, like every file the gate reads: this
     // gate now resolves cua-relay-guard.ps1 by name (NEEDLES.oemGuard), so the
     // in-image run would find "file not found" without this COPY member.
-    ['docker/windows-oem/cua-relay-guard.ps1 docker/cua-mcp-relay.py', 1]
+    ['docker/windows-oem/cua-relay-guard.ps1 docker/cua-mcp-relay.py', 1],
+    // ---------------------------------------------------------------------
+    // CUA_CLI_VERSION: THE CLI IS RESOLVED AT BUILD TIME, NOT BAKED AS A FIXED
+    // RELEASE. The step used to be `ARG CUA_CLI_VERSION=0.7.0` with the tarball
+    // built from that one string, so every image shipped whatever release was
+    // current the day the line was written. Now the default is `latest` and the
+    // RUN resolves it from the releases API; a pinned value still goes through
+    // verbatim. These rows are what a revert to a frozen ARG breaks, and the
+    // LAST one is the point: the URL template must spend the RESOLVED variable
+    // (`$cua_version`), not the build arg, or "latest" would resolve a version
+    // and then download a different one.
+    //
+    // The failure paths are pinned too: the API being unreachable and the payload
+    // carrying no `cua-sdk-v*` tag both have to FAIL the build. A `curl || true`
+    // or a fallback tag turns a broken release into an image that looks fine.
+    // tools/cua-cli-version.mjs executes this RUN fragment against a fixture so
+    // the resolution itself is proved without a docker daemon (ci-gates).
+    ['ARG CUA_CLI_VERSION=latest', 1],
+    ['https://api.github.com/repos/trycua/cua/releases?per_page=100', 1],
+    ['cua_version="${CUA_CLI_VERSION}"', 1],
+    ['[ "$cua_version" = "latest" ]', 1],
+    ['s/.*"cua-sdk-v//', 1],
+    ['releases/download/cua-sdk-v${cua_version}/cua-cli-${cua_version}-linux-${cua_asset}.tar.gz', 1],
+    ['the GitHub releases API did not answer', 1],
+    ['no cua-sdk-v* release', 1]
   ],
   client: [
     // the four labels are a contract: automation reads them
@@ -3424,6 +3448,9 @@ const NEEDLES = {
   ],
   env: [
     ['DSH_CUA_VM_WINDOWS=0', 1],
+    // CUA_CLI_VERSION defaults to `latest` in the operator's own .env, right
+    // next to the store it belongs to, and says it is a BUILD argument.
+    ['CUA_CLI_VERSION=latest', 1],
     // K10: the mounted-but-denied fix, with the host command that produces it.
     ['KVM_GID', 1],
     ['stat -c %g /dev/kvm', 1],

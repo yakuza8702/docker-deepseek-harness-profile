@@ -221,6 +221,13 @@ const REPO_GATES = [
   // coordinate space, the Windows backend, the proxy's console rewrite and the
   // compose wiring. All repository files, so a push can always answer it.
   { file: "check-cua-vm.mjs", args: [], label: "personal VM chain (spec → guest → proxy → compose)" },
+  // The cua CLI's BUILD-TIME version resolution. `check-cua-vm.mjs` above pins the
+  // NEEDLES (the ARG default, the API URL, the resolved-variable URL template,
+  // both failure messages); this gate runs the fragment itself — the Dockerfile's
+  // own shell text, extracted from the RUN block and executed under `sh` with a
+  // stub curl — against a fixture payload. A docker daemon is not available on a
+  // push runner, and downloading the release to prove a parse would be worse.
+  { file: "cua-cli-version.mjs", args: ["--check"], label: "cua CLI resolves latest at build time (RUN fragment, offline)" },
   // The tool layer's own contract: the 18 `cua_vm_*` schemas are FROZEN (names,
   // parameter keys in order, types, enums, required, output marker) and the
   // prose is under a budget. Text-only, no network, no QEMU, no node_modules —
