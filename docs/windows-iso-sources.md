@@ -62,12 +62,40 @@ that serves `SERVERSTANDARD` says so), and the caller can override with
 The strategy vocabulary (`mido`, `esd`, the fwlink ids, the product ids) and the
 mirror set follow **dockur/windows** (`github.com/dockur/windows`, MIT), which is
 where this media-resolution approach was worked out. This module does not vendor
-or run their image — the guest is a pinned Microsoft ISO on direct QEMU — but the
-"ask Microsoft's own page, then fall back to a pinned mirror" idea is theirs, and
-their `assets/` catalogue is what the tiny11/tiny10 archive.org coordinates and
-the 7z/cabextract feature detection are modelled on.
+or run their image — the guest installs from the per-code chain above on direct
+QEMU (a live Microsoft page for `11`/`10`, a pinned object for every other code)
+— but the "ask Microsoft's own page, then fall back to a pinned mirror" idea is
+theirs, and their `assets/` catalogue is what the tiny11/tiny10 archive.org
+coordinates and the 7z/cabextract feature detection are modelled on.
 
 ---
+
+## What the create does with that chain
+
+The chain above is not decoration: `cua_vm_create` walks it. This changed in
+0.2.3, and it is the difference between "the chain's declared order is honoured"
+and "the first static mirror is the only thing ever tried".
+
+**What "live" applies to, precisely.** Only `11` and `10` have a Microsoft
+product page this code can drive (`MIDO_PRODUCTS` has exactly those two keys), so
+only they re-resolve Microsoft's newest release on every create. `11e`/`10e`
+start at the ESD catalog, `11l` and `2025`–`2012` at their pinned `midoDirect`
+object (a fixed Microsoft CDN build), and `7u`/`core11`/`tiny11`/`tiny10` at the
+mirrors they have — no live Microsoft source exists for those.
+
+| what the create does | before this release | now |
+|---|---|---|
+| version path | `resolveWindowsIso()` → the first **static** URL (`dl.bobpony.com` for `11`) | `ensureIsoForSource(resolveWindowsIsoSources(code))` → the chain's declared order (live `mido` for `11`/`10`; the pinned `midoDirect`/`esd`/mirror entry for every other code) |
+| on every recreate | the same pinned mirror forever | for `11`/`10` it re-resolves Microsoft's page (`productEditionId` is read **live**), so a new release is picked up; the other codes re-walk their pinned chain |
+| explicit `windowsIso` | one URL | **unchanged** — a named URL is a pin, recorded as `isoMedia: "pinned"` |
+| provenance | a log line | the row records `isoSourceId` (`mido` / `esd` / `link1` / …), `isoMedia` and `isoResolvedAt` |
+| switch | — | `DSH_CUA_WINDOWS_ISO_MIDO=0` restores the static-only order |
+
+`resolveWindowsIso()` is still called first on the version path, so the refusal a
+code like `xp` gets, and the quota sizing for the download, are unchanged: the
+gate stayed, only the download moved. A medium delivered by the chain is
+referenced by its computer's row, and `cua_vm_gc` prunes it once that row is gone
+and the retention window has passed.
 
 # The codes
 

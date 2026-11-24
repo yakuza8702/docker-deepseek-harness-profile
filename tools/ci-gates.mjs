@@ -221,6 +221,11 @@ const REPO_GATES = [
   // coordinate space, the Windows backend, the proxy's console rewrite and the
   // compose wiring. All repository files, so a push can always answer it.
   { file: "check-cua-vm.mjs", args: [], label: "personal VM chain (spec → guest → proxy → compose)" },
+  // The tool layer's own contract: the 18 `cua_vm_*` schemas are FROZEN (names,
+  // parameter keys in order, types, enums, required, output marker) and the
+  // prose is under a budget. Text-only, no network, no QEMU, no node_modules —
+  // it answers in a checkout the way `check-tool-trim.mjs` does.
+  { file: "check-cua-vm-tools.mjs", args: [], label: "cua_vm tool layer: schema frozen, prose under budget" },
   // The Windows put/get chain, asserted as ARGV: a stub `scp`/`ssh` records its
   // own argv, the real supervisor is driven over its real socket, and the
   // recorded argv is parsed with OpenSSH's own grammar. `ssh -p` reused for scp

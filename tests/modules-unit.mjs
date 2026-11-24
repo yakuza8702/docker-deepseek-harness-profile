@@ -5271,6 +5271,172 @@ registerHooks({
 
 
 
+// ------------------------------------------------------------------ *
+// C4 + C18 — THE TWO COMPUTED FACTS ON A STATUS READ
+// ------------------------------------------------------------------ *
+//
+// `stateHolds` and `computerHealth` are exported from the supervisor, so they are
+// asserted against the REAL module (imported in a child with a throwaway store,
+// like parseGuestDf/buildScpArgv above — this suite must never bind the
+// supervisor's socket).
+{
+  const store = mkdtempSync(path.join(os.tmpdir(), 'cua-holds-unit-'))
+  try {
+    const supervisorUrl = new URL('../docker/cua-vm-supervisor.mjs', import.meta.url).href
+    const program = `const m = await import(${JSON.stringify(supervisorUrl)});`
+      + `const states = ['ready','running','installing','booting','suspended','powered-off','off','stopped','error','missing'];`
+      + `const holds = Object.fromEntries(states.map((state) => [state, m.stateHolds(state)]));`
+      + `holds.nonsense = m.stateHolds('nonsense'); holds.undefined = m.stateHolds(undefined);`
+      + `const ready = { kind: 'windows', state: 'ready', stateStale: false, stateAgeMs: 1000, lock: null, gpuDegraded: null, share: 'attached', restoreFrom: { kind: 'checkpoint' }, isoSourceId: 'mido', isoMedia: 'chain' };`
+      + `const facts = { ageMs: 1000, stale: false, windowMs: 120000, source: 'probe', confirmedAt: null };`
+      + `const rows = {`
+      + ` ready: m.computerHealth('vm', ready, facts),`
+      + ` stale: m.computerHealth('vm', { ...ready, stateStale: true }, { ...facts, ageMs: 300000, stale: true }),`
+      + ` image: m.computerHealth('vm', { ...ready, state: 'powered-off', restoreFrom: { kind: 'image' } }, { ageMs: null, stale: false, windowMs: null }),`
+      + ` pinned: m.computerHealth('vm', { ...ready, isoMedia: 'pinned', isoSourceId: 'pinned-url' }, facts),`
+      + ` locked: m.computerHealth('vm', { ...ready, lock: { heldBy: 'gc:vm', heldMs: 5000, poisoned: false } }, facts),`
+      + ` noAge: m.computerHealth('vm', { ...ready }, { ageMs: null, stale: false, windowMs: null, source: null, confirmedAt: null }),`
+      + ` linux: m.computerHealth('vm', { kind: 'linux', state: 'ready', stateStale: false }, { ageMs: null, stale: false, windowMs: null }) };`
+      + `process.stdout.write(JSON.stringify({ holds, rows }));process.exit(0)`
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', program], {
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, CUA_VM_STORE: path.join(store, 'store'), CUA_VM_HOME: path.join(store, 'home'), CUA_SUPERVISOR_SOCK: path.join(store, 's.sock') }
+    })
+    let parsed = null
+    try { parsed = JSON.parse(result.stdout ?? 'null') } catch { parsed = null }
+    const holds = parsed?.holds ?? {}
+    const rows = parsed?.rows ?? {}
+
+    // (1) THE SIX-STATE TABLE. `error`/`missing`/anything else are NULL, never
+    // false: a torn or vanished disk is not a claim about memory.
+    const live = ['ready', 'running', 'installing', 'booting']
+    check('C4: stateHolds says memory+disk for every live state',
+      live.every((state) => holds[state]?.memory === true && holds[state]?.disk === true && holds[state]?.text === 'memory+disk'),
+      live.map((state) => `${state}=${JSON.stringify(holds[state])}`).join(' '))
+    check('C4: stateHolds(suspended) keeps memory AND says resume is instant',
+      holds.suspended?.memory === true && holds.suspended?.disk === true && /resume is instant/u.test(String(holds.suspended?.text ?? '')),
+      JSON.stringify(holds.suspended))
+    check('C4: stateHolds says disk-only (checkpoint) for powered-off/off/stopped',
+      ['powered-off', 'off', 'stopped'].every((state) => holds[state]?.memory === false && holds[state]?.disk === true && holds[state]?.text === 'disk only (checkpoint)'),
+      ['powered-off', 'off', 'stopped'].map((state) => `${state}=${JSON.stringify(holds[state])}`).join(' '))
+    check('C4: stateHolds answers null/null (unverified) for error, missing, an unknown word and undefined — never false',
+      ['error', 'missing', 'nonsense', 'undefined'].every((state) => holds[state]?.memory === null && holds[state]?.disk === null && holds[state]?.text === 'unverified'),
+      ['error', 'missing', 'nonsense', 'undefined'].map((state) => `${state}=${JSON.stringify(holds[state])}`).join(' '))
+
+    // (2) THE PER-COMPUTER VERDICT.
+    check('C18: a fresh ready Windows row is ok and carries no guide',
+      rows.ready?.verdict === 'ok' && rows.ready?.guide === null && rows.ready?.checks?.length === 6,
+      JSON.stringify(rows.ready))
+    check('C18: a stale Windows row is degraded, names state-fresh and prints the frozen guide',
+      rows.stale?.verdict === 'degraded'
+      && rows.stale?.checks?.some((entry) => entry.id === 'state-fresh' && entry.ok === false)
+      && /has not answered for \d+m/u.test(String(rows.stale?.guide ?? '')),
+      `${rows.stale?.verdict} ${JSON.stringify(rows.stale?.guide)}`)
+    check('C18: a powered-off row whose restoreFrom.kind is image is degraded — Start would boot the base image',
+      rows.image?.verdict === 'degraded'
+      && rows.image?.checks?.some((entry) => entry.id === 'restore-point' && entry.ok === false)
+      && rows.image?.guide === 'Start boots the base image: the previous disk is gone',
+      `${rows.image?.verdict} ${JSON.stringify(rows.image?.guide)}`)
+    check('C18: a pinned medium is degraded with the pin guide; a held lock is degraded and names the holder',
+      rows.pinned?.verdict === 'degraded'
+      && /operator-pinned medium/u.test(String(rows.pinned?.guide ?? ''))
+      && rows.locked?.verdict === 'degraded'
+      && /gc:vm/u.test(String(rows.locked?.guide ?? '')),
+      `${rows.pinned?.verdict}/${JSON.stringify(rows.pinned?.guide)} ${rows.locked?.verdict}/${JSON.stringify(rows.locked?.guide)}`)
+    // J6: THE SENTENCE FOLLOWS THE KIND. A Windows row with no parseable
+    // `stateSince` has no recorded AGE — it is not a kind without a clock, and
+    // printing the Linux sentence there told an operator the wrong thing.
+    const noAgeDetail = String(rows.noAge?.checks?.find((entry) => entry.id === 'state-fresh')?.detail ?? '')
+    check('J6: a Windows row with no recorded age says "no confirmation age", never "this kind has no staleness clock"',
+      rows.noAge?.verdict === 'ok' && noAgeDetail.includes('no confirmation age recorded') && !noAgeDetail.includes('no staleness clock'),
+      noAgeDetail)
+    // A NULL CHECK NEVER DEGRADES: the Linux row has no staleness clock, no
+    // restore point and no medium — all null — and it is still `ok`.
+    check('C18: a null check never degrades (a Linux row: three null checks, verdict ok)',
+      rows.linux?.verdict === 'ok'
+      && rows.linux?.checks?.filter((entry) => entry.ok === null).length >= 2
+      && rows.linux?.guide === null,
+      JSON.stringify(rows.linux?.checks))
+    // The verdict RULE itself: any false → degraded; else any true → ok; else
+    // unknown. Asserted over every row above, so collapsing `null` into
+    // `false` (a nag screen) or `true` (a green lie) fails here.
+    const ruleHolds = Object.values(rows).every((row) => {
+      const checks = Array.isArray(row?.checks) ? row.checks : []
+      const expected = checks.some((entry) => entry.ok === false) ? 'degraded' : (checks.some((entry) => entry.ok === true) ? 'ok' : 'unknown')
+      return row?.verdict === expected
+    })
+    check('C18: the verdict rule is any-false→degraded, else any-true→ok, else unknown (null never decides)',
+      ruleHolds, JSON.stringify(Object.fromEntries(Object.entries(rows).map(([key, row]) => [key, row?.verdict]))))
+  } finally {
+    rmSync(store, { recursive: true, force: true })
+  }
+}
+
+// (3) THE CHAIN'S ORDER, in the suite too: the gate can answer n/a in the flat
+// image layout, and "mido first" is the whole point of candidate 19.
+check('C19: resolveWindowsIsoSources("11") starts at mido and keeps the pinned mirrors',
+  resolveWindowsIsoSources('11')[0]?.strategy === 'mido'
+  && resolveWindowsIsoSources('11').some((source) => source.strategy === 'link1')
+  && resolveWindowsIsoSources('11').map((source) => source.strategy).join(' -> ') === 'mido -> esd -> link1 -> link6 -> midoDirect',
+  resolveWindowsIsoSources('11').map((source) => source.strategy).join(' -> '))
+check('C19: the static API the quota/cache probe uses is unchanged (entry.url is still the pinned mirror)',
+  typeof WINDOWS_ISO_SOURCES['11']?.url === 'string'
+  && WINDOWS_ISO_SOURCES['11'].url.startsWith('https://dl.bobpony.com/windows/11/')
+  && WINDOWS_ISO_SOURCES['11'].sources.length === 5,
+  `${String(WINDOWS_ISO_SOURCES['11']?.url ?? '')} (${WINDOWS_ISO_SOURCES['11']?.sources?.length ?? 0} chain entries)`)
+
+// ------------------------------------------------------------------ *
+// C21 — THE NODE FLOOR, ASSERTED AGAINST THE SHIPPED FUNCTION
+// ------------------------------------------------------------------ *
+//
+// `index.js` cannot be imported here (it needs the harness's schemastery), so
+// the FUNCTION is sliced out of the file and evaluated: the assertions still run
+// against the source that ships, and a drift in the arithmetic fails here.
+{
+  const indexText = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'index.js'), 'utf8')
+  const marker = 'export function nodeFloorOk('
+  const start = indexText.indexOf(marker)
+  let end = -1
+  if (start !== -1) {
+    let depth = 0
+    let quote = null
+    for (let i = start; i < indexText.length; i += 1) {
+      const ch = indexText[i]
+      if (quote !== null) {
+        if (ch === '\\') { i += 1; continue }
+        if (ch === quote) quote = null
+        continue
+      }
+      if (ch === "'" || ch === '"' || ch === '`') { quote = ch; continue }
+      if (ch === '{') depth += 1
+      else if (ch === '}') { depth -= 1; if (depth === 0) { end = i + 1; break } }
+    }
+  }
+  let nodeFloorOk = null
+  if (start !== -1 && end !== -1) {
+    const source = indexText.slice(start, end).replace(/^export /u, '')
+    nodeFloorOk = new Function(`${source}; return nodeFloorOk;`)()
+  }
+  const table = [['24.22.2', false], ['24.22.3', true], ['24.0.0', false], ['25.9.0', false], ['26.13.0', false], ['26.13.1', true], ['26.14.0', true], ['27.0.0', true]]
+  const wrong = typeof nodeFloorOk !== 'function' ? 'nodeFloorOk not found in index.js' : table.filter(([version, expected]) => nodeFloorOk(version) !== expected).map(([version, expected]) => `${version}→${!expected}`).join(' ')
+  check('C21: nodeFloorOk matches DSH 0.2.3-alpha.2 (24.22.3+ in 24.x, 26.13.1+ in 26.x, no 25.x)', wrong === '', wrong || 'all eight cases agree')
+  const floor = /const DSH_NODE_FLOOR = '([^']+)'/u.exec(indexText)?.[1] ?? null
+  check('C21: the floor constant and package.json engines state the same two numbers', floor === '24.22.3', String(floor))
+}
+
+// (5) THE SPOKEN HALF — the two answers agree with the prompt, for both kinds.
+{
+  const indexText = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'index.js'), 'utf8')
+  check('C4: the shutdown answer states memory is freed and the disk survives in the checkpoint',
+    indexText.includes('Memory is freed; the disk survives in the checkpoint (`cua_vm_start` cold-boots it).'),
+    'the sentence is the contract the tool answer must carry')
+  const suspend = 'Memory and the QEMU process are kept; resume is instant.'
+  check('C4: BOTH suspend branches (Windows and Linux) say memory and the process are kept',
+    (indexText.split('Memory and the QEMU process are kept; resume is instant.').length - 1) === 2,
+    `${indexText.split(suspend).length - 1} occurrence(s)`)
+}
+
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)
 if (pendings > 0) {
   console.log(`unit: ${pendings} check(s) PENDING — the production half is absent (SOL WP-4).`)

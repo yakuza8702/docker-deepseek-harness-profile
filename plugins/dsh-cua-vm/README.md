@@ -54,6 +54,17 @@ write to a unix socket under `/tmp`, which `workspace-write` already allows.
 | `cua_vm_port` | open a forward and publish it at `/vm/port/<name>/` (prints the URL *and* the loopback port) |
 | `cua_vm_destroy` | delete the computer and everything it left in the store |
 
+`cua_vm_status` also carries two computed fields per computer (additive JSON, no
+new tool): `holds` — which resource the state still keeps (`memory+disk`,
+`memory+disk (suspended; resume is instant)`, `disk only (checkpoint)`, or
+`unverified` for a torn/vanished disk) — and `health` — a per-computer verdict
+(`ok` | `degraded`) with six checks (`state-fresh`, `lock-free`, `gpu`, `share`,
+`restore-point`, `media`) plus the one guide sentence for the first failing check.
+A `null` check means "not observable here" and never counts as a failure; a
+healthy computer prints no `health=` segment at all. (`unknown` exists only as
+the rule's defensive floor — `state-fresh` and `lock-free` are always observable,
+so a real row never reports it.)
+
 One computer per workspace by default, named `ws-<sha256(workspace)[0:12]>`,
 recorded in `$STORE/registry.json` (schema v2) — never in the workspace.
 
@@ -141,6 +152,17 @@ and every Start button was a dead end. `cua_vm_start` therefore *never* resumes 
 with an error, e.g. a machine without an ACPI PM) is **suspended instead**, and
 the answer says `fallback: "acpi-unsupported"` — Start resumes it where it was.
 Silently pretending a shutdown happened would be the worst option.
+
+**The same contract is on the wire now.** `cua_vm_status` (and the panel, which
+reads the same decorated rows) carries `holds: { memory, disk, text }` per
+computer — `memory+disk` while it runs, `memory+disk (suspended; resume is
+instant)` after a suspend, `disk only (checkpoint)` after a shutdown, and
+`unverified` (both `null`) for a torn or vanished disk, because "I do not know" is
+not "no". The status line prints it as `holds=disk only (checkpoint)`, and the two
+tool answers say it in words (`Memory is freed; the disk survives in the
+checkpoint` / `Memory and the QEMU process are kept; resume is instant`). The
+`health` field next to it carries the per-computer verdict and its one guide
+sentence; see `## Tools`.
 
 ## Coordinates: one measured space
 
@@ -296,6 +318,26 @@ now carries an ordered list:
 | `esd` | the ESD catalog CAB behind `go.microsoft.com/fwlink` — read ONLY when `7z`/`cabextract` is already in `PATH`; otherwise `skipped: no cab extractor` and the chain moves on |
 | `link1`/`link2`/`link6` | pinned mirrors (`dl.bobpony.com`, `files.dog/MSDN`, `archive.org/download`), each with its byte count and SHA-256 |
 | `midoDirect` | the static `software-static.download.prss.microsoft.com` object the page resolves to |
+
+**The create path WALKS that chain.** Until this release the table above was the
+*intent* while the download used `resolveWindowsIso()` — deliberately static-only,
+so `windowsVersion: '11'` always took the `link1` mirror and a recreate never
+re-resolved anything. `cua_vm_create` now calls
+`ensureIsoForSource(resolveWindowsIsoSources(code))`, walking the order the table
+above shows. **`11` and `10` start at `mido`** — its `productEditionId` is read
+**live on every create**, so a recreate picks up Microsoft's newest release.
+`11e`/`10e` start at the ESD catalog, `11l` and `2025`–`2012` at their pinned
+`midoDirect` object (a Microsoft CDN build, but a FIXED one), and
+`7u`/`core11`/`tiny11`/`tiny10` at the mirrors they have — those four have no
+Microsoft page this code can drive at all. The row records which strategy won
+(`isoSourceId`, `isoMedia: "chain"`). A medium the
+chain delivered is referenced by its row and nothing else, so `cua_vm_gc` prunes
+it once that computer is deleted and the retention window passes — a stale 5.5 GB
+ISO is not kept for ever. An explicit `windowsIso` is a **deliberate pin**: it is
+downloaded as one object and recorded as `isoMedia: "pinned"`, and the status
+`health` check says so. `DSH_CUA_WINDOWS_ISO_MIDO=0` restores the static-only
+order for an isolated network, where the four extra HTTPS round trips are pure
+cost.
 
 **Verification:** the `Content-Length` and the streaming SHA-256 of every pinned
 entry are checked before the file is booted; a mismatch is
@@ -1076,6 +1118,19 @@ Kill switch: `DSH_CUA_VM_WIN_MCP=0` disables the whole path (no SSH bridge, no
 tools, no tokens). The same bridge can also be used as a plain MCP stdio server
 (`node plugins/dsh-cua-vm/win-mcp.js --stdio --port <sshPort> --key <path>`) if
 you prefer a `dsh-mcp-client` row.
+
+## Two desktop paths, one rule
+
+The guest VM has exactly **one** desktop path: SSH exec + QMP input + the noVNC
+live view at `/vm/port/<name>/`, surfaced as `cua_vm_gui` and the lazily revealed
+`tool_*` element tools. `dsh-windows-mcp` is a **different** path: it drives the
+**host** desktop (the PC DSH runs on) through `CursorTouch/Windows-MCP` and
+registers `mcp__windows__*`. It is **opt-in**, and it is never enabled next to the
+guest bridge in one session — two cursors fighting one desktop, doubled schemas
+and a `serverName` rename that invalidates the prompt cache prefix. The capability
+table, the rule and the Session-0 doctrine are in
+[`docs/desktop-paths.md`](../../docs/desktop-paths.md); `cua_vm_doctor` prints the
+one-line version of it (`desktop paths: …`).
 
 ### The clipboard, both ways
 
@@ -1983,6 +2038,7 @@ re-ran a ten-minute script on every start and failed on the same line.
 | `DSH_CUA_WINDOWS_SWTPM` | `/usr/bin/swtpm` | the TPM2 emulator |
 | `DSH_CUA_WINDOWS_VIRTIO_ISO` | *(unset)* | a virtio-win ISO; without it the disk is AHCI and the NIC e1000e |
 | `DSH_CUA_WINDOWS_ISO_TIMEOUT_MS` | `3600000` | bound on the one-time ISO download |
+| `DSH_CUA_WINDOWS_ISO_MIDO` | `1` | `1` walks the code's chain in its declared order — `11`/`10` start at Microsoft's live page (`mido`, re-read on every create), the other codes at their pinned objects; `0` restores the static-only order (faster on an isolated network, stale by construction) |
 | `DSH_CUA_WINDOWS_VIRTIO` | *(unset)* | `1` + `virtio: true` swaps the inbox AHCI disk/`e1000e` NIC for `virtio-blk-pci`/`virtio-net-pci` (only for an image that carries the drivers) |
 | `DSH_CUA_WINDOWS_EJECT_WATCH_MIN` | `90` | how long the media watcher waits for "Setup finished copying" before it leaves the eject to the ready transition (clamped 1–600 min) |
 | `DSH_CUA_VM_STATE_POLL_S` | `3` | QMP `query-status` interval while a Windows row is live (clamped 1–30); this is how a guest-initiated shutdown becomes `powered-off` |

@@ -64,6 +64,36 @@ function desktopFactsReader() {
  */
 export const PLUGIN_VERSION = '0.2.3'
 
+/**
+ * THE DSH NODE FLOOR (0.2.3-alpha.2) — the RUNTIME the harness itself refuses
+ * to start below: Node 24.22.3+ in the 24.x series, or 26.13.1+ in 26.x. 25.x
+ * is excluded because DSH does not support it.
+ *
+ * IT IS A HOST FACT, NOT A GUEST ONE. The obvious reading of "0.2.3 needs a
+ * newer Node" is to bump the guest image's Node (`docker/cua-guest-rea.sh`
+ * v22.23.4) — that is WRONG twice: the REA kit is validated on 22.x, and
+ * `tools/check-cua-rea.mjs` pins both literals. Alpha.2 constrains the process
+ * that runs DSH, which is this one, so the floor lives here and in
+ * `package.json` `engines`, where it is checkable.
+ */
+export const DSH_NODE_FLOOR = '24.22.3'
+
+/**
+ * Is this Node acceptable to DSH? Pure arithmetic on the version triple, so a
+ * unit test can hand it any string without a runtime.
+ *
+ * `>=26.13.1` also passes (the alpha.2 sentence is "24.22.3 or later in the
+ * 24.x series, or 26.13.1 or later"), and so does anything above 26.
+ */
+export function nodeFloorOk(version = process.versions.node) {
+  const parts = String(version ?? '').split('.').map((value) => Number.parseInt(value, 10))
+  if (parts.length < 3 || parts.some((value) => !Number.isFinite(value))) return false
+  const [major, minor, patch] = parts
+  if (major === 24) return minor > 22 || (minor === 22 && patch >= 3)
+  if (major === 26) return minor > 13 || (minor === 13 && patch >= 1)
+  return major > 26
+}
+
 export const name = 'cua-vm'
 export const inject = ['tools', 'systemPrompt', 'webServer']
 
@@ -5267,9 +5297,9 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => registerCuaTool({
     name: REVEAL_TOOL_NAME,
     timeoutMs: TOOL_TIMEOUTS.windows_desktop,
-    description: 'Reveal the Windows desktop: unhides this session\u2019s dsh-cua tools (element-level click/type/find over SSH) and returns their names, descriptions and parameters. No arguments. Also says `blind: true` with a `blindReason` when the bridge is attached on the session-0 fallback lane, so a hidden desktop is never pretended to work. If the handshake is still in flight it answers `code: attaching` with `pending`, `pendingSinceMs` and `retryAfterMs` instead of \u201cnothing is attached\u201d \u2014 wait that long, then call again. The result also carries `desktop` (the desktop session\u2019s measured facts, or null): `desktop.elementLaneOk === false` means `win32ui` did not import, so `tool_element_action*` and `tool_find_elements` fail with ImportError and the focus-free path is dead \u2014 fall back to `tool_click_at` + `tool_type_text`; `desktop.workDirWritable === false` means `save_path` must be under `desktop.workDir` (`C:\\cua-work`). The three receipts that look like more than they are: `tool_open_application` returns when Windows ACCEPTED the launch, so dedupe by pid before retrying; `tool_send_keys` has no `effect_verified`; and an EMPTY `save_path` writes to `%TEMP%\\win32_mcp_shots`, which is the default rather than a redirect.',
+    description: 'Reveal this session\'s dsh-cua tools (Windows guest, SSH): names and schemas. No args. Branch on `blind`/`blindReason`, `code: attaching`+`retryAfterMs` (wait, then retry), `elementLaneOk:false` (use `tool_click_at`/`tool_type_text`), `workDirWritable:false` (`save_path` under `workDir`). `tool_open_application` = ACCEPTED (dedupe by pid); empty `save_path` writes `%TEMP%\\win32_mcp_shots`; `tool_send_keys` has no `effect_verified`.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
-    output: textOutput('Whether the tools are now visible, and their schemas (an EMPTY list unless revealed), plus the lane verdict (blind/blindReason), the attaching facts when a handshake is in flight (code/pending/retryAfterMs) and the measured `desktop` facts (or null).'),
+    output: textOutput('Tool names and schemas (empty unless revealed), the lane verdict (`blind`/`blindReason`, `attaching`+`retryAfterMs`) and the measured `desktop` facts, or null.'),
     async execute(_args = {}, exec) {
       return { text: JSON.stringify(revealWindowsTools(exec?.agent)) }
     }
@@ -5278,25 +5308,25 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => registerCuaTool({
     name: DOCTOR_TOOL_NAME,
     timeoutMs: TOOL_TIMEOUTS.windows_mcp_doctor,
-    description: 'Diagnose the Windows dsh-cua bridge: target, online state, this session\u2019s binding and target match, the in-flight attach generation and its retry arithmetic (`attach.pendingSinceMs`/`retryAfterMs`/`state`), the state stream, registered names, global schemas, LEAKS (mcp__windows__* visible while offline), grants, revealed sessions, keepalive and the last error — plus the VERDICT (status ok|blind|unresponsive|leaking, blindReason, verdict sentence, which also carries the desktop warnings), the `desktopWarning` string, the functional probe\u2019s own `relayFunctional` answer (the cheap `RELAY_OK` handshake proves only the accept loop — `status: unresponsive` means the relay answered but its MCP child did not answer an initialize/tools/list round trip), pluginVersion, the payload identity (expectedRelayHash/relayHash/skew/portMismatch) and the repair record. `viewer.code` is `attaching` (not `not-the-target`) while this session\u2019s computer is being dialled. Also reports `desktop`: what the DESKTOP session measured \u2014 `measured`, `elementLaneOk` (does `win32ui` import), `workDir`/`workDirWritable` (can the desktop token write it), `scaleFix` (the scale-arithmetic patch, read from the installed source: `applied`, `skipped:no-file`, `skipped:anchor`, `unverified:<why>` — only `applied` means patched) and the version facts; `measured: false` means UNKNOWN, never false. Pass {"repair":true} to force ONE relay repair attempt before the report (throttled: it bypasses the poll window, not the client\u2019s safety rules).',
+    description: 'Diagnose the Windows dsh-cua bridge: the verdict (`status` ok|blind|unresponsive|leaking, `blindReason`, the sentence), `relayFunctional`, `desktopWarning`, the `attach` retry arithmetic, `leaks`, and `desktop` (`measured`, `elementLaneOk`, `workDirWritable`, `scaleFix`: the scale-arithmetic patch, only `applied` means patched). `measured: false` means UNKNOWN, never false; `viewer.code: attaching` means wait.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         repair: {
           type: 'boolean',
-          description: 'Force ONE relay repair attempt (schtasks re-assert + handshake) before answering, then report what it did in `forcedRepair`. Default false: read-only diagnosis. The client still applies its kill switch (DSH_CUA_VM_WIN_MCP_REPAIR=0), in-flight guard and timeout.'
+          description: 'Force ONE relay repair (schtasks re-assert + handshake) before the report; it lands in `forcedRepair`. Default false. `DSH_CUA_VM_WIN_MCP_REPAIR=0` still wins.'
         },
         // C12: the functional probe is ON by default (it is the only way to tell
         // a healthy child from a wedged one) and costs up to 20 s against a dead
         // child. `false` is the explicit opt-out for a caller in a hurry.
         functional: {
           type: 'boolean',
-          description: 'Run the functional probe (a real initialize + tools/list round trip through the relay\u2019s MCP child, 20 s budget) before answering, and report it in `relayFunctional`. Default true. Pass false to skip it: the cheap probe only proves the relay\u2019s accept loop, so a skipped probe can never prove the child.'
+          description: 'Run the functional probe (initialize + tools/list round trip, 20 s) and report `relayFunctional`. Default true; the cheap probe alone cannot prove the child.'
         }
       }
     },
-    output: textOutput('One JSON object: status (ok|blind|unresponsive|leaking), blind, blindReason, verdict, relayFunctional, desktopWarning, laneUpgrading, state (state, since, confirmedAt, ageMs, stale, source, windowMs — the state AGE, distinct from probe.stale), pluginVersion, target, online, transport (+ the documented `command`/`reason` aliases of transportCommand/transportReason; the plugin\'s own sentence is `stateReason`), registered, schemas, leaks, grants, payload (measured, expectedRelayHash, relayHash, relayPresent, skew, port, portMeasured, portMismatch), repair, forcedRepair, keepalive, stream (live, events, lastEvent, lastEventAt, lastEventAgeMs, …), gate (+ gateDetail when only part of the gate is armed).'),
+    output: textOutput('The verdict, the leak surface, the attach/retry facts, the payload identity, the repair record and the desktop measurement — one JSON object.'),
     async execute(args = {}, exec) {
       // WP-3.6: forcing ONE attempt is a doctor argument, not a second tool. The
       // attempt is bounded (WIN_MCP_FORCE_REPAIR_MS) and never throws; a success
@@ -5357,7 +5387,17 @@ export function apply(ctx, config = {}) {
           // the row itself says the state is unconfirmed. A state printed as
           // `ready` beside "no answer for 9 m" is the whole R3 defect; without
           // this clause the text would keep repeating the row's claim.
-          unconfirmedStateClause(vm)
+          unconfirmedStateClause(vm),
+          // C4: WHICH RESOURCE THE STATE STILL HOLDS. Always printed — it is
+          // the answer to "did that free the RAM?", and it is one short
+          // segment (`holds=disk only (checkpoint)`).
+          vm.holds ? `holds=${vm.holds.text}` : null,
+          // C18: the per-computer verdict, and ONLY when something is wrong.
+          // A healthy computer prints nothing here (token discipline): the
+          // failing check ids plus the ONE guide sentence that matters.
+          vm.health && vm.health.verdict !== 'ok'
+            ? `health=${vm.health.verdict}${vm.health.checks.filter((check) => check.ok === false).map((check) => `:${check.id}`).join('')} — ${vm.health.guide ?? ''}`
+            : null
         ].filter(Boolean).join(' · ')
       })
       return { text: lines.join('\n') }
@@ -5420,18 +5460,18 @@ export function apply(ctx, config = {}) {
       required: ['name'],
       properties: {
         name: { type: 'string', description: 'Computer name: lowercase letters, digits and dashes.' },
-        kind: { type: 'string', enum: ['linux', 'windows'], description: 'linux (default, the Cua guest) or windows (direct QEMU with OVMF/TPM2; exec/put/get work over SSH, the desktop is QMP plus a noVNC live view).' },
+        kind: { type: 'string', enum: ['linux', 'windows'], description: 'linux (default, the Cua guest) or windows (direct QEMU + OVMF/TPM2: SSH exec/put/get, QMP desktop, noVNC live view).' },
         cpu: { type: 'number', description: 'vCPUs (default 2; Windows floors at 2).' },
         memory: { type: 'number', description: 'RAM in GB (default 4; Windows floors at 6).' },
         image: { type: 'string', description: 'Image reference. Default "linux" (Ubuntu 24.04 slim Cua disk). Linux only.' },
         gpu: { type: 'boolean', description: 'virgl GPU for 3D/Android/Blender (Windows: GPU=Y + the render node).' },
-        diskGb: { type: 'number', description: 'Disk size in GB. Omitted: 20 for Linux, 64 for Windows. Below a Windows floor (64 GB disk / 6 GB RAM / 2 vCPU) the computer is still created and the result carries a warning.' },
+        diskGb: { type: 'number', description: 'Disk size in GB: default 20 (Linux) or 64 (Windows). Below a Windows floor it is still created, with a warning.' },
         android: { type: 'boolean', description: 'Install the Android SDK + AVD after creating (Linux only).' },
-        rea: { type: 'boolean', description: 'Install the REA reverse-engineering kit (Node 22, rea-agents, JDK 21, Ghidra 12.1.4, JADX). Needs a 40 GB disk; it is raised to 40 when this is true. Linux only.' },
-        windowsVersion: { type: 'string', enum: ['11', '11l', '11e', '10', '10l', '10e', '7u', 'xp', '2025', '2022', '2019', '2016', '2012', 'core11', 'tiny11', 'tiny10'], description: 'Windows version code (dockur/windows vocabulary): 11=Win 11 Pro, 11l=Win 11 LTSC, 11e=Win 11 Enterprise, 10=Win 10 Pro, 10l=Win 10 LTSC, 10e=Win 10 Enterprise, 7u=Win 7 Ultimate (SeaBIOS, experimental), xp=listed but refused (legacy-installer-unsupported: no Autounattend path), 2025/2022/2019/2016/2012=Server, core11/tiny11/tiny10=Tiny11/Tiny10 community media. Every code has an ordered ISO source chain (mido/ESD/mirrors) with sha256+size verification; aliases (11ltsc, ltsc11, ltsc10, win11, …) still work and canonicalise. Windows only.' },
-        windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL (downloaded once into $STORE/iso/) or a file path inside the VM store or the workspace (attached directly as a QEMU drive). Windows only; mutually exclusive with windowsVersion.' },
-        windowsImageIndex: { type: 'integer', description: 'Windows only, optional: the /IMAGE/INDEX the answer file installs (1-based, as listed in the ISO sources/install.wim). Omit to use the version default: the pinned 11l media names its edition explicitly (/IMAGE/NAME), Server 2025 installs image 2 (Standard Evaluation, Desktop Experience), any windowsIso installs image 1. Needed only for an unusual ISO where those are wrong.' },
-        windowsImageName: { type: 'string', description: 'Windows only, optional: the exact /IMAGE/NAME to install, e.g. "Windows 11 IoT Enterprise LTSC 2024 Evaluation". Wins over windowsImageIndex. Use it when the ISO carries several editions and the name is known exactly — a name that does not match the media fails the install.' }
+        rea: { type: 'boolean', description: 'Install the REA kit (Node 22, JDK 21, Ghidra 12.1.4, JADX) on a Linux computer; needs a 40 GB disk (raised to 40).' },
+        windowsVersion: { type: 'string', enum: ['11', '11l', '11e', '10', '10l', '10e', '7u', 'xp', '2025', '2022', '2019', '2016', '2012', 'core11', 'tiny11', 'tiny10'], description: 'Windows code (dockur vocabulary; aliases canonicalise): 11=Pro, 11l/11e=LTSC/Ent, 10=Pro, 10l/10e=LTSC/Ent, 7u=Win7, 2025-2012=Server, core11/tiny11/tiny10=community, xp refused. 11/10 re-resolve Microsoft\'s live page; the rest are pinned.' },
+        windowsIso: { type: 'string', description: 'Windows ISO instead of a version: an http(s) URL (downloaded into $STORE/iso/) or a path in the store/workspace (attached as a drive). A named URL is a PIN, never refreshed. Windows only.' },
+        windowsImageIndex: { type: 'integer', description: 'Windows only: the /IMAGE/INDEX the answer file installs (1-based). Omit for the version default: 11l pins a name, Server 2025 = 2, a windowsIso = 1.' },
+        windowsImageName: { type: 'string', description: 'Windows only: the exact /IMAGE/NAME to install, e.g. "Windows 11 IoT Enterprise LTSC 2024 Evaluation". Wins over windowsImageIndex; a name the media lacks fails the install.' }
       }
     },
     output: textOutput('The computer, its renderer, disk, Android and REA status.'),
@@ -5772,6 +5812,11 @@ export function apply(ctx, config = {}) {
         // the whole point of answering first.
         if (answer.checkpoint === 'deferred') parts.push('Checkpoint: deferred — runs in the background; the panel badge shows powered-off immediately.')
         else if (answer.checkpoint) parts.push(`Checkpoint: ${answer.checkpoint}.`)
+        // C4: the SPOKEN half of the `holds` contract, so the answer agrees
+        // with the prompt and with `cua_vm_status` instead of leaving the model
+        // to recall a paragraph. Only when a checkpoint was actually written —
+        // the `restoreFrom.kind === 'image'` branch below is the exception.
+        if (answer.checkpoint) parts.push('Memory is freed; the disk survives in the checkpoint (`cua_vm_start` cold-boots it).')
         if (answer.restoreFrom?.kind === 'image') parts.push('No checkpoint was written, so Start boots the base image.')
         if (answer.mayBeTorn) parts.push('The guest did not power down in time, so the image is marked mayBeTorn: the disk was captured after a forced quit.')
         if (Array.isArray(answer.notes) && answer.notes.length > 0) parts.push(`Notes: ${answer.notes.join('; ')}`)
@@ -5844,6 +5889,9 @@ export function apply(ctx, config = {}) {
           // WP-3.2 / SOL §4.8: the FIRST line is the identity, because every
           // later line is only as good as "which build said it".
           `plugin: dsh-cua-vm ${PLUGIN_VERSION}`,
+          // S6: the RUNTIME, against the floor alpha.2 sets. A Node below it is
+          // a fact about this process, stated where a support report starts.
+          `node: v${process.versions.node} (DSH 0.2.3 floor ${DSH_NODE_FLOOR}: ${nodeFloorOk() ? 'ok' : 'BELOW — DSH refuses to run on it'})`,
           // The device and its ACCESS are two facts: "present but DENIED" is
           // the group/gid bug (uid 1000 is not in the device's group), and it
           // used to read as "NOT usable" with no way to tell it from a missing
@@ -5860,12 +5908,19 @@ export function apply(ctx, config = {}) {
             : `disabled (${windows.reason})`}`,
           `windows versions: ${versions.length > 0 ? `${versions.length} code(s): ${versions.join(', ')}` : 'unknown (the supervisor is older than this plugin)'}`,
           `store: ${(store.usedBytes / 1024 ** 3).toFixed(1)} GB of ${(store.quotaBytes / 1024 ** 3).toFixed(0)} GB`,
-          `policy: shutdownTimeoutSec=${answer.shutdownTimeoutSec} checkpointPolicy=${answer.checkpointPolicy} computers=${answer.vms}`
+          `policy: shutdownTimeoutSec=${answer.shutdownTimeoutSec} checkpointPolicy=${answer.checkpointPolicy} computers=${answer.vms}`,
+          // S5: THE TWO DESKTOP PATHS, one line, so a reader never concludes
+          // that this plugin and dsh-windows-mcp are two bridges to one machine
+          // (docs/desktop-paths.md has the table).
+          'desktop paths: guest = SSH + QMP + noVNC (built-in, this plugin) · host desktop = dsh-windows-mcp (opt-in, separate plugin, never both in one session)'
         ].join('\n'),
         // WP-3.2: the host-level doctor carries the plugin's identity too. The
         // LANE verdict is deliberately NOT here (SOL D8): a host doctor has no
         // guest facts, and the lane belongs to `windows_mcp_doctor`.
         pluginVersion: PLUGIN_VERSION,
+        // S6: the runtime facts a caller can branch on without parsing prose.
+        node: process.versions.node,
+        nodeFloor: DSH_NODE_FLOOR,
         // The structured half: `text` is what the model reads, this is what a
         // caller (or a test) can branch on without parsing prose.
         windows: {
@@ -5885,8 +5940,11 @@ export function apply(ctx, config = {}) {
     output: textOutput('Suspend result.'),
     async execute(args = {}) {
       const result = await call({ op: 'suspend', name: args.name })
-      if (result.kind === 'windows') return { text: `${result.name} is suspended (the VM is paused with QMP stop; Start continues it).` }
-      return { text: `${result.name} suspended; its disk stays in the VM store.` }
+      // C4: suspend KEEPS the memory and the process — the one sentence that
+      // separates it from `cua_vm_shutdown`, in the answer rather than only in
+      // the prompt.
+      if (result.kind === 'windows') return { text: `${result.name} is suspended (the VM is paused with QMP stop; Start continues it). Memory and the QEMU process are kept; resume is instant.` }
+      return { text: `${result.name} suspended; its disk stays in the VM store. Memory and the QEMU process are kept; resume is instant.` }
     }
   })
 
@@ -5899,7 +5957,7 @@ export function apply(ctx, config = {}) {
       additionalProperties: false,
       properties: {
         name: { type: 'string' },
-        force: { type: 'boolean', description: 'Force delete: kill the VM process (QEMU/swtpm/websockify) and remove its disks even if the normal delete reported failures — the row, disks, ports and registry row all go. Ask for confirmation first: it is destructive.' }
+        force: { type: 'boolean', description: 'Force delete: kill the QEMU/swtpm/websockify processes and remove the disks even if the normal delete failed. Destructive: ask the user first.' }
       },
       required: ['name']
     },

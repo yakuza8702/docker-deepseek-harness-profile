@@ -2591,6 +2591,12 @@ export async function ensureIso({
  * every strategy and its first line — "no ISO" without the four reasons is the
  * kind of error that sends an operator to the wrong fix.
  *
+ * A source MAY arrive with `resolved` already set (the create path's quota plan,
+ * see resolveIsoSourceToUrl) or with `skipped` (a strategy the plan could not
+ * even resolve): the walker then uses that answer instead of resolving again,
+ * and a skipped source is recorded in `attempts` exactly as an unreachable
+ * strategy always was.
+ *
  * Returns `{ path, downloaded, bytes, sha256, verified, attempts, sourceId }`;
  * `sourceId` is the strategy that won, which the row can show ("downloaded from
  * link1") instead of leaving the provenance invisible.
@@ -2613,7 +2619,11 @@ export async function ensureIsoForSource(sources, { isoDir, sizeGb = 0, timeoutM
   for (const source of list) {
     const strategy = String(source.strategy ?? 'source')
     try {
-      const resolved = await resolveIsoSourceToUrl(source, { log })
+      // A PRE-RESOLVED SOURCE IS NOT RESOLVED TWICE. The create path resolves
+      // the first viable strategy BEFORE it reserves quota (so the guard names
+      // the file that will actually be written); honouring that answer here
+      // keeps the live handshake — four HTTPS round trips — from running twice.
+      const resolved = source.resolved ?? await resolveIsoSourceToUrl(source, { log })
       if (resolved === null) {
         attempts.push({ strategy, error: String(source.skipped ?? 'skipped') })
         continue
@@ -2656,8 +2666,16 @@ function firstLine(text) {
  * `null` means "this strategy cannot run here" (a skipped ESD catalog, an empty
  * descriptor) — the chain records it as `skipped` and moves on, which is
  * different from a failure and must not be reported as one.
+ *
+ * EXPORTED because the CREATE PATH has to name the file before it reserves store
+ * quota: the static mirror's URL and the live page's URL are different objects
+ * with different cache names, so a reservation keyed on the wrong one either
+ * skips the check on a ~6 GB write or charges the store for bytes that were
+ * already there. The supervisor resolves the first viable strategy through this
+ * function and hands the answer back as `source.resolved` (see
+ * ensureIsoForSource), so the live handshake still runs exactly once.
  */
-async function resolveIsoSourceToUrl(source, { log = () => {} } = {}) {
+export async function resolveIsoSourceToUrl(source, { log = () => {} } = {}) {
   if (typeof source.skipped === 'string' && source.skipped !== '') {
     log(`iso: ${source.strategy} skipped (${source.skipped})`)
     return null

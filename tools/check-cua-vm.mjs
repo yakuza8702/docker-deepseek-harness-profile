@@ -1243,7 +1243,24 @@ const NEEDLES = {
     ['if (meta.state !== \'ready\') return', 1],
     // ...and every ready transition fires it UN-AWAITED (3 call sites), so a
     // failed re-assert can never turn a successful Start into an error.
-    ['void windowsRelayReassert(name)', 3]
+    ['void windowsRelayReassert(name)', 3],
+    // C19: THE CREATE PATH WALKS THE CHAIN. Before this, `resolveWindowsIso()`
+    // (static-only, by design) was the create path and `ensureIsoForSource()`
+    // had NO caller outside its own module — the mido implementation was dead
+    // code and every create booted a third-party mirror.
+    ['resolveWindowsIsoSources(spec.windowsVersion)', 1],
+    ['await ensureIsoForSource(sources, {', 1],
+    // C19b: THE QUOTA GUARD MUST NAME THE FILE THE TAKEN BRANCH WILL WRITE.
+    // The static mirror's target and mido's are different objects with different
+    // cache names, so the plan is made (and its head resolved) BEFORE the
+    // reservation, and the probe reads the plan's URL — not the mirror's.
+    ['planWindowsIsoChain(sources, { log })', 1],
+    ['const url = chainTarget !== null ? chainTarget.url', 1],
+    ['isoSourceId', 2],
+    ['DSH_CUA_WINDOWS_ISO_MIDO', 1],
+    // C4/C18: the two computed facts ride the SAME decorate pass as staleness.
+    ['row.holds = stateHolds(row.state)', 1],
+    ['row.health = computerHealth(name, row, facts)', 1]
   ],
   space: [
     ['export const CAPTURE_MAX_PIXELS = 900_000', 1],
@@ -3363,7 +3380,18 @@ const NEEDLES = {
     // 20-21: the guard pair on the payload, and the desktop error CODE (the
     // free-text `error` keeps its semantics; the code is what a consumer reads).
     ['expectedGuardHash:', 1],
-    ['errorCode,', 1]
+    ['errorCode,', 1],
+    // C4/C18: the two new status segments (only one tool changed).
+    ['holds=', 1],
+    ['health=', 1],
+    // PRE-2: `scaleFix` alone is satisfiable by the verdict branch (it warns at
+    // runtime), so the needle names the SENTENCE that explains the field — the
+    // caveat a schema-only reader needs, and the one the trim dropped.
+    ['scaleFix`: the scale-arithmetic patch', 1],
+    // S6: the floor is one number in two files; the doctor prints it.
+    ['DSH_NODE_FLOOR', 2],
+    // S5: the one-line desktop-path doctrine, next to the identity line.
+    ['desktop paths:', 1]
   ],
   proxy: [
     ['export function prefixRootPaths(text, prefix)', 1],
@@ -3415,6 +3443,9 @@ const NEEDLES = {
     ['DSH_CUA_WIN_LEGACY_BIOS=1', 1],
     ['DSH_CUA_MCP_STATE_POLL_MS=10000', 1],
     ['DSH_CUA_WIN_ISO_SHA256=1', 1],
+    // C19: the switch that restores the static-only order, documented next to
+    // the digest switch it belongs with.
+    ['DSH_CUA_WINDOWS_ISO_MIDO=1', 1],
     // E-2 (SOL §7.2): THE FOUR KNOBS THIS RELEASE ADDS ARE DOCUMENTED WHERE AN
     // OPERATOR LOOKS. Each one changes behaviour a support ticket will ask
     // about — the wedge deadline (how long a guest call may hang), the two
@@ -4368,6 +4399,129 @@ function sourceOf(label, name) {
       failures += 1
       missing.push(`J1-6: ${path.relative(ROOT, docFile) || path.basename(docFile)} drifted from ISO_SOURCE_CHAINS — ${firstDrift}`)
       console.log('  FAIL J1-6 ISO doc honesty')
+    }
+  }
+}
+
+/**
+ * C19 — THE CHAIN REALLY STARTS AT MICROSOFT (order, not presence).
+ *
+ * A needle can prove that `resolveWindowsIsoSources()` and `ensureIsoForSource()`
+ * are called. It cannot prove the LIST they are called with begins with the live
+ * strategy: swapping `mido` behind `link1` in `ISO_SOURCE_CHAINS` would keep every
+ * needle green while the create quietly went back to a third-party mirror. So the
+ * module is IMPORTED (not grepped) and the order is read from the data the
+ * downloader actually walks.
+ *
+ * `n/a` — never a silent pass — when the module cannot be imported in a layout
+ * that lacks its neighbours, exactly like L5/N3.
+ */
+{
+  total += 1
+  const winFile = pick('cua-vm-windows-qemu.mjs')
+  if (winFile === null) {
+    failures += 1
+    missing.push('C19: docker/cua-vm-windows-qemu.mjs is required — the ISO chain ORDER cannot be checked without it')
+    console.log('  FAIL C19 ISO chain order')
+  } else {
+    let strategies = null
+    let importProblem = null
+    try {
+      const win = await import(pathToFileURL(winFile).href)
+      strategies = win.resolveWindowsIsoSources('11').map((source) => String(source?.strategy ?? ''))
+    } catch (error) {
+      importProblem = error
+    }
+    if (importProblem !== null) {
+      total -= 1
+      if (!process.argv.includes('--quiet')) console.log(`  n/a  C19 ISO chain order (the Windows module did not import here: ${String(importProblem?.message ?? importProblem).split('\n')[0]})`)
+    } else if (strategies[0] === 'mido' && strategies.includes('link1')) {
+      if (!process.argv.includes('--quiet')) console.log(`  ok   C19 the chain for windowsVersion "11" starts at the live Microsoft strategy and keeps a pinned mirror (${strategies.join(' -> ')})`)
+    } else {
+      failures += 1
+      missing.push(`C19: the chain for windowsVersion "11" must START at the live Microsoft strategy and still carry a pinned mirror — got ${strategies.join(' -> ') || '(nothing)'}`)
+      console.log('  FAIL C19 ISO chain order')
+    }
+  }
+}
+
+/**
+ * C21/S6 — THE NODE FLOOR IS ONE NUMBER IN TWO FILES.
+ *
+ * `engines.node` is what a package manager checks and `DSH_NODE_FLOOR` is what
+ * `cua_vm_doctor` prints; a release that bumps one and not the other tells an
+ * operator a floor the install does not enforce (or the reverse). Same pattern as
+ * WP-6.6's version equality: read both, compare the digits, name both values.
+ *
+ * Out of scope in the flat image tree (no `package.json` is copied), said out
+ * loud like WP-6.6.
+ */
+{
+  total += 1
+  const indexFile = pick('index.js')
+  const packageCandidates = [
+    indexFile === null ? null : path.join(path.dirname(indexFile), 'package.json'),
+    path.join(ROOT, 'plugins', 'dsh-cua-vm', 'package.json')
+  ].filter((candidate) => candidate !== null)
+  const packageFile = packageCandidates.find((candidate) => existsSync(candidate)) ?? null
+  let engines = null
+  if (packageFile !== null) {
+    try {
+      engines = JSON.parse(readFileSync(packageFile, 'utf8')).engines?.node ?? null
+    } catch {
+      engines = null
+    }
+  }
+  const indexText = indexFile === null ? '' : stripJsComments(readFileSync(indexFile, 'utf8'))
+  const floorMatch = /const DSH_NODE_FLOOR = '([^']+)'/u.exec(indexText)
+  const floor = floorMatch === null ? null : floorMatch[1]
+  if (!REPO_LAYOUT && packageFile === null) {
+    total -= 1
+    if (!process.argv.includes('--quiet')) console.log('  n/a  C21 the Node floor parity (engines vs DSH_NODE_FLOOR) lives in the checkout, not in the flat image check tree')
+  } else if (typeof engines !== 'string' || floor === null) {
+    failures += 1
+    missing.push(`C21: both floors must be readable — package.json "engines"."node" (${engines === null ? `MISSING at ${packageFile ?? 'no package.json found'}` : `got ${JSON.stringify(engines)}`}) and index.js const DSH_NODE_FLOOR = '<x>' (${floor === null ? 'MISSING' : `got ${JSON.stringify(floor)}`})`)
+    console.log('  FAIL C21 Node floor parity')
+  } else if (engines.includes('24.22.3') && engines.includes('26.13.1') && floor === '24.22.3') {
+    if (!process.argv.includes('--quiet')) console.log(`  ok   C21 the Node floor is one number in two files (engines ${JSON.stringify(engines)}, DSH_NODE_FLOOR ${JSON.stringify(floor)})`)
+  } else {
+    failures += 1
+    missing.push(`C21: engines.node ${JSON.stringify(engines)} and DSH_NODE_FLOOR ${JSON.stringify(floor)} must both state 24.22.3 (24.x) and 26.13.1 (26.x) — DSH 0.2.3-alpha.2 refuses anything below`)
+    console.log('  FAIL C21 Node floor parity')
+  }
+}
+
+/**
+ * C20 — THE TWO DESKTOP PATHS ARE WRITTEN DOWN, WITH THE RULE.
+ *
+ * A doc requirement with no assertion is a doc that gets deleted. The two facts
+ * that must survive are the plugin name and the doctrine, because the failure
+ * mode is a reader concluding that `dsh-windows-mcp` is a second bridge to the
+ * same guest.
+ */
+{
+  total += 1
+  const docCandidates = [
+    path.join(ROOT, 'desktop-paths.md'),
+    path.join(ROOT, 'docs', 'desktop-paths.md')
+  ]
+  const docFile = docCandidates.find((candidate) => existsSync(candidate)) ?? null
+  if (docFile === null && !REPO_LAYOUT) {
+    total -= 1
+    if (!process.argv.includes('--quiet')) console.log('  n/a  C20 docs/desktop-paths.md lives in the checkout, not in the flat image check tree')
+  } else if (docFile === null) {
+    failures += 1
+    missing.push(`C20: docs/desktop-paths.md is required — the host-desktop path is opt-in and the rule ("one desktop target per session") has to be written down (looked for ${docCandidates.map((candidate) => path.relative(ROOT, candidate) || '.').join(', ')})`)
+    console.log('  FAIL C20 desktop paths doc')
+  } else {
+    const md = readFileSync(docFile, 'utf8')
+    const lost = ['dsh-windows-mcp', 'Session 0'].filter((token) => !md.includes(token))
+    if (lost.length === 0) {
+      if (!process.argv.includes('--quiet')) console.log(`  ok   C20 ${path.relative(ROOT, docFile) || path.basename(docFile)} names the host path and the Session-0 doctrine`)
+    } else {
+      failures += 1
+      missing.push(`C20: ${path.relative(ROOT, docFile) || path.basename(docFile)} lost ${lost.map((token) => JSON.stringify(token)).join(' and ')} — a doc that stops naming them stops being the rule`)
+      console.log('  FAIL C20 desktop paths doc')
     }
   }
 }

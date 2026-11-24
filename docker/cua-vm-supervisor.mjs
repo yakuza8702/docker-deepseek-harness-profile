@@ -64,6 +64,10 @@ import {
   WINDOWS_MIN_CPU, WINDOWS_DEFAULT_CPU, WINDOWS_DEFAULT_MEMORY_GB, WINDOWS_DEFAULT_DISK_GB,
   WINDOWS_USERNAME, WINDOWS_QEMU, canonicalWindowsVersion, windowsCapacityWarnings,
   windowsPaths, ensureIso, isoTargetPath, writeOemPayload, generatePassword, frameSpace, resolveWindowsIso,
+  // C19: the CHAIN WALKER and the ordered list it walks. `ensureIso` above stays
+  // imported because an explicit `windowsIso` URL still takes that path — the one
+  // caller that named a URL named a pin, so there is nothing to re-resolve.
+  ensureIsoForSource, resolveWindowsIsoSources, resolveIsoSourceToUrl,
   buildSetupImage, normaliseProductKey, resolveWindowsImageSelection,
   windowsKvmPreflight, windowsPortsOf, windowsTailLines, formatWindowsInstallDetail, windowsReadinessSignals,
   // D3/D5: the post-install boot signal and the two exact sentences. The watcher
@@ -869,8 +873,162 @@ function decorateStateFacts(rows, now = Date.now()) {
     row.stateStale = facts.stale
     // A-6: the lock, so the panel can name the holder instead of spinning.
     row.lock = vmLockFacts(name)
+    // C4 (Spaces `stop` vs `suspend`): WHICH RESOURCE THE STATE STILL HOLDS.
+    // null means UNVERIFIED, never false: "disk kept" and "I do not know" are
+    // different sentences and only one of them is safe to act on.
+    row.holds = stateHolds(row.state)
+    // C18: the per-computer verdict, built ONLY from facts this read already
+    // has. Computed AFTER `lock`, because the lock is one of the checks.
+    row.health = computerHealth(name, row, facts)
   }
   return rows
+}
+
+/**
+ * C4 — WHICH RESOURCE THE STATE STILL HOLDS (the Spaces `stop` vs `suspend`
+ * distinction, made machine-readable).
+ *
+ * The README has documented the difference for a long time ("suspend keeps the
+ * process, the RAM and the device handles"; shutdown flattens the disk into a
+ * checkpoint and removes the sandbox), but nothing on the wire said it — so a
+ * model could not answer "did that free the RAM?" without reciting prose it may
+ * never have read.
+ *
+ * `null` means UNVERIFIED, never false. `error` and `missing` are null on
+ * purpose: a torn or vanished disk is not a claim about memory, and a caller
+ * that branches on `false` would act on a guess. `powered-off`/`off`/`stopped`
+ * DO claim `memory: false`, because that is what the powerdown guarantees.
+ */
+export function stateHolds(state) {
+  const text = String(state ?? '')
+  if (text === 'ready' || text === 'running' || text === 'installing' || text === 'booting') {
+    return { memory: true, disk: true, text: 'memory+disk' }
+  }
+  if (text === 'suspended') return { memory: true, disk: true, text: 'memory+disk (suspended; resume is instant)' }
+  if (text === 'powered-off' || text === 'off' || text === 'stopped') return { memory: false, disk: true, text: 'disk only (checkpoint)' }
+  return { memory: null, disk: null, text: 'unverified' }
+}
+
+/**
+ * C18 — ONE VERDICT PER COMPUTER, from facts this read ALREADY has.
+ *
+ * `cua_vm_doctor` has had a `checks[]` pattern for the host for a while; this is
+ * the same shape one level down, so `cua_vm_status` (and the panel, which reads
+ * the same decorated rows through `vmList`) can say "this computer is degraded,
+ * and HERE is why" instead of leaving the model to correlate five fields.
+ *
+ *   ok: true   the fact was observed and is good
+ *   ok: false  the fact was observed and is a problem  → verdict `degraded`
+ *   ok: null   the fact is NOT OBSERVABLE HERE          → never a failure
+ *
+ * THAT THIRD ROW IS THE WHOLE DESIGN. A Linux row has no staleness clock
+ * (`stateStaleness()` answers all-null for it, C13), a non-Windows row has no
+ * install medium, a running computer has no restore point to judge. Scoring any
+ * of those as a failure turns this into a nag screen that is wrong on the
+ * common case, so `null` is a first-class answer and the verdict rule says so:
+ * any false → `degraded`; else any true → `ok`; else `unknown`.
+ *
+ * `unknown` IS A DEFENSIVE FLOOR, NOT A STATE A REAL ROW REACHES: `state-fresh`
+ * and `lock-free` are observable on every row (a stale clock and "nobody holds
+ * the lock" are both facts), so the all-null case cannot occur today. It stays
+ * in the rule so a future check that IS entirely unobservable collapses to
+ * "unknown" instead of silently reading as healthy — and the README says the
+ * same thing, so the documented vocabulary and the reachable one agree.
+ *
+ * R7 (LOCKED): `state-fresh` reads `row.stateStale !== true`, NOT `=== false`.
+ * `stateStaleness()` returns all-null for Linux rows, so `=== false` would make
+ * every Linux computer report `unknown` for ever. Do not "fix" this to a strict
+ * comparison.
+ */
+export function computerHealth(name, row, facts = {}) {
+  const checks = []
+  const state = String(row?.state ?? '')
+  const windows = String(row?.kind ?? '') === 'windows'
+
+  // 1. DID IT ANSWER RECENTLY? (Windows only; Linux is `ok` by the R7 rule.)
+  const ageMs = Number(facts?.ageMs ?? row?.stateAgeMs ?? 0)
+  const hasClock = facts?.ageMs !== null && facts?.ageMs !== undefined
+  const stale = row?.stateStale === true
+  // J6: THE SENTENCE FOLLOWS THE KIND, NOT THE NUMBER. `stateStaleness()` answers
+  // all-null for Linux (R7) AND `ageMs: null` for a Windows row whose
+  // `stateSince` does not parse — so keying the detail on `ageMs === null`
+  // printed the Linux sentence ("this kind has no staleness clock") for a
+  // Windows computer that simply had no recorded age.
+  checks.push({
+    id: 'state-fresh',
+    ok: stale ? false : true,
+    detail: !windows
+      ? `state=${state}; this kind has no staleness clock (R7)`
+      : (stale
+        ? `no answer for ${Math.max(1, Math.round(ageMs / 60000))}m (window ${Math.round(Number(facts?.windowMs ?? 0) / 60000)}m)`
+        : (hasClock ? `state=${state} confirmed ${Math.round(ageMs / 1000)}s ago` : `state=${state}; no confirmation age recorded`))
+  })
+
+  // 2. IS ANYBODY ELSE DRIVING IT? (`row.lock` is A-6's vmLockFacts result.)
+  const lock = row?.lock ?? null
+  checks.push({
+    id: 'lock-free',
+    ok: lock === null,
+    detail: lock === null ? 'no operation holds it' : `held by ${String(lock.heldBy ?? 'unknown')} for ${Math.max(1, Math.round(Number(lock.heldMs ?? 0) / 1000))}s`
+  })
+
+  // 3. IS THE GPU THE ONE THAT WAS ASKED FOR? (`gpuDegraded` is set only when
+  //    the measured renderer was a software rasteriser.)
+  const degraded = row?.gpuDegraded ?? null
+  checks.push({
+    id: 'gpu',
+    ok: degraded === null ? true : false,
+    detail: degraded === null ? 'no degraded-renderer note' : `${String(degraded.renderer ?? 'unknown')} at ${String(degraded.at ?? 'unknown')}`
+  })
+
+  // 4. IS THE 9p SHARE THERE? (`missing` is the only failing value; `off` is a
+  //    deliberate DSH_CUA_VM_SHARE_WORKSPACE=0, and an unrecorded value is not
+  //    a claim either way — the check says so in its detail.)
+  const share = typeof row?.share === 'string' ? row.share : null
+  checks.push({
+    id: 'share',
+    ok: row?.share !== 'missing',
+    detail: share === null ? 'no share fact recorded for this computer' : `share=${share}`
+  })
+
+  // 5. WOULD START RESTORE THE DISK? Only meaningful once powered off.
+  if (state === 'powered-off' || state === 'off' || state === 'stopped') {
+    const kind = String(row?.restoreFrom?.kind ?? 'none')
+    checks.push({
+      id: 'restore-point',
+      ok: kind === 'checkpoint',
+      detail: kind === 'checkpoint' ? `${name}: restoreFrom.kind=checkpoint` : `${name}: restoreFrom.kind=${kind}`
+    })
+  } else {
+    checks.push({ id: 'restore-point', ok: null, detail: 'not powered off; nothing to restore yet' })
+  }
+
+  // 6. WHICH MEDIUM IS THIS WINDOWS COMPUTER ON? A pin never picks up a newer
+  //    Microsoft release, which is a fact worth stating; an old row with no
+  //    provenance answers `unknown` instead of guessing.
+  if (!windows) {
+    checks.push({ id: 'media', ok: null, detail: 'not a Windows computer' })
+  } else if (row?.isoMedia === 'pinned') {
+    checks.push({ id: 'media', ok: false, detail: `pinned medium (${String(row?.isoSourceId ?? 'unrecorded')})` })
+  } else if (typeof row?.isoSourceId === 'string' && row.isoSourceId !== '') {
+    checks.push({ id: 'media', ok: true, detail: `delivered by ${row.isoSourceId}` })
+  } else {
+    checks.push({ id: 'media', ok: null, detail: 'no media provenance on this row (written by an older build)' })
+  }
+
+  // Guide text: the FIRST failing check, verbatim, because one actionable
+  // sentence beats six lines of diagnostics.
+  const guides = {
+    'state-fresh': () => `the computer has not answered for ${Math.max(1, Math.round(ageMs / 60000))}m; call cua_vm_start or cua_vm_status again`,
+    'lock-free': () => `another operation holds this computer (${String(lock?.heldBy ?? 'unknown')} for ${Math.max(1, Math.round(Number(lock?.heldMs ?? 0) / 1000))}s); wait, do not retry`,
+    gpu: () => 'this gpu:true computer is on a software rasteriser; treat 3D as CPU-bound',
+    share: () => 'the 9p share is not attached; use cua_vm_put/get instead of the shared path',
+    'restore-point': () => 'Start boots the base image: the previous disk is gone',
+    media: () => 'this computer is on an operator-pinned medium; a newer release is not picked up'
+  }
+  const failed = checks.find((check) => check.ok === false) ?? null
+  const verdict = failed !== null ? 'degraded' : (checks.some((check) => check.ok === true) ? 'ok' : 'unknown')
+  return { verdict, checks, guide: failed === null ? null : (guides[failed.id]?.() ?? null) }
 }
 
 /* ------------------------------------------------------------------ *
@@ -5081,6 +5239,53 @@ function windowsInstallSshGraceMinutes() {
   return 15
 }
 
+/** C19: THE ORDER SWITCH — `0` restores the static-only order. */
+function useMidoChain() {
+  return String(process.env.DSH_CUA_WINDOWS_ISO_MIDO ?? '1') !== '0'
+}
+
+/**
+ * C19b — WHICH FILE WILL THIS CHAIN ACTUALLY WRITE?
+ *
+ * THE DEFECT THIS EXISTS FOR. `resolveWindowsIso()` answers with the first
+ * STATIC mirror in the chain (by design: it is the synchronous gate), but the
+ * chain's winner is usually a DIFFERENT OBJECT — `mido`'s live URL, the ESD
+ * catalog's media — and `isoFileName()` keys the cache on the FULL URL. So a
+ * quota reservation sized against the mirror's target was wrong in both
+ * directions: with an old mirror ISO in the store it skipped the reservation
+ * while a fresh ~6 GB mido ISO landed (no check at all), and with nothing on
+ * disk it could charge the store for bytes that were already there under
+ * another name (a spurious refusal).
+ *
+ * So the create path resolves the FIRST viable strategy BEFORE it reserves, and
+ * hands the answer back as `source.resolved` — `ensureIsoForSource()` then uses
+ * it instead of resolving again, which keeps the live handshake at exactly one
+ * run per create.
+ *
+ * A strategy that cannot even resolve is recorded as `skipped` for this create
+ * (with the reason) and the walk continues: a mirror or a page that is down must
+ * cost the next source, never the create. `null` means "nothing in this chain
+ * could name a file before the download" — the caller then falls back to the
+ * static mirror's target for the probe and the walker reports the aggregate
+ * error exactly as it always did.
+ */
+async function planWindowsIsoChain(sources, { log = () => {} } = {}) {
+  for (const source of sources) {
+    if (typeof source.skipped === 'string' && source.skipped !== '') continue
+    try {
+      const resolved = await resolveIsoSourceToUrl(source, { log })
+      if (resolved === null) continue
+      source.resolved = resolved
+      return resolved
+    } catch (error) {
+      const reason = String(error?.message ?? error).split('\n')[0]
+      source.skipped = `resolve failed: ${reason}`
+      log(`iso: ${source.strategy} could not be resolved (${reason}); the next source decides the reservation`)
+    }
+  }
+  return null
+}
+
 /**
  * D2: TAKE THE INSTALL MEDIA OUT OF THE SESSION THAT FINISHED INSTALLING.
  *
@@ -5757,18 +5962,45 @@ async function windowsCreateManaged(spec) {
 
     // ISO: a local file is used as-is; a URL is downloaded once into $STORE/iso.
     let isoPath
+    // C19: WHICH STRATEGY DELIVERED THE MEDIUM, so provenance is a fact on the
+    // row instead of a line in a log nobody keeps. Empty until a download wins.
+    let isoSourceId = ''
     if (spec.windowsIso !== '' && !/^https?:\/\//iu.test(spec.windowsIso)) {
       isoPath = path.isAbsolute(spec.windowsIso) ? spec.windowsIso : path.resolve(STORE, spec.windowsIso)
+      isoSourceId = 'local-file'
     } else {
       // K2: a version without a probed public link refuses HERE, with the
       // version named and both remediations, instead of 400ing inside the
       // download after the quota was reserved.
-      const url = spec.windowsIso !== '' ? spec.windowsIso : resolveWindowsIso(spec.windowsVersion).url
+      //
+      // THE VERSION PATH WALKS THE ORDERED CHAIN, so the order the table
+      // declares is the order that runs: `11`/`10` start at Microsoft's live page
+      // (mido: productEditionId read on every create → the newest release),
+      // `11e`/`10e` at the ESD catalog, `11l`/`2025`–`2012` at their pinned
+      // midoDirect object and `7u`/`core11`/`tiny11`/`tiny10` at the mirrors they
+      // have. It is NOT "every code re-resolves Microsoft's page" — four of the
+      // sixteen have no Microsoft source this code can drive at all.
+      // This call is also the GATE and the SIZER: its refusal and its `.url`
+      // are byte-identical to the static-only path this replaced.
+      const staticSource = spec.windowsIso !== '' ? null : resolveWindowsIso(spec.windowsVersion)
+      // C19b: THE CHAIN IS BUILT — AND ITS FIRST VIABLE TARGET RESOLVED — BEFORE
+      // ANY QUOTA DECISION, because the file the reservation must name is the one
+      // the taken branch will write, and that is not always the static mirror.
+      let sources = null
+      let chainTarget = null
+      if (spec.windowsIso === '') {
+        sources = useMidoChain() === true ? resolveWindowsIsoSources(spec.windowsVersion) : null
+        if (sources !== null) chainTarget = await planWindowsIsoChain(sources, { log })
+      }
+      const url = chainTarget !== null ? chainTarget.url : (spec.windowsIso !== '' ? spec.windowsIso : staticSource.url)
       // X6: A DOWNLOAD IS A WRITE. The quota used to be checked for the disk
       // only, and the ISO then dropped ~5.5 GB into the store unchecked — one
       // create could exceed the quota on its own. Reserve the expected size,
       // but ONLY when the file is not already cached (a cached ISO is already
       // counted by `used`; reserving again would refuse a create that fits).
+      // THE PROBE NAMES THE FILE THE TAKEN BRANCH WILL WRITE: the chain's own
+      // target when it resolved one, the pinned URL when the caller pinned one,
+      // and the static mirror only when the chain could name nothing.
       const cached = existsSync(isoTargetPath(paths.isoDir, url))
       const expectedBytes = Number(process.env.DSH_CUA_WINDOWS_ISO_BYTES || 6 * 1024 ** 3)
       if (!cached) {
@@ -5778,15 +6010,37 @@ async function windowsCreateManaged(spec) {
         }
       }
       try {
-        const downloaded = await ensureIso({
-          url,
-          isoDir: paths.isoDir,
-          timeoutMs: Number(process.env.DSH_CUA_WINDOWS_ISO_TIMEOUT_MS || 60 * 60 * 1000),
-          log,
-          onProgress: (fraction, bytes) => log(`iso: ${(bytes / 1024 ** 3).toFixed(2)} GB${fraction === null ? '' : ` (${Math.round(fraction * 100)}%)`}`)
-        })
-        isoPath = downloaded.path
+        if (spec.windowsIso !== '' || sources === null) {
+          // AN EXPLICIT URL IS A PIN, and `DSH_CUA_WINDOWS_ISO_MIDO=0` restores
+          // the static-only order: both are one object, downloaded once.
+          const downloaded = await ensureIso({
+            url,
+            isoDir: paths.isoDir,
+            timeoutMs: Number(process.env.DSH_CUA_WINDOWS_ISO_TIMEOUT_MS || 60 * 60 * 1000),
+            log,
+            onProgress: (fraction, bytes) => log(`iso: ${(bytes / 1024 ** 3).toFixed(2)} GB${fraction === null ? '' : ` (${Math.round(fraction * 100)}%)`}`)
+          })
+          isoPath = downloaded.path
+          isoSourceId = spec.windowsIso !== '' ? 'pinned-url' : staticSource.strategy
+          // The chain walker's own line, kept for parity: a static create must
+          // say WHICH strategy delivered, so an operator comparing the two
+          // orders reads the same sentence.
+          log(`iso: ${isoSourceId} delivered ${path.basename(downloaded.path)}`)
+        } else {
+          // `sources` was built (and its head resolved) before the reservation.
+          const downloaded = await ensureIsoForSource(sources, {
+            isoDir: paths.isoDir,
+            sizeGb: WINDOWS_CATALOG[canonicalWindowsVersion(spec.windowsVersion)]?.sizeGb ?? 0,
+            timeoutMs: Number(process.env.DSH_CUA_WINDOWS_ISO_TIMEOUT_MS || 60 * 60 * 1000),
+            log,
+            onProgress: (fraction, bytes) => log(`iso: ${(bytes / 1024 ** 3).toFixed(2)} GB${fraction === null ? '' : ` (${Math.round(fraction * 100)}%)`}`)
+          })
+          isoPath = downloaded.path
+          isoSourceId = String(downloaded.sourceId ?? '')
+        }
       } finally {
+        // EVERY EXIT RELEASES THE RESERVATION: a chain that throws on its last
+        // strategy still hits this `finally`, and `cached` is not re-evaluated.
         if (!cached) releaseStoreBytes(`${spec.name}/iso`)
       }
     }
@@ -5870,6 +6124,13 @@ async function windowsCreateManaged(spec) {
       // question can tell WHICH edition this computer was installed from.
       windowsImage: `${imageSelection.key}=${imageSelection.value}`,
       isoPath,
+      // C19: the medium's provenance. `chain` means the version path re-resolved
+      // Microsoft's page at this create; `pinned` means a caller named a URL.
+      // An older row has no `isoSourceId` at all, and `health.media` says
+      // `unknown` for it — which is the honest answer, not a guess.
+      isoSourceId,
+      isoMedia: spec.windowsIso === '' ? 'chain' : 'pinned',
+      isoResolvedAt: new Date().toISOString(),
       ports: portTriple,
       ssh: true,
       qemu: WINDOWS_QEMU,

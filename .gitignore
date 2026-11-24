@@ -10,4 +10,8 @@ gh-pat*
 *.log
 __pycache__/
 node_modules/
+# Research notes for an upgrade session (evidence files, not product). Kept out
+# of git on purpose: `git add -A` must not sweep a 500-line scratch file into a
+# release commit — the brief it supports lives in the issue, not in the tree.
+research/
 .DS_Store
