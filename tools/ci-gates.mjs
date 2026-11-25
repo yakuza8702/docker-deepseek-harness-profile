@@ -228,6 +228,13 @@ const REPO_GATES = [
   // stub curl — against a fixture payload. A docker daemon is not available on a
   // push runner, and downloading the release to prove a parse would be worse.
   { file: "cua-cli-version.mjs", args: ["--check"], label: "cua CLI resolves latest at build time (RUN fragment, offline)" },
+  // The OpenCode CLI's resolution, same technique and the same reason: the image
+  // owes `dsh-opencode-connect` (installed by the user later) a WORKING CLI, and
+  // "latest" must resolve the newest v1 tag while SKIPPING every v2 tag — the
+  // plugin speaks the v1 root API paths and a 2.x CLI answers none of them. The
+  // gate also proves the two refusals (a 2.x pin, anything below the 1.18.0
+  // floor) and both offline failures (API down, no v1 tag) fail the BUILD.
+  { file: "check-opencode-cli.mjs", args: ["--check"], label: "opencode CLI resolves the newest v1 release (RUN fragment, offline)" },
   // The tool layer's own contract: the 18 `cua_vm_*` schemas are FROZEN (names,
   // parameter keys in order, types, enums, required, output marker) and the
   // prose is under a budget. Text-only, no network, no QEMU, no node_modules —

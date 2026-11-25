@@ -78,6 +78,18 @@ import * as winMcpApi from '../plugins/dsh-cua-vm/win-mcp.js'
 import {
   simulateResolution, readRunBlock, extractResolveFragment, cuaCliAssetUrl, RELEASES_API_URL
 } from '../tools/cua-cli-version.mjs'
+// OPENCODE-CLI: the same treatment for the other CLI the Dockerfile resolves at
+// build time. Aliased because both tools export a `readRunBlock` /
+// `extractResolveFragment` pair and this file drives both.
+import {
+  simulateResolution as simulateOpencodeResolution,
+  readRunBlock as readOpencodeRunBlock,
+  extractResolveFragment as extractOpencodeResolveFragment,
+  opencodeAssetUrl,
+  versionFromTagName as opencodeVersionFromTagName,
+  RELEASES_API_URL as OPENCODE_RELEASES_API_URL,
+  PLUGIN_VERSION_FLOOR as OPENCODE_PLUGIN_FLOOR
+} from '../tools/check-opencode-cli.mjs'
 
 /** The checkout root — the source of `docker/windows-oem/` in these tests. */
 const REPO = path.resolve(import.meta.dirname, '..')
@@ -5511,6 +5523,107 @@ check('C19: the static API the quota/cache probe uses is unchanged (entry.url is
 
   check('CUA-CLI-7: the RUN queries the documented releases endpoint, not a cached or proxy URL',
     readRunBlock(dockerfileText).includes(RELEASES_API_URL), RELEASES_API_URL)
+}
+
+
+// (7) OPENCODE-CLI: THE OTHER CLI THE IMAGE RESOLVES AT BUILD TIME.
+//
+// The image deliberately does NOT bundle `dsh-opencode-connect` — the user adds
+// it from the Plugins page — so the one thing it owes that plugin is a WORKING
+// `opencode`. The plugin speaks the v1 root API paths (`/session`,
+// `/config/providers`, `/event`) and spawns `opencode serve --port 40961`
+// itself; a 2.x CLI would answer none of those calls. Same proof as CUA-CLI
+// above: the Dockerfile's fragment, extracted and executed, never a copy.
+//
+// The fixture is deliberately hostile in four ways a naive resolver gets wrong:
+// a v2 release at the TOP, a v2 PRE-RELEASE under it, another package's tag in
+// between, and the newest v1 BELOW all of them (the real API interleaves the
+// lines — v1.19.6 shipped after v2.3.1).
+{
+  const dockerfileText = readFileSync(path.join(REPO, 'Dockerfile'), 'utf8')
+  const OPENCODE_RELEASES = JSON.stringify([
+    { tag_name: 'v2.4.1', name: 'v2.4.1', draft: false, prerelease: false, published_at: '2026-11-22T10:00:00Z' },
+    { tag_name: 'v2.0.0-rc.1', name: 'v2.0.0-rc.1', draft: false, prerelease: true, published_at: '2026-11-21T10:00:00Z' },
+    { tag_name: 'process-daemon-v0.6.0', name: 'process-daemon 0.6.0', draft: false, prerelease: false, published_at: '2026-11-20T10:00:00Z' },
+    { tag_name: 'v1.19.6', name: 'v1.19.6', draft: false, prerelease: false, published_at: '2026-11-17T10:00:00Z' },
+    { tag_name: 'v1.18.35', name: 'v1.18.35', draft: false, prerelease: false, published_at: '2026-10-30T10:00:00Z' }
+  ], null, 2)
+
+  let fragment = ''
+  let parseError = ''
+  try {
+    fragment = extractOpencodeResolveFragment(readOpencodeRunBlock(dockerfileText))
+  } catch (error) {
+    parseError = String(error?.message ?? error)
+  }
+  check('OPENCODE-CLI-1: the Dockerfile still carries the ARG + RUN fragment this test extracts',
+    parseError === '' && /OPENCODE_VERSION/u.test(fragment) && /v1\./u.test(fragment),
+    parseError || `${fragment.split('\n').length} shell line(s) from the RUN block`)
+
+  const latest = simulateOpencodeResolution({ dockerfileText, requested: 'latest', apiJson: OPENCODE_RELEASES })
+  check('OPENCODE-CLI-2: latest takes the FIRST v1.* tag and skips v2 (prerelease included) + other packages',
+    latest.status === 0 && latest.version === '1.19.6' && latest.curlCalled === true,
+    `status ${latest.status}, version ${JSON.stringify(latest.version)}`)
+  check('OPENCODE-CLI-2b: the build log names the version it resolved AND the v2 tags it skipped',
+    /resolved to 1\.19\.6/u.test(latest.stdout) && /skipped v2 tags: .*2\.4\.1/u.test(latest.stdout),
+    (latest.stdout.match(/skipped v2 tags: .*$/mu) ?? ['missing'])[0])
+
+  check('OPENCODE-CLI-3: the asset URL is built from the RESOLVED version, per target',
+    latest.version !== null
+      && opencodeAssetUrl(latest.version, 'x64') === 'https://github.com/sst/opencode/releases/download/v1.19.6/opencode-linux-x64.tar.gz'
+      && opencodeAssetUrl(latest.version, 'arm64').endsWith('/opencode-linux-arm64.tar.gz'),
+    opencodeAssetUrl(latest.version ?? '?', 'x64'))
+
+  const pinned = simulateOpencodeResolution({ dockerfileText, requested: '1.19.6', apiJson: OPENCODE_RELEASES })
+  check('OPENCODE-CLI-4: a pinned OPENCODE_VERSION is used as given, and the API is never called',
+    pinned.status === 0 && pinned.version === '1.19.6' && pinned.curlCalled === false,
+    `status ${pinned.status}, version ${JSON.stringify(pinned.version)}, curl ${pinned.curlCalled}`)
+
+  // THE REASON THIS GATE EXISTS AT ALL: a 2.x CLI exists, is newer, and would be
+  // resolved by a plain "newest tag" rule — and then the plugin could not talk to
+  // it. Both the pin and the resolution must refuse it.
+  const pinnedV2 = simulateOpencodeResolution({ dockerfileText, requested: '2.4.1', apiJson: OPENCODE_RELEASES })
+  check('OPENCODE-CLI-5: a pinned 2.x version is REFUSED (the plugin speaks the v1 API)',
+    pinnedV2.status !== 0 && pinnedV2.version === null && /speaks the v1 API/u.test(pinnedV2.output),
+    `status ${pinnedV2.status}: ${pinnedV2.output.trim().split('\n').at(-1) ?? ''}`)
+
+  const noV1 = simulateOpencodeResolution({
+    dockerfileText, requested: 'latest', apiJson: JSON.stringify([{ tag_name: 'v2.4.1' }, { tag_name: 'v2.0.0-rc.1' }])
+  })
+  check('OPENCODE-CLI-6: a response with no v1.* tag FAILS instead of falling back to a frozen release',
+    noV1.status !== 0 && noV1.version === null && /no v1\.\* release/u.test(noV1.output),
+    `status ${noV1.status}: ${noV1.output.trim().split('\n').at(-1) ?? ''}`)
+
+  const apiDown = simulateOpencodeResolution({ dockerfileText, requested: 'latest', apiFails: true })
+  check('OPENCODE-CLI-7: an unreachable releases API FAILS the build (curl exit 22 is not swallowed)',
+    apiDown.status !== 0 && apiDown.version === null && /GitHub releases API did not answer/u.test(apiDown.output),
+    `status ${apiDown.status}: ${apiDown.output.trim().split('\n').at(-1) ?? ''}`)
+
+  // The plugin's README gates on CLI >= 1.18.0 for the free tier; an older CLI in
+  // the image is a plugin that installs and then shows no models.
+  const tooOld = simulateOpencodeResolution({ dockerfileText, requested: '1.17.9', apiJson: OPENCODE_RELEASES })
+  const atFloor = simulateOpencodeResolution({ dockerfileText, requested: '1.18.0', apiJson: OPENCODE_RELEASES })
+  check('OPENCODE-CLI-8: the plugin free-tier floor (1.18.0) is enforced, and 1.18.0 itself passes',
+    OPENCODE_PLUGIN_FLOOR === '1.18.0'
+      && tooOld.status !== 0 && tooOld.version === null && /1\.18\.0 floor/u.test(tooOld.output)
+      && atFloor.status === 0 && atFloor.version === '1.18.0',
+    `1.17.9 → ${tooOld.status}, 1.18.0 → ${atFloor.status}`)
+
+  const runBlock = readOpencodeRunBlock(dockerfileText)
+  check('OPENCODE-CLI-9: the RUN queries the documented releases endpoint, not a cached or proxy URL',
+    runBlock.includes(OPENCODE_RELEASES_API_URL)
+      && OPENCODE_RELEASES_API_URL === 'https://api.github.com/repos/sst/opencode/releases?per_page=100',
+    OPENCODE_RELEASES_API_URL)
+  check('OPENCODE-CLI-10: the binary lands on /usr/local/bin/opencode (third in the plugin lookup order) and is verified',
+    runBlock.includes('/usr/local/bin/opencode --version')
+      && /tar -xzf [^\n]*\s+-C \/usr\/local\/bin opencode/u.test(runBlock),
+    'tar → /usr/local/bin/opencode, then --version')
+
+  check('OPENCODE-CLI-11: the tag helper accepts v1 tags only',
+    opencodeVersionFromTagName('v1.19.6') === '1.19.6'
+      && opencodeVersionFromTagName('v2.4.1') === null
+      && opencodeVersionFromTagName('process-daemon-v0.6.0') === null,
+    'three cases')
 }
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)

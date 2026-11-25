@@ -329,6 +329,47 @@ Pillow, pypdf, PyMuPDF…). This native layer ships WITHOUT a build-time gate on
 purpose: the apt resolution is the proof, and the wrappers are plain `sh` over
 `soffice --convert-to`.
 
+## OpenCode's free models — the CLI is in the image, the plugin is yours
+
+The image ships a working **OpenCode CLI** at `/usr/local/bin/opencode`, and
+**deliberately does not bundle** the plugin that drives it.
+
+```
+Plugins page → install dsh-opencode-connect        # a fresh install: one card, under Installed
+docker exec seek-harness dsh plugin install dsh-opencode-connect   # or from the CLI
+```
+
+[`dsh-opencode-connect`](https://github.com/sanser9/dsh-opencode-connect) registers the
+`opencode` model provider, so OpenCode's free models show up in the DSH model picker with
+no API key and no cost. Once installed it walks this list for its binary — nothing has to
+be configured, the third entry is the image's:
+
+```
+~/.local/share/dsh-opencode-connect/bin/opencode
+~/.local/bin/opencode
+/usr/local/bin/opencode                # <- the copy this image ships
+opencode on $PATH
+```
+
+| | |
+|---|---|
+| Binary | `/usr/local/bin/opencode` — the official release tarball (no npm, no postinstall, no download at runtime) |
+| Version | `OPENCODE_VERSION=latest` → the newest **v1** tag, resolved at **build** time |
+| Why v1 only | the plugin speaks the v1 API paths (`/session`, `/config/providers`, `/event`); OpenCode 2 moved them under `/api/...`, so `latest` skips every v2 tag, pre-releases included |
+| Pin it | `OPENCODE_VERSION=1.19.6` (`docker build --build-arg OPENCODE_VERSION=1.19.6 .`) |
+| Floor | the build refuses anything below **1.18.0** (the plugin's free-tier minimum) and refuses a 2.x pin |
+| Plugin | **not in this image** — no bundle, no seed step, no card; installing it is the user's step |
+
+Not bundling it is deliberate: it is a third-party bundle with its own release cadence,
+and the one thing it needs that a user cannot add later without root is a CLI it can find
+and drive — which is what the image supplies. The plugin spawns `opencode serve --port
+40961` itself on loopback (never published), and talks to it over HTTP.
+
+The build gate is offline and hard: `node tools/check-opencode-cli.mjs --check` extracts the
+Dockerfile's own resolution fragment and runs it under `sh` with a stub `curl`, against a
+fixture that puts two v2 tags above the v1 one — proving the pick, the skipped-tag log, both
+refusals (2.x pin, below floor) and both offline failures (API down, no v1 tag).
+
 ## OCR for image-only PDFs — when the text is only pixels
 
 The Office card above reads a PDF's text layer. This is what handles the PDF that has

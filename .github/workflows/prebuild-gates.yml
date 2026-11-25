@@ -283,9 +283,14 @@ jobs:
           # CUA_CLI_VERSION: the cua CLI's release, same shape as DSH_VERSION
           # above — "latest" lets the Dockerfile resolve the newest cua-sdk-v*
           # release at build time; a repo variable of the same name pins one.
+          # OPENCODE_VERSION: the OpenCode CLI's release, same shape — "latest"
+          # lets the Dockerfile resolve the newest v1 tag (v2 tags are skipped:
+          # dsh-opencode-connect speaks the v1 API) and fail the build if that
+          # lookup does not answer; a repo variable of the same name pins one.
           build-args: |
             DSH_VERSION=${{ github.event.inputs.dsh_version || 'latest' }}
             CUA_CLI_VERSION=${{ vars.CUA_CLI_VERSION || 'latest' }}
+            OPENCODE_VERSION=${{ vars.OPENCODE_VERSION || 'latest' }}
             WITH_VIRGL_QEMU=${{ github.event.inputs.virgl == 'false' && '0' || env.DSH_WITH_VIRGL_QEMU }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.tags.outputs.ref_tag }}

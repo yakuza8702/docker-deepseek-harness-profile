@@ -102,6 +102,14 @@ env:
   # Same shape as DSH_VERSION_PIN: an env here (or a repo variable of the same
   # name) is the only place the value lives.
   CUA_CLI_VERSION: "latest"
+  # The OpenCode CLI baked into the image — the Dockerfile's OPENCODE_VERSION ARG.
+  # "latest" (default) resolves the newest `v1.*` release from the GitHub releases
+  # API at BUILD time, skipping every v2 tag (dsh-opencode-connect — which the USER
+  # installs from the Plugins page — speaks the v1 API paths, and a 2.x CLI answers
+  # none of them). The build FAILS if that lookup fails, if no v1 tag exists, or if
+  # the version is below the plugin's 1.18.0 floor, so an image can never say
+  # "latest" and carry a CLI the plugin cannot drive. Set a version to pin.
+  OPENCODE_VERSION: "latest"
 
 jobs:
   check:
@@ -322,6 +330,7 @@ jobs:
             DSH_VERSION=${{ needs.check.outputs.dsh_version }}
             DSH_SOURCE_REF=${{ needs.check.outputs.source_ref }}
             CUA_CLI_VERSION=${{ vars.CUA_CLI_VERSION || env.CUA_CLI_VERSION }}
+            OPENCODE_VERSION=${{ vars.OPENCODE_VERSION || env.OPENCODE_VERSION }}
             # Opt-in GPU support: the distro QEMU plus qemu-system-modules-opengl
             # (the package that carries virtio-gpu-gl-pci) and virgl/Mesa.
             # DSH_CUA_VM_GPU=virgl at runtime then switches cua onto it.

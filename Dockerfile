@@ -1015,6 +1015,105 @@ RUN set -eux; \
     done
 
 # ---------------------------------------------------------------------
+# OPENCODE — the CLI that `dsh-opencode-connect` drives. THE PLUGIN ITSELF IS
+# NOT IN THIS IMAGE, ON PURPOSE.
+#
+# THE SPLIT. dsh-opencode-connect (https://github.com/sanser9/dsh-opencode-connect)
+# is a third-party bundle the USER installs from the Plugins page after boot. It
+# is not vendored, not declared in either installation manifest, not seeded into
+# a profile and has no card of its own: this image's whole obligation to it is a
+# WORKING CLI, because the plugin spawns `opencode serve --port 40961` itself and
+# talks the v1 HTTP API to it (`POST /session`, `GET /config/providers`,
+# `GET /event`).
+#
+# THE LOOKUP ORDER the plugin walks, which is why the binary goes to a SYSTEM
+# path and not under a $HOME (the image runs with HOME=/workspace):
+#     ~/.local/share/dsh-opencode-connect/bin/opencode
+#     ~/.local/bin/opencode
+#     /usr/local/bin/opencode                <- installed here
+#     opencode on $PATH
+#
+# V1 ONLY, AND THAT IS THE WHOLE TRICK. The plugin was written against the v1
+# root paths; OpenCode 2 moved the API under `/api/...` and ships its own client.
+# A 2.x CLI would be a CLI whose probe, catalog and message calls all fail. So
+# `latest` resolves the newest `v1.*` tag and SKIPS every v2 tag, pre-releases
+# included — the same rule opencode's own installer applies (`curl -fsSL
+# https://opencode.ai/install`) — and a pinned 2.x value is REJECTED with a
+# message instead of quietly shipping a CLI the plugin cannot drive.
+#
+# WHERE THE BINARY COMES FROM: the official GitHub release tarball, which is
+# what that installer downloads for headless Linux —
+# `opencode-linux-<x64|arm64>[-baseline][-musl].tar.gz`, one `opencode` file at
+# the archive root. No npm step, no postinstall script, nothing fetched at
+# runtime.
+#
+# WHY `--location`: github.com/sst/opencode now redirects to its new home and
+# the API answers `301 Moved Permanently` with a JSON body instead of the
+# release list. Without `-L` the tag grep matches nothing and the build fails
+# saying "no v1.* release" — true, but for the wrong reason.
+#
+# BASELINE / MUSL. A container reports the HOST's CPU, not its own, so a host
+# without AVX2 must take the release's `-baseline` build or the CLI dies with
+# SIGILL on its first vector op; a musl libc takes its own build. Both are the
+# installer's own `needs_baseline` / `is_musl` detection, reduced to the two
+# probes that matter here (`/proc/cpuinfo`, `ldd --version`).
+#
+# SIZE: the v1.19.6 x64 asset is 76 MiB compressed, 206 MiB unpacked (the CLI is
+# one self-contained binary, so there is nothing to strip back out).
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# WHICH RELEASE. `latest` (the default) is resolved at BUILD time: the newest
+# `v1.*` tag is taken from the GitHub releases API and the tarball is fetched
+# from that tag. The API lists releases newest-first, so the first v1 match is
+# the newest v1 release. Any other value is used as given (a leading `v` is
+# tolerated), which is what a reproducible or air-gapped build passes:
+#     docker build --build-arg OPENCODE_VERSION=1.19.6 .
+# Resolution FAILS the build when the API does not answer, when the payload
+# carries no v1 tag, when the resolved or pinned version is below the plugin's
+# 1.18.0 floor, or when a pinned value is a v2 release. Silently falling back is
+# how an image says "latest" while shipping a CLI the plugin cannot talk to.
+#
+# tools/check-opencode-cli.mjs executes THIS RUN's resolution fragment against a
+# fixture, offline, so the rules above are proved without a docker daemon.
+# ---------------------------------------------------------------------
+ARG OPENCODE_VERSION=latest
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) oc_asset="x64" ;; \
+      arm64) oc_asset="arm64" ;; \
+      *) echo "opencode: unsupported architecture $arch"; exit 1 ;; \
+    esac; \
+    oc_version="${OPENCODE_VERSION}"; \
+    if [ "$oc_version" = "latest" ]; then \
+      oc_api="$(curl -fsSL --retry 3 --location -H 'Accept: application/vnd.github+json' 'https://api.github.com/repos/sst/opencode/releases?per_page=100')" || { echo "opencode: the GitHub releases API did not answer; pass --build-arg OPENCODE_VERSION=<version> to build without it"; exit 1; }; \
+      oc_v2="$(printf '%s\n' "$oc_api" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v[2-9][0-9]*\.[0-9][^"]*"' | sed -e 's/.*"v//' -e 's/"$//' | paste -sd' ' -)"; \
+      oc_version="$(printf '%s\n' "$oc_api" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v1\.[0-9][^"]*"' | head -n 1 | sed -e 's/.*"v//' -e 's/"$//')"; \
+      [ -n "$oc_version" ] || { echo "opencode: no v1.* release in the GitHub releases API response (has the tag scheme changed?)"; exit 1; }; \
+      echo "opencode: OPENCODE_VERSION=latest resolved to ${oc_version} (v1 API; skipped v2 tags: ${oc_v2:-none})"; \
+    else \
+      oc_version="${oc_version#v}"; \
+    fi; \
+    case "$oc_version" in \
+      2.*|[3-9]*|[1-9][0-9]*) echo "opencode: OPENCODE_VERSION=${oc_version} is an OpenCode 2 (or later) release and dsh-opencode-connect speaks the v1 API; drop the pin to take the newest v1 tag"; exit 1 ;; \
+    esac; \
+    [ "$(printf '%s\n%s\n' '1.18.0' "$oc_version" | sort -V | head -n 1)" = '1.18.0' ] || { echo "opencode: ${oc_version} is below the 1.18.0 floor dsh-opencode-connect needs for the free models"; exit 1; }; \
+    oc_target="${oc_asset}"; \
+    if [ "$oc_asset" = "x64" ] && ! grep -qw avx2 /proc/cpuinfo 2>/dev/null; then oc_target="${oc_target}-baseline"; fi; \
+    if ldd --version 2>&1 | grep -qi musl; then oc_target="${oc_target}-musl"; fi; \
+    url="https://github.com/sst/opencode/releases/download/v${oc_version}/opencode-linux-${oc_target}.tar.gz"; \
+    echo "opencode: fetching ${url}"; \
+    curl -fsSL --retry 3 --location -o /tmp/opencode.tgz "$url"; \
+    tar -xzf /tmp/opencode.tgz -C /usr/local/bin opencode; \
+    chmod 0755 /usr/local/bin/opencode; \
+    rm -f /tmp/opencode.tgz; \
+    oc_reported="$(/usr/local/bin/opencode --version)"; \
+    [ -n "$oc_reported" ] || { echo "opencode: /usr/local/bin/opencode --version printed nothing"; exit 1; }; \
+    [ "$oc_reported" = "$oc_version" ] || { echo "opencode: /usr/local/bin/opencode reports ${oc_reported}, the tarball was ${oc_version}"; exit 1; }; \
+    [ "$(printf '%s\n%s\n' '1.18.0' "$oc_reported" | sort -V | head -n 1)" = '1.18.0' ] || { echo "opencode: ${oc_reported} is below the 1.18.0 floor dsh-opencode-connect needs"; exit 1; }; \
+    echo "opencode: /usr/local/bin/opencode ${oc_reported} (v1 API; plugin floor 1.18.0)"
+
+# ---------------------------------------------------------------------
 # REA GATE. The kit is five files joined only by strings: the shell script the
 # supervisor looks up by name, the supervisor's call sites, this Dockerfile's
 # COPY, and the plugin's `rea: true`. None of that is type-checked, so a rename
