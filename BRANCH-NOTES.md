@@ -522,19 +522,43 @@ re-download Ghidra, and fixing a JADX pin must not re-run Xorg. A computer
 created without `rea: true` never runs the script at all; Start on a RE
 computer re-runs it, and the marker makes that a no-op when nothing changed.
 
+### Updating a kit that is already installed
+
+The marker guard is a **whole-line** match (`grep -qx "version=$VERSION"`), which
+is what makes a re-run cheap — and what makes "just run it again" useless as an
+update: a disk provisioned today answers the guard and the script exits before
+npm is reached, so the button would report success and change nothing. The
+tempting fix, bumping `REA_MARKER_VERSION`, is the wrong one: the NEXT ordinary
+run (Start, which sends no environment) would then mismatch and re-enter the
+whole installer body, turning one update into a full pass forever.
+
+So the update is a **one-shot bypass**: `REA_FORCE_UPDATE=1` skips the guard for
+exactly one run, the marker is rewritten with the same `version=`, and the next
+Start is a no-op again. The supervisor turns the route's boolean into a FROZEN
+constant, `REA_UPDATE_ENV = { REA_FORCE_UPDATE: '1', REA_AGENTS_VERSION: 'latest' }`,
+and never a map taken from the request: `runGuestScript` interpolates env straight
+into `sudo -n env KEY=VALUE … bash`, so a request-supplied environment would be a
+root shell. With `update: true` the op also owns the step list (`['rea']`), since
+otherwise an update click could queue an Android install. `rea-agents` itself is
+unpinned again (`REA_AGENTS_VERSION` defaults to `latest`, a version string still
+pins it), and the supervisor parses the same `[rea] OK … rea=…` line for the
+resolved version, which the panel prints beside the badge — that is how an update
+proves it landed instead of just proving a call happened.
+
 ### The 40 GB floor exists in three places
 
 Ghidra unpacks to ~1.4 GB; with the JDK, JADX, Node and `rea-agents` the kit is
 roughly 3.5 GB installed. On a stock 20 GB disk the unzip dies with `ENOSPC`,
 which looks like a corrupt download, not a sizing decision. So:
 
-* **the panel** raises the Disk field to 40 the moment *Enable REA* is ticked,
+* **the panel** raises the Disk field to 40 the moment *Install rea* is ticked,
   and floors the input at 40 while it is ticked (client-side, so the number on
   screen is the number sent);
 * **the supervisor** clamps independently — `REA_MIN_DISK_GB = 40`,
-  `effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb`
-  — and returns `diskGbRaised`, so a tool-created computer is floored even with
-  no panel in the loop;
+  `reaWanted(meta)` (`reaRequested ?? rea`) decides, so the floor survives a
+  failed install and a queued one, and `effectiveDiskGbFor` returns
+  `Math.max(configured, REA_MIN_DISK_GB)` — and returns `diskGbRaised`, so a
+  tool-created computer is floored even with no panel in the loop;
 * **the tool schema** says `Disk size in GB (Android and REA: 40)` and the `rea`
   property says it is raised to 40.
 
@@ -562,8 +586,11 @@ section is a closure:
   session that never opens the page and cannot keep the process alive;
 * the cheap write-through points — `/cua/state` (which the panel already polls),
   `/cua/create`, `/cua/start`, `/cua/delete`, and `cua_vm_create` — call
-  `refreshReaCache()`, so creating a RE computer adds the paragraph immediately
-  and deleting the last one removes it;
+  `refreshReaCache()`, so deleting the last RE computer removes the paragraph on
+  the next poll. A create no longer ADDS it immediately: the cache is filtered on
+  the VERIFIED `rea`, and the kit installs as a background job, so the paragraph
+  appears when the row settles (`rea: true` after `rea doctor` passes) — the
+  create's own answer says "installing in the background" instead;
 * a refresh that fails does not retry per assembly: it moves `at` forward and
   keeps the names it had.
 
@@ -576,12 +603,14 @@ One or more RE computers, and exactly one extra paragraph names them.
 path used to write a **fresh literal** for the rebuilt entry — dropping
 `gpu`, `android`, `diskGb` and `image` — so a RE computer that recovered from a
 dead QEMU process came back as a plain desktop and quietly lost its kit. Both
-literals now start from `...(known || {})` and the recovery path re-provisions
-with `known?.rea === true` (`rea: rea === true` is kept in the created row, so
-the next Start sees it). One thing is still out of scope: the recovered disk is
-the base image, so a computer bigger than 20 GB does **not** get its disk grown
-back automatically — `cua_vm_disk` is the explicit fix, and the size is still in
-the row for the panel to show before it is grown.
+literals now start from `...(known || {})`, the rebuild re-applies the disk floor
+with `regrowDiskAfterRebuild` (the disk is the base image at the stock size, so
+the 40 GB floor has to be re-applied before the kit is asked to fit), and the kit
+itself is QUEUED — `scheduleProvisioning(name, ['rea'], { reason: 'recover',
+holder: 'ensure' })`, the holder being the recovery's own lock — rather than
+installed inside the recovery answer. The row's VERIFIED
+`rea`/`reaOk` are cleared (the rebuilt disk carries no kit) and `reaRequested`
+stays, which is what both the queue decision (`reaWanted`) and the floor read.
 
 ### The build gate
 

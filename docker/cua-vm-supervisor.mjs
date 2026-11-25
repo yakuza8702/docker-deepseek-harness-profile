@@ -1528,9 +1528,13 @@ async function provisionAndroidGuest(name, { api = 35, variant = 'google_apis', 
  * download), hence an hour of headroom: a 15-minute timeout here would kill
  * healthy downloads on a slow link and then report a provisioning failure that
  * was really a too-short deadline.
+ *
+ * `env` is the ONE thing a caller may vary: the update path passes
+ * REA_FORCE_UPDATE=1 so /var/lib/cua-rea cannot turn the run into a five-line
+ * early exit. It is never a request body — see REA_UPDATE_ENV.
  */
-async function provisionReaGuest(name) {
-  const result = await runGuestScript(name, REA_SCRIPT, {}, { timeoutSec: 3600, timeoutMs: 3900000 })
+async function provisionReaGuest(name, env = {}) {
+  const result = await runGuestScript(name, REA_SCRIPT, env, { timeoutSec: 3600, timeoutMs: 3900000 })
   const output = `${result.stdout}${result.stderr}`.trim()
   // A provisioned disk answers `[rea] already provisioned (v1)` and exits 0,
   // exactly like the desktop layer's `[provision] already provisioned`.
@@ -1547,8 +1551,335 @@ async function provisionReaGuest(name) {
   const node = (/\[rea\] OK[^\n]*\bnode=(v[0-9][^\s]*)/u.exec(output) || [])[1]
     || (/\bnode=(v[0-9][^\s]*)/u.exec(output) || [])[1]
     || 'unknown'
+  // The kit's own version, off the SAME OK line (`rea=6.10.1`). `node` cannot
+  // answer it, and it is what makes an UPDATE visible on the row instead of a
+  // button that reports nothing: the panel prints it beside the badge.
+  const reaVersion = (/\[rea\] OK[^\n]*\brea=(v?[0-9][^\s]*)/u.exec(output) || [])[1] || undefined
   log(`rea: ${name} ready (node ${node})`)
-  return { ok: true, node, output }
+  return { ok: true, node, reaVersion, output }
+}
+
+/* ------------------------------------------------------------------ *
+ * BACKGROUND PROVISIONING: A CREATE RETURNS WHEN THE VM IS UP
+ *
+ * The REA kit (a 1.4 GB Ghidra download) and the Android SDK (several GB) are
+ * the two slow layers of a create. Running them inside the create's answer made
+ * the tool call a quarter of an hour long, the panel spin for the same time, and
+ * a browser reload lose the whole progress. They now run as an IN-MEMORY job
+ * that starts right after the desktop is ready, and the row is the progress
+ * bar: `provisioning=<stage>` while it runs, then `rea`/`reaOk`/`reaError` (and
+ * the android twins) once it finishes — the fields `cua_vm_status`, the panel
+ * badges and the retry button read.
+ *
+ * The job deliberately takes NO `vm:<name>` lock. A create/exec/start may hold
+ * that lock for minutes, and a background download must not queue behind it —
+ * the job only ever writes the row through the short `@registry` critical
+ * section. Its writes are token-guarded by the row's `createdAt`, so a delete
+ * followed by a re-create of the same name can never be stamped by the old job.
+ * ------------------------------------------------------------------ */
+const REA_RETRY_HINT = 'Call cua_vm_start (idempotent), Retry install or Update rea in the panel; the script is safe to re-run.'
+const ANDROID_RETRY_HINT = 'Call cua_vm_android, or Retry install in the panel; the script is safe to re-run.'
+const PROVISIONING_STEPS = new Set(['desktop', 'rea', 'android'])
+/**
+ * THE UPDATE ENVIRONMENT — a FROZEN CONSTANT, not a passthrough.
+ *
+ * `runGuestScript` interpolates an env map straight into
+ * `sudo -n env KEY=VALUE … bash`, so a map taken from a request body would be a
+ * remote shell. The route sends a BOOLEAN (`update: true`); this is the only map
+ * it can become. `REA_AGENTS_VERSION=latest` is spelled out on purpose: it has to
+ * move a disk installed by an image whose own default was a pin.
+ */
+const REA_UPDATE_ENV = Object.freeze({ REA_FORCE_UPDATE: '1', REA_AGENTS_VERSION: 'latest' })
+/**
+ * name → { token, steps, stage, startedAt, cancelled, reason }. MEMORY ONLY: a
+ * job is this process's work, so a restart has nothing to resume, and the boot
+ * sweep (sweepStaleProvisioning) turns the abandoned row into an honest failure.
+ */
+const PROVISION_JOBS = new Map()
+
+/** The job running for this computer, or null. */
+function provisioningBusy(name) {
+  return PROVISION_JOBS.get(name) ?? null
+}
+
+/**
+ * THE OTHER HALF OF THE BUSY GUARD — the SYNCHRONOUS installer legs.
+ *
+ * `provisioningBusy` only sees background jobs. The foreground legs (a start's
+ * RE kit, the synchronous `provision`, `cua_vm_android`) hold `vm:<name>` and run
+ * the same installers, and a background job holds no lock at all — so nothing
+ * excluded a queued job from a start that was halfway through the RE kit, and
+ * two npm/Ghidra installs could race /opt/node22, /opt/ghidra and the npm global
+ * root. The HOLDER NAME is the evidence: it is set for the whole duration of the
+ * op, so a request that arrives between two awaits can refuse instead of racing.
+ *
+ * Refusing is deliberately the whole fix: giving background jobs a lock would
+ * make a 15-minute install queue behind an exec, which is the defect this
+ * mechanism exists to remove.
+ */
+const INSTALLER_HOLDERS = new Set(['vmStart', 'provision', 'vmAndroid', 'vmCreate', 'ensure'])
+/**
+ * `except` is the holder of the CALLER'S OWN chain (a name, or a list of names
+ * when two paths can legitimately be the caller). Create and ensure queue the
+ * job while they still hold `vm:<name>` (create calls scheduleProvisioning after
+ * provisionGuest, inside its own lock), so without it their own lock would read
+ * as "another installer is running" and the job would never be queued. That is
+ * TWO names, not one: `cua_vm_create` holds `vmCreate`, but the same create
+ * reached through `cua_vm_ensure`/`ensure` holds `ensure`, and a first-ever
+ * ensure with `rea: true` is exactly the path that would otherwise never install
+ * the kit. A second create/ensure for the same name cannot be the caller: it is
+ * waiting on that very lock.
+ */
+function installerLockHolder(name, except = null) {
+  const facts = vmLockFacts(name)
+  if (facts === null) return null
+  const holder = String(facts.heldBy ?? '')
+  const own = Array.isArray(except) ? except : (except === null ? [] : [except])
+  if (own.includes(holder)) return null
+  return INSTALLER_HOLDERS.has(holder) ? facts : null
+}
+
+/**
+ * Queue the given layers for a computer and return the job (or null when there
+ * is nothing to do). Idempotent per name: a second call while a job is running
+ * answers THAT job instead of starting a competing one.
+ */
+function scheduleProvisioning(name, steps, { reason = 'create', holder = null, reaEnv = null } = {}) {
+  const wanted = [...new Set((Array.isArray(steps) ? steps : []).filter((step) => PROVISIONING_STEPS.has(step)))]
+  if (wanted.length === 0) return null
+  const existing = PROVISION_JOBS.get(name)
+  if (existing !== undefined) return existing
+  // A foreground installer owns the same directories. Queueing behind it would
+  // start a SECOND installer the moment this lock is released, so refuse here
+  // too — the caller (`provision` async) turns this null into a refusal with the
+  // holder's name, and a create/ensure cannot even reach this point while a
+  // start holds the lock.
+  const foreground = installerLockHolder(name, holder)
+  if (foreground !== null) {
+    log(`provision: ${name} was not queued (${foreground.heldBy} has held vm:${name} for ${Math.round((foreground.heldMs ?? 0) / 1000)} s and may be installing a layer)`)
+    return null
+  }
+  let row
+  try {
+    row = readRegistry().vms[name] ?? null
+  } catch (error) {
+    log(`provision: ${name} was not queued (registry unreadable: ${error?.message ?? error})`)
+    return null
+  }
+  // A Windows computer has no guest layers to install, and a computer that is
+  // still installing/booting has no shell to install them through.
+  if (row === null || row.kind === 'windows') return null
+  if (row.state === 'installing' || row.state === 'booting') return null
+  const job = {
+    token: String(row.createdAt ?? ''),
+    steps: wanted,
+    env: reaEnv,
+    stage: null,
+    startedAt: new Date().toISOString(),
+    cancelled: false,
+    reason
+  }
+  PROVISION_JOBS.set(name, job)
+  log(`provision: ${name} queued ${wanted.join(' → ')} (${reason})`)
+  void runProvisioningJob(name, job).catch((error) => log(`provision: ${name} job failed (${error?.message ?? error})`))
+  return job
+}
+
+/**
+ * Patch the row from a background job. `undefined` in `patch` DELETES the field
+ * (a finished job must leave no `provisioning` behind), and a write against a
+ * row whose `createdAt` no longer matches the job's token is dropped: that row
+ * is a different computer that happens to share the name.
+ */
+async function writeProvisioningRow(name, job, patch) {
+  const token = job?.token
+  await mutateRegistry((fresh) => {
+    const row = fresh.vms[name]
+    if (!row) return
+    if (token !== undefined && row.createdAt !== token) return
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) delete row[key]
+      else row[key] = value
+    }
+  })
+}
+
+/** Record a REA run: `rea` IS the verified field, `reaRequested` the intent. */
+async function recordReaResult(name, result, token) {
+  // A null result means "this computer did not ask for REA" (the call sites
+  // pass `reaWanted(meta) ? await provisionReaGuest(name) : null`); there is
+  // nothing to record and `null.ok` is not a failure.
+  if (result === null || result === undefined) return
+  const patch = {
+    rea: result.ok === true,
+    reaOk: result.ok === true,
+    reaRequested: true,
+    // The kit version this run resolved. `writeProvisioningRow` deletes on
+    // undefined, so a FAILURE clears the version instead of leaving the last
+    // good one beside a "REA failed" badge.
+    reaVersion: result.reaVersion,
+    reaCheckedAt: new Date().toISOString()
+  }
+  if (result.ok === true) {
+    patch.reaError = undefined
+    patch.reaErrorHint = undefined
+  } else {
+    patch.reaError = String(result.output ?? '').slice(-1500)
+    patch.reaErrorHint = REA_RETRY_HINT
+  }
+  await writeProvisioningRow(name, { token }, patch)
+}
+
+/** The Android twin of recordReaResult. */
+async function recordAndroidResult(name, result, token) {
+  if (result === null || result === undefined) return
+  const patch = {
+    android: result.ok === true,
+    androidOk: result.ok === true,
+    androidRequested: true,
+    androidCheckedAt: new Date().toISOString()
+  }
+  if (result.ok === true) {
+    patch.androidError = undefined
+    patch.androidErrorHint = undefined
+  } else {
+    patch.androidError = String(result.output ?? '').slice(-1500)
+    patch.androidErrorHint = ANDROID_RETRY_HINT
+  }
+  await writeProvisioningRow(name, { token }, patch)
+}
+
+/** The desktop layer: verified state only, no retry hint (its output is advice). */
+async function recordDesktopResult(name, result, token) {
+  if (result === null || result === undefined) return
+  await writeProvisioningRow(name, { token }, {
+    desktopOk: result.ok === true,
+    desktopError: result.ok === true ? undefined : String(result.output ?? '').slice(-1500)
+  })
+}
+
+/**
+ * Run one queued job. Each step publishes its name BEFORE it starts (so the
+ * panel says `provisioning=rea` while the download runs) and its own result
+ * after; the `finally` clears the job and stamps `provisionedAt` even when a
+ * step threw, because a row stuck on `provisioning=rea` is the failure this
+ * whole mechanism exists to make impossible.
+ *
+ * EVERY STEP IS ITS OWN TRY/CATCH. A throw in the RE kit (a `provisionReaGuest`
+ * bug, an ENOSPC in the row write) used to abort the loop, so an Android step
+ * queued behind it never ran and the row kept the PREVIOUS attempt's error next
+ * to the new `provisioning=rea` badge. Now the step is recorded as a failure and
+ * the loop continues, and the step's old error is cleared before it starts so
+ * "installing" and "failed" can never be on screen at once.
+ */
+async function runProvisioningJob(name, job) {
+  try {
+    for (const step of job.steps) {
+      if (job.cancelled === true) break
+      job.stage = step
+      // A RETRY STARTS CLEAN. The badge says "REA…" from here on; leaving the
+      // last attempt's `reaError` in place put "REA failed" beside it.
+      const clear = step === 'rea'
+        ? { reaError: undefined, reaErrorHint: undefined }
+        : step === 'android'
+          ? { androidError: undefined, androidErrorHint: undefined }
+          : { desktopError: undefined }
+      await writeProvisioningRow(name, job, {
+        ...clear,
+        provisioning: step,
+        provisioningSteps: job.steps,
+        provisioningStartedAt: job.startedAt
+      })
+      try {
+        if (step === 'rea') {
+          await recordReaResult(name, await provisionReaGuest(name, job.env ?? {}), job.token)
+        } else if (step === 'android') {
+          await recordAndroidResult(name, await provisionAndroidGuest(name, {}), job.token)
+        } else if (step === 'desktop') {
+          const gpu = readRegistry().vms[name]?.gpu === true
+          await recordDesktopResult(name, await provisionGuest(name, { gpu }), job.token)
+        }
+      } catch (error) {
+        const message = error?.message ?? error
+        log(`provision: ${name} ${step} threw (${message}); recorded as a failure, continuing with the remaining steps`)
+        const failed = { ok: false, output: `step threw: ${message}` }
+        if (step === 'rea') await recordReaResult(name, failed, job.token)
+        else if (step === 'android') await recordAndroidResult(name, failed, job.token)
+        else if (step === 'desktop') await recordDesktopResult(name, failed, job.token)
+      }
+      if (job.cancelled === true) break
+    }
+  } catch (error) {
+    // A backstop for a failure OUTSIDE a step (the row write itself): the job
+    // stops here, and the `finally` below still clears `provisioning`.
+    log(`provision: ${name} job aborted by ${job.stage ?? 'a job-level'} error (${error?.message ?? error})`)
+  } finally {
+    // IDENTITY, NOT NAME. A destroy cancels and deletes the entry, a recreate
+    // can schedule a NEW job for the same name before this one finishes — and an
+    // unconditional delete here would erase the SUCCESSOR, leaving a running
+    // installer invisible to `provisioningBusy`.
+    if (PROVISION_JOBS.get(name) === job) PROVISION_JOBS.delete(name)
+    try {
+      await writeProvisioningRow(name, job, {
+        provisioning: undefined,
+        provisioningSteps: undefined,
+        provisioningStartedAt: undefined,
+        provisionedAt: new Date().toISOString()
+      })
+    } catch (error) {
+      log(`provision: ${name} could not be marked finished (${error?.message ?? error})`)
+    }
+  }
+}
+
+/**
+ * BOOT SWEEP: a job died with the previous process, so a row that still says
+ * `provisioning` is describing work nobody is doing. Turn it into the failure it
+ * is — with the hint that makes the retry obvious — instead of a spinner that
+ * never stops. Runs once, outside any lock, at startup.
+ */
+function sweepStaleProvisioning() {
+  let registry
+  try {
+    registry = readRegistry()
+  } catch (error) {
+    log(`provision: stale sweep skipped (registry unreadable: ${error?.message ?? error})`)
+    return 0
+  }
+  const stale = Object.entries(registry.vms).filter(([name, row]) => row?.provisioning !== undefined && !PROVISION_JOBS.has(name))
+  if (stale.length === 0) return 0
+  const at = new Date().toISOString()
+  return mutateRegistry((fresh) => {
+    for (const [name] of stale) {
+      const row = fresh.vms[name]
+      if (!row || row.provisioning === undefined) continue
+      // `provisioning` is only ever written as a STAGE STRING by
+      // writeProvisioningRow (the array in a create/ensure ANSWER is never
+      // persisted), so there is no array form to unwrap here.
+      const stage = String(row.provisioning)
+      delete row.provisioning
+      delete row.provisioningSteps
+      delete row.provisioningStartedAt
+      if (stage === 'rea') {
+        row.rea = false
+        row.reaOk = false
+        row.reaError = 'the supervisor restarted during the install'
+        row.reaErrorHint = REA_RETRY_HINT
+        row.reaCheckedAt = at
+      } else if (stage === 'android') {
+        row.android = false
+        row.androidOk = false
+        row.androidError = 'the supervisor restarted during the install'
+        row.androidErrorHint = ANDROID_RETRY_HINT
+        row.androidCheckedAt = at
+      }
+      log(`provision: ${name} was left provisioning=${stage || 'unknown'} by a previous run; marked failed with a retry hint`)
+    }
+    return stale.length
+  }).catch((error) => {
+    log(`provision: stale sweep write failed (${error?.message ?? error})`)
+    return 0
+  })
 }
 
 /**
@@ -2318,6 +2649,23 @@ const REA_SCRIPT = String(process.env.DSH_CUA_REA_SCRIPT || '/usr/local/bin/cua-
  */
 const REA_MIN_DISK_GB = 40
 /**
+ * WHAT THE USER ASKED FOR, AS OPPOSED TO WHAT IS INSTALLED.
+ *
+ * `rea` used to mean both, so a create that queued the kit (or a kit that
+ * failed) was indistinguishable from "never asked for". `reaRequested` is the
+ * intent and survives failures; `rea`/`reaOk` are written only by a run that
+ * passed `rea doctor`. Rows written before the split have neither field, so the
+ * fallback keeps their old meaning (`rea: true` = wanted and verified).
+ */
+function reaWanted(meta) {
+  return (meta?.reaRequested ?? meta?.rea) === true
+}
+
+function androidWanted(meta) {
+  return (meta?.androidRequested ?? meta?.android) === true
+}
+
+/**
  * The disk a record must actually have: the REA floor for a RE computer, the
  * recorded size (20 GB when unset) otherwise. `cua sb create` always builds the
  * stock disk, so every rebuild has to re-apply this — the same floor vmCreate
@@ -2325,7 +2673,7 @@ const REA_MIN_DISK_GB = 40
  */
 function effectiveDiskGbFor(meta) {
   const configured = Number(meta?.diskGb) > 0 ? Number(meta.diskGb) : 20
-  return meta?.rea === true ? Math.max(configured, REA_MIN_DISK_GB) : configured
+  return reaWanted(meta) ? Math.max(configured, REA_MIN_DISK_GB) : configured
 }
 
 /**
@@ -2336,7 +2684,7 @@ function effectiveDiskGbFor(meta) {
  */
 async function regrowDiskAfterRebuild(name, meta) {
   const needGb = effectiveDiskGbFor(meta)
-  if (meta?.rea !== true || needGb <= 20) return null
+  if (!reaWanted(meta) || needGb <= 20) return null
   try {
     const grown = await growGuestDisk(name, needGb)
     // A refusal is not "already big enough" (WP-9.1 made the difference
@@ -3049,6 +3397,18 @@ async function destroyVmLocked(name, { reason = 'delete', deleteContainer = true
   // a QMP close event from the kill below would otherwise write `error` over the
   // removal.
   dismantleQmpStateWatcher(name)
+  // A BACKGROUND PROVISIONING JOB OUTLIVES THE ROW IF IT IS NOT STOPPED. Cancel
+  // it FIRST. What the flag buys is bounded and worth stating precisely: it stops
+  // every FUTURE step and the final row write, so a queued android step cannot
+  // start on a disk that is being unlinked. It does NOT abort the step already in
+  // flight (the installer is a child `cua sb exec`), which finishes or dies with
+  // the sandbox — and the token guard drops any row write that still lands.
+  const job = PROVISION_JOBS.get(name)
+  if (job !== undefined) {
+    job.cancelled = true
+    PROVISION_JOBS.delete(name)
+    log(`destroy ${name}: cancelled the ${job.stage ?? 'queued'} provisioning job`)
+  }
   const items = []
   // THE ROW DECIDES WHAT KIND OF COMPUTER THIS IS, before anything is removed:
   // a `kind: 'windows'` row has NO cua sandbox, so `cua sb rm --local <name>` is
@@ -3801,6 +4161,8 @@ async function createLinuxNow(spec, warnings = []) {
   const { name, rea } = spec
   const wantedDiskGb = Number(spec.diskGb) > 0 ? Number(spec.diskGb) : 20
   const effectiveDiskGb = rea === true ? Math.max(wantedDiskGb, REA_MIN_DISK_GB) : wantedDiskGb
+  const reaRequested = rea === true
+  const androidRequested = spec.android === true
   const blocked = resolutionProblem(DESKTOP_RESOLUTION, RESOLUTION_ALLOW_SCALE)
   if (blocked !== null) return fail(blocked)
 
@@ -3822,8 +4184,15 @@ async function createLinuxNow(spec, warnings = []) {
       gpu: spec.gpu,
       // Kept so the panel can show a GPU / Android / REA indicator per
       // computer long after creation, without asking the guest.
-      android: spec.android,
-      rea: rea === true,
+      // REQUESTED vs INSTALLED: `rea`/`android` are the verified fields, and a
+      // create cannot honestly claim either — the install is a background job
+      // from here on. The requested fields are what the badges, the prompt gate
+      // and cua_vm_status read while that job runs, and what makes a failure
+      // retryable instead of reading as "never asked".
+      android: false,
+      androidRequested: spec.android === true,
+      rea: false,
+      reaRequested: rea === true,
       // The disk this computer was actually given, after the REA floor.
       diskGb: effectiveDiskGb,
       // `disk-over-policy` travels with the row too, so the panel can still
@@ -3848,9 +4217,13 @@ async function createLinuxNow(spec, warnings = []) {
   await recordGuestShare(name)
   let disk = null
   if (effectiveDiskGb > 20) disk = await growGuestDisk(name, effectiveDiskGb)
-  const reaResult = rea === true ? await provisionReaGuest(name) : null
-  let androidResult = null
-  if (spec.android === true) androidResult = await provisionAndroidGuest(name, {})
+  // THE SLOW LAYERS LEAVE THE ANSWER. The RE kit (~2 GB of downloads) and the
+  // Android SDK (several GB) used to run here, which made a create take a
+  // quarter of an hour and gave the caller no way to tell "still working" from
+  // "hung". They are a background job now; the row carries the progress and the
+  // result. A create WITHOUT either flag does exactly what it did before.
+  const steps = [...(reaRequested ? ['rea'] : []), ...(androidRequested ? ['android'] : [])]
+  const job = steps.length === 0 ? null : scheduleProvisioning(name, steps, { reason: 'create', holder: ['vmCreate', 'ensure'] })
   return ok({
     name,
     kind: 'linux',
@@ -3868,10 +4241,31 @@ async function createLinuxNow(spec, warnings = []) {
     // A sparse disk bigger than the quota is CREATED (never refused); the
     // warning says the guest may hit the real ceiling.
     warnings: warnings.length > 0 ? warnings : undefined,
-    rea: reaResult ? reaResult.ok : undefined,
-    android: androidResult ? androidResult.ok : undefined,
+    // NOT `rea: false`: the install has not run yet, and a caller that reads
+    // `rea === false` would think it FAILED. Requested says why the row will
+    // flip later; `provisioning` says what is queued right now.
+    rea: undefined,
+    android: undefined,
+    reaRequested: reaRequested || undefined,
+    androidRequested: androidRequested || undefined,
+    provisioning: job === null ? undefined : job.steps,
     gpu: spec.gpu,
-    output: `${(provisioned.output || '').slice(-1200)}${reaResult ? `\n${(reaResult.output || '').slice(-1200)}` : ''}${androidResult ? `\n${(androidResult.output || '').slice(-1200)}` : ''}`
+    notes: [
+      provisioned.ok ? null : 'Guest provisioning did not finish — the desktop may be incomplete; see the output below.',
+      reaRequested && job !== null ? 'REA is installing in the background; the row flips rea=yes only after `rea doctor --provider ghidra` passes, and carries reaError + a retry hint if it fails.' : null,
+      // A REFUSED QUEUE IS SAID OUT LOUD. The kit was asked for and nothing is
+      // installing it (another installer holds the computer); silence here
+      // would read as "queued" until the row was checked.
+      reaRequested && job === null ? 'REA install could not be queued; use Retry install in the panel or cua_vm_start.' : null,
+      androidRequested && job === null ? 'Android could not be queued; use Retry install in the panel or cua_vm_android.' : null,
+      // "Queued BEHIND REA" is only true when REA is queued too: an
+      // Android-only create used to be told it was waiting for a kit it never
+      // asked for.
+      androidRequested && job !== null
+        ? (reaRequested ? 'Android is queued behind REA and installs in the background.' : 'Android is installing in the background.')
+        : null
+    ].filter((line) => line !== null),
+    output: (provisioned.output || '').slice(-1200)
   })
 }
 
@@ -4316,7 +4710,19 @@ async function startFromCheckpoint(name, meta) {
   // WP-9.3: a cold boot re-provisions, so it can degrade the GPU just like a
   // create can — and this is the path a user takes after a shutdown.
   const gpuDegraded = await recordGpuRenderer(name, noteGpuRenderer(name, { gpu: meta.gpu === true, renderer: provisioned.renderer }))
-  const rea = meta.rea === true ? await provisionReaGuest(name) : null
+  // THE BACKGROUND JOB OWNS THE KIT WHILE IT RUNS. It deliberately holds no
+  // `vm:<name>` lock (see scheduleProvisioning), so a start does not exclude it
+  // — and running the installer twice would race /opt/node22, /opt/ghidra and
+  // the npm global root. Skip the synchronous leg and let the job write the
+  // result; `recordReaResult(name, null)` is a no-op, so nothing is clobbered.
+  const reaJob = provisioningBusy(name)
+  // ONLY A JOB THAT ACTUALLY INSTALLS REA REPLACES THIS LEG. An Android-only
+  // job leaves /opt/node22 and /opt/ghidra untouched, so skipping here would
+  // silently drop the kit the user asked for.
+  const reaJobCoversRea = reaJob !== null && Array.isArray(reaJob.steps) && reaJob.steps.includes('rea')
+  if (reaJobCoversRea) log(`start: ${name} is already installing REA in the background; the kit result comes from that job`)
+  const rea = !reaJobCoversRea && reaWanted(meta) ? await provisionReaGuest(name) : null
+  await recordReaResult(name, rea)
   return ok({
     name,
     state: 'ready',
@@ -4324,6 +4730,9 @@ async function startFromCheckpoint(name, meta) {
     bootedFrom: from,
     provisioned: provisioned.ok,
     rea: rea ? rea.ok : undefined,
+    // The hint, not the log: a start that fails the kit must tell the caller
+    // what to do about it, and the row already carries the tail.
+    reaErrorHint: rea && rea.ok === false ? REA_RETRY_HINT : undefined,
     renderer: provisioned.renderer,
     gpuDegraded: gpuDegraded ?? undefined,
     detail: from === 'checkpoint'
@@ -8265,6 +8674,15 @@ const handlers = {
                 }
                 delete fresh.vms[name].restoreFrom
                 delete fresh.vms[name].mayBeTorn
+                // The rebuilt disk is the base image: whatever kit the old
+                // disk carried is gone, so the VERIFIED field must stop
+                // claiming one. The INTENT stays (legacy rows carry it in
+                // `rea`), because that is what decides whether the job below
+                // puts the kit back.
+                if (reaWanted(known) || reaWanted(fresh.vms[name])) fresh.vms[name].reaRequested = true
+                delete fresh.vms[name].rea
+                delete fresh.vms[name].reaOk
+                delete fresh.vms[name].provisioning
               })
               // The rebuilt disk is the base image at the stock build size, so
               // the 40 GB REA floor vmCreate applied is gone even though the
@@ -8272,11 +8690,13 @@ const handlers = {
               // unpacks Ghidra into it.
               await regrowDiskAfterRebuild(name, readRegistry().vms[name])
               // The rebuilt disk is the base image, so every provisioned layer
-              // is gone with it. Put the RE kit back when this computer had
-              // one; the desktop provisioning happens on the next exec.
-              const reaBack = known?.rea === true ? await provisionReaGuest(name) : null
-              if (reaBack !== null) log(`recovering ${name}: rea ${reaBack.ok ? 're-provisioned' : 're-provision failed'}`)
-              return ok({ name, state: 'ready', created: true, recovered: true, tier: readRegistry().vms[name]?.tier, rea: reaBack ? reaBack.ok : undefined })
+              // is gone with it. The RE kit goes back as a BACKGROUND job: the
+              // recovery already cost a full rebuild, and blocking the answer on
+              // a 2 GB download is what made this path time out instead of
+              // reporting. The desktop provisioning happens on the next exec.
+              const reaQueued = reaWanted(known) ? scheduleProvisioning(name, ['rea'], { reason: 'recover', holder: 'ensure' }) : null
+              if (reaQueued !== null) log(`recovering ${name}: rea re-provision queued`)
+              return ok({ name, state: 'ready', created: true, recovered: true, tier: readRegistry().vms[name]?.tier, rea: undefined, reaRequested: reaWanted(known) || undefined, provisioning: reaQueued === null ? undefined : reaQueued.steps })
             }
           }
         }
@@ -8357,7 +8777,13 @@ const handlers = {
       // minute longer and the result says so). The REA layer has its own marker,
       // so a plain computer returns from it in one exec as well.
       const provisioned = await provisionGuest(name, { gpu: meta.gpu === true })
-      const rea = meta.rea === true ? await provisionReaGuest(name) : null
+      // Same guard as the checkpoint path: the background job takes no
+      // `vm:<name>` lock, so the two installers must not run side by side.
+      const reaJob = provisioningBusy(name)
+      const reaJobCoversRea = reaJob !== null && Array.isArray(reaJob.steps) && reaJob.steps.includes('rea')
+      if (reaJobCoversRea) log(`start: ${name} is already installing REA in the background; the kit result comes from that job`)
+      const rea = !reaJobCoversRea && reaWanted(meta) ? await provisionReaGuest(name) : null
+      await recordReaResult(name, rea)
       // WP-9.4: Start is a boot, so the cmdline exists now.
       await recordGuestShare(name)
       const gpuDegraded = await recordGpuRenderer(name, noteGpuRenderer(name, { gpu: meta.gpu === true, renderer: provisioned.renderer }))
@@ -8366,6 +8792,7 @@ const handlers = {
         state: 'ready',
         provisioned: provisioned.ok,
         rea: rea ? rea.ok : undefined,
+        reaErrorHint: rea && rea.ok === false ? REA_RETRY_HINT : undefined,
         renderer: provisioned.renderer,
         gpuDegraded: gpuDegraded ?? undefined,
         output: provisioned.ok ? (rea && !rea.ok ? rea.output.slice(-1200) : undefined) : provisioned.output.slice(-1200)
@@ -8673,17 +9100,76 @@ const handlers = {
    * layers are re-run: the desktop one is version-guarded, the REA one has its
    * own marker. Success means BOTH answered — a start that restores the
    * desktop but silently drops the RE kit would be the worst of both.
+   *
+   * `async: true` IS THE PANEL'S PATH (and the Retry install button's): it
+   * validates, queues the job and answers at once, because the caller is a page
+   * with a row that can carry the progress. `async: false` keeps the old
+   * synchronous contract — it holds the computer's lock and does not answer
+   * until the layers are installed — which is what a scripted caller expects.
+   *
+   * `update: true` is the panel's Update rea: one `rea` step, forced past the
+   * guest marker.
    */
-  async provision({ name }) {
+  async provision({ name, steps, async: runInBackground = false, update = false } = {}) {
+    if (runInBackground === true) {
+      const registry = readRegistry()
+      const meta = registry.vms[name]
+      if (!meta) return fail(`no computer named "${name}"`)
+      if (meta.kind === 'windows') {
+        return fail(`provisioning is not available for a Windows computer: it has no Linux guest to install into.`)
+      }
+      if (meta.state === 'installing' || meta.state === 'booting') {
+        return fail(`${name} is still ${meta.state}; provisioning can be queued once it is ready`)
+      }
+      const running = provisioningBusy(name)
+      if (running !== null) {
+        return fail(`provisioning is already running on ${name} (stage: ${running.stage ?? running.steps[0] ?? 'starting'}); cua_vm_status shows it`)
+      }
+      // ...AND THE FOREGROUND LEG IS JUST AS REAL: it holds the lock and runs the
+      // SAME installers, so queueing now would put two of them on /opt/ghidra
+      // the moment the lock is released.
+      const foreground = installerLockHolder(name)
+      if (foreground !== null) {
+        return fail(`another operation on ${name} (${foreground.heldBy}) is running and may be installing the same layers; retry when it finishes — cua_vm_status shows the row`)
+      }
+      // AN UPDATE IS ONE STEP, AND IT IS ALWAYS `rea`. Letting `steps` choose
+      // would let an "Update rea" click queue an Android install; when update is
+      // on, the step list is the op's contract, not the caller's.
+      const explicit = update === true
+        ? ['rea']
+        : Array.isArray(steps)
+          ? [...new Set(steps.filter((step) => PROVISIONING_STEPS.has(step)))]
+          : []
+      const wanted = explicit.length > 0
+        ? explicit
+        : ['desktop', ...(reaWanted(meta) ? ['rea'] : []), ...(androidWanted(meta) ? ['android'] : [])]
+      const job = scheduleProvisioning(name, wanted, { reason: 'provision', reaEnv: update === true ? REA_UPDATE_ENV : null })
+      return ok({
+        name,
+        queued: job !== null,
+        update: update === true ? true : undefined,
+        provisioning: job?.steps,
+        detail: job === null
+          ? 'nothing to provision'
+          : update === true
+            ? 'rea update queued; the row carries the result.'
+            : `${job.steps.join(' → ')} queued; the row carries the result.`
+      })
+    }
     return withVmLockAs(name, 'provision', async () => {
       const registry = readRegistry()
       const meta = registry.vms[name]
       if (!meta) return fail(`no computer named "${name}"`)
+      const running = provisioningBusy(name)
+      if (running !== null) {
+        return fail(`provisioning is already running on ${name} (stage: ${running.stage ?? running.steps[0] ?? 'starting'}); cua_vm_status shows it, or wait for it to finish`)
+      }
       const result = await provisionGuest(name, { gpu: meta.gpu === true })
       // WP-9.3: a re-provision is the second chance for the renderer, so it is
       // also the second place it can be recorded as degraded.
       const gpuDegraded = await recordGpuRenderer(name, noteGpuRenderer(name, { gpu: meta.gpu === true, renderer: result.renderer }))
-      const rea = meta.rea === true ? await provisionReaGuest(name) : null
+      const rea = reaWanted(meta) ? await provisionReaGuest(name, update === true ? REA_UPDATE_ENV : {}) : null
+      await recordReaResult(name, rea)
       const both = result.ok && (rea === null || rea.ok)
       if (!both) {
         const reaPart = rea !== null && !rea.ok ? `\nrea:\n${rea.output.slice(-900)}` : ''
@@ -9912,12 +10398,19 @@ fetch it with cua_vm_get {guest: "${guestFile}"}; the panel's copy is ${source}`
   /** Install the Android SDK + an AVD inside the guest (several GB, one-off). */
   async vmAndroid({ name, api = 35, variant = 'google_apis', arch = 'x86_64', avd = 'cua' }) {
     return withVmLockAs(name, 'vmAndroid', async () => {
+      // The background job installs the same layer through the same script;
+      // two of them at once would race the SDK directory.
+      const running = provisioningBusy(name)
+      if (running !== null) {
+        return fail(`provisioning is already running on ${name} (stage: ${running.stage ?? running.steps[0] ?? 'starting'}); cua_vm_status shows it`)
+      }
       const registry = readRegistry()
       if (!registry.vms[name]) return fail(`no computer named "${name}"`)
       if (registry.vms[name].kind === 'windows') {
         return ok({ available: false, name, message: 'Android is not available for Windows computers: the SDK and the AVD run in a Linux guest.' })
       }
       const result = await provisionAndroidGuest(name, { api: Number(api) || 35, variant, arch, avd })
+      await recordAndroidResult(name, result)
       return result.ok
         ? ok({ name, installed: true, output: result.output.slice(-1500) })
         : fail(`android provisioning failed:\n${result.output.slice(-1200)}`)
@@ -10256,6 +10749,17 @@ try {
   await migrateRegistryFile()
 } catch (error) {
   log(`registry: migration failed (${error?.message ?? error}); the first write will retry it`)
+}
+
+// A PROVISIONING JOB IS THIS PROCESS'S MEMORY, so a row that still says
+// `provisioning` after a restart is describing work nobody is doing. The sweep
+// runs ONCE, here, after the registry has been read and before the socket
+// accepts callers — never inside a lock (it takes the registry lock itself, in
+// a section of its own).
+try {
+  await sweepStaleProvisioning()
+} catch (error) {
+  log(`provision: stale sweep failed (${error?.message ?? error})`)
 }
 
 server.listen(SOCK, () => {

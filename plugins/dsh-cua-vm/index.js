@@ -167,13 +167,17 @@ const TOOL_TIMEOUT_MS = 1_800_000
  *     3600 s), so the live deadline is resolved per call (`PER_CALL_TIMEOUTS`)
  *     and the number here is only the ceiling the harness guard may arm.
  *   * create / ensure — the supervisor's own allowances, verified by reading it:
- *     `createLinuxNow` awaits `cua sb create` with `timeoutMs: 1500000` and then
- *     provisions the guest (REA up to 3_900_000 ms, Android up to 3_300_000 ms),
- *     and `ensure` may rebuild the computer exactly the same way. A Linux create
- *     is therefore SYNCHRONOUS for minutes: 60 s here would fail every real
- *     first create, so Linux create/ensure get 30 min. A WINDOWS create answers
- *     while the install keeps running in the background (`state: installing`),
- *     so its per-call envelope is 60 s — see `PER_CALL_TIMEOUTS`.
+ *     a Linux create awaits `cua sb create` with `timeoutMs: 1500000`, then
+ *     provisions the DESKTOP and re-applies the disk size (`growGuestDisk`).
+ *     That is the whole envelope now: REA and Android are a BACKGROUND job in
+ *     the supervisor (`provisioning=rea|android` on the row), so the create
+ *     returns as soon as the VM plus its desktop are up and the slow layers
+ *     keep installing without holding this answer. `ensure` may rebuild the
+ *     computer with exactly the same calls, so both take 48 min — `sb create`
+ *     plus provisioning plus the disk work, with room for a slow store. A
+ *     WINDOWS create answers while the install keeps running in the background
+ *     (`state: installing`), so its per-call envelope is 60 s — see
+ *     `PER_CALL_TIMEOUTS`.
  *   * android — `provisionAndroidGuest` runs a ~7 GB SDK download with a
  *     3_300_000 ms allowance; the envelope is that allowance plus a minute.
  *   * windows_desktop / windows_mcp_doctor — the two ungated helpers. They are
@@ -208,9 +212,10 @@ const TOOL_TIMEOUTS = Object.freeze({
   cua_vm_gui: 120_000,
   // caller-budgeted: the CEILING only (the live deadline is per call)
   cua_vm_exec: 3_660_000,
-  // legitimately multi-minute supervisor ops (evidence in the comment above)
-  cua_vm_create: 1_800_000,
-  cua_vm_ensure: 1_800_000,
+  // the VM + desktop + disk op (REA/Android left this envelope: they are a
+  // supervisor background job, reported by `provisioning` on the row)
+  cua_vm_create: 2_880_000,
+  cua_vm_ensure: 2_880_000,
   cua_vm_android: 3_360_000
 })
 
@@ -258,8 +263,10 @@ const PER_CALL_TIMEOUTS = Object.freeze({
  * lead is the whole point of keeping them as a separate table: the supervisor's
  * own waiter deadline is 30 s (`LOCK_WAIT_MS`), and its typed `lock-timeout`
  * answer must reach BOTH surfaces before either surface gives up. A 60 s route
- * would race that answer; 65 s cannot. A `create`/`ensure` is a synchronous
- * multi-minute supervisor op, so it keeps the tool's 30 min plus the same 5 s.
+ * would race that answer; 65 s cannot. A `create`/`ensure` is still a
+ * multi-minute supervisor op (VM + desktop + disk), so it keeps the tool's
+ * 48 min plus the same 5 s; `provision` is a QUEUE, so it is as cheap as a
+ * state poll.
  *
  * EVERY CASE IN THE SWITCH PASSES ONE (C17): `call(payload, budgetMs)`. The
  * fallback is for an action this table has never heard of, so a new `case` that
@@ -283,10 +290,12 @@ export const ROUTE_TIMEOUTS = Object.freeze({
   suspend: 65_000,
   stop: 65_000,
   delete: 65_000,
-  // synchronous multi-minute supervisor ops (tool ceiling + the same 5 s lead)
-  create: 1_805_000,
-  ensure: 1_805_000,
+  // multi-minute supervisor ops (tool ceiling + the same 5 s lead)
+  create: 2_885_000,
+  ensure: 2_885_000,
   android: 3_365_000,
+  // a queue PUT: validate, schedule a background job, answer
+  provision: 30_000,
   // desktop driving, mirroring the tool envelopes
   metrics: 30_000,
   view: 30_000,
@@ -417,6 +426,16 @@ function clamp(text, limit) {
   const value = typeof text === 'string' ? text : ''
   if (value.length <= limit) return value
   return `${value.slice(0, limit)}\n… [truncated ${value.length - limit} chars]`
+}
+
+/**
+ * The LAST non-empty line of a captured log tail, bounded. A failure tail can be
+ * 1.5 KB of npm noise; the status row needs the sentence that says why, not the
+ * whole dump.
+ */
+function lastLineOf(text, limit) {
+  const line = String(text ?? '').trim().split('\n').filter((part) => part.trim() !== '').slice(-1)[0] ?? ''
+  return line.length <= limit ? line : `${line.slice(0, limit)}…`
 }
 
 const textOutput = (description) => ({
@@ -5034,9 +5053,15 @@ export function apply(ctx, config = {}) {
           case 'config': return send(200, { ok: true, ...(await call({ op: 'configSet', config: await body() }, routeTimeoutMs('config'))) })
           case 'create': {
             const answer = await call({ op: 'vmCreate', ...(await body()) }, routeTimeoutMs('create'))
-            // A computer created with `rea: true` is provisioned by the time
-            // this answers, so the awareness paragraph can appear at once
-            // instead of up to 30 s later.
+            // REA/Android are QUEUED by the time this answers, not installed:
+            // the create returns when the VM plus its desktop are up, so the
+            // cache is refreshed to pick up `reaRequested`/`provisioning` and the
+            // 10 s tick carries the verified flips when the job finishes.
+            void refreshReaCache()
+            return send(200, { ok: true, ...answer })
+          }
+          case 'provision': {
+            const answer = await call({ op: 'provision', ...(await body()), async: true }, routeTimeoutMs('provision'))
             void refreshReaCache()
             return send(200, { ok: true, ...answer })
           }
@@ -5377,6 +5402,14 @@ export function apply(ctx, config = {}) {
           vm.kind === 'windows' ? `windows=${vm.windowsVersion || 'ISO'}` : null,
           vm.lastUsed ? `lastUsed=${vm.lastUsed}` : null,
           vm.rea === true ? 'rea=yes' : null,
+          // A BACKGROUND JOB, reported where an agent looks for state: which
+          // stage is running, and the one line that explains a failure.
+          vm.provisioning ? `provisioning=${vm.provisioning}` : null,
+          vm.reaRequested === true && vm.rea !== true && vm.reaError ? `rea=failed: ${lastLineOf(vm.reaError, 200)}` : null,
+          vm.androidRequested === true && vm.android !== true && vm.androidError ? `android=failed: ${lastLineOf(vm.androidError, 200)}` : null,
+          // The desktop layer is not retryable from a badge, so the row is the
+          // only place its failure is visible at all.
+          vm.desktopOk === false ? `desktop=failed: ${lastLineOf(vm.desktopError, 200) || 'see the supervisor log'}` : null,
           vm.lastCommand ? `lastCommand=${vm.lastCommand}` : null,
           vm.kind === 'windows' && info?.installDetail ? `install: ${info.installDetail}` : null,
           vm.kind === 'windows' && Array.isArray(info?.serialTail) && info.serialTail.length > 0
@@ -5446,7 +5479,13 @@ export function apply(ctx, config = {}) {
       // to a name a session recorded, never to "the first ready row".
       rememberSessionTarget(exec, result.name)
       const gpuNote = result.gpu === true ? ' with a GPU (virgl)' : ''
-      return { text: `${result.created ? 'Created' : 'Resumed'} ${result.name} (tier=${result.tier}, state=${result.state}${gpuNote}). Use this name with cua_vm_exec.` }
+      const head = `${result.created ? 'Created' : 'Resumed'} ${result.name} (tier=${result.tier}, state=${result.state}${gpuNote}).`
+      // A create through ensure can QUEUE the slow layers; saying which ones
+      // are installing is the difference between "done" and "done for now".
+      if (Array.isArray(result.provisioning) && result.provisioning.length > 0) {
+        return { text: `${head} ${result.provisioning.join('+')} installing in the background — cua_vm_status shows provisioning=<stage>` }
+      }
+      return { text: `${head} Use this name with cua_vm_exec.` }
     }
   })
 
@@ -5505,16 +5544,21 @@ export function apply(ctx, config = {}) {
       if (answer.renderer) parts.push(`Renderer: ${answer.renderer}.`)
       if (answer.disk && answer.disk.ok === false) parts.push(`Disk: ${answer.disk.error}`)
       else if (answer.disk && answer.disk.changed) parts.push(`Disk grown to ${answer.disk.sizeGb} GB (guest: ${answer.disk.guest || 'unknown'}).`)
-      if (input.android === true) parts.push(answer.android ? 'Android SDK provisioned; boot it with `cua-emulator`.' : 'Android provisioning did not finish — see the output below.')
-      // `rea` is true only when the guest's own marker was written after a
-      // passing `rea doctor`; undefined/false means the kit is not there, and
-      // Start re-runs the idempotent script.
-      if (input.rea === true) parts.push(answer.rea ? 'REA is ready. Verify with `cua_vm_exec` → `rea doctor --provider ghidra --json`.' : 'REA provisioning did not finish — see the output below, then `cua_vm_start` once to retry (it is idempotent).')
+      // The supervisor's own sentences (`notes`): what is still installing, and
+      // what a failure means. They are the honest half of a create that now
+      // returns before the slow layers finish.
+      for (const note of Array.isArray(answer.notes) ? answer.notes : []) parts.push(note)
+      // NO PER-FLAG BRANCHES HERE. A create answers `rea`/`android` as
+      // undefined (the install is a background job), so `answer.rea === true`
+      // and `answer.reaOk === false` can never both describe a create — the
+      // supervisor's `notes` already carry "installing in the background" and
+      // every failure reaches the caller through `cua_vm_status`, where the
+      // verified fields live. The notes loop above is the whole reply.
       // The supervisor's own floor; the panel raises the field too, but the
       // tool is reachable without the panel.
       if (answer.diskGbRaised !== undefined) parts.push(`Disk was raised to ${answer.diskGbRaised} GB: the REA kit does not fit below 40 GB.`)
       // The paragraph must follow the create, not the next 30 s tick.
-      if (input.rea === true) void refreshReaCache()
+      void refreshReaCache()
       if (answer.output) parts.push(`\n${answer.output}`)
       return { text: parts.join(' ') }
     }
@@ -5773,6 +5817,9 @@ export function apply(ctx, config = {}) {
       if (answer.bootedFrom === 'image') parts.push('No checkpoint was available, so it booted the base image: the previous disk is gone.')
       if (answer.provisioned === false) parts.push(`Guest provisioning did not finish:\n${(answer.output || '').slice(-1200)}`)
       if (answer.rea === false) parts.push('REA did not finish provisioning; call cua_vm_start again (it is idempotent).')
+      // The supervisor's retry hint, verbatim: it names both the tool and the
+      // panel button, and a start is exactly where a failed kit is discovered.
+      if (answer.reaErrorHint) parts.push(answer.reaErrorHint)
       if (answer.detail && answer.coldBoot !== true) parts.push(answer.detail)
       if (answer.console) parts.push(`Console: ${answer.console}`)
       return { text: parts.join(' ') }

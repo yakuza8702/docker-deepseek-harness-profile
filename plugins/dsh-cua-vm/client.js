@@ -56,6 +56,13 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * THE LAST LINE OF A CAPTURED LOG TAIL, bounded. A failed install's tail is
+     * 1.5 KB of npm/curl noise; the row needs the sentence that says why, not
+     * the dump (`reaError` keeps the rest for the tool answer).
+     */
+    const lastLine = (text) => String(text ?? '').trim().split('\n').filter(Boolean).slice(-1)[0]?.slice(0, 300) ?? ''
+
+    /**
      * U1: THE SECRET STATE IS CLEARABLE.
      *
      * `setSecret` only ever ADDED a key (`{ ...current, [name]: password }`), so
@@ -243,7 +250,7 @@ window.__ModuleLoader__.load({
      * whether the supervisor ever saw the request.
      *
      *   state 15 s → 20 s      lifecycle (start/shutdown/suspend/stop/delete)
-     *   65 s → 70 s            create 1_805 s → 1_810 s
+     *   65 s → 70 s            create 2_885 s → 2_890 s; provision 30 s → 35 s
      *   exec                   route `(timeout | 300) + 60 s` → that + 5 s, PER CALL (D1)
      *
      * Duplicated on purpose: the client half is a separate module bundle and
@@ -256,7 +263,7 @@ window.__ModuleLoader__.load({
       windowsStatus: 35_000, windowsFreeSpace: 35_000, windowsPassword: 20_000,
       windowsClipboardSet: 35_000, windowsClipboardGet: 35_000,
       start: 70_000, shutdown: 70_000, suspend: 70_000, stop: 70_000, delete: 70_000,
-      create: 1_810_000, ensure: 1_810_000, android: 3_370_000,
+      create: 2_890_000, ensure: 2_890_000, android: 3_370_000, provision: 35_000,
       metrics: 35_000, view: 35_000, screenshot: 35_000, input: 35_000, gui: 125_000, pointer: 35_000,
       // D1: `exec` is 0 — "ask the resolver", exactly as the route's own table
       // says (`ROUTE_TIMEOUTS.exec === 0`). It was a frozen 180_000 (= 120 s +
@@ -704,9 +711,9 @@ window.__ModuleLoader__.load({
         setPending({ name: draft.name, action: 'create' })
         setNote(windows
           ? `Creating ${draft.name} (Windows ${draft.windowsVersion})… QEMU starts the install at once with the ${draft.diskGb} GB disk and ${draft.memory} GB RAM you asked for, so this is tens of minutes. The computer lists as installing until SSH answers; the panel follows the serial log.`
-          : `Creating ${draft.name}${draft.gpu === true ? ' with GPU' : ''}${draft.android ? ' + Android SDK' : ''}${draft.rea ? ' + REA' : ''}… the first start also provisions the guest (a minute or two).${draft.rea ? ' The REA kit adds several minutes for Node 22, rea-agents, a JDK, Ghidra and JADX.' : ''}`)
+          : `Creating ${draft.name}${draft.gpu === true ? ' with GPU' : ''}${draft.android ? ' + Android SDK' : ''}${draft.rea ? ' + REA' : ''}… the first start also provisions the guest (a minute or two).${draft.rea || draft.android ? ' The slow layers install in the background once the VM is up; this note is not the progress bar, the row is.' : ''}`)
         try {
-          await api('create', windows
+          const answer = await api('create', windows
             ? {
                 name: draft.name,
                 kind: 'windows',
@@ -746,7 +753,14 @@ window.__ModuleLoader__.load({
             android: false, rea: false, windowsVersion: '11', windowsIso: '', windowsKey: ''
           })
           await load()
-          setNote(`${draft.name} is up.`)
+          // THE SUPERVISOR'S OWN SENTENCES WIN. A create returns when the VM is
+          // up, so "is up" alone would read as "everything is installed" — the
+          // notes say which layers are still installing in the background (and
+          // what a failure means), so they belong in the same line.
+          const notes = Array.isArray(answer?.notes)
+            ? answer.notes.filter((line) => typeof line === 'string' && line !== '')
+            : []
+          setNote(clean([`${draft.name} is up.`, ...notes].join(' ')))
         } catch (error) {
           setNote(clean(error?.message ?? error))
         } finally {
@@ -1042,12 +1056,12 @@ window.__ModuleLoader__.load({
                     // installed and Ghidra refuses to unpack on a full volume.
                     onChange: (event) => setDraft({ ...draft, rea: event.target.checked, diskGb: event.target.checked ? Math.max(40, draft.diskGb) : draft.diskGb })
                   }),
-                  'Enable REA'
+                  'Install rea'
                 )
               )
             ),
             draft.kind === 'linux'
-              ? h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Enable REA adds Node 22, rea-agents, a JDK 21, Ghidra 12.1.4 and JADX to the computer, roughly 3.5 GB installed, and lifts the disk to at least a 40 GB one. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field. Leaving Enable GPU unticked uses the host default (virgl when this host can do it).')
+              ? h('div', { style: S.muted }, 'Provisioning is automatic on the first start: Xorg on virgl + OpenGL 4.3 + render/KVM access + a 1200x750 desktop + the workspace share (Enable GPU), and the official Android SDK with an AVD inside the VM (Install Android, ~7 GB, needs a 40 GB disk and a GPU computer). Install rea adds Node 22, rea-agents, a JDK 21, Ghidra 12.1.4 and JADX to the computer, roughly 3.5 GB installed, and lifts the disk to at least a 40 GB one. It installs per computer, in the background: Create returns as soon as the VM is up, the row shows REA… while it runs, and a failure shows REA failed with a Retry install button. rea-agents comes from npm\'s latest tag (REA_AGENTS_VERSION pins it), and an installed computer has an Update rea button that moves it to the latest without deleting the disk. Debian and Arch are not Cua disks yet: build one with `cua images build` and paste its reference into the image field. Leaving Enable GPU unticked uses the host default (virgl when this host can do it).')
               : h('div', { style: S.muted }, 'Windows is a DIRECT QEMU computer (OVMF firmware for the UEFI editions, SeaBIOS for 7u, a swtpm TPM2, a qcow2 disk under the VM store) — there is no container runtime. It needs /dev/kvm and compose.windows.yaml for the devices (DSH_CUA_VM_WINDOWS=1). The recommended floor is 64 GB disk and 6 GB RAM: create below it anyway, and the computer carries a warning that Windows Update will run out of space. The install takes tens of minutes and lists as installing until SSH answers AND QMP says running. Once ready: exec/put/get work over SSH, the desktop is cua_vm_gui over QMP, and the live view at /vm/port/<name>/ is a noVNC stream a human can drive. It cannot take REA or Android, and the disk does not grow. Its password is generated and shown with Reveal — stored 0600 in the VM store, never in the registry.'),
             // A SPARSE DISK OVER THE POLICY IS CREATED, NOT REFUSED: this is advice,
             // not a block (the supervisor sends warnings[code: disk-over-policy]).
@@ -1173,6 +1187,19 @@ window.__ModuleLoader__.load({
                   vm.gpu === true && h('span', { style: { ...S.badge(false), color: T.info } }, 'GPU'),
                   vm.android === true && h('span', { style: { ...S.badge(false), color: T.success, border: `1px solid ${T.line}`, background: 'rgba(126, 231, 135, .14)' } }, 'Android'),
                   vm.rea === true && h('span', { style: { ...S.badge(false), color: T.info, border: `1px solid ${T.line}`, background: 'rgba(138, 180, 255, .14)' } }, 'REA'),
+                  vm.rea === true && typeof vm.reaVersion === 'string' && vm.reaVersion !== '' &&
+                    h('span', { style: { ...S.badge(false), color: T.secondary } }, `rea ${vm.reaVersion}`),
+                  // A QUEUED INSTALL AND A FAILED ONE ARE DIFFERENT FACTS.
+                  // `provisioning` is the stage the background job is on; the
+                  // Ok=false badges are what a finished run that did not pass
+                  // `rea doctor` / the SDK check leaves behind.
+                  // THREE STAGES, THREE LABELS. The old ternary had two arms, so
+                  // the `desktop` stage — the one a Retry install can queue — was
+                  // badged "Android…", which is a lie about what is installing.
+                  vm.provisioning !== undefined && h('span', { style: { ...S.badge(false), color: T.info, border: `1px solid ${T.line}`, background: 'rgba(138, 180, 255, .10)' } },
+                    vm.provisioning === 'rea' ? 'REA…' : vm.provisioning === 'android' ? 'Android…' : 'Provisioning…'),
+                  vm.reaOk === false && h('span', { style: { ...S.badge(false), color: T.error, border: `1px solid ${T.line}`, background: 'rgba(242, 139, 130, .12)' } }, 'REA failed'),
+                  vm.androidOk === false && h('span', { style: { ...S.badge(false), color: T.error, border: `1px solid ${T.line}`, background: 'rgba(242, 139, 130, .12)' } }, 'Android failed'),
                   vm.diskGb > 0 && h('span', { style: { ...S.badge(false), color: T.caption } }, `${vm.diskGb} GB`),
                   h('span', { style: { ...S.muted, marginLeft: 'auto' } }, specLine)
                 ),
@@ -1295,6 +1322,57 @@ window.__ModuleLoader__.load({
                 // is spelled out where the buttons are.
                 staleMin !== null && h('div', { style: { ...S.muted, color: T.error } },
                   `This row has not been confirmed by the computer for ${staleMin} min — the guest is probably gone. Try Start, then restart the supervisor if it does not settle.`),
+                // P6: THE SLOW LAYERS ARE A BACKGROUND JOB, SO THE ROW IS THE
+                // PROGRESS BAR. Create answered when the VM came up; this line
+                // is the only thing that says the kit is still installing, and
+                // the poll below refreshes it on its own.
+                !windows && vm.provisioning !== undefined && h('div', { style: S.muted },
+                  `Installing ${vm.provisioning === 'rea' ? 'REA' : vm.provisioning === 'android' ? 'Android' : vm.provisioning} in the background — the Create/tool call already returned. The last line of this row updates itself.`),
+                // A FAILURE IS NOT A SPINNER. The tail says what the script
+                // said, the hint says which button (or tool) retries it.
+                !windows && typeof vm.reaError === 'string' && vm.reaError !== '' && h('div', { style: { ...S.muted, color: T.error } },
+                  clean(`REA did not finish: ${lastLine(vm.reaError)} ${vm.reaErrorHint ?? ''}`.trim())),
+                !windows && typeof vm.androidError === 'string' && vm.androidError !== '' && h('div', { style: { ...S.muted, color: T.error } },
+                  clean(`Android did not finish: ${lastLine(vm.androidError)} ${vm.androidErrorHint ?? ''}`.trim())),
+                // THE DESKTOP LAYER HAS NO RETRY BUTTON (a re-run is the Start
+                // path), but a silent `desktopOk:false` is the one failure the
+                // row would otherwise never mention.
+                !windows && typeof vm.desktopError === 'string' && vm.desktopError !== '' && h('div', { style: { ...S.muted, color: T.error } },
+                  clean(`Desktop did not finish: ${lastLine(vm.desktopError)} — see the supervisor log.`)),
+                // THE RETRY IS A QUEUE, NOT A WAIT: `async: true` makes the
+                // supervisor answer at once, so the button re-enables on the
+                // next poll instead of hanging for the length of the install.
+                // A RETRY NEEDS A FAILURE, NOT A REQUEST. `requested && !installed`
+                // is also true during the create window (the job has not written
+                // its result yet), where a Retry button offers to re-run work that
+                // is already running. `*Ok === false` is only ever written by a
+                // finished run that did not pass.
+                !windows && vm.provisioning === undefined && (vm.reaOk === false || vm.androidOk === false) && (() => {
+                  const steps = [
+                    ...(vm.reaRequested === true && vm.rea !== true ? ['rea'] : []),
+                    ...(vm.androidRequested === true && vm.android !== true ? ['android'] : [])
+                  ]
+                  if (steps.length === 0) return null
+                  return h('div', { style: S.row },
+                    h('button', {
+                      type: 'button', style: S.button, disabled: busy,
+                      onClick: () => void act(name, `Queuing ${steps.join('+')} install for ${name}…`, 'provision', { name, steps, async: true })
+                    }, busy && busyLabel !== null ? busyLabel : 'Retry install')
+                  )
+                })(),
+                // R2: UPDATE AFTER CREATED. A provisioned disk carries version=1
+                // in /var/lib/cua-rea, so "re-run the installer" is a no-op there;
+                // the op's `update` flag is what moves rea-agents on a disk the
+                // user keeps. Gated on the VERIFIED kit: a failed row already
+                // offers Retry install, and two buttons for one run would be a
+                // choice the panel cannot explain.
+                !windows && vm.provisioning === undefined && vm.rea === true && h('div', { style: S.row },
+                  h('button', {
+                    type: 'button', style: S.button, disabled: busy,
+                    title: 'Update rea to the latest; safe to re-run. Re-runs the REA installer past its marker (REA_FORCE_UPDATE=1), so rea-agents moves without deleting the disk.',
+                    onClick: () => void act(name, `Updating rea on ${name} to the latest…`, 'provision', { name, steps: ['rea'], async: true, update: true })
+                  }, 'Update rea')
+                ),
                 secret[name] && h('div', { style: { ...S.muted, fontFamily: 'ui-monospace, monospace' } },
                   `user "cua" password "${secret[name]}" (also in $STORE/windows/${name}/credentials.json, mode 0600)`),
                 // U4: THE DISK IS NOT THE FREE SPACE. A below-floor number is

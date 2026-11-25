@@ -108,7 +108,10 @@ const source = stripJsComments(readFileSync(INDEX, 'utf8'))
 
 /** THE DOC'S ACTION LIST (SOL §1.5 / WP-B B-1): every case of the `/cua` switch. */
 const DOC_ACTIONS = [
-  'state', 'config', 'create', 'start', 'shutdown', 'suspend', 'gc', 'doctor', 'space',
+  // 2026-11: `provision` is the panel's Retry install route (and the async
+  // re-provision queue); it is documented because an action missing here is an
+  // action nobody notices losing its budget.
+  'state', 'config', 'create', 'provision', 'start', 'shutdown', 'suspend', 'gc', 'doctor', 'space',
   'windowsStatus', 'windowsPassword', 'windowsClipboardSet', 'windowsClipboardGet', 'windowsFreeSpace',
   'stop', 'delete', 'exec', 'metrics', 'view', 'screenshot', 'input', 'gui', 'pointer'
 ]

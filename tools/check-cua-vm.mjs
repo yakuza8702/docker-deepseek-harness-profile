@@ -2869,7 +2869,17 @@ const NEEDLES = {
   client: [
     // the four labels are a contract: automation reads them
     ["'Enable GPU'", 1],
-    ["'Enable REA'", 1],
+    // 2026-11: relabelled. "Enable" promised a flag; the button installs a kit
+    // (and the row can fail it), so the label is what the feature IS.
+    ["'Install rea'", 1],
+    // ...and the ROW's half of the same contract: a stage badge, a verified
+    // failure badge, the failure sentence with the script's own tail, and the
+    // ONE button that re-queues it. These are the strings the panel renders, so
+    // a refactor that drops one of them fails here instead of in a user's row.
+    ["'Retry install'", 1],
+    ["'REA…'", 1],
+    ["'REA failed'", 1],
+    ['REA did not finish:', 1],
     ["'Install Android'", 1],
     // kind + version
     ["value: 'linux' }, 'Linux (Cua guest)'", 1],
@@ -5486,7 +5496,7 @@ function lSlice(source, from, to) {
   const budgets = client.includes('const CLIENT_TIMEOUTS = Object.freeze({')
     && /state: 20_000,\s*config: 20_000,/u.test(client.replace(/\n/gu, ' '))
     && client.includes('start: 70_000,')
-    && client.includes('create: 1_810_000,')
+    && client.includes('create: 2_890_000,')
     && client.includes('AbortSignal.timeout(budget)')
   const notGated = client.includes("onClick: () => void cleanup() }, 'Clean up')")
     && client.includes("'Create computer'")

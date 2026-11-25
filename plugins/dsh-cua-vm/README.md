@@ -40,7 +40,7 @@ write to a unix socket under `/tmp`, which `workspace-write` already allows.
 |---|---|
 | `cua_vm_status` | which computers exist, their state, spec, last command |
 | `cua_vm_ensure` | create or resume the computer for this workspace (idempotent, carries the full spec) |
-| `cua_vm_create` | new computer: `name`, `kind`, vCPU, RAM, image, `gpu`, `diskGb`, `android`, `rea` (Windows: `windowsVersion` / `windowsIso`) |
+| `cua_vm_create` | new computer: `name`, `kind`, vCPU, RAM, image, `gpu`, `diskGb`, `android`, `rea` (Windows: `windowsVersion` / `windowsIso`). **Returns when the VM + desktop are up**; `rea` and `android` install in the background (`provisioning=<stage>` on the row) |
 | `cua_vm_start` | start: resumes a suspended computer, **cold-boots** a powered-off one from its checkpoint |
 | `cua_vm_shutdown` | real ACPI powerdown, answered in seconds → `powered-off` immediately, the checkpoint convert runs in the background (deferred) |
 | `cua_vm_suspend` | pause, keep the sandbox; resume is instant |
@@ -1929,10 +1929,38 @@ firstboot failed"**, not as a failed install.
 
 ## REA in the computer
 
-`cua_vm_create` with `rea: true` (or **Enable REA** in New computer) installs
+`cua_vm_create` with `rea: true` (or **Install rea** in New computer) installs
 the reverse-engineering kit *inside* the guest, from `docker/cua-guest-rea.sh` —
 a real file, not a blob in the supervisor, so it can be read, diffed and run by
 hand. It is Linux-only: the Windows backend refuses it by name.
+
+**It installs per computer, in the background.** The create answers as soon as
+the VM and its desktop are up; the kit is a job in the supervisor that the ROW
+reports on — `provisioning=rea` while it runs, `rea: true` + `reaOk: true` once
+`rea doctor --provider ghidra` passes, and `rea: false` + `reaError` (the tail of
+the script's output) + `reaErrorHint` when it fails. `reaRequested` is the
+INTENT and survives a failure, so the panel can offer **Retry install** (POST
+`/cua/provision` with `{ steps: ["rea"], async: true }`) instead of asking the
+user to create the computer again. `/cua/state` and `cua_vm_status` read the
+verified field, never the request: `rea=yes` is a claim about a kit that passed
+its own doctor, not about one that was queued.
+
+Nothing is pinned for you. A new computer installs `rea-agents@latest` (Node
+`v22.23.4`, Ghidra `12.1.4` and JADX `1.5.6` stay pinned — REA's doctor refuses
+other Ghidra builds), so the kit a computer gets is the kit npm had when it was
+created; `REA_AGENTS_VERSION=6.10.1` in the guest environment pins the install
+instead.
+
+**An existing disk updates in place.** A row with a verified kit carries
+**Update rea**: it queues one `rea` step with `update: true`, the supervisor
+passes `REA_FORCE_UPDATE=1` to `docker/cua-guest-rea.sh` (without it the marker
+answers `[rea] already provisioned` and npm is never touched), and the installer
+re-runs `npm install --global rea-agents@latest`. Node, Ghidra, JADX and the MCP
+jar are behind presence guards, so this is an npm fetch, not a 3.5 GB rebuild.
+The row shows `REA…` while it runs and the resolved `rea <version>` beside the
+badge when it lands. `POST /cua/provision` with `{"update": true}` is the same
+run without the panel. A `REA_MARKER_VERSION` bump is now only for changing the
+kit's own recipe, not for moving a pin.
 
 | Component | What lands in the guest |
 |---|---|
@@ -1942,6 +1970,7 @@ hand. It is Linux-only: the Windows backend refuses it by name.
 | Ghidra | `12.1.4` unpacked at `/opt/ghidra`, `support/analyzeHeadless` + the native `decompile` binary |
 | JADX | `1.5.6` plus the pinned `jadx-headless-mcp-0.7.1-all.jar` (sha256-verified) in `/opt/rea/android` |
 | `procps` | `ps`/`top` for the doctor's process probes |
+| rea-agents | `latest` from npm by default (`REA_AGENTS_VERSION` pins a version); **Update rea** on a provisioned row moves it past the marker, and the row shows the resolved `rea <version>` |
 
 **Disk floor: 40 GB.** Ghidra unpacks to ~1.4 GB and the JDK, JADX, Node and
 `rea-agents` add up to roughly 3.5 GB installed; on a stock 20 GB disk the unzip
@@ -1982,7 +2011,7 @@ instead of remembered as done.
 Verify from the model side:
 
 ```
-cua_vm_status                     # the row carries rea=yes
+cua_vm_status  # rea=yes once VERIFIED; provisioning=rea while the job runs; rea=failed: … with the tail
 cua_vm_exec → node -v             # v22.23.4
 cua_vm_exec → rea --version
 cua_vm_exec → rea doctor --provider ghidra --json

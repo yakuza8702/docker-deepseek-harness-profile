@@ -3296,8 +3296,13 @@ registerHooks({
     cua_vm_get: '120_000',
     cua_vm_gui: '120_000',
     cua_vm_exec: '3_660_000',
-    cua_vm_create: '1_800_000',
-    cua_vm_ensure: '1_800_000',
+    // 2026-11: a create no longer waits for the REA/Android layers (they are a
+    // supervisor background job), but `sb create` + the desktop provisioning +
+    // the disk grow still live inside this answer, so the envelope GREW rather
+    // than shrinking. 48 min is 1 500 s of `sb create`, the guest provisioning
+    // and the disk work, with room for a cold store.
+    cua_vm_create: '2_880_000',
+    cua_vm_ensure: '2_880_000',
     cua_vm_android: '3_360_000'
   }
   const missing = Object.entries(frozen)
@@ -3310,6 +3315,36 @@ registerHooks({
   check('WP-6.5: the boot wait (≤ 60 s) stays far inside `cua_vm_exec`\'s envelope',
     bootWaitMax < execCeiling / 10,
     `${bootWaitMax} ms vs ${execCeiling} ms (${Math.round((bootWaitMax / execCeiling) * 1000) / 10}%)`)
+  // THE CREATE BUDGET IS A LADDER, NOT THREE NUMBERS. The tool envelope is what
+  // the harness guard may arm, the route is the page's request, and the client
+  // is the page's own abort — each must outlive the one below it, or the
+  // specific sentence ("the supervisor did not answer create within …") is
+  // replaced by a generic abort on exactly the surface the user watches.
+  const clientSource = readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'client.js'), 'utf8')
+  const ladder = {
+    tool: source.includes('cua_vm_create: 2_880_000,'),
+    route: source.includes('create: 2_885_000,'),
+    client: clientSource.includes('create: 2_890_000,')
+  }
+  check('WP-6.5: the create/ensure budget ladder is 2 880 000 (tool) → 2 885 000 (route) → 2 890 000 (client)',
+    ladder.tool && ladder.route && ladder.client,
+    `tool=${ladder.tool} route=${ladder.route} client=${ladder.client}`)
+  // THE FOREGROUND HALF OF THE BUSY GUARD. A background provisioning job holds no
+  // lock, so these holder names are the ONLY thing that stops a queued job from
+  // racing a synchronous installer over /opt/node22, /opt/ghidra and the npm
+  // global root. A name lost here re-opens the race silently, which is exactly
+  // why the set is pinned rather than left to review.
+  const supervisorSource = readFileSync(path.join(REPO, 'docker', 'cua-vm-supervisor.mjs'), 'utf8')
+  const holdersLine = /const INSTALLER_HOLDERS = new Set\(\[([^\]]*)\]\)/u.exec(supervisorSource)
+  const holders = (holdersLine?.[1] ?? '')
+    .split(',')
+    .map((part) => part.trim().replace(/^'|'$/gu, ''))
+    .filter((part) => part !== '')
+  const requiredHolders = ['vmStart', 'provision', 'vmAndroid', 'vmCreate', 'ensure']
+  const missingHolders = requiredHolders.filter((holder) => holders.includes(holder) === false)
+  check('WP-6.5: INSTALLER_HOLDERS names every synchronous installer leg (start, provision, android, create, ensure)',
+    holdersLine !== null && missingHolders.length === 0,
+    holdersLine === null ? 'INSTALLER_HOLDERS not found' : `holders=${holders.join(',')}${missingHolders.length > 0 ? ` missing=${missingHolders.join(',')}` : ''}`)
 }
 
 /* ================================================================== *

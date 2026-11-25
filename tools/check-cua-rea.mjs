@@ -111,7 +111,16 @@ const NEEDLES = {
     ['NODE_DIR=/opt/node22', 1],
     ['sort -V', 1],
     ['ln -sfn "$NODE_DIR/bin/$bin" "/usr/local/bin/$bin"', 1],
-    ['npm" install --global --no-fund --no-audit rea-agents@latest', 1],
+    // 2026-11: the kit follows npm's `latest` again, but through the script's
+    // own variable, so a workspace can still pin (`REA_AGENTS_VERSION=6.10.1`).
+    // The install needle names the VARIABLE, so it also fails if a literal
+    // version is pasted back into the npm line. `REA_FORCE_UPDATE` is the one
+    // switch that gets an UPDATE past the marker; both halves are pinned here
+    // because either alone is a silent no-op.
+    ['npm" install --global --no-fund --no-audit "rea-agents@${REA_AGENTS_VERSION}"', 1],
+    ['REA_AGENTS_VERSION="${REA_AGENTS_VERSION:-latest}"', 1],
+    ['FORCE_UPDATE="${REA_FORCE_UPDATE:-0}"', 1],
+    ['if [ "$FORCE_UPDATE" != 1 ] && [ -f "$MARKER" ]', 1],
     ['REA_MJS="${NPM_GLOBAL_ROOT}/rea-agents/scripts/rea.mjs"', 1],
     ['Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip', 1],
     ['GHIDRA_DIR=/opt/ghidra', 1],
@@ -139,7 +148,7 @@ const NEEDLES = {
   supervisor: [
     ["const REA_SCRIPT = String(process.env.DSH_CUA_REA_SCRIPT || '/usr/local/bin/cua-guest-rea.sh')", 1],
     ['const REA_MIN_DISK_GB = 40', 1],
-    ['async function provisionReaGuest(name)', 1],
+    ['async function provisionReaGuest(name, env = {})', 1],
     ['timeoutSec: 3600, timeoutMs: 3900000', 1],
     ['\\[rea\\] OK', 1],
     ['already provisioned', 1],
@@ -150,7 +159,11 @@ const NEEDLES = {
     // field a concurrent update had just removed. Same invariant (the rebuilt
     // computer keeps what the old row knew), same commit.
     ['...(fresh.vms[name] || known || {}),', 1],
-    ['const reaBack = known?.rea === true ? await provisionReaGuest(name) : null', 1],
+    // 2026-11: the rebuild no longer blocks on the kit — it QUEUES it, because
+    // the recovery already paid for a full disk rebuild and a 2 GB download on
+    // top of that is what timed the path out. Same invariant (an RE computer
+    // comes back with its kit), different mechanism.
+    ['const reaQueued = reaWanted(known) ? scheduleProvisioning(name, [\'rea\'], { reason: \'recover\', holder: \'ensure\' }) : null', 1],
     ['rea: false,', 1],
     // 2026-11: the create signature became a normalised spec (kind + one shape
     // for every caller), so the two create flags are asserted where they are
@@ -165,12 +178,31 @@ const NEEDLES = {
     // The label was relabelled (it used to read "Disk Size (GB)"), so the needle
     // pins the exact destination a refusal message must name.
     ['sidebar panel "Personal VM (CUA)" → Policy → Store quota (GB)', 1],
-    ['rea: rea === true,', 1],
+    // 2026-11: REQUESTED vs INSTALLED. A create writes rea:false (the kit is a
+    // background job and has not run yet) plus the intent, which is what makes
+    // a failed install retryable instead of looking like "never asked".
+    ['reaRequested: rea === true,', 1],
+    ['androidRequested: spec.android === true,', 1],
     ['diskGb: effectiveDiskGb,', 1],
     ['if (effectiveDiskGb > 20) disk = await growGuestDisk(name, effectiveDiskGb)', 1],
-    ['const reaResult = rea === true ? await provisionReaGuest(name) : null', 1],
+    // 2026-11: the create tail queues the job instead of awaiting the install.
+    ['async function runProvisioningJob(name, job)', 1],
+    ['await recordReaResult(name, await provisionReaGuest(name, job.env ?? {}), job.token)', 1],
+    ['const REA_UPDATE_ENV = Object.freeze({ REA_FORCE_UPDATE: \'1\', REA_AGENTS_VERSION: \'latest\' })', 1],
+    ['async provision({ name, steps, async: runInBackground = false, update = false } = {})', 1],
+    ["const explicit = update === true ? ['rea'] : Array.isArray(steps)", 1],
+    ["reaEnv: update === true ? REA_UPDATE_ENV : null", 1],
+    ['provisionReaGuest(name, update === true ? REA_UPDATE_ENV : {})', 1],
+    ['reaVersion: result.reaVersion,', 1],
     ['diskGbRaised: effectiveDiskGb > wantedDiskGb ? effectiveDiskGb : undefined', 1],
-    ['const rea = meta.rea === true ? await provisionReaGuest(name) : null', 2],
+    // 2026-11: THE GUARD IS PART OF THE INVARIANT. The background job takes no
+    // `vm:<name>` lock, so a start that provisioned unconditionally could race
+    // it over /opt/node22 and /opt/ghidra. Both start paths (checkpoint cold
+    // boot and vmStart) must carry the same guarded expression; the min stays 2
+    // so losing the guard on ONE of them fails here, not in a user's first
+    // reboot. The skip is keyed on the JOB's steps containing 'rea' — an
+    // android-only job must not suppress the kit.
+    ['const rea = !reaJobCoversRea && reaWanted(meta) ? await provisionReaGuest(name) : null', 2],
     ['const both = result.ok && (rea === null || rea.ok)', 1]
   ],
   dockerfile: [
@@ -181,6 +213,8 @@ const NEEDLES = {
   client: [
     ['rea: false', 1],
     ['rea: draft.rea', 1],
+    ["'Update rea'", 1],
+    ['{ name, steps: [\'rea\'], async: true, update: true }', 1],
     ['REA', 1]
   ],
   index: [

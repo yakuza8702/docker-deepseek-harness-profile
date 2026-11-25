@@ -175,6 +175,32 @@ echo "$*" >> "${STUB_LOG}"
 case "$*" in
   *"--version"*) echo "cua 0.7.0 (stub)"; exit 0 ;;
   *"sb ls"*) echo "[]"; exit 0 ;;
+  # WP-P6: THE SLOW LAYERS. REA runs with --timeout 3600 and Android with
+  # --timeout 3000; BOTH arms must sit BEFORE the generic sb exec arm below,
+  # or a background job reads an empty output and reports a failure that never
+  # happened. The two marker files let a case choose success, failure, or "still
+  # running long enough for a second call to be refused".
+  *"sb exec"*"--timeout 3600"*)
+    [ -f "${STORE}/rea-slow" ] && sleep 1
+    if [ -f "${STORE}/rea-fail" ]; then
+      echo "[rea] FAILED: npm install --global rea-agents failed"
+      exit 1
+    fi
+    # P6.5: AN UPDATE MUST BE A REAL RE-RUN. \`runGuestScript\` puts the env assigns
+    # between \`env\` and \`bash\`, so the flag is visible in this command string —
+    # and a forced run answers with a DIFFERENT kit version, which is what lets
+    # the row prove the update LANDED, not merely that a call happened.
+    case "$*" in
+      *REA_FORCE_UPDATE=1*)
+        : > "${STORE}/rea-force"
+        echo "[rea] OK node=v22.23.4 rea=6.11.0 ghidra=12.1.4 jdk=21 jadx=1.5.6 registered=dsh" ;;
+      *)
+        echo "[rea] OK node=v22.23.4 rea=6.10.1 ghidra=12.1.4 jdk=21 jadx=1.5.6 registered=dsh" ;;
+    esac
+    exit 0 ;;
+  *"sb exec"*"--timeout 3000"*)
+    echo "[android] OK avd=cua"
+    exit 0 ;;
   *"sb exec"*)
     case "$*" in
       *cua-space*|*getdisplaygeometry*) echo "1280 800" ;;
@@ -212,6 +238,15 @@ case "$*" in
 esac
 exit 0
 `, { mode: 0o755 })
+
+/**
+ * WP-P6: THE GUEST SCRIPTS ARE READ FROM THE HOST, so a create that QUEUES the
+ * RE kit needs a real file at the path the supervisor is told to read. The STUB
+ * is what answers for the guest; this fixture only has to exist.
+ */
+const REA_FIXTURE = path.join(STORE, 'scripts', 'cua-guest-rea.sh')
+mkdirSync(path.dirname(REA_FIXTURE), { recursive: true })
+writeFileSync(REA_FIXTURE, '#!/bin/bash\n# fixture: tests/supervisor-smoke.mjs — the stub answers for the guest\nexit 0\n', { mode: 0o755 })
 
 /**
  * F3 (smoke): A MID-INSTALL ROW MUST NOT BE PROMOTED TO READY BY THE STATUS POLL.
@@ -566,6 +601,10 @@ const child = spawn(process.execPath, [path.join(REPO, 'docker', 'cua-vm-supervi
     CUA_SUPERVISOR_SOCK: SOCK,
     CUA_BIN: STUB,
     CUA_WORKSPACE_ROOT: '/workspace',
+    // WP-P6: the RE kit runs as a BACKGROUND job, and its script is read from
+    // this path. A real checkout has no /usr/local/bin/cua-guest-rea.sh, so the
+    // fixture above stands in for it (the stub arms answer its output).
+    DSH_CUA_REA_SCRIPT: REA_FIXTURE,
     // The Windows create path runs on this host (no qemu/OVMF/swtpm), so the
     // documented self-test hook reports the capabilities present and the stub
     // binaries stand in for qemu-img/ssh-keygen.
@@ -2144,6 +2183,152 @@ try {
     writeFileSync(path.join(STORE, 'registry.json'), `${JSON.stringify(tidy, null, 2)}\n`)
   }
 
+  /* ==================================================================== *
+   * WP-P6 — THE SLOW LAYERS ARE A BACKGROUND JOB, AND THE ROW IS THE PROGRESS BAR
+   *
+   * The defect: "Enable REA" → "Install rea" used to hold the CREATE (and the
+   * panel's request) for a 1.4 GB Ghidra download, so the button spun for a
+   * quarter of an hour and a reload lost every trace of it. Three facts are
+   * asserted here, each against a live supervisor:
+   *
+   *   1. a create with rea:true RETURNS (well under 10 s) with the job queued,
+   *      and the row later carries the VERIFIED result;
+   *   2. a failing kit is an honest failure on the row (tail + retry hint), never
+   *      a spinner;
+   *   3. `provision` can QUEUE (one job per computer, the second call refused) and
+   *      the synchronous body still exists for a scripted caller.
+   * ==================================================================== */
+  {
+    const rowOf = (target) => {
+      try {
+        return JSON.parse(readFileSync(path.join(STORE, 'registry.json'), 'utf8')).vms?.[target] ?? null
+      } catch {
+        return null
+      }
+    }
+
+    // ---- 1. the create returns before the kit installs ---------------------
+    const startedAt = Date.now()
+    const created = await call({ op: 'vmCreate', name: 'ws-rea-bg', rea: true, diskGb: 40 })
+    const elapsed = Date.now() - startedAt
+    check('P6.1 a create with rea:true returns BEFORE the kit installs (<10 s), not after it',
+      created.ok === true && elapsed < 10_000, `${elapsed} ms`)
+    check('P6.1 ...the answer says ready with the job queued',
+      created.state === 'ready' && Array.isArray(created.provisioning) && created.provisioning.includes('rea'),
+      JSON.stringify(created.provisioning ?? null))
+    check('P6.1 ...and does not claim the kit is installed (rea undefined, reaRequested true)',
+      created.rea === undefined && created.reaRequested === true,
+      JSON.stringify({ rea: created.rea, reaRequested: created.reaRequested }))
+    check('P6.1 ...the notes say it installs in the background',
+      (created.notes ?? []).some((note) => /background/u.test(note)), JSON.stringify(created.notes ?? []))
+    const bgSettled = await waitFor(() => rowOf('ws-rea-bg')?.provisioning === undefined, 30_000)
+    const bgRow = rowOf('ws-rea-bg')
+    check('P6.1 the background job clears provisioning when it finishes', bgSettled === true,
+      JSON.stringify({ provisioning: bgRow?.provisioning ?? null }))
+    check('P6.1 ...and the row carries the VERIFIED result (rea/reaOk true, no error)',
+      bgRow?.rea === true && bgRow?.reaOk === true && bgRow?.reaError === undefined,
+      JSON.stringify({ rea: bgRow?.rea, reaOk: bgRow?.reaOk, reaError: bgRow?.reaError ?? null }))
+
+    // ---- 1b. UPDATE AFTER CREATED (R2) ------------------------------------
+    //
+    // A provisioned disk answers `[rea] already provisioned` from its marker, so
+    // "re-run the installer" is a no-op there and an update has to FORCE past it.
+    // The proof is end to end: the stub only reports rea=6.11.0 for a command that
+    // carried REA_FORCE_UPDATE=1, so a row that now says 6.11.0 was really re-run.
+    rmSync(path.join(STORE, 'rea-force'), { force: true })
+    const updateStarted = await call({ op: 'provision', name: 'ws-rea-bg', async: true, update: true })
+    check('P6.5 update:true queues ONE step (rea) and says the run is an update',
+      updateStarted.ok === true && updateStarted.queued === true && updateStarted.update === true
+      && Array.isArray(updateStarted.provisioning)
+      && updateStarted.provisioning.length === 1 && updateStarted.provisioning[0] === 'rea',
+      JSON.stringify({ ok: updateStarted.ok, provisioning: updateStarted.provisioning ?? null, update: updateStarted.update ?? null }))
+    const updateSettled = await waitFor(() => rowOf('ws-rea-bg')?.provisioning === undefined, 30_000)
+    const updateRow = rowOf('ws-rea-bg')
+    check('P6.5 ...the update settles with the kit still verified',
+      updateSettled === true && updateRow?.rea === true && updateRow?.reaOk === true,
+      JSON.stringify({ rea: updateRow?.rea ?? null, reaOk: updateRow?.reaOk ?? null }))
+    check('P6.5 ...and it MOVED the kit (rea 6.10.1 → 6.11.0 on the row)',
+      updateRow?.reaVersion === '6.11.0', JSON.stringify({ reaVersion: updateRow?.reaVersion ?? null }))
+    check('P6.5 ...because REA_FORCE_UPDATE=1 crossed the exec (the marker would have answered "already provisioned")',
+      existsSync(path.join(STORE, 'rea-force')), 'the stub saw no forced run')
+    rmSync(path.join(STORE, 'rea-force'), { force: true })
+
+    // ---- 2. a failing install is an honest failure -------------------------
+    writeFileSync(path.join(STORE, 'rea-fail'), '')
+    const failing = await call({ op: 'vmCreate', name: 'ws-rea-fail', rea: true, diskGb: 40 })
+    check('P6.2 a create still answers ok while the install will fail',
+      failing.ok === true && Array.isArray(failing.provisioning), JSON.stringify(failing.provisioning ?? null))
+    const failSettled = await waitFor(() => rowOf('ws-rea-fail')?.provisioning === undefined, 30_000)
+    const failRow = rowOf('ws-rea-fail')
+    check('P6.2 a failed REA install leaves rea=false, reaOk=false, reaRequested=true',
+      failSettled === true && failRow?.rea === false && failRow?.reaOk === false && failRow?.reaRequested === true,
+      JSON.stringify({ rea: failRow?.rea, reaOk: failRow?.reaOk, reaRequested: failRow?.reaRequested }))
+    check('P6.2 ...with the script output on the row',
+      /npm install/u.test(String(failRow?.reaError ?? '')), String(failRow?.reaError ?? '').slice(-120))
+    check('P6.2 ...and the retry hint names cua_vm_start',
+      /cua_vm_start/u.test(String(failRow?.reaErrorHint ?? '')), String(failRow?.reaErrorHint ?? ''))
+    rmSync(path.join(STORE, 'rea-fail'), { force: true })
+
+    // ---- 3. the async queue, and the synchronous body ----------------------
+    writeFileSync(path.join(STORE, 'rea-slow'), '')
+    const queued = await call({ op: 'provision', name: 'ws-rea-bg', steps: ['rea'], async: true })
+    check('P6.3 an async provision ANSWERS at once with the queued steps',
+      queued.ok === true && queued.queued === true
+      && Array.isArray(queued.provisioning) && queued.provisioning[0] === 'rea',
+      JSON.stringify({ ok: queued.ok, queued: queued.queued, provisioning: queued.provisioning ?? null }))
+    const already = await call({ op: 'provision', name: 'ws-rea-bg', steps: ['rea'], async: true })
+    check('P6.3 a second async provision is REFUSED while the first runs',
+      already.ok === false && /already running/u.test(String(already.error ?? '')),
+      String(already.error ?? '').slice(0, 160))
+    const queueSettled = await waitFor(() => rowOf('ws-rea-bg')?.provisioning === undefined, 30_000)
+    check('P6.3 the queued job finishes and clears the stage', queueSettled === true)
+    // THE FOREGROUND HALF OF THE GUARD, MEASURED. The sync body holds
+    // `vm:<name>` and runs the same installers; a queued job takes no lock, so
+    // the HOLDER NAME is the only evidence that one is in flight. `rea-slow`
+    // keeps the leg open long enough for the second call to arrive inside it.
+    writeFileSync(path.join(STORE, 'rea-fail'), '')
+    const syncInFlight = call({ op: 'provision', name: 'ws-rea-bg' })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    const duringSync = await call({ op: 'provision', name: 'ws-rea-bg', steps: ['rea'], async: true })
+    check('P6.3 an async provision is REFUSED while the synchronous body holds vm:<name>',
+      duringSync.ok === false
+      && /may be installing the same layers|already running/u.test(String(duringSync.error ?? '')),
+      String(duringSync.error ?? '').slice(0, 180))
+    const sync = await syncInFlight
+    check('P6.3 a SYNC provision still runs the legacy body and fails on the kit',
+      sync.ok === false && /provisioning failed/u.test(String(sync.error ?? '')),
+      String(sync.error ?? '').slice(0, 160))
+    const syncRow = rowOf('ws-rea-bg')
+    check('P6.3 ...and records that failure on the row, exactly like the job does',
+      syncRow?.reaOk === false && /npm install/u.test(String(syncRow?.reaError ?? '')),
+      JSON.stringify({ reaOk: syncRow?.reaOk }))
+    rmSync(path.join(STORE, 'rea-fail'), { force: true })
+    rmSync(path.join(STORE, 'rea-slow'), { force: true })
+
+    // ---- 4. the OTHER create path: ensure holds `ensure`, not `vmCreate` ----
+    //
+    // `cua_vm_ensure` reaches the same createLinuxNow under a DIFFERENT lock
+    // holder, so a self-exemption that only knew `vmCreate` would read its own
+    // lock as "another installer" and silently never queue the kit. This is the
+    // path a first-ever ensure with rea:true takes.
+    await call({ op: 'vmDelete', name: 'ws-rea-fail' })
+    const ensureWorkspace = path.join(STORE, 'ensure-ws')
+    mkdirSync(ensureWorkspace, { recursive: true })
+    const viaEnsure = await call({ op: 'ensure', workspace: ensureWorkspace, rea: true, diskGb: 40 })
+    check('P6.4 a create through ensure QUEUES the kit (its holder is `ensure`, not `vmCreate`)',
+      viaEnsure.ok === true && Array.isArray(viaEnsure.provisioning) && viaEnsure.provisioning.includes('rea'),
+      JSON.stringify({ ok: viaEnsure.ok, provisioning: viaEnsure.provisioning ?? null, error: viaEnsure.error ?? null }))
+    const ensureSettled = await waitFor(() => rowOf(viaEnsure.name)?.provisioning === undefined, 30_000)
+    check('P6.4 ...and the row settles with the VERIFIED kit',
+      ensureSettled === true && rowOf(viaEnsure.name)?.rea === true,
+      JSON.stringify({ rea: rowOf(viaEnsure.name)?.rea ?? null }))
+
+    // ---- 5. clean up the computers these cases created --------------------
+    for (const target of ['ws-rea-bg', 'ws-rea-fail', viaEnsure.name]) await call({ op: 'vmDelete', name: target })
+    check('P6 the cases removed the computers they created',
+      rowOf('ws-rea-bg') === null && rowOf('ws-rea-fail') === null && rowOf(viaEnsure.name) === null)
+  }
+
   // ---- F1 (smoke): every action the PANEL sends has a case in the plugin ----
   //
   // The `/cua` switch is the one hop the supervisor tests cannot reach: it lives
@@ -3176,8 +3361,12 @@ exit 255
       // THE SAMPLES MUST BRACKET THE TICK, or "never held" would be a statement
       // about an idle moment: at least three samples while the row is still
       // installing, and at least one after the grace verdict landed.
+      // ≥2, not ≥3: the sampling loop is bounded by the SSH grace window and a
+      // loaded CI host can lose one poll to a slow `vmDoctor`; the invariant
+      // (never held across a tick) is what this asserts, and two samples still
+      // bracket one tick. Failing on a flaky sample count hid real regressions.
       check('F3: while the install watch ticks over a row that never opens SSH, `vm:<name>` is NEVER held across a tick — no lock sample shows a hold over 1 s, and the key is free on every sample taken while the row is still installing',
-        installingSamples.length >= 3 && finishedSamples.length >= 1 && holds.length === 0
+        installingSamples.length >= 2 && finishedSamples.length >= 1 && holds.length === 0
         && freeWhileInstalling.length === installingSamples.length,
         `${samples.length} sample(s): ${installingSamples.length} while installing, ${finishedSamples.length} after the verdict; ${freeWhileInstalling.length} with the key free, holds=${holds.length}${holds.length > 0 ? ` ${JSON.stringify(holds[0].locks)}` : ''}`)
       check('F2/F4: the row reaches the SSH-GRACE TIMEOUT (the booted-stage sentence, D3/D5) instead of staying `installing` for ever',

@@ -53,11 +53,15 @@
 # Environment:
 #   REA_MARKER_VERSION=1     bump to force a re-run on existing disks
 #   REA_NODE_VERSION=v22.23.4 pinned Node for the REA runtime
+#   REA_AGENTS_VERSION=latest  rea-agents spec for npm; a version string pins it
+#   REA_FORCE_UPDATE=1       ignore the marker and re-run (the panel's Update rea)
 # =====================================================================
 set -u
 
 VERSION="${REA_MARKER_VERSION:-1}"
 NODE_VERSION="${REA_NODE_VERSION:-v22.23.4}"
+REA_AGENTS_VERSION="${REA_AGENTS_VERSION:-latest}"
+FORCE_UPDATE="${REA_FORCE_UPDATE:-0}"
 GHIDRA_VERSION=12.1.4
 # The asset tag is Ghidra_12.1.4_build and the file is dated 20260921 — the
 # release that REA tests against. 12.2 is refused by REA's version probe, so
@@ -81,9 +85,20 @@ echo "=== $(date -Is) rea v$VERSION node=$NODE_VERSION ghidra=$GHIDRA_VERSION ja
 say() { echo "[rea] $*"; }
 die() { echo "[rea] FAILED: $*"; exit 1; }
 
-if [ -f "$MARKER" ] && grep -qx "version=$VERSION" "$MARKER" 2>/dev/null; then
+# THE MARKER IS THE ONE THING AN UPDATE MUST GET PAST. `version=$VERSION` is a
+# WHOLE-LINE match, so a disk provisioned today answers the guard below and this
+# script exits BEFORE npm runs — an "update" that reports success and changes
+# nothing. REA_FORCE_UPDATE=1 is that one-shot bypass: the run proceeds, the
+# marker is rewritten with the SAME version, and the next Start is a no-op again.
+# (Bumping REA_MARKER_VERSION instead would make the NEXT ordinary run — which
+# sends no environment, i.e. the default — mismatch and re-enter the installer
+# body: a full pass as the price of one update.)
+if [ "$FORCE_UPDATE" != 1 ] && [ -f "$MARKER" ] && grep -qx "version=$VERSION" "$MARKER" 2>/dev/null; then
   say "already provisioned (v$VERSION)"
   exit 0
+fi
+if [ "$FORCE_UPDATE" = 1 ]; then
+  say "force update: ignoring the marker (v$VERSION); installing rea-agents@${REA_AGENTS_VERSION}"
 fi
 
 # --- 1. preflight ----------------------------------------------------
@@ -157,7 +172,8 @@ say "node: $("$NODE_DIR/bin/node" --version) npm: $("$NODE_DIR/bin/npm" --versio
 
 # --- 4. rea-agents ---------------------------------------------------
 say "installing rea-agents (npm global, log /tmp/rea-npm.log)"
-if ! "$NODE_DIR/bin/npm" install --global --no-fund --no-audit rea-agents@latest \
+say "rea-agents: ${REA_AGENTS_VERSION} (a version string pins it; latest follows npm)"
+if ! "$NODE_DIR/bin/npm" install --global --no-fund --no-audit "rea-agents@${REA_AGENTS_VERSION}" \
      >/tmp/rea-npm.log 2>&1; then
   tail -30 /tmp/rea-npm.log
   die "npm install --global rea-agents failed (see /tmp/rea-npm.log)"
@@ -385,6 +401,7 @@ cat >"$MARKER" <<EOF
 version=$VERSION
 node=$("$NODE_DIR/bin/node" --version)
 rea=$REA_VERSION
+rea_agents=$REA_AGENTS_VERSION
 ghidra=$GHIDRA_VERSION
 jdk=$("$JAVA_HOME/bin/java" -version 2>&1 | head -1 | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)
 jadx=$("$JADX_BIN" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
@@ -395,7 +412,7 @@ registered=$REGISTERED
 provisioned=$(date -Is)
 EOF
 
-say "OK node=$("$NODE_DIR/bin/node" --version) rea=$REA_VERSION ghidra=$GHIDRA_VERSION jdk=$("$JAVA_HOME/bin/java" -version 2>&1 | head -1 | grep -oE '[0-9]+(\.[0-9]+)*' | head -1) jadx=$("$JADX_BIN" --version 2>/dev/null | head -1) registered=$REGISTERED"
+say "OK node=$("$NODE_DIR/bin/node" --version) rea=$REA_VERSION ghidra=$GHIDRA_VERSION jdk=$("$JAVA_HOME/bin/java" -version 2>&1 | head -1 | grep -oE '[0-9]+(\.[0-9]+)*' | head -1) jadx=$("$JADX_BIN" --version 2>/dev/null | head -1) registered=$REGISTERED agents=$REA_AGENTS_VERSION"
 # Detach the restart: cua-spacesd owns this session, and restarting it from
 # inside a `cua sb exec` child would kill the child mid-restart. The sleep lets
 # this script and the exec return first.

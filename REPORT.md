@@ -49,12 +49,22 @@ Components:
   **toggles**.
 * **New computer**: name, vCPU, RAM (GB), Image, **Enable GPU** — one row.
   Shutdown asks "Do you want to shutdown <name>?" first.
-* **Enable REA** — third checkbox in New computer: installs Node 22,
+* **Install rea** — third checkbox in New computer: installs Node 22,
   rea-agents, JDK 21, Ghidra 12.1.4, JADX and the pinned jadx-headless-mcp jar,
   roughly 3.5 GB installed on a 40 GB disk; the Disk field rises to 40 when
   ticked and the card warns when the store quota is below it — the create still
   proceeds (the disk is sparse) and carries `warnings[code: disk-over-policy]`.
-  Computers carry an **REA** badge.
+  It **installs in the background**: Create returns when the VM is up, the row
+  shows `REA…` while the job runs, and a failure shows **REA failed** with a
+  **Retry install** button (the row also carries the tail and the retry hint).
+  Computers carry an **REA** badge once the kit is verified.
+  A verified row also shows the resolved `rea <version>` beside the badge.
+  Nothing is pinned for you any more: a new computer installs `rea-agents@latest`
+  (Node, Ghidra and JADX stay pinned — REA's doctor refuses other Ghidra builds),
+  and `REA_AGENTS_VERSION` pins a version when a workspace wants one.
+  **Update rea** on a verified row queues one `rea` step with `update: true`, which
+  the supervisor runs as `REA_FORCE_UPDATE=1` — past `/var/lib/cua-rea`, without
+  deleting the disk (`POST /cua/provision {"update": true}` is the tool-side twin).
 * **Policy**: auto-suspend, idle minutes, **Disk Size (GB)**, max running.
   "Shutdown frees a slot, disks are untouched."
 * **Viewer**: `Video` (cua stream, HTTPS) or `Frames (http)`; the agent's cursor
