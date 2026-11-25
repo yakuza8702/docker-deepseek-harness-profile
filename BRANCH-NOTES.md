@@ -3675,3 +3675,54 @@ passes; a missing `description`, an `assets/` with no `SKILL.md`, and a stale
 `check_office.py` reference each still exit 1. The shipped image's own tree
 (0.2.2-rc.5, which carries BOTH layouts) passes too: `node tools/ci-gates.mjs
 --installed`, Office row green.
+
+## 32. Branch `cua-vm-improve-v2` — 2026-11-25: an OpenCode CLI in the image, and the bridge that was not built
+
+The image now ships the **OpenCode CLI** (`sst/opencode`, `/usr/local/bin/opencode`) as a
+build-time artifact, and still does **not** ship `dsh-opencode-connect`. The split is the
+whole point: the CLI is the one piece a user cannot add later without root, while the plugin
+is a third-party bundle with its own release cadence that belongs to the profile, not the
+image.
+
+**What was added.** `Dockerfile` grows `ARG OPENCODE_VERSION=latest` plus a `RUN` that
+resolves the newest **v1** tag from the GitHub releases API and extracts the official
+`opencode-linux-{x64,arm64}.tar.gz` to `/usr/local/bin/opencode` (no npm, no postinstall, no
+runtime download), then verifies it with `opencode --version`. v1 only, because the plugin
+speaks the v1 root API paths (`/session`, `/config/providers`, `/event`) and OpenCode 2 moved
+them under `/api/...`; a 2.x pin and anything below the plugin's `1.18.0` free-tier floor are
+refused at build time, as is a failed or v1-less releases lookup. `tools/check-opencode-cli.mjs`
+is the offline gate (`--check`, 21 assertions): it extracts that same `RUN` fragment and runs
+it under `sh` with a stub `curl` against a fixture whose two newest tags are v2, so the pick,
+the skipped-tag log, both refusals and both offline failures are proved without a docker
+daemon. It is wired into `tools/ci-gates.mjs` `REPO_GATES` and mirrored by `OPENCODE-CLI-1…12`
+in `tests/modules-unit.mjs`; `.env.example` documents the ARG.
+
+**The 0-sentinel toggle.** `OPENCODE_VERSION=0` is not a version — it is the OFF switch. The
+`RUN` echoes one line and `exit 0`s before any network call, so a build with the toggle off
+produces an image that simply has no `/usr/local/bin/opencode`, and the plugin reports it as
+missing instead of spawning a broken binary. Both workflows expose it: `docker-build.yml` and
+`prebuild-gates.yml` take an `opencode` boolean input (default true) and map it to
+`OPENCODE_VERSION=0` when unchecked, with precedence manual input > repo variable > the file's
+env default (`cua_cli_version` got the same treatment in the same round).
+
+**No agent bridge — by decision, not by omission.** The CLI is a prerequisite for the
+*model* bridge and nothing else. Serving an OpenCode free model through a foreign harness
+cannot give it DSH's tools — opencode's agency lives in its server-side instruction stack and
+tool loop, not the weights — so the "make opencode's full agent drive DSH" idea was researched
+and dropped; the reasoning, including what a real bridge would have to re-implement, is in a
+**local, untracked** research note — `research/opencode-agent-bridge-brief.md` (§2 mechanism,
+§6 verdict). `research/` is gitignored (`.gitignore:16`), so that file ships with no clone and
+is not a link a reader can follow; it is working evidence for this round only. The README's
+OpenCode section states the conclusion and says the note is local-only, so no future session
+re-opens it as a gap.
+
+**Removal.** README's OpenCode section carries the recipe at both rungs — per-build
+(uncheck `opencode`, or `OPENCODE_VERSION=0`) and permanent (the ARG + `RUN`, the build-arg and
+input lines in both workflows, the `REPO_GATES` row, the tool file, the `OPENCODE-CLI-*` rows
+and their imports, the `.env.example` entry, the section itself) — plus what survives: only the
+image layer held the binary (no volume, no seed, no `~/.config` copy), and an already-installed
+`dsh-opencode-connect` is removed from the Plugins page, breaking cleanly because the CLI was
+its only requirement.
+
+Evidence: `node tools/check-opencode-cli.mjs --check` → 21 passed; `node tests/modules-unit.mjs`
+→ exit 0 with `OPENCODE-CLI-1…12` green; `node tools/check-cua-vm.mjs` → exit 0.

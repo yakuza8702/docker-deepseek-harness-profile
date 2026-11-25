@@ -88,7 +88,9 @@ import {
   opencodeAssetUrl,
   versionFromTagName as opencodeVersionFromTagName,
   RELEASES_API_URL as OPENCODE_RELEASES_API_URL,
-  PLUGIN_VERSION_FLOOR as OPENCODE_PLUGIN_FLOOR
+  PLUGIN_VERSION_FLOOR as OPENCODE_PLUGIN_FLOOR,
+  SKIP_SENTINEL as OPENCODE_SKIP_SENTINEL,
+  SKIP_ECHO as OPENCODE_SKIP_ECHO
 } from '../tools/check-opencode-cli.mjs'
 
 /** The checkout root — the source of `docker/windows-oem/` in these tests. */
@@ -5624,6 +5626,17 @@ check('C19: the static API the quota/cache probe uses is unchanged (entry.url is
       && opencodeVersionFromTagName('v2.4.1') === null
       && opencodeVersionFromTagName('process-daemon-v0.6.0') === null,
     'three cases')
+
+  // THE OFF SENTINEL (`--build-arg OPENCODE_VERSION=0`, what the workflows'
+  // `opencode` toggle sends when unchecked). It must be a DELIBERATE, logged
+  // skip — exit 0, the skip line, no curl, no version — and not a resolver
+  // failure, because a failing build is not "the CLI is off". The guard is the
+  // RUN's own text; deleting it makes this row throw, not pass.
+  const off = simulateOpencodeResolution({ dockerfileText, requested: OPENCODE_SKIP_SENTINEL, apiJson: OPENCODE_RELEASES })
+  check('OPENCODE-CLI-12: OPENCODE_VERSION=0 skips the CLI (exit 0, skip line, no curl) instead of resolving it',
+    runBlock.includes(OPENCODE_SKIP_ECHO)
+      && off.status === 0 && off.version === null && off.curlCalled === false && off.skipped === true,
+    `status ${off.status}, curl ${off.curlCalled}, skipped ${off.skipped}`)
 }
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)

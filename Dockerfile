@@ -1075,9 +1075,21 @@ RUN set -eux; \
 #
 # tools/check-opencode-cli.mjs executes THIS RUN's resolution fragment against a
 # fixture, offline, so the rules above are proved without a docker daemon.
+#
+# `0` IS NOT A VERSION — IT IS THE OFF SWITCH. `--build-arg OPENCODE_VERSION=0`
+# (what the workflows' `opencode` toggle sends when it is unchecked) means "build
+# this image WITHOUT the CLI": the RUN below echoes one line and exits 0 before
+# it touches the network, so that image simply has no /usr/local/bin/opencode and
+# dsh-opencode-connect reports it as missing instead of spawning a broken binary.
+# Every other value — "latest", a pin, a leading-`v` tag — keeps the resolution
+# rules above unchanged; only the literal `0` short-circuits.
 # ---------------------------------------------------------------------
 ARG OPENCODE_VERSION=latest
 RUN set -eux; \
+    if [ "${OPENCODE_VERSION}" = "0" ]; then \
+      echo "opencode: OPENCODE_VERSION=0 — skipping the OpenCode CLI (disabled for this build)"; \
+      exit 0; \
+    fi; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
       amd64) oc_asset="x64" ;; \

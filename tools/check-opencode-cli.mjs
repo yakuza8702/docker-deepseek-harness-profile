@@ -40,6 +40,9 @@
  *     called — an offline or reproducible build must not need the network.
  *   * a 2.x pin → refused with a message that names the v1 constraint.
  *   * anything below 1.18.0 → refused (the plugin's free-tier floor).
+ *   * `0` → NOT a version: the RUN's own guard (above the resolution) echoes the
+ *     skip line and exits 0 before the resolver or any network call. Simulated
+ *     from the guard's real text, so deleting the guard fails this gate.
  *
  * USAGE
  * -----
@@ -74,6 +77,20 @@ export const PLUGIN_VERSION_FLOOR = "1.18.0";
 /** The asset the RUN downloads, for one architecture/baseline/musl target. */
 export const ASSET_GLOB = "opencode-linux-<target>.tar.gz";
 
+/**
+ * The OFF sentinel: `--build-arg OPENCODE_VERSION=0` means "build without the
+ * CLI" (the workflows' `opencode` toggle sends it), never a version to resolve.
+ */
+export const SKIP_SENTINEL = "0";
+
+/**
+ * The one line the RUN prints when the sentinel is in play. Exported because the
+ * gate asserts it against the RUN text itself: the echo is what an operator
+ * reads in a build log to know the CLI was skipped on purpose.
+ */
+export const SKIP_ECHO =
+  "opencode: OPENCODE_VERSION=0 — skipping the OpenCode CLI (disabled for this build)";
+
 /** Read the `ARG OPENCODE_VERSION=` line and the RUN block that follows it. */
 export function readRunBlock(dockerfileText) {
   const lines = dockerfileText.split(/\r?\n/u);
@@ -90,6 +107,31 @@ export function readRunBlock(dockerfileText) {
     if (!lines[index].trimEnd().endsWith("\\")) break;
   }
   return block.join("\n");
+}
+
+/**
+ * The OFF-SENTINEL guard: the `if [ "${OPENCODE_VERSION}" = "0" ]` block at the
+ * top of the RUN, through its closing `fi;`.
+ *
+ * It is extracted (not re-written) for the same reason the resolver is: the gate
+ * has to run the text Docker would run. The guard sits ABOVE `oc_version=`, so
+ * it is deliberately outside `extractResolveFragment` — a sentinel run must not
+ * execute a single line of the resolver, which is exactly what this proves.
+ */
+export function extractSkipGuard(runBlock) {
+  const lines = runBlock.split(/\r?\n/u);
+  const begin = lines.findIndex((line) =>
+    /^\s*if\s+\[\s*"\$\{OPENCODE_VERSION\}"\s*=\s*"0"\s*\]/u.test(line),
+  );
+  if (begin === -1) {
+    throw new Error('the RUN block has no `if [ "${OPENCODE_VERSION}" = "0" ]` guard');
+  }
+  const end = lines.findIndex((line, index) => index > begin && /^\s*fi;\s*\\?\s*$/u.test(line));
+  if (end === -1) throw new Error("the OPENCODE_VERSION=0 guard has no closing `fi;`");
+  return lines
+    .slice(begin, end + 1)
+    .map((line) => line.replace(/\\\s*$/u, ""))
+    .join("\n");
 }
 
 /**
@@ -123,7 +165,9 @@ export function extractResolveFragment(runBlock) {
  *
  * Returns { status, version, curlCalled, stdout, stderr, output }. `version` is
  * null whenever the fragment exited non-zero — a partial parse is never a
- * version.
+ * version. `skipped` is true only when the requested value was the OFF sentinel
+ * AND the guard's own skip line was printed: the sentinel is a "no CLI in this
+ * image" build, which is exit 0 with no version and no curl.
  */
 export function simulateResolution({
   dockerfileText,
@@ -131,7 +175,12 @@ export function simulateResolution({
   apiJson = "[]",
   apiFails = false,
 }) {
-  const fragment = extractResolveFragment(readRunBlock(dockerfileText));
+  const runBlock = readRunBlock(dockerfileText);
+  // `0` never reaches the resolver — the RUN's guard exits first. So the text
+  // executed for the sentinel is the GUARD, not the resolver: running the
+  // resolver here would prove a branch Docker never takes.
+  const skipping = requested === SKIP_SENTINEL;
+  const fragment = skipping ? extractSkipGuard(runBlock) : extractResolveFragment(runBlock);
   const dir = mkdtempSync(path.join(tmpdir(), "opencode-cli-version-"));
   try {
     const bin = path.join(dir, "bin");
@@ -154,7 +203,11 @@ export function simulateResolution({
     chmodSync(stub, 0o755);
     // `-u` mirrors the Dockerfile's `set -eux`: an unset variable is a failure,
     // not an empty string. `-e` makes an unchecked failing command fail the run.
-    const script = `set -eu\n${fragment}\nprintf 'RESOLVED=%s' "$oc_version"\n`;
+    // For the sentinel the trailing printf is unreachable by design (the guard's
+    // `exit 0`) — an empty RESOLVED is the proof that nothing resolved.
+    const script = skipping
+      ? `set -eu\n${fragment}\nprintf 'RESOLVED=%s' "${SKIP_SENTINEL}"\n`
+      : `set -eu\n${fragment}\nprintf 'RESOLVED=%s' "$oc_version"\n`;
     const result = spawnSync("sh", ["-c", script], {
       encoding: "utf8",
       timeout: 30_000,
@@ -177,6 +230,8 @@ export function simulateResolution({
     return {
       status: result.status,
       version: result.status === 0 && found !== null ? found[1] : null,
+      // The OFF sentinel: exit 0, the guard's own line in the log, no version.
+      skipped: skipping && stdout.includes(SKIP_ECHO),
       curlCalled: callLog.length > 0,
       // The argv the Dockerfile's curl actually received: the endpoint and the
       // redirect flag are part of the contract, not incidental.
@@ -358,6 +413,22 @@ if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === path.reso
       "a leading `v` on a pinned version is tolerated (the tag and the asset differ by it)",
       pinnedV.status === 0 && pinnedV.version === "1.19.6" && pinnedV.curlCalled === false,
       `status ${pinnedV.status}, version ${JSON.stringify(pinnedV.version)}`,
+    );
+
+    // THE OFF SENTINEL. `0` is not a version: the RUN's guard must short-circuit
+    // the whole block — exit 0, the skip line in the log, no curl, no version —
+    // and that line must be IN the RUN text, not only in this simulator. A
+    // build with the toggle off therefore contains no CLI and says so.
+    const off = simulateResolution({ dockerfileText, requested: SKIP_SENTINEL, apiJson: SAMPLE_RELEASES });
+    check(
+      "OPENCODE_VERSION=0 short-circuits: exit 0, the skip echo in the log, never a curl call",
+      block.includes(SKIP_ECHO) &&
+        off.status === 0 &&
+        off.version === null &&
+        off.curlCalled === false &&
+        off.skipped === true &&
+        /skipping the OpenCode CLI/u.test(off.output),
+      `status ${off.status}, version ${JSON.stringify(off.version)}, curl ${off.curlCalled}, skip echo ${off.skipped ? "present" : "MISSING"}`,
     );
 
     const pinnedV2 = simulateResolution({ dockerfileText, requested: "2.4.1", apiJson: SAMPLE_RELEASES });

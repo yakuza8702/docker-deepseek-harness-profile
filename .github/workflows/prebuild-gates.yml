@@ -83,6 +83,14 @@ on:
         description: "Upstream @deepseek-ai/dsh version to build (default: latest)"
         required: false
         default: "latest"
+      opencode:
+        description: "Install the OpenCode CLI in the image (sst/opencode, newest v1 release; uncheck to build without it)"
+        type: boolean
+        default: true
+      cua_cli_version:
+        description: "cua CLI version: latest resolves the newest cua-sdk-v* release; or pin an exact version"
+        required: false
+        default: "latest"
 
 permissions:
   contents: read
@@ -282,15 +290,22 @@ jobs:
           # somebody remembers the toggle; a dispatch run may turn it off.
           # CUA_CLI_VERSION: the cua CLI's release, same shape as DSH_VERSION
           # above — "latest" lets the Dockerfile resolve the newest cua-sdk-v*
-          # release at build time; a repo variable of the same name pins one.
+          # release at build time; a dispatch run may pass `cua_cli_version`,
+          # else a repo variable of the same name pins one.
           # OPENCODE_VERSION: the OpenCode CLI's release, same shape — "latest"
           # lets the Dockerfile resolve the newest v1 tag (v2 tags are skipped:
           # dsh-opencode-connect speaks the v1 API) and fail the build if that
           # lookup does not answer; a repo variable of the same name pins one.
+          # The `opencode` input OFF passes the `0` sentinel, which the
+          # Dockerfile's RUN short-circuits on before any network call. The
+          # boolean is read as `github.event.inputs.opencode` (a string) for the
+          # same reason this file's `virgl`/`push_image` checks are: on push/tag
+          # events `inputs.opencode` is null, and null == false is TRUE in the
+          # expression language — that would silently disable the CLI everywhere.
           build-args: |
             DSH_VERSION=${{ github.event.inputs.dsh_version || 'latest' }}
-            CUA_CLI_VERSION=${{ vars.CUA_CLI_VERSION || 'latest' }}
-            OPENCODE_VERSION=${{ vars.OPENCODE_VERSION || 'latest' }}
+            CUA_CLI_VERSION=${{ inputs.cua_cli_version || vars.CUA_CLI_VERSION || 'latest' }}
+            OPENCODE_VERSION=${{ github.event.inputs.opencode == 'false' && '0' || vars.OPENCODE_VERSION || 'latest' }}
             WITH_VIRGL_QEMU=${{ github.event.inputs.virgl == 'false' && '0' || env.DSH_WITH_VIRGL_QEMU }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.tags.outputs.ref_tag }}

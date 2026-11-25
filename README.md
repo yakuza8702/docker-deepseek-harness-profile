@@ -357,6 +357,7 @@ opencode on $PATH
 | Version | `OPENCODE_VERSION=latest` → the newest **v1** tag, resolved at **build** time |
 | Why v1 only | the plugin speaks the v1 API paths (`/session`, `/config/providers`, `/event`); OpenCode 2 moved them under `/api/...`, so `latest` skips every v2 tag, pre-releases included |
 | Pin it | `OPENCODE_VERSION=1.19.6` (`docker build --build-arg OPENCODE_VERSION=1.19.6 .`) |
+| Build toggle | uncheck `opencode` in the workflow trigger, or `OPENCODE_VERSION=0` as a build-arg — the build skips the CLI install entirely (exit 0, one logged line, no `/usr/local/bin/opencode`) |
 | Floor | the build refuses anything below **1.18.0** (the plugin's free-tier minimum) and refuses a 2.x pin |
 | Plugin | **not in this image** — no bundle, no seed step, no card; installing it is the user's step |
 
@@ -369,6 +370,40 @@ The build gate is offline and hard: `node tools/check-opencode-cli.mjs --check` 
 Dockerfile's own resolution fragment and runs it under `sh` with a stub `curl`, against a
 fixture that puts two v2 tags above the v1 one — proving the pick, the skipped-tag log, both
 refusals (2.x pin, below floor) and both offline failures (API down, no v1 tag).
+
+**There is no agent bridge — only this CLI.** It exists for the one job above: it is the
+prerequisite the optional `dsh-opencode-connect` model bridge spawns, and nothing more. A
+free model served through a foreign harness **cannot drive DSH's tools**: OpenCode's agency
+is its server-side instruction stack and tool loop, not the weights, so a DSH-side adapter
+gets a chat endpoint that talks about file access instead of making the call. The "why" —
+what a real bridge would have to re-implement, and why it was dropped — was researched in a
+local note, `research/opencode-agent-bridge-brief.md` (§2 the mechanism, §6 the feasibility
+verdict). That file is **not in this tree**: `research/` is gitignored on purpose
+(`.gitignore`), so no clone carries it — treat the note as local-only working evidence, not
+something a reader of this README can open, and re-run the research if you need it. The
+conclusion is what matters here and it does not depend on the file: the decision is closed,
+not deferred to a document.
+
+**If you ever remove it.** Two rungs, and the first one needs no edit:
+
+* **For one build** — uncheck `opencode` in the manual workflow trigger (the input sends
+  `OPENCODE_VERSION=0`), or pass `--build-arg OPENCODE_VERSION=0` yourself. `0` is an OFF
+  sentinel, not a version: the `RUN` prints one line and exits 0 before it touches the
+  network, and the image simply has no `/usr/local/bin/opencode`.
+* **Permanently** — delete, in this order: the `ARG OPENCODE_VERSION` line plus the whole
+  opencode `RUN` block in the `Dockerfile`; the `opencode` input and the
+  `OPENCODE_VERSION=…` build-arg lines in `.github/workflows/docker-build.yml` and
+  `.github/workflows/prebuild-gates.yml`; the `check-opencode-cli.mjs` row from
+  `REPO_GATES` in `tools/ci-gates.mjs`; the tool file `tools/check-opencode-cli.mjs`; the
+  import block and every `OPENCODE-CLI-*` check in `tests/modules-unit.mjs`; the
+  `OPENCODE_VERSION` entry in `.env.example`; and this README section.
+
+What stays: nothing outside the image. `/usr/local/bin/opencode` is a file in an image
+layer — no volume holds it, no entrypoint seeds it, no `~/.config` copy is made — so an image
+rebuilt without it has no opencode anywhere and a container recreated from that image loses
+nothing else. If `dsh-opencode-connect` was installed through the plugin manager, remove it
+from the Plugins page too: it lives in the DSH profile, not the image, and because it only
+ever required the binary it uninstalls cleanly ("opencode not found", never a wedged provider).
 
 ## OCR for image-only PDFs — when the text is only pixels
 
@@ -1937,8 +1972,8 @@ differently after a rebuild as an image change first, and check
   falls back to that package's `next` tag and says so in the log
 - **the cua CLI is `latest` unless you pin it**: each build resolves the newest
   `cua-sdk-v*` release from the GitHub API and fails rather than falling back;
-  set `CUA_CLI_VERSION` (workflow env / repo variable, or
-  `--build-arg CUA_CLI_VERSION=0.7.0`) to pin one
+  set `CUA_CLI_VERSION` (workflow env / repo variable / the `cua_cli_version`
+  trigger input, or `--build-arg CUA_CLI_VERSION=0.7.0`) to pin one
 - build key = `dsh <version>` + this repo's commit SHA → rebuilds only when **either** upstream releases a new version **or** this repo's Dockerfile changes
 - pushes `linux/amd64` (default; arm64 opt-in via workflow input or `vars.DSH_PLATFORMS`) to `ghcr.io/<owner>/<repo>` with tags `latest`, `dsh-<version>`, `build-<version>-<sha8>`
 - manual **Run workflow** button always available (`force_build` to bypass the skip check)

@@ -15,6 +15,10 @@
 #                  (workflow input `virgl`, or repo variable DSH_WITH_VIRGL_QEMU=1)
 #                  or repo variable vars.DSH_PLATFORMS (source builds for
 #                  arm64 run under slow QEMU emulation, avoid on free runners)
+# * CLIs         : the cua and OpenCode CLI versions are inputs on a manual run
+#                  (`cua_cli_version`, `opencode`) — input > vars > env. The
+#                  `opencode` toggle OFF passes OPENCODE_VERSION=0, the
+#                  Dockerfile's "do not install the CLI" sentinel.
 #
 # CHANNELS
 #   npm (default) : @deepseek-ai/dsh dist-tags.latest — the OFFICIAL
@@ -71,6 +75,14 @@ on:
         description: "Build with the virgl-capable QEMU (GPU acceleration for the personal VM; +~200 MB, needs /dev/dri on the host)"
         type: boolean
         default: false
+      opencode:
+        description: "Install the OpenCode CLI in the image (sst/opencode, newest v1 release; uncheck to build without it)"
+        type: boolean
+        default: true
+      cua_cli_version:
+        description: "cua CLI version: latest resolves the newest cua-sdk-v* release; or pin an exact version"
+        required: false
+        default: "latest"
   schedule:
     - cron: "0 */6 * * *"
 
@@ -100,7 +112,8 @@ env:
   # releases API at BUILD time; the build FAILS if that lookup fails, so an
   # image can never say "latest" and carry an old CLI. Set a version to pin.
   # Same shape as DSH_VERSION_PIN: an env here (or a repo variable of the same
-  # name) is the only place the value lives.
+  # name) is the only place the value lives — and, like DSH_VERSION_PIN, a
+  # manual run may override it with the `cua_cli_version` input.
   CUA_CLI_VERSION: "latest"
   # The OpenCode CLI baked into the image — the Dockerfile's OPENCODE_VERSION ARG.
   # "latest" (default) resolves the newest `v1.*` release from the GitHub releases
@@ -109,6 +122,9 @@ env:
   # none of them). The build FAILS if that lookup fails, if no v1 tag exists, or if
   # the version is below the plugin's 1.18.0 floor, so an image can never say
   # "latest" and carry a CLI the plugin cannot drive. Set a version to pin.
+  # The CLI install can be switched OFF entirely: uncheck the `opencode` input
+  # on a manual run (or pass OPENCODE_VERSION=0 as a build-arg) and the RUN
+  # short-circuits before any network call — 0 is the sentinel, not a version.
   OPENCODE_VERSION: "latest"
 
 jobs:
@@ -326,11 +342,25 @@ jobs:
           context: .
           platforms: ${{ github.event.inputs.platforms || vars.DSH_PLATFORMS || 'linux/amd64' }}
           push: true
+          # CUA_CLI_VERSION / OPENCODE_VERSION: precedence is manual input >
+          # repo variable > this file's top-level env (the same shape as the
+          # check job's channel resolution: `dsh_version`'s input wins on a
+          # dispatch run, and push/schedule runs — which carry NO inputs — keep
+          # the old vars → env chain byte for byte).
+          #   * cua: `inputs.cua_cli_version` is empty on push/schedule, so the
+          #     chain falls straight through to vars → env.
+          #   * opencode: the input is a BOOLEAN, so it is read as the string
+          #     `github.event.inputs.opencode` (this file's own convention for
+          #     `virgl` / `force_build`, and the reason it is not `inputs.opencode
+          #     == false`: on push/schedule that context is null and null == false
+          #     is TRUE in the expression language, which would silently disable
+          #     the CLI on every cron build). Unchecked → the `0` sentinel, which
+          #     the Dockerfile's RUN short-circuits on before any network call.
           build-args: |
             DSH_VERSION=${{ needs.check.outputs.dsh_version }}
             DSH_SOURCE_REF=${{ needs.check.outputs.source_ref }}
-            CUA_CLI_VERSION=${{ vars.CUA_CLI_VERSION || env.CUA_CLI_VERSION }}
-            OPENCODE_VERSION=${{ vars.OPENCODE_VERSION || env.OPENCODE_VERSION }}
+            CUA_CLI_VERSION=${{ inputs.cua_cli_version || vars.CUA_CLI_VERSION || env.CUA_CLI_VERSION }}
+            OPENCODE_VERSION=${{ github.event.inputs.opencode == 'false' && '0' || vars.OPENCODE_VERSION || env.OPENCODE_VERSION }}
             # Opt-in GPU support: the distro QEMU plus qemu-system-modules-opengl
             # (the package that carries virtio-gpu-gl-pci) and virgl/Mesa.
             # DSH_CUA_VM_GPU=virgl at runtime then switches cua onto it.
