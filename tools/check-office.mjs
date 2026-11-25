@@ -13,17 +13,21 @@
  *   2. the engine (`@deepseek-ai/libreoffice-kit` + its WebAssembly package) — without
  *      it there is no render, no convert and no recalculation, i.e. no way for a vision
  *      model to ever look at a page;
- *   3. the skill assets (`@deepseek-ai/dsh-skill-office/assets`) — the checker and the
- *      three skill bodies;
+ *   3. the skill assets (`@deepseek-ai/dsh-skill-office/assets`) — every skill body the
+ *      release ships (split skills plus the combined `office` skill through 0.2.2,
+ *      `office` alone from 0.2.3), each one loadable by the registry and teaching all
+ *      three document families;
  *   4. the four declarations that put the whole thing on the Plugins page as one
  *      switchable card (bundle patch rows, the host row table, the duplicate-card
  *      suppression list, the entrypoint switch).
  *
  * So this gate does not list files — it EXECUTES the surface: it runs the payload's
  * interpreter, imports every library the skills use, writes a real .docx with it, runs
- * the real checker over that document, converts it to PDF and renders a page to PNG
- * with the real engine, and then reads the four declarations out of the repository
- * files. A green run means a model could do the same thing on the first boot.
+ * the real checker over that document when the release ships it (it does not since
+ * 0.2.1-rc.2; the bundled skill bodies are validated instead), converts it to PDF and
+ * renders a page to PNG with the real engine, and then reads the four declarations out
+ * of the repository files. A green run means a model could do the same thing on the
+ * first boot.
  *
  * USAGE
  * -----
@@ -39,6 +43,7 @@
 
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 
@@ -194,7 +199,78 @@ print("MISSING", "; ".join(missing) if missing else "none")
   return python
 }
 
-/** Write a real document with the payload, then run the REAL checker over it. */
+/**
+ * Every skill folder a skill-office release ships, as `assets/<name>/SKILL.md`.
+ *
+ * The SET is release-dependent, and that is the point: upstream shipped the split skills
+ * (`office-docx`, `office-pptx`, `office-xlsx`) and, by 0.2.2, the combined `office`
+ * skill alongside them; 0.2.3 ships `office` alone — that provider registers exactly
+ * one name and reads `assets/office/SKILL.md`. Demanding the old names reds a legitimate
+ * release;
+ * demanding only "some file exists" passes a bundle that teaches nothing. So the gate
+ * reads the release's own layout (the assets directory it will load from) and then
+ * holds every folder in it to the registry's contract.
+ */
+function bundledSkillDirs(skillOffice) {
+  const assets = join(skillOffice, 'assets')
+  if (!existsSync(assets) || !statSync(assets).isDirectory()) return undefined
+  return readdirSync(assets, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && existsSync(join(assets, entry.name, 'SKILL.md')))
+    .map((entry) => entry.name)
+    .sort()
+}
+
+/**
+ * Reject any skill the registry would refuse, and prove the set still covers Office.
+ *
+ * The frontmatter rules are the provider's own: `parseSkill` throws without a `---`
+ * block, and a skill without a description is registered but invisible to the model
+ * (the catalog shows descriptions). The family coverage is the bundle's promise: a
+ * card called "Office documents" that teaches only Word is a half-working feature, so
+ * the bodies must still mention the Word, PowerPoint and Excel workflows.
+ */
+function checkSkillAssets(skillOffice) {
+  const assets = join(skillOffice, 'assets')
+  const dirs = bundledSkillDirs(skillOffice)
+  if (dirs === undefined) return bad(`@deepseek-ai/dsh-skill-office has no assets/ directory at ${assets}`)
+  if (dirs.length === 0) return bad(`no <name>/SKILL.md under ${assets} — the bundle would register no skill`)
+
+  const broken = []
+  const bodies = new Map()
+  for (const name of dirs) {
+    const text = readFileSync(join(assets, name, 'SKILL.md'), 'utf8')
+    bodies.set(name, text)
+    const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u.exec(text)
+    const declared = frontmatter === null ? undefined : /^name:\s*(\S+)\s*$/mu.exec(frontmatter[1])?.[1]
+    if (frontmatter === null) broken.push(`${name} (no YAML frontmatter)`)
+    else if (declared === undefined) broken.push(`${name} (no frontmatter name)`)
+    else if (!/^description:\s*\S/mu.test(frontmatter[1])) broken.push(`${name} (no frontmatter description)`)
+    else if (declared !== name) note(`${name}/SKILL.md declares name "${declared}"; the registry loads it by its folder name`)
+  }
+  if (broken.length > 0) return bad(`skill assets the registry would reject: ${broken.join(', ')}`)
+
+  // The scripts went away with the split skills; a body that still tells the model to
+  // run check_office.py would send it at a file this release does not ship.
+  if (!existsSync(join(assets, 'scripts', 'check_office.py'))) {
+    const stale = dirs.filter((name) => /check_office\.py/u.test(bodies.get(name) ?? ''))
+    if (stale.length > 0) bad(`skill body still instructs the model to run check_office.py, which this release does not ship: ${stale.join(', ')}`)
+  }
+
+  const families = [
+    ['Word', /python-docx|\bdocx\b/iu],
+    ['PowerPoint', /python-pptx|\bpptx\b/iu],
+    ['Excel', /openpyxl|\bxlsx\b/iu],
+  ]
+  const uncovered = families.filter(([, pattern]) => ![...bodies.values()].some((text) => pattern.test(text))).map(([family]) => family)
+  if (uncovered.length > 0) return bad(`the bundled skill(s) ${dirs.join(', ')} do not cover ${uncovered.join(', ')} — the Office card would teach only part of its surface`)
+  ok(`the release's ${dirs.length} bundled skill(s) (${dirs.join(', ')}) are registry-valid and cover Word, PowerPoint and Excel`)
+}
+
+/**
+ * Write a real document with the payload, then run the REAL checker over it when the
+ * release ships one — it does not since 0.2.1-rc.2, where the bundled skill bodies are
+ * validated instead (see checkSkillAssets).
+ */
 function checkCheckerAndRoundTrip(python, installs, work) {
   mkdirSync(work, { recursive: true })
   const document = join(work, 'office-gate.docx')
@@ -224,10 +300,7 @@ print("wrote", ${JSON.stringify(document)})
     // gate honest — require the skills themselves, not a file that no longer
     // exists — so following upstream does not fail the build.
     ok('this skill-office release ships no assets/scripts/check_office.py (removed upstream in 0.2.1-rc.2) — validating the bundled skills instead')
-    const skills = ['office-docx', 'office-pptx', 'office-xlsx']
-    const missingSkills = skills.filter((name) => !existsSync(join(skillOffice, 'assets', name, 'SKILL.md')))
-    if (missingSkills.length === 0) ok(`the three bundled skills are present (${skills.join(', ')})`)
-    else bad(`missing skill assets: ${missingSkills.join(', ')}`)
+    checkSkillAssets(skillOffice)
   } else {
     const report = join(work, 'checks.json')
     try {
@@ -238,10 +311,7 @@ print("wrote", ${JSON.stringify(document)})
     } catch (error) {
       bad(`check_office.py failed: ${String(error.stderr ?? error.message).trim().split('\n').slice(-1)[0]}`)
     }
-    const skills = ['office-docx', 'office-pptx', 'office-xlsx']
-    const missingSkills = skills.filter((name) => !existsSync(join(skillOffice, 'assets', name, 'SKILL.md')))
-    if (missingSkills.length === 0) ok(`the three bundled skills are present (${skills.join(', ')}) and their CLI resolves beside them`)
-    else bad(`missing skill assets: ${missingSkills.join(', ')}`)
+    checkSkillAssets(skillOffice)
   }
 
   const kitDir = findPackageDir(installs, '@deepseek-ai/libreoffice-kit')
@@ -389,7 +459,9 @@ async function main() {
   console.log(`check-office: carrier ${carrier}`)
   console.log(`check-office: installations ${installs.join(', ')}`)
 
-  const work = join('/tmp', 'office-gate')
+  // Respect TMPDIR like the rest of the suite: in the image this is /tmp, and a host
+  // whose /tmp is a small or full tmpfs can still run the gate by pointing it elsewhere.
+  const work = join(tmpdir(), 'office-gate')
   rmSync(work, { recursive: true, force: true })
 
   console.log('payload manifest')

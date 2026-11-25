@@ -530,7 +530,7 @@ seed_brave_devtools_bundle() {
 #
 # Same contract as its three siblings above, and for the same reason: the rows live
 # in the bundle's own patch (a row mounted by a launcher overlay re-declares itself
-# enabled every boot and no switch can win), and `skill-office` puts three skill
+# enabled every boot and no switch can win), and `skill-office` puts the Office skill
 # descriptions into every session's catalog, i.e. a context cost while it is on.
 #
 # The payload is the difference: this feature is useless without
@@ -585,7 +585,7 @@ seed_office_bundle() {
   case "$how" in
     selected|already-selected)
       printf '%s\n' "$how" > "$marker" 2>/dev/null || true
-      log "office: \"$OFFICE_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page under \"Office documents\" to release the three Office skills"
+      log "office: \"$OFFICE_BUNDLE\" is selected for profile \"$PROFILE\" ($how) — switch it off in the Plugins page under \"Office documents\" to release the Office skills"
       ;;
     existing-home) ;;
     unreadable|no-profile-block) log "WARN: could not select \"$OFFICE_BUNDLE\" ($how) — enable it by hand in the Plugins page" ;;
@@ -858,7 +858,7 @@ export DSH_REAL_HOME
 # DSH_BUNDLED_SKILL_DIR when the row has no explicit `bundledSkillDir`, and treats it
 # as a trusted bundled root — the same rank as the skills that ship inside packages,
 # so `pdf-documents` (this image's own PDF skill, see office-skills/) is discovered
-# exactly like the three Office ones. An explicit value always wins.
+# exactly like the harness's Office skills. An explicit value always wins.
 if [[ "${DSH_OFFICE:-1}" != "0" && -d /opt/dsh-office/office-skills ]]; then
   export DSH_BUNDLED_SKILL_DIR="${DSH_BUNDLED_SKILL_DIR:-/opt/dsh-office/office-skills}"
 fi
@@ -912,9 +912,11 @@ else
   # home.
   seed_browser_desktop_bundle
   # …and Office documents as a FOURTH (see seed_office_bundle): the harness's own
-  # office-docx/office-pptx/office-xlsx skills on the payload this image bakes in,
-  # with one card in the Plugins page. Same reason as the others — the skills are
-  # catalog context in every request, so the switch that releases them is the point.
+  # Office skills — `office` from 0.2.3, split skills plus `office` through 0.2.2 —
+  # on the payload this image bakes in, with one card in the Plugins page. Same
+  # reason as the others —
+  # the skills are catalog context in every request, so the switch that releases
+  # them is the point.
   seed_office_bundle
   # …and the personal VM as a FIFTH (see plugins/dsh-cua-vm): build/test inside
   # a Linux VM whose disk lives outside the workspace, with the shell staying

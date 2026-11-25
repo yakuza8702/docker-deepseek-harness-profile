@@ -251,15 +251,15 @@ DeepSeek Harness **already ships** the Office feature; a plain container mounts 
 it. This image mounts it, supplies the interpreter it expects, and puts a switch on it:
 
 ```
-Plugins page → Office documents → on    # office-docx / office-pptx / office-xlsx / pdf-documents
-Plugins page → Office documents → off   # the four skills released from every request
+Plugins page → Office documents → on    # the harness's Office skills + pdf-documents
+Plugins page → Office documents → off   # the skills released from every request
 ```
 
 | | |
 |---|---|
 | Bundle / package | `dsh-office` (`plugins/dsh-office`) |
 | Rows it mounts | `skill-office` → `@deepseek-ai/dsh-skill-office` · `workspace-dependencies` → `@deepseek-ai/dsh-tool-workspace-dependencies` |
-| Skills | `office-docx`, `office-pptx`, `office-xlsx` (bundled upstream) + `pdf-documents` (this image) |
+| Skills | the release's Office skills — `office` alone from 0.2.3; split skills plus `office` through 0.2.2 — + `pdf-documents` (this image) |
 | Interpreter | `/opt/dsh-office/primary-runtime` — Python 3.12.14, 15 distributions, ~282 MiB |
 | Engine | `@deepseek-ai/libreoffice-kit` — LibreOffice, prebuilt, WebAssembly backend on Linux |
 | Switches | `DSH_OFFICE=0` · `DSH_OFFICE_RUNTIME=<dir>` |
@@ -276,21 +276,22 @@ wheels this repo adds on purpose: `pypdf` and `PyMuPDF`.
 everywhere. `tools/build-office-payload.mjs` downloads, verifies and unpacks it at build
 time (no repository checkout needed, no compiler on the build host); `tools/check-office.mjs`
 then **executes** the result — imports all ten libraries, writes a `.docx` with the
-payload's own interpreter, runs the real `check_office.py` over it, converts it to a real
-PDF and renders a page to a real PNG with the real engine, and reads the four declarations
-that put the card on the Plugins page.
+payload's own interpreter, validates the skill bodies the release ships against the
+provider's own frontmatter rules, converts that document to a real PDF and renders a page
+to a real PNG with the real engine, and reads the four declarations that put the card on
+the Plugins page.
 
 What the model can do, and what proves it works:
 
 | Capability | How |
 |---|---|
-| Create, read and edit `.docx` / `.pptx` / `.xlsx` | the three bundled skills on the payload's libraries |
+| Create, read and edit `.docx` / `.pptx` / `.xlsx` | the bundled office skill(s) on the payload's libraries |
 | Look at a page, slide or worksheet range | the engine renders it to PNG; the core `read_image` tool hands it to the model |
 | Extract embedded pictures | `word/media/`, `ppt/media/`, `xl/media/` from the package, or PyMuPDF inside a PDF |
 | Convert to PDF | `convert` — real PDF 1.7 (measured: a one-page document in ~3.2 s) |
 | Recalculate a workbook | `recalculate`, formulas preserved |
 | Read a PDF's text, images and pages | `pypdf` + `PyMuPDF` + the engine's PDFium render path |
-| Check before delivering | `check_office.py` — OOXML packages, relationships, structure |
+| Check before delivering | the skills' own Python validation — re-open the package with python-docx / openpyxl, render a page to catch overflow (`check_office.py` was removed upstream in 0.2.1-rc.2) |
 
 And for the PDF that has **no text to read at all** — a scan, a photographed form, a
 deck exported as pictures — the image carries a real OCR layer (`ocr-pdf`, tesseract 5):

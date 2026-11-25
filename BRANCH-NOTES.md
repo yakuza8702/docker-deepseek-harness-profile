@@ -3636,3 +3636,42 @@ words, so nothing is outstanding for agent-7 on this point.
 * **The payload repair stages the guard only.** Relay/firstboot staging is out of
   scope by arithmetic (32/47 chunks cannot fit the 30 s forced-repair envelope),
   and `payload.stale: true` is the honest answer for that case.
+
+## 31. Branch `cua-vm-improve-v2` — 2026-11-24: the Office gate that demanded three skills from a release that ships one
+
+`docker-build.yml` (run 45425464673, `channel=github-tag`, `DSH_SOURCE_REF=dsh-v0.2.3-alpha.2`)
+died at the Office gate (`Dockerfile` ~line 685) with `exit code 1` and no FAIL line in
+the visible transcript. A throwaway `node:24-trixie` container that mirrors the image's
+steps — clone at the tag, `pnpm install` (pnpm 11.28.5, selected by `packageManager`),
+`build-office-payload.mjs --target linux-x64`, `office-skills` staged, then the exact
+`check-office` command — shows **no crash at all**. The gate prints its own summary and
+exits 1 itself:
+
+    FAIL  missing skill assets: office-docx, office-pptx, office-xlsx
+    check-office: 1 problem(s)
+
+**Root cause.** alpha.2 ships ONLY the combined `office` skill: `packages/skill/skill-office/assets/`
+holds `office/SKILL.md` and nothing else (0.2.2-rc.5 still shipped the split skills *and*
+`office`, which is why the old gate passed there), and the provider registers the single
+name `office` (`SKILL_NAMES = ['office']` in its `src/index.ts`). The gate hardcoded the
+old names, so a legitimate upstream reshape read as a missing install. Nothing else was wrong: the payload manifest and interpreter, the kit's
+`capabilities`/`convert`/`render`, the `pdf-documents` skill and all four declarations
+passed in the same run.
+
+**Fix.** `tools/check-office.mjs` no longer names a layout: it reads the release's own
+`assets/*/SKILL.md` set and holds every folder to the registry's contract (a `---`
+frontmatter block with `name` and `description`, the provider's `parseSkill` rules),
+requires the set to still teach Word, PowerPoint and Excel, and fails a body that still
+tells the model to run `check_office.py` when the release does not ship it. The work
+directory now uses `os.tmpdir()`, so a host whose `/tmp` is a small or full tmpfs can
+still run the gate. Prose that still counted skills is corrected everywhere it survives
+(the Dockerfile, the entrypoint, the bundle patch, the Plugins-page card in
+`plugins/dsh-plugins-page-extras/client.js`, both READMEs and `compose.yaml`), and every
+version claim now says "split skills plus the combined `office` skill through 0.2.2,
+`office` alone from 0.2.3" — the mixed layout 0.2.2-rc.5 actually registers. No check was
+removed or relaxed. Evidence: `office-gate-evidence.txt` — alpha.2, `EXIT:0`, every `ok` line
+visible. Negative controls in the same container: a simulated 0.2.2 split layout still
+passes; a missing `description`, an `assets/` with no `SKILL.md`, and a stale
+`check_office.py` reference each still exit 1. The shipped image's own tree
+(0.2.2-rc.5, which carries BOTH layouts) passes too: `node tools/ci-gates.mjs
+--installed`, Office row green.

@@ -625,9 +625,10 @@ RUN MCP_SLIM=0 node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-m
 #
 # WHY IT IS IN THE IMAGE
 # The harness ships the whole feature and mounts none of it in a plain container:
-# `@deepseek-ai/dsh-skill-office` carries the three skills (office-docx,
-# office-pptx, office-xlsx) plus the standard-library check_office.py structural
-# checker, and `@deepseek-ai/libreoffice-kit` carries the rendering engine
+# `@deepseek-ai/dsh-skill-office` carries the Office skills — split skills
+# (office-docx, office-pptx, office-xlsx) plus the combined `office` skill through
+# 0.2.2, `office` alone from 0.2.3 — and `@deepseek-ai/libreoffice-kit` carries the
+# rendering engine
 # (LibreOffice compiled to WebAssembly — a prebuilt dependency, nothing to
 # apt-install and nothing to run as a service). What is missing is the interpreter
 # the skills are told to use: they call `load_workspace_dependencies` and run the
@@ -640,7 +641,7 @@ RUN MCP_SLIM=0 node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-m
 #      python-docx, python-pptx, openpyxl, XlsxWriter, Pillow, lxml, numpy, pandas,
 #      and this image's two additions: pypdf and PyMuPDF, which are what make
 #      reading a PDF's text and embedded images possible.
-#   2. /opt/dsh-office/office-skills/pdf-documents — this repository's fourth skill,
+#   2. /opt/dsh-office/office-skills/pdf-documents — this repository's extra skill,
 #      for PDFs, discovered through DSH_BUNDLED_SKILL_DIR (set in the entrypoint).
 #   3. the bundle that mounts both rows, so the Plugins page has one switch for it.
 #
@@ -648,10 +649,11 @@ RUN MCP_SLIM=0 node /tmp/check-brave-mcp.mjs /usr/local/bin/dsh-brave-devtools-m
 # the target is derived from the platform actually being built.
 #
 # The gate EXECUTES the payload and the engine — the interpreter imports every
-# library, the checker passes on a document the payload itself wrote, the engine
-# converts that document to a real PDF and renders a page to a real PNG, and the
-# four declarations that have to agree (bundle patch row, Plugins-page row host
-# table, duplicate-card suppression, entrypoint switch) are read out of the files.
+# library, the release's own skill bodies are validated against the registry's
+# rules, the engine converts that document to a real PDF and renders a page to a
+# real PNG, and the four declarations that have to agree (bundle patch row,
+# Plugins-page row host table, duplicate-card suppression, entrypoint switch) are
+# read out of the files.
 # See tools/check-office.mjs.
 COPY --chmod=0644 docker/office-runtime.lock.json tools/build-office-payload.mjs /tmp/office/
 RUN set -eux; \

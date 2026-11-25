@@ -93,8 +93,9 @@ services:
       DSH_WORKSPACE_MAX_PREVIEW_BYTES: "${DSH_WORKSPACE_MAX_PREVIEW_BYTES:-524288}"
       DSH_WORKSPACE_MAX_WRITE_BYTES: "${DSH_WORKSPACE_MAX_WRITE_BYTES:-1048576}"
       # --- Office documents (dsh-office) ---
-      # Word, PowerPoint, Excel and PDF work for the model: the harness's own
-      # office-docx/office-pptx/office-xlsx skills plus this image's PDF skill,
+      # Word, PowerPoint, Excel and PDF work for the model: the harness's own Office
+      # skills (the combined `office` skill from 0.2.3; split skills plus `office`
+      # through 0.2.2) plus this image's PDF skill,
       # running on the pinned Python payload baked into the image, with the bundled
       # LibreOffice kit rendering pages to images (so a vision model can look at a
       # document) and converting to PDF. It is a SWITCHABLE CARD in the Plugins

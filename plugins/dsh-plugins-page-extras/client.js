@@ -50,10 +50,11 @@ window.__ModuleLoader__.load({
      * releasing a cheaper one to drop an expensive one, with no way to keep, say, the
      * visible desktop while dropping a tool surface.
      *
-     * The fourth is the Office row: the harness's OWN skills (office-docx,
-     * office-pptx, office-xlsx) on the Python payload this image bakes in. It is here
-     * rather than always-on for the same reason — the skills are context in every
-     * request, so the person paying for it should be able to release it.
+     * The fourth is the Office row: the harness's OWN office skills — one combined
+     * skill from 0.2.3, the per-format ones before it — on the Python payload this
+     * image bakes in. It is here rather than always-on for the same reason — the
+     * skills are context in every request, so the person paying for it should be able
+     * to release it.
      *
      * The two MCP rows overlap on purpose and are not alternatives to each other:
      * `browser-mcp` DRIVES the page (navigate, click, type, screenshot), the
@@ -114,7 +115,7 @@ window.__ModuleLoader__.load({
         row: 'skill-office',
         glyph: 'office',
         title: 'Office documents',
-        body: 'Word, PowerPoint and Excel work for the model: the harness\u2019s own office-docx, office-pptx and office-xlsx skills, running on a pinned Python payload, with the bundled LibreOffice engine rendering and converting when a page needs to be looked at or a PDF is asked for. Turn it off to release the three skills and their instructions from every request.'
+        body: 'Word, PowerPoint and Excel work for the model: the harness\u2019s own office skills \u2014 one combined office skill from 0.2.3, the per-format skills before it \u2014 running on a pinned Python payload, with the bundled LibreOffice engine rendering and converting when a page needs to be looked at or a PDF is asked for. Turn it off to release those skills and their instructions from every request.'
       },
     ]
 

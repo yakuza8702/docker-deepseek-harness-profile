@@ -6,9 +6,9 @@
 # image:
 #
 #   skill-office           @deepseek-ai/dsh-skill-office — the bundled Word,
-#                          PowerPoint and Excel skills (office-docx, office-pptx,
-#                          office-xlsx) plus the standard-library check_office.py
-#                          structural checker they run before delivery.
+#                          PowerPoint and Excel skills: split skills
+#                          (office-docx, office-pptx, office-xlsx) plus the combined
+#                          `office` skill through 0.2.2, `office` alone from 0.2.3.
 #   workspace-dependencies @deepseek-ai/dsh-tool-workspace-dependencies — the
 #                          `load_workspace_dependencies` tool. The skills do NOT
 #                          ship an interpreter: they call this tool for the Python
@@ -42,9 +42,9 @@
 # that lost the payload boots with the feature hidden instead of not booting at all.
 #
 # NO assetRoot / node / cli config, on purpose: both defaults resolve inside the
-# installation — skill-office finds @deepseek-ai/libreoffice-kit and its own three
-# skill folders beside itself (verified against the shipped image), so naming them
-# here would only be a second place to keep right.
+# installation — skill-office finds its own skill folders beside itself (split
+# folders plus `office` through 0.2.2, `office` alone from 0.2.3; verified against
+# the shipped image), so naming them here would only be a second place to keep right.
 #
 # SWITCHES
 # --------

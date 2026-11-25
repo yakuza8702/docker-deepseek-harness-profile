@@ -6,7 +6,7 @@ a third-party plugin, nothing is installed at runtime, and no Marketplace entry 
 involved.
 
 ```
-Plugins page → Office documents → on    # office-docx / office-pptx / office-xlsx skills + the payload tool
+Plugins page → Office documents → on    # the harness's Office skills + the payload tool
 Plugins page → Office documents → off   # skills released; the tool row stays, inert
 ```
 
@@ -14,21 +14,21 @@ Plugins page → Office documents → off   # skills released; the tool row stay
 |---|---|
 | Bundle / package | `dsh-office` (title "Office documents") |
 | Plugin rows it mounts | `skill-office` → `@deepseek-ai/dsh-skill-office` · `workspace-dependencies` → `@deepseek-ai/dsh-tool-workspace-dependencies` |
-| Skills it makes available | `office-docx`, `office-pptx`, `office-xlsx` (bundled upstream), plus this image's `pdf-documents` |
+| Skills it makes available | the release's Office skills — `office` alone from 0.2.3; split skills plus `office` through 0.2.2 — plus this image's `pdf-documents` |
 | Interpreter | the pinned payload at `/opt/dsh-office/primary-runtime` (Python 3.12.14) |
 | Rendering / conversion | `@deepseek-ai/libreoffice-kit` — LibreOffice compiled to WebAssembly, already inside the image |
 | Applies | at the next boot (bundle selection is read when the tree is composed) |
 
 ## What it adds
 
-The harness ships three Office skills and the engine that renders them, but a plain
+The harness ships the Office skills and the engine that renders them, but a plain
 container deployment mounts neither: `@deepseek-ai/dsh-base` carries the skill
 *registry* (`skill-filesystem`, `tool-skill`), not the Office provider. Only the SDK
 profile and DSH Desktop mount `skill-office`, and both of them supply the Python their
 instructions depend on. This bundle is the container's equivalent — the same two rows,
 plus the payload that makes them work.
 
-The skills are deliberately explicit about that dependency: `office-docx` says *"call
+The skills are deliberately explicit about that dependency: the `office` skill says *"call
 `load_workspace_dependencies` and execute the returned Python path with its bundled
 libraries. Do not install packages or discover a system Python for the default
 workflow."* So the payload is not an optimisation, it is the contract.
@@ -45,8 +45,9 @@ the SHA-256 in the lock *before* unpacking, and writes the layout
 `@deepseek-ai/dsh-tool-workspace-dependencies` validates: `runtime.json`, then
 `dependencies/python/bin/python3` and `dependencies/python/lib/python3.12/site-packages`.
 `tools/check-office.mjs` then proves it in the same build — the interpreter imports the
-libraries, the checker passes on a document the payload itself wrote, and the engine
-converts and renders a real file.
+libraries, writes a real `.docx` with them, validates the bundled skill bodies the
+release ships against the provider's own frontmatter rules (the `check_office.py` checker
+no longer ships since 0.2.1-rc.2), and the engine converts and renders a real file.
 
 Payload contents: `numpy`, `pandas`, `python-dateutil`, `six`, `tzdata`, `python-docx`,
 `python-pptx`, `openpyxl`, `Pillow`, `lxml`, `XlsxWriter`, `typing_extensions`,
@@ -93,7 +94,7 @@ An overlay row is applied *after* the profile layer, which is why the browser ro
 into bundles too — see `plugins/dsh-browser-mcp/README.md`.
 
 The switch flips the `skill-office` row. That is the half worth switching: it is what
-puts three skill descriptions in the catalog and their instructions behind them. The
+puts the Office skill descriptions in the catalog and their instructions behind them. The
 `workspace-dependencies` row stays mounted — one tool definition, answering one
 question, with nothing left to call it once the skills are released.
 
