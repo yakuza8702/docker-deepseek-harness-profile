@@ -103,6 +103,7 @@ document per theme, so a change lands in one place:
 | [docs/cua-capability-roadmap.md](docs/cua-capability-roadmap.md) | what the Personal VM can and cannot do yet |
 | [docs/compose-hardening.md](docs/compose-hardening.md) | the compose hardening notes |
 | [plugins/dsh-cua-vm/README.md](plugins/dsh-cua-vm/README.md) | the Personal VM plugin's own architecture, tools and limits |
+| [patches/README.md](patches/README.md) | the source patches applied to the upstream monorepo — the auth fix: what it fixes, its base commit `4b399c39`, how the build applies and verifies it |
 
 Sections that stayed in this file:
 
@@ -187,6 +188,40 @@ docker run --rm -it --entrypoint bash ghcr.io/yakuza8702/docker-deepseek-harness
 | `DSH_PERMISSION_MODE` | unset | `read-only` / `workspace-write` / `danger-full-access` — confined modes use the Landlock launcher that ships **inside the image** (kernel ≥ 5.13) and is probe-verified at build time; nothing to mount. `bwrap` is installed too but cannot create user namespaces under this hardening, so Landlock is the backend that runs |
 | `DSH_TOOLS_MODE` | unset | `native` / `ptc` / `both` |
 | `DSH_NODE_FLAGS` | `--expose-internals` | Node flags for the DSH main process only (agent children don't inherit) |
+
+## Sign-in durability fix (source channel)
+
+`patches/auth-fix.patch` fixes three defects in the DeepSeek account path that
+upstream `0.2.3-alpha.2` (commit `4b399c39`) still has:
+
+* an account that reads as **signed out after a restart** while the Platform is
+  unreachable — the identity is now persisted beside the grant and seeded back at
+  boot, and only a *ready* Platform read replaces it;
+* **one HTTP 401 deleting the stored grant** (a proxy, a clock skew, a platform
+  edge is enough — the "logged out again" / 403 storms): a rejection now only
+  records a strike, and the grant is removed when a **second** rejection of the
+  same token arrives at least one `requestTimeoutMs` later and outside the boot
+  grace;
+* a settings card that stays **blank while the account cannot be reached**: the
+  account section now mounts in the unknown state with "Can't reach DeepSeek right
+  now / Try again", and the retry shares the grant handle so a revoked grant
+  starts no read.
+
+It is a patch against the upstream **TypeScript sources**, so it can only reach a
+**source build**: the image applies it between the clone and `pnpm run build`
+(`DSH_SIGNIN_FIX=1`, the default), then proves the compiled Host lib carries it and
+fails the build if the patch stops applying.
+
+```bash
+docker build --build-arg DSH_SOURCE_REF=dsh-v0.2.3-alpha.2 -t seek-harness:auth-fix .
+# or: Actions → docker-build → Run workflow → channel = github-tag
+```
+
+The **npm channel** installs compiled JavaScript and cannot carry a source patch,
+so an image built that way keeps upstream's behaviour — the build log says so.
+`docker logs` states which one you are running (`auth fix: active — two-strike 401
+expiry …` on a patched source build). Base commit, scope and the update recipe:
+[patches/README.md](patches/README.md).
 
 ## What's inside (smanx devtools-latest set)
 

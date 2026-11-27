@@ -45,13 +45,46 @@ ARG DSH_SOURCE_REF
 WORKDIR /opt/dsh
 RUN mkdir -p /opt/dsh /src
 
+# ---------------------------------------------------------------------
+# Auth durability fix — patches/auth-fix.patch, applied to the SOURCE build.
+#
+# Upstream 0.2.3-alpha.2 (commit 4b399c39) carries three sign-in defects the npm
+# release has too: the account identity is re-read from the Platform at every
+# boot (an unreachable Platform at startup reads as signed out), ONE HTTP 401
+# removes the stored grant irreversibly (a proxy, a clock skew or a platform edge
+# is enough — the "logged out after restart" and 403 storms), and the settings
+# card can stay blank while the account is unreachable. The patch makes the
+# identity durable beside the grant, turns one rejection into a strike that only
+# a second rejection at least a request deadline later confirms, and mounts the
+# account section in the unknown state with a retry that shares the grant handle.
+#
+# A source patch can only reach the SOURCE channel (`DSH_SOURCE_REF=<tag>`), which
+# is why it is applied here, between clone and `pnpm run build` — the npm channel
+# installs compiled JavaScript. The applier is idempotent (`git apply --check`
+# decides: pending → apply, already applied → skip) and FAILS THE BUILD when a
+# hunk no longer applies or when the compiled Host lib lacks the patch's markers,
+# so an upstream refactor can never silently ship the old behaviour.
+#
+#   DSH_SIGNIN_FIX=1 (default)  apply + verify on the source channel
+#   DSH_SIGNIN_FIX=0            build the source tree unpatched (debugging only)
+#
+# Base commit and the full story: patches/README.md.
+# ---------------------------------------------------------------------
+ARG DSH_SIGNIN_FIX=1
+COPY --chmod=0644 patches/auth-fix.patch /tmp/auth-fix.patch
+COPY --chmod=0644 tools/apply-dsh-source-patches.mjs /tmp/apply-dsh-source-patches.mjs
+
 # npm channel
 RUN if [ -z "${DSH_SOURCE_REF}" ]; then \
       npm init -y >/dev/null 2>&1 \
    && npm install --omit=dev --no-audit --no-fund "@deepseek-ai/dsh@${DSH_VERSION}" \
    && node -p "require('/opt/dsh/node_modules/@deepseek-ai/dsh/package.json').version" > /opt/dsh/.dsh-version \
    && echo "fetched @deepseek-ai/dsh $(cat /opt/dsh/.dsh-version) (npm)" \
-   && /opt/dsh/node_modules/.bin/dsh --version; \
+   && /opt/dsh/node_modules/.bin/dsh --version \
+   && if [ "${DSH_SIGNIN_FIX}" = "1" ]; then \
+        echo "NOTE: npm channel — @deepseek-ai/dsh ships compiled JavaScript, so patches/auth-fix.patch cannot be applied."; \
+        echo "      Build with DSH_SOURCE_REF=dsh-v0.2.3-alpha.2 (workflow channel=github-tag) to ship the auth fix."; \
+      fi; \
     fi
 
 # source channel (github tag, incl. pre-releases/alphas missing from npm)
@@ -60,9 +93,19 @@ RUN if [ -n "${DSH_SOURCE_REF}" ]; then \
    && rm -rf /var/lib/apt/lists/* \
    && git clone --depth 1 --branch "${DSH_SOURCE_REF}" https://github.com/deepseek-ai/deepseek-harness.git /src \
    && npm install -g --no-audit --no-fund pnpm@10 \
+   && if [ "${DSH_SIGNIN_FIX}" = "1" ]; then \
+        node /tmp/apply-dsh-source-patches.mjs /src \
+          --patch /tmp/auth-fix.patch --expect-base 4b399c39; \
+      else \
+        echo "auth fix: DSH_SIGNIN_FIX=${DSH_SIGNIN_FIX} — built WITHOUT patches/auth-fix.patch"; \
+      fi \
    && cd /src \
    && (pnpm install --frozen-lockfile || pnpm install) \
    && pnpm run build \
+   && if [ "${DSH_SIGNIN_FIX}" = "1" ]; then \
+        node /tmp/apply-dsh-source-patches.mjs /src \
+          --verify-built --patch /tmp/auth-fix.patch; \
+      fi \
    && node -p "require('/src/package.json').version" > /src/.dsh-version \
    && echo "built @deepseek-ai/dsh $(cat /src/.dsh-version) (source ${DSH_SOURCE_REF})" \
    && node /src/apps/cli/lib/bin.js --version; \
@@ -194,6 +237,36 @@ RUN if [ -f /opt/dsh/node_modules/.bin/dsh ]; then \
    && echo "installed @deepseek-ai/dsh $(cat /opt/dsh-src/.dsh-version) (source)"; \
     fi \
  && dsh --version
+
+# ---------------------------------------------------------------------
+# Auth fix provenance — the patch itself plus the status the entrypoint reads.
+#
+# `patches/auth-fix.patch` is a SOURCE patch (base commit 4b399c39 = tag
+# dsh-v0.2.3-alpha.2; see patches/README.md): the source channel applies it to the
+# cloned monorepo before `pnpm run build`, so it exists in this image only there.
+# The status is derived from WHAT IS IN THE IMAGE — the compiled Host lib, not the
+# build arguments — because that is the only thing that answers "does the harness
+# I am about to run carry the fix?":
+#
+#   applied=4b399c39    source channel, fix compiled into the Host lib
+#   applied=no + source source channel built with DSH_SIGNIN_FIX=0 (a WARN at boot)
+#   applied=no + npm    the stock npm image (expected; the entrypoint stays quiet)
+#
+# The entrypoint logs one line from it on every boot (report_auth_fix).
+# ---------------------------------------------------------------------
+COPY --chmod=0644 patches/auth-fix.patch /opt/seek-harness/patches/auth-fix.patch
+RUN set -eu; \
+    libdir=/opt/dsh-src/packages/account/deepseek-account/lib; \
+    if grep -rq expiryConfirmed "$libdir" 2>/dev/null; then \
+      printf 'applied=4b399c39\nchannel=source\n' > /opt/seek-harness/patches/auth-fix.status; \
+    elif [ -d /opt/dsh-src/packages ]; then \
+      printf 'applied=no\nchannel=source\n' > /opt/seek-harness/patches/auth-fix.status; \
+    elif [ -f /opt/dsh/node_modules/.bin/dsh ]; then \
+      printf 'applied=no\nchannel=npm\n' > /opt/seek-harness/patches/auth-fix.status; \
+    else \
+      printf 'applied=no\nchannel=unknown\n' > /opt/seek-harness/patches/auth-fix.status; \
+    fi; \
+    cat /opt/seek-harness/patches/auth-fix.status
 
 # ---------------------------------------------------------------------
 # Official Browser Use — the model-facing half of the browser stack.

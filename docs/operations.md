@@ -36,6 +36,25 @@ Channel selection precedence: workflow input (manual run) > repository **variabl
 
 Example reality check (Aug 2026): npm `latest` = `0.1.1-rc.2`; GitHub has `dsh-v0.1.2-alpha.1` as a source-only pre-release (no npm package, no release assets). With the default channel a push builds `0.1.1-rc.2`; run the workflow once with `channel=github-tag` to build the alpha from source. The moment `0.1.2` (rc or final) is published to npm `latest`, the default channel picks it up automatically.
 
+### The sign-in durability fix is a source-channel patch
+
+`patches/auth-fix.patch` repairs the account path — a durable identity across a
+restart, a single 401 no longer deleting the stored grant, and an honest "Can't
+reach DeepSeek right now / Try again" card instead of a blank one. It is a diff
+against the upstream **TypeScript sources**, so an image can only carry it on the
+**source** channel: the `dsh-fetch` stage applies it after the clone and before
+`pnpm run build` (`DSH_SIGNIN_FIX=1`, the default), then verifies the compiled Host
+lib carries it. Either step failing stops the build; `DSH_SIGNIN_FIX=0` builds the
+source tree unpatched (debugging only) and the entrypoint then warns at boot.
+
+Consequence for this repository's automation: to keep `:latest` carrying the fix,
+build with `channel=github-tag` — the workflow input, or the repository variable
+`DSH_CHANNEL=github-tag` so the cron does it too. The tag must be
+`dsh-v0.2.3-alpha.2` (commit `4b399c39`) or newer; on a newer tag the applier warns
+that the patch was verified on `4b399c39` only, and still refuses to continue if a
+hunk does not apply. Base commit, scope and the update procedure:
+[patches/README.md](../patches/README.md).
+
 ## Security model
 
 - **Non-root** (uid/gid 1000), rootfs read-only, `cap_drop: ALL`, `no-new-privileges`, `/tmp` tmpfs — in the provided `compose.yaml`

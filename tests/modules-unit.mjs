@@ -101,6 +101,7 @@ await import('./modules-unit/18-relay-unresponsive.mjs')
 await import('./modules-unit/19-payload-staging.mjs')
 await import('./modules-unit/20-supervisor-window-and-relay.mjs')
 await import('./modules-unit/21-cli-resolution.mjs')
+await import('./modules-unit/22-dsh-source-patch.mjs')
 
 
 console.log(failures === 0 ? '\nunit: PASS' : `\nunit: ${failures} FAILURE(S)`)

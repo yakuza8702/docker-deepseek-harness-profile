@@ -70,6 +70,37 @@ record_ready_log() {
   ) &
 }
 # ---------------------------------------------------------------------
+# Auth durability fix provenance (patches/auth-fix.patch, base 4b399c39).
+#
+# The fix is a SOURCE patch: it is applied to the cloned monorepo while the image
+# builds (/opt/dsh-src) and compiled into the Host lib there. An image built on
+# the npm channel ships upstream's compiled JavaScript and cannot carry it, so
+# this function reads the status the Dockerfile wrote from what is ACTUALLY in the
+# image instead of assuming what the build intended:
+#
+#   applied=4b399c39   the built Host lib carries the two-strike expiry + durable
+#                      identity (one informational line)
+#   source, not applied a source-channel image that skipped the patch — a WARN,
+#                      because a sign-in can then be lost on restart and a single
+#                      401 still removes the stored grant
+#   npm                 silent on purpose: the stock image, expected, and the
+#                      README says so. Nothing to warn about on every boot.
+# ---------------------------------------------------------------------
+report_auth_fix() {
+  local status=/opt/seek-harness/patches/auth-fix.status
+  [[ -f "$status" ]] || return 0
+  local applied channel
+  applied="$(sed -n 's/^applied=//p' "$status" 2>/dev/null | head -1)"
+  channel="$(sed -n 's/^channel=//p' "$status" 2>/dev/null | head -1)"
+  if [[ "$applied" == "4b399c39" ]]; then
+    log "auth fix: active — two-strike 401 expiry + durable account identity are in the built Host lib (base 4b399c39)"
+  elif [[ "$channel" == "source" ]]; then
+    log "WARN: this source-channel image was built WITHOUT patches/auth-fix.patch (DSH_SIGNIN_FIX=0?):"
+    log "      a sign-in can still be lost on restart and ONE HTTP 401 still removes the stored grant."
+    log "      Rebuild with DSH_SIGNIN_FIX=1 (default) — see patches/README.md."
+  fi
+}
+# ---------------------------------------------------------------------
 # `~/.dsh` must BE the harness home (fresh-start trap).
 #
 # This image keeps HOME=/workspace on purpose (the Web UI's directory picker
@@ -769,6 +800,9 @@ fatal() {
 if [[ "$DSH_PORT" == "$PROXY_PORT" ]]; then
   fatal "DSH_PORT (${DSH_PORT}) must differ from PROXY_PORT (${PROXY_PORT})."
 fi
+
+# Auth fix provenance — one line on every boot (patches/README.md).
+report_auth_fix
 
 # ---------------------------------------------------------------------
 # Docker access diagnostics (non-fatal — purely informational)
