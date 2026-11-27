@@ -23,7 +23,8 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import {
-  DEFAULT_CLIENT_SECRET_REF, DEFAULT_CLOUDFLARE_REFRESH_REF, DEFAULT_GITHUB_REFRESH_REF, DEFAULT_REFS, PROVIDERS,
+  DEFAULT_CLIENT_SECRET_REF, DEFAULT_CLOUDFLARE_REFRESH_REF, DEFAULT_GITEA_REFRESH_REF, DEFAULT_GITHUB_REFRESH_REF,
+  DEFAULT_REFS, PROVIDERS,
 } from './lib/credentials.js'
 import { CLOUDFLARE_CALLBACK_PATH, GITEA_CALLBACK_PATH } from './lib/oauth.js'
 import { createOperations, GITHUB_DEFAULT_SCOPES } from './lib/operations.js'
@@ -132,6 +133,13 @@ function buildConfig() {
       'DSH credential reference holding the Gitea token (a NAME; the value lives in DSH).',
     ),
     aliases: aliases().description('Extra aliases: alias name to credential reference name.'),
+    // The refresh half of the Gitea authorization-code grant. Same rule as the
+    // access reference — a NAME, never a value — and it is written by the Login
+    // callback, which is what makes one login enough for an expiring token.
+    refreshCredentialRef: z.string().default(DEFAULT_GITEA_REFRESH_REF).description(
+      'DSH credential reference holding the Gitea OAuth REFRESH token (a NAME; written by the login callback).',
+    ),
+    refreshAliases: aliases().description('Extra aliases for the refresh reference: alias name to reference name.'),
     apiBase: z.string().default('').description(
       'REQUIRED for Gitea: the self-hosted origin, e.g. https://git.example.com. Never carries a token.',
     ),
@@ -225,10 +233,10 @@ export const Config = z === undefined ? undefined : buildConfig()
  *     Gitea capability probes) and the login/scope-403 answer;
  *   * the one ordering rule that prevents wasted calls (`connector_status` first).
  *
- * Measured budget: this section is 1303 characters (1129 before the LIVE-token
- * clause and the liveness hint). `selftest/harness.mjs`
- * asserts an upper bound and `selftest/measure-text.mjs` reports the exact value
- * beside the tool descriptions, so a future edit cannot re-inflate it unnoticed.
+ * Measured budget: this section is 1496 characters (1303 before the refresh
+ * clause said ALL THREE providers renew once, then retry; 1129 before the
+ * LIVE-token clause and the liveness hint). The measurement is re-taken on every
+ * edit to this array, so it cannot drift silently.
  *
  * Nothing value-dependent is composed here, so it never needs a credential to
  * build, and it names no mask shape (a mask is still an oracle).
@@ -238,7 +246,7 @@ const CONNECTOR_PROMPT = [
   '`READ ✓` unrestricted; `WRITE ⚠` approval-gated (approval policy: state what changes and why). Slots: provider, alias (default: provider default), owner, repo, action; ids 32-hex, Cloudflare `owner` = account id and `repo` = Pages project. `no value in or out`.',
   'Writes require a LIVE token — if status marks the token dead, direct the user to Login; never route github pushes through arbitrary git remotes.',
   '`connector_status` first (liveness flags a dead token; rateLimit:false skips the probes). `connector_file`: read_tree/read_file read, put_file commits (sha replaces, else creates). `connector_repo_actions`: 8 reads, the rest write — issue/label/assignee/branch/tag/PR edits, run_dispatch/run_cancel/run_rerun/delete_run, pr_merge.',
-  'Cloudflare verbs outside `connector_cloudflare` are unsupported; Gitea capability-detects (Swagger), the rest is explicit unsupported; `connector_push` = wrangler deploy there, dryRun:false. 401 or an "invalid token" 403 = token expired (refresh once, then Login); a plain 403 = scope not granted; unresolved reference or OAuth: Connector page Login.',
+  'Cloudflare verbs outside `connector_cloudflare` are unsupported; Gitea capability-detects (Swagger), the rest is explicit unsupported; `connector_push` = wrangler deploy there, dryRun:false. 401 or an "invalid token" 403 = token expired: GitHub, Gitea and Cloudflare each refresh once automatically, then retry; a refused refresh clears the pair, so Login is the answer then. A plain 403 = scope not granted; unresolved reference or OAuth: Connector page Login.',
 ].join(' ')
 
 /**

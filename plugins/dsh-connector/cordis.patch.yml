@@ -63,6 +63,11 @@
           defaultAlias: "default"
           credentialRef: "GITEA_TOKEN"
           aliases: {}
+          # The refresh half of the Gitea authorization-code grant: a NAME (the
+          # value lives in DSH), written by the login callback. One login then
+          # keeps renewing itself instead of expiring after an hour.
+          refreshCredentialRef: "GITEA_REFRESH_TOKEN"
+          refreshAliases: {}
           # REQUIRED before a Gitea call can work: the user's self-hosted origin,
           # e.g. https://git.example.com — editable from the Connector page.
           apiBase: ""

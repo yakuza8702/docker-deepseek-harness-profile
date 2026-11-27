@@ -41,15 +41,15 @@ import { tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
 import {
   DEFAULT_REFS, PROVIDERS, assertAlias, assertProvider, clientSecretRefName, cloudflareRefreshRefName,
-  describeCredential, githubRefreshRefName, isRefName, listReferences, redact, requireRefName,
-  resolveSecret, setSecret, storePath, unsetSecret,
+  describeCredential, giteaRefreshRefName, githubRefreshRefName, isRefName, listReferences, redact,
+  refreshRefNameOf, requireRefName, resolveSecret, setSecret, storePath, unsetSecret,
 } from './credentials.js'
 import {
   CLOUDFLARE_CALLBACK_PATH, CLOUDFLARE_DEFAULT_SCOPES, CLOUDFLARE_OAUTH_ORIGIN, GITEA_CALLBACK_PATH,
   buildCloudflareAuthorizeUrl, buildGiteaAuthorizeUrl, callbackUrlOf, classifyGiteaExchangeFailure,
   cloudflareCallbackUrlOf, createPkcePair, createStateStore, exchangeCloudflareCode, exchangeGiteaCode,
   giteaWebOrigin, isCloudflareRedirectOrigin, isSecureCallbackOrigin, refreshCloudflareToken,
-  revokeCloudflareToken,
+  refreshGiteaToken, revokeCloudflareToken,
 } from './oauth.js'
 import { createGitHub, decodeTextBase64, webOriginOf } from './providers/github.js'
 import {
@@ -666,6 +666,31 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
   }
   /** Per-instance capability memo for Gitea's Actions / blame / route surface. */
   const giteaVersion = { at: 0, baseUrl: '', caps: { version: '', actions: true, actionLogs: false }, routes: undefined, routesBaseUrl: '' }
+  /**
+   * THE IN-FLIGHT REFRESH MEMO — one promise per `provider:alias`.
+   *
+   * Two calls can hit a 401 for the same alias at the same moment (a page that
+   * renders several cards, a status probe beside a write). Without this they
+   * would both refresh, and because every provider ROTATES the refresh token on
+   * use, the second request would present a token the first one just invalidated
+   * — a self-inflicted `refresh_refused` that then clears a working login. The
+   * loser of the race awaits the same promise instead, so a burst costs exactly
+   * ONE refresh request.
+   *
+   * Keyed by provider AND alias: two aliases are two logins, and a Cloudflare
+   * refresh must never be answered with a Gitea token. Nothing is persisted.
+   */
+  const refreshInFlight = new Map()
+  /**
+   * WHEN THIS PROCESS LAST RENEWED a token, per `provider:alias`.
+   *
+   * Deliberately IN MEMORY ONLY: no expiry is written to config, to the
+   * credential store, or to any file, because an expiry derived from a token is
+   * a fact about the token. This is used for bookkeeping/diagnostics inside this
+   * process and is dropped on restart; a cold start simply has no entry and the
+   * reactive 401 path does the same work it always did.
+   */
+  const refreshDeadlines = new Map()
 
   /**
    * One HTTP call. `redirect: 'follow'` matters for GitHub's log archive; the
@@ -692,6 +717,27 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
     }
   }
 
+  /**
+   * The value currently stored under one alias's access REFERENCE, or
+   * `undefined` when the reference is unset or the store refuses to answer.
+   *
+   * Used by the GitHub read hook to say WHICH token a 401 rejected, so the
+   * cross-process healing check ({@link adoptRenewedElsewhere}) can tell "another
+   * process already rotated the pair" from "this login really is dead". A lookup
+   * failure is not an error: the hook then behaves exactly as it did before, with
+   * no attempted token and no adoption.
+   *
+   * @param alias - the alias whose read is in flight (canonical or `''`).
+   * @returns the stored value, or `undefined`.
+   */
+  async function storedAccessToken(alias) {
+    try {
+      return await resolveSecret(ctx, requireRefName(config, 'github', alias))
+    } catch {
+      return undefined
+    }
+  }
+
   /** Adapters are stateless views over the current config, so they are cheap to rebuild. */
   function adapters(alias = undefined) {
     return {
@@ -699,9 +745,19 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         apiBase: config?.github?.apiBase ?? 'https://api.github.com',
         request,
         // THE REFRESH HOOK, bound to the alias whose read is in flight. The
-        // adapter calls it at most once, only for a 401 on a `/repos/...` READ —
-        // never for a write and never for `/user*`.
-        onUnauthorized: () => refreshGitHubAccess(alias),
+        // adapter calls it at most once, only for a 401 on a `/repos/...` READ.
+        // It goes through {@link refreshAccess} so two reads racing on the same
+        // alias share ONE refresh request.
+        //
+        // THE ATTEMPTED TOKEN IS RESOLVED HERE, exactly like the write path in
+        // {@link withSecret} passes the value it just had refused. Without it the
+        // memo was unusable on the READ path: `adoptRenewedElsewhere` needs to
+        // know what this request presented before it can recognize that a fresh
+        // resolve now holds a DIFFERENT value (another process won the rotation),
+        // so a read-path loser used to clear a perfectly healthy login. Resolving
+        // it does not add a request or a refresh, and the memo still collapses a
+        // concurrent burst into ONE refresh POST.
+        onUnauthorized: async () => refreshAccess('github', alias, await storedAccessToken(alias)),
       }),
       cloudflare: createCloudflare({
         apiBase: config?.cloudflare?.apiBase ?? 'https://api.cloudflare.com',
@@ -741,9 +797,10 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
    * `reason: 'refresh_refused'`; it never names a value.
    *
    * @param alias - the alias the call was made for.
+   * @param attemptedToken - the access token that was refused, when known.
    * @returns the renewed access token, or `undefined` when no refresh is possible.
    */
-  async function refreshCloudflareAccess(alias) {
+  async function refreshCloudflareAccess(alias, attemptedToken) {
     const clientId = cloudflareOAuthClientId()
     if (clientId === '') return undefined
     const refreshRef = cloudflareRefreshRefName(config, alias)
@@ -753,10 +810,13 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       clientId, refreshToken, request, origin: cloudflareOAuthOrigin(),
     })
     if (answer.ok !== true) {
+      const adopted = await adoptRenewedElsewhere('cloudflare', alias, attemptedToken)
+      if (adopted !== undefined) return adopted
       const { ref } = targetOf('cloudflare', alias)
       // Best effort: a store failure here must not mask the provider's refusal.
       await unsetSecret(ctx, ref).catch(() => undefined)
       await unsetSecret(ctx, refreshRef).catch(() => undefined)
+      refreshDeadlines.delete(`cloudflare:${alias}`)
       /**
        * THE MESSAGE STAYS THE EXPIRED-TOKEN ONE. A user whose grant was revoked
        * gets "press Login", which is the action that actually helps; the reason id
@@ -776,6 +836,15 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       // old one only when it sent nothing (some servers do not rotate).
       await setSecret(ctx, refreshRef, answer.refreshToken)
     }
+    // In memory only; see the note on `refreshDeadlines`. Cloudflare's answer
+    // carries the ACCESS lifetime and nothing about the refresh half, so only the
+    // access deadline is recorded here — a made-up refresh lifetime would be a
+    // guess published as a fact.
+    const now = Date.now()
+    const accessTtl = Number.isFinite(Number(answer.expiresIn)) && Number(answer.expiresIn) > 0
+      ? Number(answer.expiresIn)
+      : 3600
+    refreshDeadlines.set(`cloudflare:${alias}`, { accessExpiresAt: now + accessTtl * 1000 })
     return answer.accessToken
   }
 
@@ -796,9 +865,10 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
    * `reason: 'refresh_refused'` (route 424) — never quiet, never echoing a value.
    *
    * @param alias - the alias the read was made for.
+   * @param attemptedToken - the access token that was refused, when known.
    * @returns the renewed access token, or `undefined` when no refresh is possible.
    */
-  async function refreshGitHubAccess(alias) {
+  async function refreshGitHubAccess(alias, attemptedToken) {
     const clientId = deviceClientId()
     if (clientId === '') return undefined
     const refreshRef = githubRefreshRefName(config, alias)
@@ -822,9 +892,12 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
     const body = answer.json ?? {}
     const token = typeof body.access_token === 'string' ? body.access_token : ''
     if (!answer.ok || token === '') {
+      const adopted = await adoptRenewedElsewhere('github', alias, attemptedToken)
+      if (adopted !== undefined) return adopted
       const { ref } = targetOf('github', alias)
       await unsetSecret(ctx, ref).catch(() => undefined)
       await unsetSecret(ctx, refreshRef).catch(() => undefined)
+      refreshDeadlines.delete(`github:${alias}`)
       const refused = new Error('GitHub refused to refresh this login; press Login on the GitHub card to authorize again')
       refused.code = 'CONNECTOR_PROVIDER_ERROR'
       refused.reason = 'refresh_refused'
@@ -836,6 +909,162 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       await setSecret(ctx, refreshRef, body.refresh_token)
     }
     return token
+  }
+
+  /**
+   * THE REFRESH-COLLISION GUARD — a refresh token has already been rotated.
+   *
+   * Every provider rotates the refresh token when it is used, and two processes
+   * (this host plus a second one, an image rebuild overlapping a restart) can
+   * hold the same alias. When THIS process loses that race its refresh is
+   * refused with a terminal code even though the login is perfectly healthy: the
+   * winner already wrote a NEW access token under the same reference.
+   *
+   * The test is a fresh resolve of the access reference. A stored value that is
+   * not the one this request presented means somebody else renewed it, so the
+   * honest answer is to USE it — not to clear a working pair and send the user to
+   * Login for a login that was never broken.
+   *
+   * @param name - provider id.
+   * @param alias - the alias being refreshed.
+   * @param attemptedToken - the value this request saw fail (or `undefined`).
+   * @returns the stored replacement, or `undefined` when the login really is dead.
+   */
+  async function adoptRenewedElsewhere(name, alias, attemptedToken) {
+    if (attemptedToken === undefined) return undefined
+    const { ref } = targetOf(name, alias)
+    const stored = await resolveSecret(ctx, ref).catch(() => undefined)
+    if (stored === undefined || stored === attemptedToken) return undefined
+    return stored
+  }
+
+  /**
+   * ONE refresh attempt for a Gitea access token the API rejected.
+   *
+   * The Gitea analogue of {@link refreshCloudflareAccess} and
+   * {@link refreshGitHubAccess}, and the reason a Gitea login is now needed ONCE:
+   * the authorization-code callback stores the refresh half, so a 1-hour access
+   * token renews itself instead of dying mid-session.
+   *
+   * Gitea is a CONFIDENTIAL client, so the refresh repeats the application's
+   * client id AND secret. Both are resolved at call time (the secret from its own
+   * reference) and used for one request body.
+   *
+   * FAILURE SEMANTICS (deliberately finer than "any refusal is terminal"):
+   *
+   *   * a TERMINAL refusal — `invalid_grant`/`invalid_client`/
+   *     `unauthorized_client` whose own text says the grant is gone/already used/
+   *     unparseable, or a bare 400 — clears BOTH references and throws the typed
+   *     `refresh_refused` error (route 424), because no retry can help;
+   *   * anything else (a 5xx, a proxy page, a network shape Gitea did not author)
+   *     reports `undefined`: the caller fails with the ORIGINAL 401 and the pair
+   *     stays untouched, so a provider hiccup cannot destroy a working login.
+   *
+   * @param alias - the alias the failing call was made for.
+   * @param attemptedToken - the access token that was refused, when known.
+   * @returns the renewed access token, or `undefined` when no refresh is possible.
+   */
+  async function refreshGiteaAccess(alias, attemptedToken) {
+    const clientId = giteaOAuthClientId()
+    if (clientId === '') return undefined
+    if (settings.gitea.baseUrl === '') return undefined
+    const secretRef = clientSecretRefName(config, alias)
+    const clientSecret = await resolveSecret(ctx, secretRef)
+    if (clientSecret === undefined) return undefined
+    const refreshRef = giteaRefreshRefName(config, alias)
+    const refreshToken = await resolveSecret(ctx, refreshRef)
+    if (refreshToken === undefined) return undefined
+    const answer = await refreshGiteaToken({
+      apiBase: settings.gitea.baseUrl, clientId, clientSecret, refreshToken, request,
+    })
+    const { ref } = targetOf('gitea', alias)
+    if (answer.ok !== true) {
+      const errorCode = String(answer.errorCode ?? '').trim().toLowerCase()
+      const description = String(answer.errorDescription ?? '')
+      const terminal = (['invalid_grant', 'invalid_client', 'unauthorized_client'].includes(errorCode)
+        && /already used|grant does not exist|unable to parse/iu.test(description))
+        || (errorCode === '' && Number(answer.status) === 400)
+      if (!terminal) return undefined
+      const adopted = await adoptRenewedElsewhere('gitea', alias, attemptedToken)
+      if (adopted !== undefined) return adopted
+      // Best effort: a store failure here must not mask the provider's refusal.
+      await unsetSecret(ctx, ref).catch(() => undefined)
+      await unsetSecret(ctx, refreshRef).catch(() => undefined)
+      refreshDeadlines.delete(`gitea:${alias}`)
+      const detail = [answer.errorCode, answer.errorDescription]
+        .filter(part => typeof part === 'string' && part !== '')
+        .join(': ')
+      const refused = new Error('Gitea refused to renew this login, so the stored token and its refresh reference were cleared. Press Login on the Connector page to authorize again.')
+      refused.code = 'CONNECTOR_PROVIDER_ERROR'
+      refused.reason = 'refresh_refused'
+      refused.tokenExpired = true
+      if (detail !== '') refused.detail = detail
+      throw refused
+    }
+    await setSecret(ctx, ref, answer.accessToken)
+    if (typeof answer.refreshToken === 'string' && answer.refreshToken !== '') {
+      // Rotation is the provider's call: store what it sent, keep the old one
+      // only when it sent nothing.
+      await setSecret(ctx, refreshRef, answer.refreshToken)
+    }
+    // IN MEMORY ONLY, and only bookkeeping: nothing derived from a token is
+    // persisted anywhere. A restart starts with no entry, which is fine — the
+    // refresh path is reactive and needs no deadline to work.
+    const now = Date.now()
+    const accessTtl = Number.isFinite(Number(answer.expiresIn)) && Number(answer.expiresIn) > 0
+      ? Number(answer.expiresIn)
+      : 3600
+    refreshDeadlines.set(`gitea:${alias}`, {
+      accessExpiresAt: now + accessTtl * 1000,
+      refreshExpiresAt: now + GITEA_DEFAULT_REFRESH_TTL_SECONDS * 1000,
+    })
+    return answer.accessToken
+  }
+
+  /**
+   * THE ONE REFRESH DISPATCHER (SOL D1): provider in, renewed token out.
+   *
+   * Two properties matter and neither lives in the per-provider functions:
+   *
+   *   * **one attempt per alias at a time** — the promise is MEMOIZED under
+   *     `provider:alias`, so a burst of 401s from parallel calls shares a single
+   *     refresh request. Without it every provider's rotation would invalidate
+   *     the refresh token the sibling call is holding and the loser would report
+   *     a refusal for a login that just got healthier;
+   *   * **release on settle** — a terminal refusal is forgettable, so a user who
+   *     logs in again gets a real attempt instead of a cached rejection.
+   *
+   * Nothing here is persisted, and no value is retained after the promise
+   * settles: the memo holds the ANSWER briefly, and the deadlines map holds only
+   * timestamps in this process.
+   *
+   * @param provider - provider id.
+   * @param alias - the alias being refreshed.
+   * @param attemptedToken - the access token that was refused, when known.
+   * @returns the renewed access token, or `undefined` when no refresh is possible.
+   */
+  function refreshAccess(provider, alias, attemptedToken) {
+    // ONE KEY PER LOGIN, whatever spelling reached us: `undefined`/`''` mean the
+    // provider's default alias, and the adapter hook and `withSecret` must agree
+    // on that or the memo would miss exactly when a burst needs it most.
+    const target = alias === undefined || alias === '' ? settings.defaultAlias[provider] : alias
+    const key = `${provider}:${target}`
+    const existing = refreshInFlight.get(key)
+    if (existing !== undefined) return existing
+    const attempt = (async () => {
+      if (provider === 'cloudflare') return refreshCloudflareAccess(target, attemptedToken)
+      if (provider === 'github') return refreshGitHubAccess(target, attemptedToken)
+      if (provider === 'gitea') return refreshGiteaAccess(target, attemptedToken)
+      return undefined
+    })()
+    refreshInFlight.set(key, attempt)
+    const release = () => {
+      if (refreshInFlight.get(key) === attempt) refreshInFlight.delete(key)
+    }
+    // `then(release, release)` consumes the rejection on this side, so a refused
+    // refresh cannot surface as an unhandled rejection as well as a typed error.
+    attempt.then(release, release)
+    return attempt
   }
 
   /**
@@ -878,25 +1107,37 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
    * (or one askpass file); everything `fn` returns is scrubbed of it before it
    * leaves this module, and a thrown error is scrubbed the same way.
    *
-   * CLOUDFLARE OAUTH RETRY. An access token minted by the OAuth flow expires. When
-   * a Cloudflare call fails with a 401 for the token itself, this attempts ONE
-   * refresh and ONE retry; a second failure is surfaced as the typed provider
-   * error (route: 424), and a refused refresh additionally clears both references
-   * (see {@link refreshCloudflareAccess}). No other provider retries: a GitHub PAT
-   * or Gitea token that fails does not become valid by asking again.
+   * REFRESH + RETRY, ALL THREE PROVIDERS. An access token minted by any OAuth
+   * flow expires. When a call fails with a 401 for the token ITSELF
+   * (`error.tokenRejected === true`), this attempts ONE refresh and ONE retry; a
+   * second failure is surfaced as the typed provider error (route: 424), and a
+   * refused refresh additionally clears both references (see the per-provider
+   * refresh helpers). A token that fails for any other reason is not retried: an
+   * expired login does not become valid by asking again, and a 403 that means
+   * "scope not granted" would just spend a refresh to be refused twice.
+   *
+   * PRE-FLIGHT (`ensureLive`). A WRITE cannot be healed after the fact: by the
+   * time the provider answers 401 the commit/dispatch it was asked to perform has
+   * already been refused, and a retry of a write is only safe because the retry
+   * carries a NEW token — not because the first attempt was harmless. So a write
+   * that is about to run with a token the liveness probe already calls `expired`
+   * renews FIRST (the same ONE refresh, same memo), and only then calls `fn`.
+   * Reads keep the reactive path: one extra probe per read would be pure cost.
    */
-  async function withSecret(provider, alias, fn) {
+  async function withSecret(provider, alias, fn, { ensureLive = false, verb = 'write' } = {}) {
     const name = alias === undefined || alias === '' ? settings.defaultAlias[provider] : assertAlias(alias)
     const credentialRef = requireRefName(config, provider, alias)
-    const secret = await resolveSecret(ctx, credentialRef)
+    let secret = await resolveSecret(ctx, credentialRef)
     if (secret === undefined) {
       const missing = new Error(`credential reference ${credentialRef} does not resolve; store that credential in DSH (or point alias "${name}" at another reference)`)
       missing.code = 'CONNECTOR_NO_TOKEN'
       throw missing
     }
-    /** A typed failure whose message cannot contain either value. */
-    const fail = (error, secrets) => {
-      const text = secrets.reduce((value, secretValue) => redact(value, secretValue), String(error?.message ?? error))
+    /** Every value that entered this call; all of them are scrubbed on the way out. */
+    const secrets = [secret]
+    /** A typed failure whose message cannot contain any of them. */
+    const fail = (error, values) => {
+      const text = values.reduce((value, secretValue) => redact(value, secretValue), String(error?.message ?? error))
       const failure = new Error(text)
       failure.code = error?.code ?? 'CONNECTOR_PROVIDER_ERROR'
       if (Number.isFinite(error?.status)) failure.status = error.status
@@ -911,28 +1152,57 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       if (typeof error?.scopeMissing === 'string') failure.scopeMissing = error.scopeMissing
       return failure
     }
+    /**
+     * EXACTLY ONE REFRESH PER REQUEST (SOL D3). A write may already have spent
+     * its refresh in the pre-flight; if the renewed token is then refused too,
+     * asking again would burn the rotation for nothing, so the second failure is
+     * surfaced as-is.
+     */
+    let refreshedInCall = false
+    if (ensureLive === true) {
+      const verdict = await tokenLiveness(name, adapters(name)[provider], secret)
+      if (verdict.state === 'expired') {
+        let renewed
+        try {
+          renewed = await refreshAccess(provider, name, secret)
+        } catch (refreshError) {
+          throw fail(refreshError, secrets)
+        }
+        // No refresh is possible (no refresh reference, no client id): refuse the
+        // write NOW, before it is attempted, with the message that says so.
+        if (renewed === undefined) throw deadTokenError(provider, verb)
+        refreshedInCall = true
+        const reprobe = await tokenLiveness(name, adapters(name)[provider], renewed)
+        if (reprobe.state === 'expired') {
+          secrets.push(renewed)
+          throw deadTokenError(provider, verb)
+        }
+        secret = renewed
+        secrets.push(renewed)
+      }
+    }
     let result
     try {
       result = await fn(secret, name, credentialRef)
     } catch (error) {
-      if (provider !== 'cloudflare' || error?.tokenRejected !== true) throw fail(error, [secret])
+      if (error?.tokenRejected !== true || refreshedInCall === true) throw fail(error, secrets)
       let renewed
       try {
-        renewed = await refreshCloudflareAccess(name)
+        renewed = await refreshAccess(provider, name, secret)
       } catch (refreshError) {
-        throw fail(refreshError, [secret])
+        throw fail(refreshError, secrets)
       }
-      if (renewed === undefined) throw fail(error, [secret])
+      if (renewed === undefined) throw fail(error, secrets)
       try {
         result = await fn(renewed, name, credentialRef)
       } catch (second) {
-        throw fail(second, [secret, renewed])
+        throw fail(second, [...secrets, renewed])
       }
-      // Defense in depth: neither value may appear in what this returns.
-      return scrubResult(result, [secret, renewed])
+      // Defense in depth: no value may appear in what this returns.
+      return scrubResult(result, [...secrets, renewed])
     }
     // Defense in depth: nothing returned may carry the value.
-    return scrubResult(result, [secret])
+    return scrubResult(result, secrets)
   }
 
   /**
@@ -982,6 +1252,25 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
 
   /** Provider labels for the one message that tells a user what to do next. */
   const PROVIDER_LABEL = { github: 'GitHub', gitea: 'Gitea', cloudflare: 'Cloudflare' }
+
+  /**
+   * How long a Gitea REFRESH token is assumed to live, in seconds.
+   *
+   * Gitea does not publish a refresh-token lifetime (`expires_in` describes the
+   * ACCESS token). Two years is the bookkeeping default the login hint quotes;
+   * it is used for nothing but an in-memory deadline, never to decide whether a
+   * refresh is attempted — that decision is always the provider's 401.
+   */
+  const GITEA_DEFAULT_REFRESH_TTL_SECONDS = 730 * 60 * 60
+
+  /**
+   * The PUBLIC sentence the Gitea hint adds to the dead-token refusal.
+   *
+   * Gitea's login now stores a refresh token, so "press Login" is no longer the
+   * first thing to say when a token dies: the host renews it once by itself. The
+   * sentence says that, and says Login is for the case where renewal was refused.
+   */
+  const GITEA_LOGIN_ONCE_HINT = 'A Gitea OAuth login now also stores a refresh token, so signing in once enables automatic renewal.'
 
   /**
    * THE FACT `resolved` CANNOT REPORT: does the stored value still authenticate?
@@ -1055,6 +1344,44 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
   }
 
   /**
+   * PROBE, AND HEAL ONCE — the pre-flight a caller with no value in hand needs.
+   *
+   * {@link probeToken} reports; this one also does the ONE thing that makes a
+   * pre-flight useful for a login the host can renew by itself. Its contract:
+   *
+   *   1. probe;
+   *   2. when the verdict is `expired`, attempt ONE refresh (through the same
+   *      memo as every other caller) and re-probe;
+   *   3. report honestly: an unreachable provider or a missing refresh reference
+   *      still answers `expired` with the reason, because a pre-flight must never
+   *      turn a working login into a refusal over a network blip — the caller
+   *      decides, and the push path only refuses on `state === 'expired'` after
+   *      this second chance.
+   *
+   * A refresh that THROWS is reported as `expired` with the throw's message: that
+   * is the refused-refresh case, whose error already cleared the pair, so the
+   * caller must stop rather than retry the dead value.
+   *
+   * @param name - provider id.
+   * @param alias - alias being used.
+   * @returns `{ state, login?, reason? }` like {@link probeToken}.
+   */
+  async function ensureLiveToken(name, alias) {
+    const first = await probeToken(name, alias)
+    if (first.state !== 'expired') return first
+    const target = targetOf(name, alias)
+    const attempted = await resolveSecret(ctx, target.ref).catch(() => undefined)
+    let renewed
+    try {
+      renewed = await refreshAccess(name, target.alias, attempted)
+    } catch (error) {
+      return { state: 'expired', reason: String(error?.message ?? error) }
+    }
+    if (renewed === undefined) return first
+    return probeToken(name, alias)
+  }
+
+  /**
    * THE DEAD-TOKEN REFUSAL — typed, instant, and explicit about what did NOT
    * happen. `verb` decides the last sentence: a push and a repository write are
    * different promises, and the caller must be able to repeat either one verbatim.
@@ -1063,7 +1390,11 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
    */
   function deadTokenError(name, verb) {
     const what = verb === 'push' ? 'No push was attempted.' : 'No write was attempted.'
-    const error = new Error(`${PROVIDER_LABEL[name] ?? name} token expired/invalid — press Login on the Connector page, then retry. ${what}`)
+    // Gitea's login now stores a refresh half, so an expired access token is
+    // renewed by the host itself in the normal case: the hint names the flow that
+    // makes Login a once-per-authorization event, and says when Login IS needed.
+    const hint = name === 'gitea' ? ` ${GITEA_LOGIN_ONCE_HINT}` : ''
+    const error = new Error(`${PROVIDER_LABEL[name] ?? name} token expired/invalid — press Login on the Connector page, then retry.${hint} ${what}`)
     error.code = 'CONNECTOR_TOKEN_DEAD'
     error.reason = 'token_expired'
     // The same public classification every provider refusal carries, so a caller
@@ -1126,21 +1457,6 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
     error.code = 'CONNECTOR_PUSH_FORBIDDEN'
     error.reason = 'push_forbidden'
     return error
-  }
-
-  /**
-   * PRE-FLIGHT for every path that mutates a remote. A dead token is refused
-   * HERE, before the write (and, for a push, before any git process exists), so
-   * the outcome is instant and explicit instead of a provider 401 after the fact.
-   *
-   * It is deliberately permissive about everything except `expired`: an
-   * unreachable/unknown state is not evidence that the token is bad, and refusing
-   * on it would break a working login behind a flaky network.
-   */
-  async function assertLiveToken(name, api, token, verb) {
-    const state = await tokenLiveness(name, api, token)
-    if (state.state === 'expired') throw deadTokenError(name, verb)
-    return state
   }
 
   /**
@@ -1759,6 +2075,8 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       // the OAuth grant are revoked at the dashboard endpoint (best effort — the
       // local unset happens regardless, and a provider failure never stops it),
       // and the refresh reference is cleared with the access reference.
+      // GitHub and Gitea have no revoke endpoint this plugin is entitled to call,
+      // so their refresh reference is simply unset (see the finally below).
       let revoked = false
       if (name === 'cloudflare') {
         revoked = await revokeCloudflareGrant(target, ref)
@@ -1775,7 +2093,27 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       } catch (error) {
         failure = error
       } finally {
-        if (name === 'cloudflare') await unsetSecret(ctx, cloudflareRefreshRefName(config, target)).catch(() => undefined)
+        /**
+         * BOTH HALVES GO, FOR EVERY PROVIDER. A login that stored a refresh token
+         * (Cloudflare, GitHub's device flow, Gitea's code flow) leaves a second
+         * reference behind; clearing only the access half would keep a credential
+         * that can MINT new tokens after the user asked to be logged out — and it
+         * would keep renewing a login the user just ended. One lookup
+         * (`refreshRefNameOf`) so a future provider cannot be forgotten here.
+         */
+        const refreshRef = refreshRefNameOf(config, name, target)
+        if (refreshRef !== '') await unsetSecret(ctx, refreshRef).catch(() => undefined)
+        // Forget this process's own bookkeeping for the alias: a stale deadline or
+        // a memoized in-flight attempt must not outlive the login it describes.
+        refreshDeadlines.delete(`${name}:${target}`)
+        // EXACT KEY ONLY. `refreshAccess` memoizes under the canonical
+        // `provider:alias` it computes from this same default-alias fallback, and
+        // an UNANCHORED PREFIX match would evict a SIBLING alias (`github:dev2`
+        // also starts with `github:dev`) — dropping a live attempt in another
+        // alias and letting that alias issue a second refresh POST for a login
+        // this logout never touched. `target` is already canonical (see
+        // `targetOf`), so the key below is byte-identical to the memo's.
+        refreshInFlight.delete(`${name}:${target}`)
         // Abandon anything still in flight for this provider. No value is
         // involved: these are opaque flow ids and one-time state strings.
         for (const [flowId, flow] of deviceFlows) {
@@ -2075,8 +2413,36 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         )
       }
       await setSecret(ctx, ref, exchanged.accessToken)
+      /**
+       * THE REFRESH HALF — the reason one Gitea login is now enough.
+       *
+       * Gitea issues a refresh token when the OAuth2 application has the
+       * `refresh_token` grant. It is written under its OWN reference (a NAME; the
+       * value lives in DSH like every other credential), so the 1-hour access
+       * token can renew itself instead of dying mid-session. Nothing about expiry
+       * is persisted — only this process's in-memory deadline map, which a restart
+       * simply loses.
+       */
+      const refreshRef = giteaRefreshRefName(config, target)
+      const refreshStored = typeof exchanged.refreshToken === 'string' && exchanged.refreshToken !== ''
+      if (refreshStored) await setSecret(ctx, refreshRef, exchanged.refreshToken)
+      const now = Date.now()
+      const accessTtl = Number.isFinite(Number(exchanged.expiresIn)) && Number(exchanged.expiresIn) > 0
+        ? Number(exchanged.expiresIn)
+        : 3600
+      refreshDeadlines.set(`gitea:${target}`, {
+        accessExpiresAt: now + accessTtl * 1000,
+        refreshExpiresAt: now + GITEA_DEFAULT_REFRESH_TTL_SECONDS * 1000,
+      })
       const receipt = await referenceReceipt('gitea', ref)
-      return { ...receipt, provider: 'gitea', alias: target, redirectUri: callback }
+      return {
+        ...receipt,
+        provider: 'gitea',
+        alias: target,
+        redirectUri: callback,
+        refreshStored,
+        refreshCredentialRef: refreshRef,
+      }
     },
 
     /**
@@ -3092,6 +3458,20 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       if (name === 'cloudflare') {
         throw new TypeError(`Cloudflare stores Pages projects rather than repositories; "${action}" is a GitHub/Gitea verb with no Cloudflare equivalent`)
       }
+      /**
+       * THE WRITE PRE-FLIGHT NOW LIVES IN `withSecret`.
+       *
+       * It used to be an `assertLiveToken` call INSIDE the callback, which meant a
+       * dead token was refused after resolution and — for a renewing provider —
+       * without the one refresh that would have fixed it. `ensureLive` is set for
+       * the write verbs only: a read heals reactively, on the 401 the provider
+       * itself says is about the token; a write renews BEFORE the first request,
+       * so a commit is never attempted with a token the probe already knows is
+       * dead.
+       */
+      // A FILE WRITE renews an expired token before the commit is attempted; a read
+      // keeps the reactive path.
+      const guarantees = { ensureLive: FILE_WRITE_ACTIONS.has(action), verb: 'write' }
       return withSecret(name, input.alias, async (token, usedAlias) => {
         const built = adapters(usedAlias)
         assertGiteaReady(name)
@@ -3147,10 +3527,6 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
             if (message === '') throw new TypeError('message (the commit message) must not be empty')
             const target = String(input.branch ?? '').trim()
             if (target === '') throw new TypeError('branch is required: a commit needs a branch to land on')
-            // WRITE PRE-FLIGHT, after the local argument checks and before any
-            // request: a commit cannot succeed on a dead token, and saying so now
-            // keeps the failure instant and explicit.
-            await assertLiveToken(name, api, token, 'write')
             const written = await api.putFile(token, owner, repo, {
               path, content, message, branch: refName(target, 'branch'),
               sha: input.sha === undefined || input.sha === '' ? undefined : String(input.sha),
@@ -3164,7 +3540,7 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
           default:
             throw new TypeError(`unsupported action ${action}`)
         }
-      })
+      }, guarantees)
     },
 
     /**
@@ -3185,20 +3561,22 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       // real message behind CONNECTOR_NO_TOKEN whenever no Cloudflare credential
       // happened to exist.
       assertProviderVerb(name, action)
+      /**
+       * EVERY WRITE VERB HERE LANDS ON THE REMOTE, so the dead-token pre-flight
+       * moved into `withSecret` (`ensureLive`): it now runs BEFORE resolution's
+       * callback and therefore BEFORE the verb's own argument validation — a
+       * credential that cannot authenticate makes every argument moot — and it
+       * renews the token instead of refusing outright when a refresh is possible.
+       * A read keeps the reactive 401 path.
+       */
+      // A WRITE renews first; a READ heals reactively.
+      const guarantees = { ensureLive: WRITE_ACTIONS.has(action), verb: 'write' }
       return withSecret(name, input.alias, async (token, usedAlias, credentialRef) => {
         const built = adapters(usedAlias)
         const owner = repoPart(input.owner, 'owner')
         const repo = repoPart(input.repo, 'repo')
         assertGiteaReady(name)
         const api = built[name]
-        /**
-         * WRITE PRE-FLIGHT. Every WRITE verb here lands on the remote, so a dead
-         * token must be refused before the verb's own request — and before its
-         * argument validation, because a credential that cannot authenticate
-         * makes every argument moot. One cheap `GET /user`; a live token costs
-         * one call, a dead one gets the explicit "no write was attempted".
-         */
-        if (WRITE_ACTIONS.has(action)) await assertLiveToken(name, api, token, 'write')
         const receipt = { ok: true, provider: name, alias: usedAlias, action, owner, repo }
 
         switch (action) {
@@ -3405,7 +3783,7 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
           default:
             throw new TypeError(`unsupported action ${action}`)
         }
-      })
+      }, guarantees)
     },
 
     /**
@@ -3426,12 +3804,15 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       if (!info.isDirectory()) throw configError('the project path must be a directory')
 
       /**
-       * PRE-FLIGHT: A DEAD TOKEN STOPS THE PUSH BEFORE GIT EXISTS.
+       * PRE-FLIGHT: A DEAD TOKEN STOPS THE PUSH BEFORE GIT EXISTS — and a token
+       * the host can renew is renewed HERE instead of being reported dead.
        *
-       * One `GET /user` with the stored token, before ANY git process is spawned.
-       * A 401 aborts here with the typed dead-token error, so the caller learns
-       * immediately and explicitly that nothing was attempted — instead of a git
-       * failure minutes later that invites a workaround.
+       * `ensureLiveToken` probes once and, on `expired`, spends the same single
+       * refresh every other caller shares before re-probing. The 403 message below
+       * still uses `preflight.login`, so the probe (and its identity) is kept; only
+       * the refusal decision moved. A push that still reads `expired` afterwards
+       * is refused with the typed dead-token error, before ANY git process is
+       * spawned.
        *
        * WHAT THIS FUNCTION WILL NOT DO, EVER: switch, add or rewrite a remote; fall
        * back to a shell/SSH remote the user never approved; or attempt an
@@ -3439,7 +3820,7 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
        * answer and passed to `git push` as an argument, so nothing is configured
        * and nothing is left behind.
        */
-      const preflight = await probeToken(name, input.alias)
+      const preflight = await ensureLiveToken(name, input.alias)
       if (preflight.state === 'expired') throw deadTokenError(name, 'push')
 
       const inside = await run('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], { cwd: projectPath })
@@ -3479,6 +3860,9 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
       const ref = input.ref === undefined ? branch : String(input.ref)
       if (!REF_PATTERN.test(ref)) throw new TypeError('ref is not a valid ref name')
 
+      // `ensureLive:false` on purpose: the probe above already decided, and the
+      // verb is a git process, not a request whose 401 could be retried here.
+      // `verb:'push'` only picks the wording of a refusal.
       return withSecret(name, input.alias, async (token, usedAlias) => {
         const built = adapters(usedAlias)
         let remoteUrl
@@ -3579,7 +3963,7 @@ export function createOperations({ ctx, config, workspaceRoot, logger }) {
         } finally {
           await rm(dir, { recursive: true, force: true }).catch(() => {})
         }
-      })
+      }, { ensureLive: false, verb: 'push' })
     },
 
     /**

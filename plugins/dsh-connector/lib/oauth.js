@@ -292,18 +292,24 @@ export function originOfRequest(headers, fallback = '') {
  *
  *   * control characters are flattened (a page is not a terminal);
  *   * the ONE secret this call holds is removed if the provider echoes it;
+ *   * the REFRESH TOKEN is removed for the same reason, on the refresh path: a
+ *     token endpoint that quotes the value it was asked about must not turn a
+ *     refusal into a way to read that value back out of `refused.detail`;
  *   * the authorization code is removed for the same reason;
  *   * the result is truncated, so a chatty server cannot fill the tab.
  *
  * @param value - candidate provider text.
- * @param options - `{ secret, code }` values that must never survive.
+ * @param options - `{ secret, refresh_token, code }` values that must never survive.
  * @returns the safe, short text (possibly empty).
  */
-function providerText(value, { secret = '', code = '' } = {}) {
+function providerText(value, { secret = '', refresh_token: refreshToken = '', code = '' } = {}) {
   const raw = typeof value === 'string' ? value : ''
   if (raw.trim() === '') return ''
   let text = raw.replace(/[\u0000-\u001f\u007f]+/gu, ' ').replace(/\s+/gu, ' ').trim()
   if (typeof secret === 'string' && secret !== '') text = text.split(secret).join('[secret]')
+  // `[refresh_token]` is a PLACEHOLDER, never a derived fact: it says "something
+  // was removed here", not how long it was or what it started with.
+  if (typeof refreshToken === 'string' && refreshToken !== '') text = text.split(refreshToken).join('[refresh_token]')
   if (typeof code === 'string' && code.length >= 8) text = text.split(code).join('[code]')
   return text.length > 200 ? `${text.slice(0, 200)}…` : text
 }
@@ -373,7 +379,7 @@ export function classifyGiteaExchangeFailure(result = {}) {
  * @param options.code - the authorization code from the callback.
  * @param options.redirectUri - the same `redirect_uri` used in the authorize step.
  * @param options.request - injected HTTP function (`(url, init) => response`).
- * @returns `{ ok, status, accessToken?, scope?, reason?, errorCode?, errorDescription? }` — never the code, the secret or a token on failure.
+ * @returns `{ ok, status, accessToken?, refreshToken?, expiresIn?, scope?, reason?, errorCode?, errorDescription? }` — never the code, the secret or a token on failure.
  */
 export async function exchangeGiteaCode({ apiBase, clientId, clientSecret, code, redirectUri, request }) {
   const origin = giteaWebOrigin(apiBase)
@@ -421,6 +427,12 @@ export async function exchangeGiteaCode({ apiBase, clientId, clientSecret, code,
     ok: true,
     status: Number(answer.status ?? 200),
     accessToken,
+    // THE REFRESH HALF. Gitea issues one when the OAuth2 application has the
+    // `refresh_token` grant; storing it is what makes a 1-hour access token
+    // renew itself instead of forcing a fresh login. Omitted when the server
+    // did not send one, exactly like the Cloudflare exchange above.
+    ...(typeof body.refresh_token === 'string' && body.refresh_token !== '' ? { refreshToken: body.refresh_token } : {}),
+    ...(Number.isFinite(Number(body.expires_in)) ? { expiresIn: Number(body.expires_in) } : {}),
     ...(typeof body.scope === 'string' && body.scope !== '' ? { scope: body.scope } : {}),
   }
 }
@@ -682,6 +694,82 @@ export async function refreshCloudflareToken({ clientId, refreshToken, request, 
   })
   const body = answer.json ?? {}
   if (!answer.ok) return { ok: false, status: Number(answer.status ?? 0), reason: 'the refresh was refused' }
+  const accessToken = typeof body.access_token === 'string' ? body.access_token : ''
+  if (accessToken === '') return { ok: false, status: Number(answer.status ?? 200), reason: 'the refresh answered without an access_token' }
+  return {
+    ok: true,
+    status: Number(answer.status ?? 200),
+    accessToken,
+    ...(typeof body.refresh_token === 'string' && body.refresh_token !== '' ? { refreshToken: body.refresh_token } : {}),
+    ...(Number.isFinite(Number(body.expires_in)) ? { expiresIn: Number(body.expires_in) } : {}),
+  }
+}
+
+/**
+ * Renew a Gitea access token (`grant_type=refresh_token`, confidential client).
+ *
+ * This is the Gitea analogue of {@link refreshCloudflareToken}, with the two
+ * differences the instance imposes:
+ *
+ *   * the endpoint lives on the INSTANCE origin (`https://git.example.com/
+ *     login/oauth/access_token`), which is what {@link giteaWebOrigin} derives —
+ *     the configured `apiBase` is the API root and may carry `/api/v1`;
+ *   * Gitea is a CONFIDENTIAL client, so the same `client_id`/`client_secret`
+ *     pair as the code exchange travels in the body.
+ *
+ * The caller must store the refresh token from the answer when one is present
+ * (Gitea rotates it) and keep the old one only when it is not. A refusal keeps
+ * the provider's OWN `error`/`error_description` — bounded and de-identified by
+ * {@link providerText} — because "refused" alone cannot distinguish a revoked
+ * grant (`invalid_grant`) from a rotated client secret (`invalid_client`), and
+ * those two have different fixes. Neither token is echoed, measured or logged.
+ *
+ * @param options - wiring.
+ * @param options.apiBase - the configured Gitea base URL.
+ * @param options.clientId - the public OAuth2 client id.
+ * @param options.clientSecret - the SECRET, resolved at call time.
+ * @param options.refreshToken - the refresh token resolved at call time.
+ * @param options.request - injected HTTP function.
+ * @returns `{ ok, status, accessToken?, refreshToken?, expiresIn?, reason?, errorCode?, errorDescription? }`.
+ * @throws TypeError (`CONNECTOR_BAD_REQUEST`) when the base URL is unusable.
+ */
+export async function refreshGiteaToken({ apiBase, clientId, clientSecret, refreshToken, request }) {
+  const origin = giteaWebOrigin(apiBase)
+  if (origin === '') {
+    const error = new TypeError('Gitea base URL is not configured; set it on the Gitea card before refreshing a token')
+    error.code = 'CONNECTOR_BAD_REQUEST'
+    throw error
+  }
+  const answer = await request(`${origin}/login/oauth/access_token`, {
+    method: 'POST',
+    headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+    }).toString(),
+  })
+  const body = answer.json ?? {}
+  if (!answer.ok) {
+    // BOTH values are scrubbed at the source: the confidential client's secret
+    // AND the refresh token this request presented. A token endpoint is allowed
+    // to quote what it was sent ("refresh token ... is invalid"), and that quote
+    // would otherwise ride into `refused.detail` — a place a page reads. Nothing
+    // here is measured or echoed back: the needles only ever DELETE text.
+    const errorCode = providerText(body.error, { secret: clientSecret, refresh_token: refreshToken })
+    const errorDescription = providerText(
+      body.error_description ?? body.message,
+      { secret: clientSecret, refresh_token: refreshToken },
+    )
+    return {
+      ok: false,
+      status: Number(answer.status ?? 0),
+      reason: 'the refresh was refused',
+      ...(errorCode === '' ? {} : { errorCode }),
+      ...(errorDescription === '' ? {} : { errorDescription }),
+    }
+  }
   const accessToken = typeof body.access_token === 'string' ? body.access_token : ''
   if (accessToken === '') return { ok: false, status: Number(answer.status ?? 200), reason: 'the refresh answered without an access_token' }
   return {

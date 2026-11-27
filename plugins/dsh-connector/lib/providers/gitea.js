@@ -115,11 +115,38 @@ export function createGitea({ apiBase, request, version }) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
 
+  /**
+   * The typed provider refusal this adapter raises, with the classification the
+   * operations layer branches on kept ON the error rather than inferred from the
+   * message.
+   *
+   * `tokenRejected` is set for a 401 ONLY. That is the one signal that lets
+   * `withSecret` attempt ONE refresh and ONE retry: Gitea answers 401 for a token
+   * that expired or was revoked (the case a refresh fixes) and 403 for a scope or
+   * account restriction (which a refresh cannot fix, and which must therefore
+   * never spend a refresh token).
+   *
+   * The message is byte-for-byte the sentence this adapter has always produced —
+   * `Gitea <status> on <what>` — so nothing a caller matches on changes.
+   *
+   * @param response - the normalized response.
+   * @param what - the route or verb, as it already reads in the message.
+   * @returns the typed error.
+   */
+  function failure(response, what) {
+    const error = new Error(`Gitea ${response.status} on ${what}`)
+    error.code = 'CONNECTOR_PROVIDER_ERROR'
+    if (Number.isFinite(response.status)) error.status = Number(response.status)
+    if (response.status === 401) error.tokenRejected = true
+    return error
+  }
+
   async function expect(response, what) {
     if (response.ok) return response.json
     if (response.status === 404) throw new Error(`Gitea 404 on ${what}: not found, or this server version does not expose it`)
-    if (response.status === 401 || response.status === 403) throw new Error(`Gitea ${response.status} on ${what}: the token was refused`)
-    throw new Error(`Gitea ${response.status} on ${what}`)
+    if (response.status === 401) throw failure(response, `${what}: the token was refused`)
+    if (response.status === 403) throw failure(response, `${what}: the token was refused`)
+    throw failure(response, what)
   }
 
   /**
@@ -246,7 +273,7 @@ export function createGitea({ apiBase, request, version }) {
     const wanted = (Array.isArray(names) ? names : []).map(name => String(name).trim()).filter(name => name !== '')
     if (wanted.length === 0) return []
     const response = await call(token, `${repoPath(owner, repo)}/labels?limit=100`)
-    if (!response.ok) throw new Error(`Gitea ${response.status} on labels`)
+    if (!response.ok) throw failure(response, `labels`)
     const rows = Array.isArray(response.json) ? response.json : []
     const byName = new Map(rows.map(row => [String(row.name), row.id]))
     const missing = wanted.filter(name => !byName.has(name))
@@ -373,7 +400,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 404) {
         return { supported: false, items: [], truncated: false, reason: `no tree for ref "${want === '' ? '(default branch)' : want}", or this server does not expose git/trees` }
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on git/trees/${target}`)
+      if (!response.ok) throw failure(response, `git/trees/${target}`)
       const rows = Array.isArray(response.json?.tree) ? response.json.tree : []
       const prefix = path === undefined || path === '' ? '' : `${String(path).replace(/\/+$/u, '')}/`
       const items = rows
@@ -387,7 +414,7 @@ export function createGitea({ apiBase, request, version }) {
       const query = ref === undefined || ref === '' ? '' : `?ref=${encodeURIComponent(ref)}`
       const response = await call(token, `${repoPath(owner, repo)}/contents/${seg(path)}${query}`)
       if (response.status === 404) throw new Error(`Gitea 404 on contents/${path}: no such file at that ref`)
-      if (!response.ok) throw new Error(`Gitea ${response.status} on contents/${path}`)
+      if (!response.ok) throw failure(response, `contents/${path}`)
       const row = response.json ?? {}
       if (Array.isArray(row)) throw new Error(`contents/${path} is a directory; use read_tree to list it`)
       const contentBase64 = String(row.content ?? '').replace(/\s+/gu, '')
@@ -419,7 +446,7 @@ export function createGitea({ apiBase, request, version }) {
         throw new Error(`Gitea 422 on contents/${path}: ${update ? 'the sha passed is not the current blob' : 'the file already exists — pass sha to update it'}`)
       }
       if (response.status === 409) throw new Error(`Gitea 409 on contents/${path}: the branch is protected or the base changed`)
-      if (!response.ok) throw new Error(`Gitea ${response.status} on contents/${path} (${update ? 'PUT' : 'POST'})`)
+      if (!response.ok) throw failure(response, `contents/${path} (${update ? 'PUT' : 'POST'})`)
       return {
         commit: response.json?.commit?.sha,
         contentSha: response.json?.content?.sha,
@@ -430,7 +457,7 @@ export function createGitea({ apiBase, request, version }) {
     /** The repository's default branch (used when read_tree names no ref). */
     async defaultBranchOf(token, owner, repo) {
       const response = await call(token, repoPath(owner, repo))
-      if (!response.ok) throw new Error(`Gitea ${response.status} on repository`)
+      if (!response.ok) throw failure(response, `repository`)
       return response.json?.default_branch ?? 'main'
     },
 
@@ -502,7 +529,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 404) {
         return { supported: false, text: '', reason: `run ${runId} was not found, or this server does not expose run logs` }
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on actions run ${runId} logs`)
+      if (!response.ok) throw failure(response, `actions run ${runId} logs`)
       const text = typeof response.text === 'string' ? response.text : ''
       if (looksLikeZip(text)) {
         return {
@@ -538,7 +565,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 404) {
         return { supported: false, reason: `workflow "${workflow}" was not found, or this server does not expose workflow dispatch` }
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on actions/workflows/${workflow}/dispatches`)
+      if (!response.ok) throw failure(response, `actions/workflows/${workflow}/dispatches`)
       return { supported: true, dispatched: true, workflow, ref }
     },
 
@@ -554,7 +581,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 404) {
         return { supported: false, reason: `run ${runId} was not found, or this server does not expose run cancel` }
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on actions/runs/${runId}/cancel`)
+      if (!response.ok) throw failure(response, `actions/runs/${runId}/cancel`)
       return { supported: true, cancelled: true, runId: String(runId) }
     },
 
@@ -570,7 +597,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 404) {
         return { supported: false, reason: `run ${runId} was not found, or this server does not expose run rerun` }
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on actions/runs/${runId}/rerun`)
+      if (!response.ok) throw failure(response, `actions/runs/${runId}/rerun`)
       return { supported: true, rerun: true, runId: String(runId) }
     },
 
@@ -586,7 +613,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 404) {
         return { supported: false, reason: `run ${runId} was not found, or this server does not expose run delete` }
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on actions/runs/${runId} (DELETE)`)
+      if (!response.ok) throw failure(response, `actions/runs/${runId} (DELETE)`)
       return { supported: true, deleted: true, runId: String(runId) }
     },
 
@@ -628,7 +655,7 @@ export function createGitea({ apiBase, request, version }) {
         throw new Error(`Gitea ${response.status} on branches: branch "${name}" already exists, or "${base}" is not a ref in this repository`)
       }
       if (response.status === 404) throw new Error(`Gitea 404 on branches: no such repository, or this server does not expose branch create`)
-      if (!response.ok) throw new Error(`Gitea ${response.status} on branches (create)`)
+      if (!response.ok) throw failure(response, `branches (create)`)
       const created = response.json?.name ?? name
       return {
         branch: created,
@@ -643,7 +670,7 @@ export function createGitea({ apiBase, request, version }) {
       const response = await call(token, `${repoPath(owner, repo)}/branches/${seg(branch)}`, { method: 'DELETE' })
       if (response.status === 404) throw new Error(`Gitea 404 on branches/${branch}: no such branch`)
       if (response.status === 403) throw new Error(`Gitea 403 on branches/${branch}: the branch is protected or the token may not delete it`)
-      if (!response.ok) throw new Error(`Gitea ${response.status} on branches/${branch} (DELETE)`)
+      if (!response.ok) throw failure(response, `branches/${branch} (DELETE)`)
       return { deleted: true, branch }
     },
 
@@ -656,7 +683,7 @@ export function createGitea({ apiBase, request, version }) {
       if (message !== undefined && message !== '') body.message = message
       const response = await call(token, `${repoPath(owner, repo)}/tags`, { method: 'POST', body })
       if (response.status === 409 || response.status === 422) throw new Error(`Gitea ${response.status} on tags: tag "${tag}" already exists`)
-      if (!response.ok) throw new Error(`Gitea ${response.status} on tags (create)`)
+      if (!response.ok) throw failure(response, `tags (create)`)
       return { tag: response.json?.name ?? tag, sha: response.json?.commit?.sha ?? sha, ref: `refs/tags/${tag}` }
     },
 
@@ -667,7 +694,7 @@ export function createGitea({ apiBase, request, version }) {
       if (ref !== undefined && ref !== '') params.set('sha', ref)
       const response = await call(token, `${repoPath(owner, repo)}/commits?${params.toString()}`)
       if (response.status === 404) return []
-      if (!response.ok) throw new Error(`Gitea ${response.status} on commits`)
+      if (!response.ok) throw failure(response, `commits`)
       return (Array.isArray(response.json) ? response.json : []).map(row => ({
         sha: row.sha,
         date: row.commit?.author?.date ?? row.created,
@@ -697,7 +724,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 404) {
         return { supported: false, items: [], reason: `blame is not available for ${path} on this server (route absent for that file or build)` }
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on blame/${path}`)
+      if (!response.ok) throw failure(response, `blame/${path}`)
       const rows = Array.isArray(response.json) ? response.json : []
       return {
         supported: true,
@@ -736,7 +763,7 @@ export function createGitea({ apiBase, request, version }) {
       if (body !== undefined && body !== '') payload.body = body
       if (ids.length > 0) payload.labels = ids
       const response = await call(token, `${repoPath(owner, repo)}/issues`, { method: 'POST', body: payload })
-      if (!response.ok) throw new Error(`Gitea ${response.status} on issues (create)`)
+      if (!response.ok) throw failure(response, `issues (create)`)
       return {
         number: response.json?.number,
         url: response.json?.html_url,
@@ -748,7 +775,7 @@ export function createGitea({ apiBase, request, version }) {
     /** Open or close an issue (Gitea uses the same PATCH as an edit). */
     async issueState(token, owner, repo, number, state) {
       const response = await call(token, `${repoPath(owner, repo)}/issues/${encodeURIComponent(number)}`, { method: 'PATCH', body: { state } })
-      if (!response.ok) throw new Error(`Gitea ${response.status} on issues/${number} (state)`)
+      if (!response.ok) throw failure(response, `issues/${number} (state)`)
       return { number: String(number), state: response.json?.state }
     },
 
@@ -758,7 +785,7 @@ export function createGitea({ apiBase, request, version }) {
       const response = await call(token, `${repoPath(owner, repo)}/issues/${encodeURIComponent(number)}/labels`, {
         method: 'PUT', body: { labels: ids },
       })
-      if (!response.ok) throw new Error(`Gitea ${response.status} on issues/${number}/labels`)
+      if (!response.ok) throw failure(response, `issues/${number}/labels`)
       return {
         number: String(number),
         labels: (Array.isArray(response.json) ? response.json : []).map(label => label.name),
@@ -770,7 +797,7 @@ export function createGitea({ apiBase, request, version }) {
       const response = await call(token, `${repoPath(owner, repo)}/issues/${encodeURIComponent(number)}/assignees`, {
         method: 'POST', body: { assignees },
       })
-      if (!response.ok) throw new Error(`Gitea ${response.status} on issues/${number}/assignees`)
+      if (!response.ok) throw failure(response, `issues/${number}/assignees`)
       return {
         number: String(number),
         assignees: (response.json?.assignees ?? []).map(user => user.login),
@@ -785,7 +812,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 409 || response.status === 422) {
         throw new Error(`Gitea ${response.status} on pulls: no commits between base and head, or a pull request already exists`)
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on pulls (create)`)
+      if (!response.ok) throw failure(response, `pulls (create)`)
       return { number: response.json?.number, url: response.json?.html_url, state: response.json?.state }
     },
 
@@ -805,7 +832,7 @@ export function createGitea({ apiBase, request, version }) {
       if (response.status === 405 || response.status === 409) {
         throw new Error(`Gitea ${response.status} on pulls/${number}/merge: the pull request is not mergeable`)
       }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on pulls/${number}/merge`)
+      if (!response.ok) throw failure(response, `pulls/${number}/merge`)
       // Gitea answers 200 with an empty body on success and does not return a sha.
       return { number: String(number), merged: true, sha: response.json?.sha, message: response.json?.message }
     },
@@ -823,7 +850,7 @@ export function createGitea({ apiBase, request, version }) {
     async pullDiff(token, owner, repo, number) {
       const response = await call(token, `${repoPath(owner, repo)}/pulls/${encodeURIComponent(number)}.diff`, { accept: 'text/plain' })
       if (response.status === 404) return { supported: false, text: '', reason: `pull request ${number} was not found, or this server does not serve the .diff suffix` }
-      if (!response.ok) throw new Error(`Gitea ${response.status} on pulls/${number}.diff`)
+      if (!response.ok) throw failure(response, `pulls/${number}.diff`)
       const text = typeof response.text === 'string' ? response.text : ''
       if (text.trimStart().startsWith('{')) {
         return { supported: false, text: '', reason: 'this server answered with JSON for the .diff suffix' }

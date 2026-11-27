@@ -79,6 +79,16 @@ export const DEFAULT_CLOUDFLARE_REFRESH_REF = 'CLOUDFLARE_REFRESH_TOKEN'
  */
 export const DEFAULT_GITHUB_REFRESH_REF = 'GITHUB_REFRESH_TOKEN'
 
+/**
+ * The reference that holds the Gitea OAuth REFRESH token.
+ *
+ * Gitea's authorization-code flow issues one whenever the OAuth2 application has
+ * the `refresh_token` grant, so signing in ONCE is enough to keep the access
+ * token renewing itself. It is written by the same Login callback, read exactly
+ * once per refresh, and never sent as an `Authorization` header.
+ */
+export const DEFAULT_GITEA_REFRESH_REF = 'GITEA_REFRESH_TOKEN'
+
 /** Alias grammar: a stable key inside one provider's alias map. */
 export const ALIAS_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/
 
@@ -260,6 +270,46 @@ export function githubRefreshRefName(config, alias = undefined) {
   return isRefName(configured) ? configured : DEFAULT_GITHUB_REFRESH_REF
 }
 
+/**
+ * The reference that holds the Gitea OAuth refresh token for one alias.
+ *
+ * Two layers like the others: `config.gitea.refreshCredentialRef` for the
+ * default alias, `config.gitea.refreshAliases[alias]` for the rest. An alias
+ * with no entry of its own falls back to the default reference, because one
+ * OAuth2 application usually serves every alias of one instance.
+ *
+ * @param config - the live non-secret config.
+ * @param alias - alias, or `undefined` for the provider default.
+ * @returns the reference name (never empty).
+ */
+export function giteaRefreshRefName(config, alias = undefined) {
+  const section = config?.gitea ?? {}
+  const name = alias === undefined || alias === '' ? section.defaultAlias ?? 'default' : alias
+  const mapped = section.refreshAliases?.[name]
+  if (isRefName(mapped)) return mapped
+  const configured = section.refreshCredentialRef
+  return isRefName(configured) ? configured : DEFAULT_GITEA_REFRESH_REF
+}
+
+/**
+ * The refresh reference one provider+alias uses, whichever provider it is.
+ *
+ * A single lookup so a caller that walks all three providers (Logout, a status
+ * row) cannot forget one of them — the omission that used to leave a stale
+ * refresh half behind after a logout.
+ *
+ * @param config - the live non-secret config.
+ * @param provider - provider id.
+ * @param alias - alias, or `undefined` for the provider default.
+ * @returns the reference name, or `''` for an unknown provider.
+ */
+export function refreshRefNameOf(config, provider, alias = undefined) {
+  if (provider === 'cloudflare') return cloudflareRefreshRefName(config, alias)
+  if (provider === 'github') return githubRefreshRefName(config, alias)
+  if (provider === 'gitea') return giteaRefreshRefName(config, alias)
+  return ''
+}
+
 /** The credential provider, when this host has one mounted. */
 function provider(ctx) {
   return ctx?.get?.('credentials') ?? ctx?.credentials
@@ -383,6 +433,11 @@ export async function describeCredential(ctx, ref) {
  * Status for one provider (or all of them): each alias, its reference name, and
  * whether that reference resolves.
  *
+ * A GitHub or Gitea row also carries its REFRESH reference name and whether that
+ * one resolves (`refreshCredentialRef` / `refreshResolved`), because those two
+ * providers renew an expired access token by themselves. Both are public facts of
+ * the same kind as the access reference: names and booleans, never values.
+ *
  * @param ctx - plugin context.
  * @param config - live non-secret config.
  * @param options - `provider` and `alias` filters.
@@ -405,11 +460,24 @@ export async function listReferences(ctx, config, { provider, alias } = {}) {
       const state = isRefName(row.credentialRef)
         ? await describeCredential(ctx, row.credentialRef)
         : { credentialRef: '', resolved: false }
+      /**
+       * THE REFRESH HALF, AS A PUBLIC FACT. GitHub and Gitea logins store a second
+       * reference (the refresh token) that the page never showed before, so a user
+       * could not tell whether an auto-renewing login was actually configured. Only
+       * the NAME and whether it resolves are published — the same two facts the
+       * access reference already exposes, and nothing derived from either value.
+       */
+      const refreshRef = name === 'github' || name === 'gitea' ? refreshRefNameOf(config, name, row.alias) : ''
+      const refreshState = refreshRef === '' ? undefined : await describeCredential(ctx, refreshRef)
       described.push({
         alias: row.alias,
         credentialRef: state.credentialRef,
         resolved: state.resolved,
         ...(state.source === undefined ? {} : { source: state.source }),
+        ...(refreshRef === '' ? {} : {
+          refreshCredentialRef: refreshRef,
+          refreshResolved: refreshState?.resolved === true,
+        }),
       })
     }
     rows.push({

@@ -215,7 +215,7 @@ window.__ModuleLoader__.load({
       // authenticates gets its own verdict so it can never read as healthy.
       'status.live': 'live',
       'status.dead': 'EXPIRED — press Login',
-      'status.deadHint': 'this token no longer authenticates: reads may fall back anonymously. Press Login to refresh it.',
+      'status.deadHint': 'this token no longer authenticates: reads may fall back anonymously. Press Login to refresh it. A stored refresh token renews automatically; Login is only needed after a refused refresh.',
       'status.noRef': '(no reference set)',
       'status.noAlias': 'This provider has no alias yet.',
       'status.setRef': 'Set reference',
@@ -345,7 +345,7 @@ window.__ModuleLoader__.load({
         'Press Create, then copy the generated Client ID and Client Secret. The secret is shown ONLY once: if you lose it, regenerate the application; this plugin stores it under GITEA_CLIENT_SECRET.',
         'Back on this card press Login: the panel shows "Application Client ID" and "Application Client Secret" — save both (the secret goes into DSH under its own reference and is never shown again).',
         'Press Login again: your Gitea instance opens in a NEW TAB where you must already be signed in.',
-        'Press "Authorize" on that page. The plugin exchanges the code at {base}/login/oauth/access_token (POST: client_id, client_secret, code, grant_type=authorization_code, redirect_uri) and writes the token to GITEA_TOKEN.',
+        'Press "Authorize" on that page. The plugin exchanges the code at {base}/login/oauth/access_token (POST: client_id, client_secret, code, grant_type=authorization_code, redirect_uri) and writes the token to GITEA_TOKEN. It also stores the refresh half under GITEA_REFRESH_TOKEN, so the 1-hour access token renews itself and you stop re-logging in.',
         'The tab shows "Login complete", closes ITSELF (the Login click opened it, so the browser allows it), and this panel closes too while the badge turns resolved — no Cancel click, no coming back.',
       ],
       'login.guide.gitea.note': 'You must be logged into Gitea in the SAME browser: the browser is what authorizes the application. If the tab lands on a login page, sign in there and the redirect continues to the callback. Scopes: this client asks for what the connector uses (repository and issue access); Gitea versions before 1.23 have no scope picker and grant full access to the authorizing account.',

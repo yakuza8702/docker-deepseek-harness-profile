@@ -128,6 +128,31 @@ function looksLikeZip(text) {
 export function createGitHub({ apiBase, request, onUnauthorized }) {
   const base = String(apiBase || 'https://api.github.com').replace(/\/+$/u, '')
 
+  /**
+   * The typed provider refusal this adapter raises, carrying the one
+   * classification the operations layer branches on.
+   *
+   * `tokenRejected` is set for a 401 ONLY, and that is what buys the call ONE
+   * refresh and ONE retry in `withSecret` (and in {@link readRepo}'s own hook):
+   * GitHub answers 401 "Bad credentials" for a token that expired or was revoked
+   * — the case a refresh fixes — while a 403 is a scope/SSO/rate wall that a
+   * refresh would only spend a refresh token on.
+   *
+   * The message is byte-for-byte the sentence this adapter has always produced —
+   * `GitHub <status> on <what>` — so nothing a caller matches on changes.
+   *
+   * @param response - the normalized response.
+   * @param what - the route or verb, as it already reads in the message.
+   * @returns the typed error.
+   */
+  function failure(response, what) {
+    const error = new Error(`GitHub ${response.status} on ${what}`)
+    error.code = 'CONNECTOR_PROVIDER_ERROR'
+    if (Number.isFinite(response.status)) error.status = Number(response.status)
+    if (response.status === 401) error.tokenRejected = true
+    return error
+  }
+
   /** One authenticated call. The token rides only this header. */
   const call = (token, path, { method = 'GET', body, accept = ACCEPT } = {}) => request(`${base}${path}`, {
     method,
@@ -173,6 +198,14 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
    * (`/user`, `/user/*`, secrets): `isRepoPath` is the gate, and the write verbs
    * call `call` directly. `meta` receives `public: true` / `refreshed: true` so
    * the caller can say how a read was served.
+   *
+   * WRITES ARE COVERED ELSEWHERE, NOT HERE. This function's anonymous fallback is
+   * a READ-only privilege. A write that answers 401 now gets the same ONE refresh
+   * and ONE retry, but from `withSecret` in `lib/operations.js`: it catches the
+   * `tokenRejected` classification this module puts on a 401, renews the token and
+   * retries `fn` once. So a `put_file`/`create_tag` on an expired-but-renewable
+   * login succeeds without the user re-logging in, and it never falls back
+   * anonymously — an unauthenticated write is not a fallback, it is a failure.
    *
    * @param token - the access token for the first attempt.
    * @param path - REST path, starting with `/repos/`.
@@ -221,7 +254,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     for (let page = 1; page <= MAX_PAGES; page += 1) {
       const separator = path.includes('?') ? '&' : '?'
       const response = await readRepo(token, `${path}${separator}per_page=${PER_PAGE}&page=${page}`, { accept }, meta)
-      if (!response.ok) throw new Error(`GitHub ${response.status} on ${path}`)
+      if (!response.ok) throw failure(response, path)
       const batch = Array.isArray(response.json) ? response.json : []
       rows.push(...batch)
       if (batch.length < PER_PAGE) break
@@ -235,7 +268,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     for (let page = 1; page <= MAX_PAGES; page += 1) {
       const separator = path.includes('?') ? '&' : '?'
       const response = await call(token, `${path}${separator}per_page=${PER_PAGE}&page=${page}`, { accept })
-      if (!response.ok) throw new Error(`GitHub ${response.status} on ${path}`)
+      if (!response.ok) throw failure(response, path)
       const batch = Array.isArray(response.json) ? response.json : []
       rows.push(...batch)
       if (batch.length < PER_PAGE) break
@@ -248,7 +281,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
   /** A repository's default branch, for a call that named no ref. */
   async function defaultBranch(token, owner, repo, meta = {}) {
     const response = await readRepo(token, repoPath(owner, repo), {}, meta)
-    if (!response.ok) throw new Error(`GitHub ${response.status} on repository`)
+    if (!response.ok) throw failure(response, `repository`)
     return response.json?.default_branch ?? 'HEAD'
   }
 
@@ -262,7 +295,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     const name = String(ref ?? '').trim()
     if (FULL_SHA.test(name)) return name
     const response = await readRepo(token, `${repoPath(owner, repo)}/commits/${seg(name)}`, {}, meta)
-    if (!response.ok) throw new Error(`GitHub ${response.status} on commits/${name}: ref not found`)
+    if (!response.ok) throw failure(response, `commits/${name}: ref not found`)
     const sha = response.json?.sha
     if (typeof sha !== 'string' || sha === '') throw new Error(`GitHub returned no sha for ref ${name}`)
     return sha
@@ -275,7 +308,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     /** Token identity and the scopes GitHub reports back. */
     async whoami(token) {
       const response = await call(token, '/user')
-      if (!response.ok) throw new Error(`GitHub ${response.status} on /user`)
+      if (!response.ok) throw failure(response, `/user`)
       const user = response.json ?? {}
       return {
         login: user.login,
@@ -419,7 +452,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       if (response.status === 404) {
         return { supported: false, items: [], truncated: false, reason: `no tree for ref "${want === '' ? '(default branch)' : want}"` }
       }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on git/trees`)
+      if (!response.ok) throw failure(response, `git/trees`)
       const rows = Array.isArray(response.json?.tree) ? response.json.tree : []
       const prefix = path === undefined || path === '' ? '' : `${String(path).replace(/\/+$/u, '')}/`
       const items = rows
@@ -438,7 +471,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       const query = ref === undefined || ref === '' ? '' : `?ref=${encodeURIComponent(ref)}`
       const response = await readRepo(token, `${repoPath(owner, repo)}/contents/${seg(path)}${query}`, {}, meta)
       if (response.status === 404) throw new Error(`GitHub 404 on contents/${path}: no such file at that ref`)
-      if (!response.ok) throw new Error(`GitHub ${response.status} on contents/${path}`)
+      if (!response.ok) throw failure(response, `contents/${path}`)
       const row = response.json ?? {}
       if (Array.isArray(row)) throw new Error(`contents/${path} is a directory; use read_tree to list it`)
       if (row.type !== undefined && row.type !== 'file') throw new Error(`contents/${path} is a ${row.type}, not a file`)
@@ -473,7 +506,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       if (response.status === 422) {
         throw new Error(`GitHub 422 on contents/${path}: the file may already exist (pass sha to update it), or the branch is protected`)
       }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on contents/${path} (PUT)`)
+      if (!response.ok) throw failure(response, `contents/${path} (PUT)`)
       return {
         commit: response.json?.commit?.sha,
         contentSha: response.json?.content?.sha,
@@ -485,7 +518,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     async listRuns(token, owner, repo, meta = {}) {
       const response = await readRepo(token, `${repoPath(owner, repo)}/actions/runs?per_page=30`, {}, meta)
       if (response.status === 404) return { supported: false, runs: [], reason: 'Actions is not enabled for this repository' }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on actions/runs`)
+      if (!response.ok) throw failure(response, `actions/runs`)
       const runs = (response.json?.workflow_runs ?? []).map(row => ({
         id: row.id, name: row.name, branch: row.head_branch, event: row.event, status: row.status,
         conclusion: row.conclusion, createdAt: row.created_at, url: row.html_url,
@@ -508,9 +541,9 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
      */
     async runLog(token, owner, repo, runId) {
       const detail = await call(token, `${repoPath(owner, repo)}/actions/runs/${encodeURIComponent(runId)}`)
-      if (!detail.ok) throw new Error(`GitHub ${detail.status} on actions/runs/${runId}`)
+      if (!detail.ok) throw failure(detail, `actions/runs/${runId}`)
       const jobs = await call(token, `${repoPath(owner, repo)}/actions/runs/${encodeURIComponent(runId)}/jobs`)
-      if (!jobs.ok) throw new Error(`GitHub ${jobs.status} on actions/runs/${runId}/jobs`)
+      if (!jobs.ok) throw failure(jobs, `actions/runs/${runId}/jobs`)
       const rows = Array.isArray(jobs.json?.jobs) ? jobs.json.jobs : []
       const texts = []
       const refused = []
@@ -550,7 +583,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       if (response.status === 404) {
         return { supported: false, reason: `workflow "${workflow}" was not found, has no workflow_dispatch trigger, or Actions is not enabled` }
       }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on actions/workflows/${workflow}/dispatches`)
+      if (!response.ok) throw failure(response, `actions/workflows/${workflow}/dispatches`)
       return { supported: true, dispatched: true, workflow, ref }
     },
 
@@ -558,7 +591,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     async runCancel(token, owner, repo, runId) {
       const response = await call(token, `${repoPath(owner, repo)}/actions/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' })
       if (response.status === 404) return { supported: false, reason: `run ${runId} was not found` }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on actions/runs/${runId}/cancel`)
+      if (!response.ok) throw failure(response, `actions/runs/${runId}/cancel`)
       return { supported: true, cancelled: true, runId: String(runId) }
     },
 
@@ -566,7 +599,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     async runRerun(token, owner, repo, runId) {
       const response = await call(token, `${repoPath(owner, repo)}/actions/runs/${encodeURIComponent(runId)}/rerun`, { method: 'POST' })
       if (response.status === 404) return { supported: false, reason: `run ${runId} was not found` }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on actions/runs/${runId}/rerun`)
+      if (!response.ok) throw failure(response, `actions/runs/${runId}/rerun`)
       return { supported: true, rerun: true, runId: String(runId) }
     },
 
@@ -574,7 +607,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     async deleteRun(token, owner, repo, runId) {
       const response = await call(token, `${repoPath(owner, repo)}/actions/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' })
       if (response.status === 404) return { supported: false, reason: `run ${runId} was not found` }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on actions/runs/${runId} (DELETE)`)
+      if (!response.ok) throw failure(response, `actions/runs/${runId} (DELETE)`)
       return { supported: true, deleted: true, runId: String(runId) }
     },
 
@@ -583,7 +616,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       const response = await call(token, `${repoPath(owner, repo)}/git/refs/heads/${seg(branch)}`, { method: 'DELETE' })
       if (response.status === 404) throw new Error(`GitHub 404 on git/refs/heads/${branch}: no such branch`)
       if (response.status === 422) throw new Error(`GitHub 422 on git/refs/heads/${branch}: the branch is protected`)
-      if (!response.ok) throw new Error(`GitHub ${response.status} on git/refs/heads/${branch} (DELETE)`)
+      if (!response.ok) throw failure(response, `git/refs/heads/${branch} (DELETE)`)
       return { deleted: true, branch }
     },
 
@@ -599,14 +632,14 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
         const annotated = await call(token, `${repoPath(owner, repo)}/git/tags`, {
           method: 'POST', body: { tag, message, object: sha, type: 'commit' },
         })
-        if (!annotated.ok) throw new Error(`GitHub ${annotated.status} on git/tags`)
+        if (!annotated.ok) throw failure(annotated, 'git/tags')
         target = annotated.json?.sha ?? sha
       }
       const response = await call(token, `${repoPath(owner, repo)}/git/refs`, {
         method: 'POST', body: { ref: `refs/tags/${tag}`, sha: target },
       })
       if (response.status === 422) throw new Error(`GitHub 422 on git/refs: tag "${tag}" already exists`)
-      if (!response.ok) throw new Error(`GitHub ${response.status} on git/refs (tag)`)
+      if (!response.ok) throw failure(response, `git/refs (tag)`)
       return { tag, ref: response.json?.ref, sha: response.json?.object?.sha }
     },
 
@@ -617,7 +650,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       if (ref !== undefined && ref !== '') params.set('sha', ref)
       const response = await readRepo(token, `${repoPath(owner, repo)}/commits?${params.toString()}`, {}, meta)
       if (response.status === 404) return []
-      if (!response.ok) throw new Error(`GitHub ${response.status} on commits`)
+      if (!response.ok) throw failure(response, `commits`)
       return (Array.isArray(response.json) ? response.json : []).map(row => ({
         sha: row.sha,
         date: row.commit?.author?.date ?? row.commit?.committer?.date,
@@ -646,7 +679,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       const response = await call(token, `${repoPath(owner, repo)}/issues/${encodeURIComponent(number)}/comments`, {
         method: 'POST', body: { body },
       })
-      if (!response.ok) throw new Error(`GitHub ${response.status} on issue comment`)
+      if (!response.ok) throw failure(response, `issue comment`)
       return { id: response.json?.id, url: response.json?.html_url }
     },
 
@@ -655,7 +688,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       const response = await call(token, `${repoPath(owner, repo)}/issues/${encodeURIComponent(number)}`, {
         method: 'PATCH', body: patch,
       })
-      if (!response.ok) throw new Error(`GitHub ${response.status} on issue patch`)
+      if (!response.ok) throw failure(response, `issue patch`)
       return { number: response.json?.number, state: response.json?.state, title: response.json?.title }
     },
 
@@ -664,7 +697,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       const response = await call(token, `${repoPath(owner, repo)}/pulls/${encodeURIComponent(number)}/comments`, {
         method: 'POST', body: { body },
       })
-      if (!response.ok) throw new Error(`GitHub ${response.status} on pull comment`)
+      if (!response.ok) throw failure(response, `pull comment`)
       return { id: response.json?.id, url: response.json?.html_url }
     },
 
@@ -698,7 +731,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       if (response.status === 422) {
         throw new Error(`GitHub 422 on git/refs: branch "${name}" already exists, or the base commit is not in this repository`)
       }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on git/refs (create branch)`)
+      if (!response.ok) throw failure(response, `git/refs (create branch)`)
       return {
         branch: name,
         ref: response.json?.ref ?? `refs/heads/${name}`,
@@ -713,7 +746,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       if (Array.isArray(labels) && labels.length > 0) payload.labels = labels
       const response = await call(token, `${repoPath(owner, repo)}/issues`, { method: 'POST', body: payload })
       if (response.status === 410) throw new Error('GitHub 410 on issues: issues are disabled for this repository')
-      if (!response.ok) throw new Error(`GitHub ${response.status} on issues (create)`)
+      if (!response.ok) throw failure(response, `issues (create)`)
       return {
         number: response.json?.number,
         url: response.json?.html_url,
@@ -727,7 +760,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       const response = await call(token, `${repoPath(owner, repo)}/issues/${encodeURIComponent(number)}/labels`, {
         method: 'PUT', body: { labels },
       })
-      if (!response.ok) throw new Error(`GitHub ${response.status} on issues/${number}/labels`)
+      if (!response.ok) throw failure(response, `issues/${number}/labels`)
       return {
         number: String(number),
         labels: (Array.isArray(response.json) ? response.json : []).map(label => (typeof label === 'string' ? label : label.name)),
@@ -739,7 +772,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       const response = await call(token, `${repoPath(owner, repo)}/issues/${encodeURIComponent(number)}/assignees`, {
         method: 'POST', body: { assignees },
       })
-      if (!response.ok) throw new Error(`GitHub ${response.status} on issues/${number}/assignees`)
+      if (!response.ok) throw failure(response, `issues/${number}/assignees`)
       return {
         number: String(number),
         assignees: (response.json?.assignees ?? []).map(user => user.login),
@@ -752,7 +785,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       if (body !== undefined && body !== '') payload.body = body
       const response = await call(token, `${repoPath(owner, repo)}/pulls`, { method: 'POST', body: payload })
       if (response.status === 422) throw new Error('GitHub 422 on pulls: no commits between base and head, or a pull request already exists')
-      if (!response.ok) throw new Error(`GitHub ${response.status} on pulls (create)`)
+      if (!response.ok) throw failure(response, `pulls (create)`)
       return { number: response.json?.number, url: response.json?.html_url, state: response.json?.state }
     },
 
@@ -765,7 +798,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       if (response.status === 405) throw new Error(`GitHub 405 on pulls/${number}/merge: the pull request is not mergeable`)
       if (response.status === 409) throw new Error(`GitHub 409 on pulls/${number}/merge: the head branch changed; re-read the pull request`)
       if (response.status === 422) throw new Error(`GitHub 422 on pulls/${number}/merge: the merge could not be performed`)
-      if (!response.ok) throw new Error(`GitHub ${response.status} on pulls/${number}/merge`)
+      if (!response.ok) throw failure(response, `pulls/${number}/merge`)
       return { number: String(number), merged: response.json?.merged === true, sha: response.json?.sha, message: response.json?.message }
     },
 
@@ -782,7 +815,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     async pullDiff(token, owner, repo, number, meta = {}) {
       const response = await readRepo(token, `${repoPath(owner, repo)}/pulls/${encodeURIComponent(number)}`, { accept: DIFF_ACCEPT }, meta)
       if (response.status === 404) throw new Error(`GitHub 404 on pulls/${number}`)
-      if (!response.ok) throw new Error(`GitHub ${response.status} on pulls/${number} (diff)`)
+      if (!response.ok) throw failure(response, `pulls/${number} (diff)`)
       const text = typeof response.text === 'string' ? response.text : ''
       // A server that ignores the media type answers JSON. A real diff never
       // begins with `{`, so this is a safe discriminator, and reporting it is
@@ -805,7 +838,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
         method: 'PATCH', body: { state },
       })
       if (response.status === 404) throw new Error(`GitHub 404 on issues/${number}: no such issue`)
-      if (!response.ok) throw new Error(`GitHub ${response.status} on issues/${number} (state)`)
+      if (!response.ok) throw failure(response, `issues/${number} (state)`)
       return { number: String(number), state: response.json?.state }
     },
 
@@ -813,7 +846,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
     async repoInfo(token, owner, repo) {
       const response = await call(token, repoPath(owner, repo))
       if (response.status === 404) return { exists: false }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on repository`)
+      if (!response.ok) throw failure(response, `repository`)
       return {
         exists: true,
         private: response.json?.private === true,
@@ -837,7 +870,7 @@ export function createGitHub({ apiBase, request, onUnauthorized }) {
       // docs site. Report the conflict and leave the URL to the caller, which
       // derives it from the configured origin.
       if (response.status === 422) return { created: false, reason: 'already exists' }
-      if (!response.ok) throw new Error(`GitHub ${response.status} on /user/repos`)
+      if (!response.ok) throw failure(response, `/user/repos`)
       return {
         created: true,
         fullName: response.json?.full_name,
