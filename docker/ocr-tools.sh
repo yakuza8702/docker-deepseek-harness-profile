@@ -1,33 +1,36 @@
 #!/bin/sh
 # =====================================================================
-# ocr-tools — what this image can do with an image-only or scanned PDF,
-# and what answers.
+# ocr-tools — what this image can do with an image-only or scanned PDF.
 #
 # Installed by the image build (see docker/ocr-toolchain.sh). Safe to run
-# any time; it only reads. `ocr-tools --check` re-runs the same probe the
-# build ran (tools/check-ocr-toolchain.mjs), so a deployed container can
-# prove its own OCR stack instead of assuming the image was built right.
+# any time; it only reads.
+#
+# THE INVENTORY IS NOT IMPLEMENTED HERE. `node /opt/ocr-tools/check.mjs` is the
+# one owner of "what is installed, and does it work": it renders a page whose
+# text it knows, OCRs it through the real driver and reads the words back out of
+# the RESULT. A second inventory in shell could only disagree with it — and did:
+# printing `tesseract --version` says "installed" for a tessdata directory the
+# gate refuses, and the wrapper's `tier` line was a third copy of the pins. So
+# every inventory path DELEGATES, and this file keeps only what a gate cannot
+# answer: the option parsing, and `--versions` (a plain `cat` of the pins, which
+# callers parse).
+#
+# Exit status: 0 = the stack proved itself, 1 = it did not (the gate's own
+# verdict, propagated unchanged); `--help` is 0, an unknown option is 1.
 #
 # `ocr-pdf` is the driver an operator (or the agent) actually calls:
 # tools/ocr-pdf.py, on the payload interpreter that already owns pypdf and
-# PyMuPDF. This wrapper only answers "what is here" and forwards.
+# PyMuPDF.
 # =====================================================================
 set -u
 
 TOOLS=/opt/ocr-tools
-PAYLOAD_PYTHON=/opt/dsh-office/primary-runtime/dependencies/python/bin/python3
-DRIVER=/opt/ocr-tools/ocr-pdf.py
-
-have() { # have <label> <cmd> — presence only
-  if command -v "$2" >/dev/null 2>&1; then
-    printf '  %-16s installed (%s)\n' "$1" "$(command -v "$2")"
-  else
-    printf '  %-16s MISSING — node /opt/ocr-tools/check.mjs says why\n' "$1"
-  fi
-}
 
 case "${1:-}" in
-  --check) exec node "$TOOLS/check.mjs" ;;
+  --check | --inventory)
+    # Kept as an alias: it is the documented "re-prove the stack" spelling.
+    exec node "$TOOLS/check.mjs"
+    ;;
   --versions | --pin)
     exec cat "$TOOLS/VERSIONS.txt"
     ;;
@@ -36,7 +39,8 @@ case "${1:-}" in
 ocr-tools — what this image can do about image-only (scanned) PDFs.
 
   ocr-tools                   what is installed, with versions
-  ocr-tools --check           re-run the build-time probe (exit 1 on any failure)
+                              (the full probe; exit 1 if the stack does not pass)
+  ocr-tools --check           the same probe, spelled out (exit 1 on any failure)
   ocr-tools --versions        the versions this image was built with
 
   ocr-pdf --probe             the engines the driver can actually reach
@@ -59,24 +63,14 @@ EOF
     ;;
 esac
 
-printf 'OCR toolchain (image-only / scanned PDFs)\n'
-printf '  driver           %s\n' "$DRIVER"
-printf '  python           %s\n' "$PAYLOAD_PYTHON"
-
-printf '\nengine — tesseract 5 (route A)\n'
-if command -v tesseract >/dev/null 2>&1; then
-  printf '  %-16s %s\n' "tesseract" "$(tesseract --version 2>&1 | head -n 1)"
-  printf '  %-16s %s\n' "tessdata" "$(tesseract --print-tessdata-dir 2>/dev/null || echo '?')"
-  printf '  %-16s %s\n' "languages" "$(tesseract --list-langs 2>/dev/null | tail -n +2 | paste -sd ' ' -)"
-else
-  printf '  %-16s MISSING — node /opt/ocr-tools/check.mjs says why\n' "tesseract"
-fi
-if [ -f "$TOOLS/VERSIONS.txt" ]; then
-  printf '  %-16s %s\n' "traineddata" "$(sed -n 's/^tessdata_tier: /tier /p' "$TOOLS/VERSIONS.txt")"
-fi
-
+# The bare invocation: the gate's inventory and its verdict, nothing restated.
+# Status is captured (not `exec`ed) only so the "first moves" lines — which the
+# gate has no reason to print — can follow it; the exit code is the gate's.
+node "$TOOLS/check.mjs"
+status=$?
 printf '\nfirst moves\n'
 printf '  ocr-pdf --probe                          which engines this container can reach\n'
 printf '  ocr-pdf --input scan.pdf --output out.pdf  searchable copy, pixels untouched\n'
 printf '  ocr-pdf --input in.pdf --output out.pdf --verify   measure the layer, do not assume it\n'
 printf '  cat /opt/ocr-tools/README.md             the workflow, incl. engine choice\n'
+exit "$status"

@@ -1,25 +1,16 @@
 # =====================================================================
-# GPU override — hand the personal VM a real GL context (virgl), sharing
-# the host GPU with the rest of the container instead of passing it through.
+# GPU override — a real GL context for the personal VM (virgl), sharing the
+# host GPU instead of passing it through.
 #
+#   docker build --build-arg WITH_VIRGL_QEMU=1 ...   # the default QEMU has no virgl
 #   docker compose -f compose.yaml -f compose.gpu.yaml up -d
 #
-# Build the image with the virgl QEMU (the default one cannot do it):
-#   docker build --build-arg WITH_VIRGL_QEMU=1 ...
+# Needs a render node (/dev/dri/renderD128) and, on NVIDIA, the container
+# toolkit with the `graphics` capability. Paravirtual GL, not VFIO passthrough
+# and not CUDA: the host GPU stays usable.
 #
-# WHAT IT NEEDS ON THE HOST
-#   * /dev/dri/renderD128 + /dev/dri/card0 (Intel/AMD, or NVIDIA with
-#     nvidia-drm loaded). virgl refuses to start without a render node.
-#   * For NVIDIA: the NVIDIA Container Toolkit, and the `graphics` capability
-#     below so the EGL/GL libs are mounted (compute alone is not enough).
-#   * The GPU stays usable by the host (llama-server keeps working); this is a
-#     paravirtual GL device, not VFIO passthrough, and it is NOT CUDA.
-#
-# WHAT THE GUEST GETS
-#   virtio-gpu-gl with Mesa virgl → accelerated OpenGL/GLES for the desktop,
-#   browsers, Blender's viewport/EEVEE and the Android emulator's GLES path.
-#   Vulkan (Venus) additionally needs host kernel >= 6.13, guest Mesa >= 24.2
-#   and NVIDIA driver >= 570.86.
+# Guest-side detail (Vulkan/Venus kernel, Mesa and driver floors) and the
+# per-file hardening notes: docs/compose-hardening.md.
 # =====================================================================
 services:
   seek-harness:

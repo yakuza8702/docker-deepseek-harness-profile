@@ -12,3 +12,22 @@ workspace/
 
 # ci
 .github
+
+# Not build inputs — verified with grep: no COPY (and no build-time script the
+# Dockerfile runs) reads anything under these paths, so excluding them only
+# trims the context.
+tests/
+research/
+__pycache__/
+.td-wf/
+win32_mcp_shots/
+
+# `docs/` is deliberately NOT excluded. The brief expected it to be droppable,
+# but the Dockerfile COPYs `docs/windows-iso-sources.md` into the in-image
+# cua-check tree (and a flat-tree assertion in tools/check-cua-vm.mjs fails the
+# build if it does not land as `windows-iso-sources.md`), so excluding the
+# directory would break `docker build`. The long-form notes under it are already
+# outside the context when they sit at the root (`*.md` above); as `docs/*.md`
+# they are now included, ~360 KB of markdown that no COPY reads. Left in place
+# rather than pattern-matched, because a second don't-ship-this exception list
+# is exactly how the next COPY breaks silently.

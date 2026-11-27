@@ -22,6 +22,11 @@
 #   * Only the workspace bind is writable. Never mount ~, .ssh, cloud
 #     credentials, or docker.sock into the BASE compose file — use the
 #     compose.docker.yaml override for docker access.
+#
+# The shared hardening argument for all seven compose files — why devices live
+# in the override FILES (compose.*.yaml), why the store is not mounted read-only,
+# why there is no mem_limit, and how the three docker engines rank — is
+# docs/compose-hardening.md.
 # =====================================================================
 
 services:
@@ -163,10 +168,13 @@ services:
       # since the diagnostic-screen work, so the stale 415-line copy silently
       # shadowed every later proxy change. The image copy is now authoritative.
       #
-      # FIX 2026-09-01: re-export settingsNamespace (made internal upstream in
-      # 0.1.2-alpha.3) so ecosystem plugins that still import it keep loading.
-      # Remove once the plugins ship alpha3-compatible releases.
-      - ./overrides/settings-index.js:/opt/dsh-src/packages/settings/settings/lib/index.js:ro
+      # NOTE (2026-11-26): the ./overrides/settings-index.js bind-mount was
+      # REMOVED too. It was a 616-line copy of upstream's settings module that
+      # re-exported `settingsNamespace`, and it drifted from the module it
+      # shadowed — every upstream settings fix landed in the image and none of
+      # them in the override. Nothing in this tree imports `settingsNamespace`,
+      # so the mount bought nothing and risked serving stale code.
+      # See docs/compose-hardening.md.
       # NOTE (2026-10-02): the Landlock launcher bind-mount was REMOVED. The
       # image now bundles the launcher (the platform package
       # @deepseek-ai/node-addon-system-<platform>-<arch>) and the build PROVES it

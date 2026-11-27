@@ -235,10 +235,13 @@ const REPO_GATES = [
   // gate also proves the two refusals (a 2.x pin, anything below the 1.18.0
   // floor) and both offline failures (API down, no v1 tag) fail the BUILD.
   { file: "check-opencode-cli.mjs", args: ["--check"], label: "opencode CLI resolves the newest v1 release (RUN fragment, offline)" },
-  // The tool layer's own contract: the 18 `cua_vm_*` schemas are FROZEN (names,
-  // parameter keys in order, types, enums, required, output marker) and the
-  // prose is under a budget. Text-only, no network, no QEMU, no node_modules —
-  // it answers in a checkout the way `check-tool-trim.mjs` does.
+  // The tool layer's own contract: the 18 schemas the plugin registers are
+  // FROZEN (names, parameter keys in order, types, enums, required, output
+  // marker) and the prose is under a budget. 16 of the 18 are `cua_vm_*`;
+  // `windows_desktop` and `windows_mcp_doctor` are the Windows half of the same
+  // registry and are frozen in the same table, which is why they are counted
+  // here. Text-only, no network, no QEMU, no node_modules — it answers in a
+  // checkout the way `check-tool-trim.mjs` does.
   { file: "check-cua-vm-tools.mjs", args: [], label: "cua_vm tool layer: schema frozen, prose under budget" },
   // The Windows put/get chain, asserted as ARGV: a stub `scp`/`ssh` records its
   // own argv, the real supervisor is driven over its real socket, and the

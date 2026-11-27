@@ -1,7 +1,7 @@
 # =====================================================================
 # prebuild-gates — answer "is the wiring sound?" and "does the image
-# still build?" on every push to `rea` and every `v*` tag, BEFORE the
-# image is published.
+# still build?" on every push to `main` and `cua-vm-improve-v2`, and every
+# `v*` tag, BEFORE the image is published.
 #
 # WHY THIS EXISTS, NEXT TO docker-build.yml
 # -----------------------------------------
@@ -66,7 +66,8 @@ name: prebuild-gates
 on:
   push:
     branches:
-      - rea
+      - main
+      - cua-vm-improve-v2
     tags:
       - "v*"
   workflow_dispatch:
@@ -177,6 +178,37 @@ jobs:
             # themselves print the exact number and fail on their own contract, so
             # this line only has to be honest, not exhaustive.
             echo '`tests/relay-wedge.mjs` ≥26 checks (WP-A) · `tests/modules-unit.mjs` ≥472 (WP-B/CB) · `tests/windows-mcp-gate.mjs` ≥137, 0 PENDING (WP-C) — measured floors; the suites print the exact totals.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # WP-A/WP-D/WP-E — THE SIX SUITES THAT WERE ORPHANS. relay-wedge /
+      # modules-unit / windows-mcp-gate above are the bridge's behavioural half;
+      # these six drive the SUPERVISOR's own budgets, locks, watcher and boot
+      # paths, and until now nothing ran them on a push — they only ran when
+      # somebody remembered the filename. Every one of them imports the real
+      # `docker/cua-vm-supervisor.mjs` or `cua-vm-windows-qemu.mjs` and needs
+      # node alone:
+      #   exec-budget / route-budget   the client and route timeout tables (D1, R4)
+      #   lock-deadline               the waiter's deadline and the holder's name (R1)
+      #   watcher-wedge               the QMP poll surviving a wedged lifecycle op (R2)
+      #   qmp-shutdown                a REAL QEMU if the runner has one, and a
+      #                               loud "NOT RUN" plus exit 0 when it does not
+      #   windows-boot                boot() against stub binaries, no guest, no KVM
+      # The 46 s of wall clock is watcher-wedge's real 20 s provision hold plus a
+      # 46 s install watch; it is a measurement, not a sleep to trim.
+      - name: Run the supervisor suites (exec/route budgets, locks, watcher, QMP, Windows boot)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tests/exec-budget.mjs
+          node tests/route-budget.mjs
+          node tests/lock-deadline.mjs
+          node tests/watcher-wedge.mjs
+          node tests/qmp-shutdown.mjs
+          node tests/windows-boot.mjs
+          {
+            echo '## Supervisor suites'
+            echo ''
+            echo '`exec-budget` · `route-budget` · `lock-deadline` · `watcher-wedge` · `qmp-shutdown` · `windows-boot` — all green. `qmp-shutdown` runs the real QEMU path when the runner has `/usr/bin/qemu-system-x86_64` and prints NOT RUN (exit 0) otherwise; it never fabricates a pass.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # WP-D — THE GUEST-PATCH SUITE. It applies firstboot's here-strings to the

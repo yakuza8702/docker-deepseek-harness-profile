@@ -104,34 +104,25 @@ ENV NPM_CONFIG_CACHE=/tmp/.npm-cache \
 #                           xdpyinfo (the entrypoint waits for the display with
 #                           it) and the fonts keep real web pages readable,
 #                           including CJK.
-RUN set -eux; \
-    install -m 0755 -d /etc/apt/keyrings; \
-    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" \
-      > /etc/apt/sources.list.d/docker.list; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      nano jq unzip vim zip htop tmux tree openssl python3 bash-completion \
-      less ripgrep rsync procps ca-certificates \
-      tini bubblewrap \
-      docker-ce-cli docker-compose-plugin docker-buildx-plugin \
-      xvfb x11vnc x11-utils openbox websockify novnc \
-      fonts-liberation fonts-noto-cjk \
-      imagemagick; \
-    rm -rf /var/lib/apt/lists/*
+# ---------------------------------------------------------------------
+# ONE apt transaction for the whole system layer.
+#
+# WHY ONE: each `apt-get update` + `rm -rf /var/lib/apt/lists/*` pair is a full
+# index download, a package-cache write and (because the lists are deleted)
+# a layer nobody can reuse. This used to be FIVE rounds — devtools/docker, the
+# Windows QEMU set, the virgl QEMU set, Brave, and LibreOffice (which sat next to
+# the office wrappers it feeds, ~780 lines down) — so a build paid five index
+# downloads and carried five list layers that were immediately thrown away.
+# The two QEMU sets stay behind their `WITH_*` switches, which is what the
+# `if` blocks below are: they select PACKAGE NAMES, never a second update.
+# The third-party repos (Docker, Brave) are added before the one `update`.
+#
 # imagemagick is the GUI's crop engine (`cua_vm_gui` with a `region`), and the
 # only reason it is here: the supervisor reads a PNG's size from its own IHDR
 # (zero dependency) and never needs `identify` for coordinates. --no-install-
 # recommends keeps the ~120 MB of documentation/ghostscript fonts out; the
 # convert(1) path used here needs nothing beyond libmagickcore.
-
-# Optional: a virgl-capable QEMU. cua provisions its own QEMU, but that build
-# has no virtio-gpu-gl-pci (verified: "This QEMU was built without
-# virglrenderer"), so the personal VM is limited to software GL. Installing the
-# distro build lets `cua sb create --gpu virgl` hand the guest a virgl context;
-# the supervisor points cua's wrapper at this binary when DSH_CUA_VM_GPU=virgl.
-# Off by default: it costs ~200 MB and needs /dev/dri (or the NVIDIA toolkit)
-# on the host to be worth anything.
+#
 # mtools builds the FAT32 answer-file disk (`setup.img`) Windows Setup reads
 # from — the dockur/windows mechanism. It is a RUNTIME dependency, not a build
 # convenience: every Windows create runs mformat/mcopy, and verifySetupImage
@@ -141,25 +132,14 @@ RUN set -eux; \
 # it needs the firmware, a software TPM and qemu-img, and no container runtime at
 # all. On by default because DSH_CUA_VM_WINDOWS=0 is the switch that removes the
 # feature — an image that cannot run it should not advertise it.
-ARG WITH_WINDOWS_QEMU=1
-RUN set -eux; \
-    if [ "$WITH_WINDOWS_QEMU" = "1" ]; then \
-      apt-get update; \
-      apt-get install -y --no-install-recommends \
-        qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools \
-        mtools; \
-      rm -rf /var/lib/apt/lists/*; \
-    fi
-
-ARG WITH_VIRGL_QEMU=0
-RUN set -eux; \
-    if [ "$WITH_VIRGL_QEMU" = "1" ]; then \
-      apt-get update; \
-      apt-get install -y --no-install-recommends \
-        qemu-system-x86 qemu-system-modules-opengl libvirglrenderer1 libegl1 libgl1-mesa-dri; \
-      rm -rf /var/lib/apt/lists/*; \
-    fi
-
+#
+# The optional virgl QEMU: cua provisions its own QEMU, but that build has no
+# virtio-gpu-gl-pci (verified: "This QEMU was built without virglrenderer"), so
+# the personal VM is limited to software GL. Installing the distro build lets
+# `cua sb create --gpu virgl` hand the guest a virgl context; the supervisor
+# points cua's wrapper at this binary when DSH_CUA_VM_GPU=virgl. Off by default:
+# it costs ~200 MB and needs /dev/dri (or the NVIDIA toolkit) on the host.
+#
 # Brave — the browser the desktop runs (user's choice; it is also the browser
 # they use locally). Installed from Brave's official APT repository, added here
 # explicitly with its keyring rather than via a curl|bash installer.
@@ -167,16 +147,29 @@ RUN set -eux; \
 #   * Chrome Web Store extensions still install normally
 #   * ANY Debian Chromium fork would work; swap this block for
 #     `apt-get install chromium` to drop the third-party repo.
+# ---------------------------------------------------------------------
+ARG WITH_WINDOWS_QEMU=1
+ARG WITH_VIRGL_QEMU=0
 ARG BRAVE_APT_URL=https://brave-browser-apt-release.s3.brave.com
 RUN set -eux; \
-    install -m 0755 -d /usr/share/keyrings; \
+    install -m 0755 -d /etc/apt/keyrings /usr/share/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" \
+      > /etc/apt/sources.list.d/docker.list; \
     curl -fsSL --retry 3 -o /usr/share/keyrings/brave-browser-archive-keyring.gpg \
       "${BRAVE_APT_URL}/brave-browser-archive-keyring.gpg"; \
     chmod 0644 /usr/share/keyrings/brave-browser-archive-keyring.gpg; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] ${BRAVE_APT_URL}/ stable main" \
       > /etc/apt/sources.list.d/brave-browser-release.list; \
+    pkgs="nano jq unzip vim zip htop tmux tree openssl python3 bash-completion less ripgrep rsync procps ca-certificates tini bubblewrap docker-ce-cli docker-compose-plugin docker-buildx-plugin xvfb x11vnc x11-utils openbox websockify novnc fonts-liberation fonts-noto-cjk imagemagick brave-browser libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw python3-docx python3-openpyxl"; \
+    if [ "$WITH_WINDOWS_QEMU" = "1" ]; then \
+      pkgs="$pkgs qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools mtools"; \
+    fi; \
+    if [ "$WITH_VIRGL_QEMU" = "1" ]; then \
+      pkgs="$pkgs qemu-system-x86 qemu-system-modules-opengl libvirglrenderer1 libegl1 libgl1-mesa-dri"; \
+    fi; \
     apt-get update; \
-    apt-get install -y --no-install-recommends brave-browser; \
+    apt-get install -y --no-install-recommends $pkgs; \
     rm -rf /var/lib/apt/lists/*; \
     brave-browser --version
 
@@ -456,6 +449,16 @@ COPY plugins/dsh-brave-devtools-mcp /opt/dsh-brave-devtools-mcp
 COPY plugins/dsh-plugins-page-extras /opt/dsh-plugins-page-extras
 COPY plugins/dsh-office /opt/dsh-office-bundle
 COPY plugins/dsh-connector /opt/dsh-connector
+# The mode fix at the end of this RUN is one loop over one path list: the 16-argument
+# `chmod -R a+rX` (two 8-path continuation lines) is now a `for dir in …` loop, so each
+# install path is written once and a missing directory is tolerated per entry instead
+# of somewhere in a 16-argument list.
+#
+# It iterates full paths rather than a bare name list over both roots because
+# `tools/check-connector.mjs` asserts the literal string
+# `/opt/dsh/node_modules/dsh-connector` (and the source-root twin) appears in this
+# Dockerfile; a `"$root/$name"` loop drops it and fails 2 of its 47 checks (measured).
+# The gate is the contract, so the paths stay spelled out.
 RUN set -eux; \
     installed=0; \
     for target in /opt/dsh/node_modules /opt/dsh-src/node_modules; do \
@@ -473,32 +476,15 @@ RUN set -eux; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
     rm -rf /opt/dsh-profile-switcher /opt/dsh-browser-desktop /opt/dsh-workspace-browser /opt/dsh-browser-mcp /opt/dsh-brave-devtools-mcp /opt/dsh-plugins-page-extras /opt/dsh-office-bundle /opt/dsh-connector; \
-    chmod -R a+rX \
+    for dir in \
       /opt/dsh/node_modules/dsh-profile-switcher /opt/dsh/node_modules/dsh-browser-desktop /opt/dsh/node_modules/dsh-workspace-browser /opt/dsh/node_modules/dsh-browser-mcp /opt/dsh/node_modules/dsh-brave-devtools-mcp /opt/dsh/node_modules/dsh-plugins-page-extras /opt/dsh/node_modules/dsh-office /opt/dsh/node_modules/dsh-connector \
-      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras /opt/dsh-src/node_modules/dsh-office /opt/dsh-src/node_modules/dsh-connector 2>/dev/null || true
+      /opt/dsh-src/node_modules/dsh-profile-switcher /opt/dsh-src/node_modules/dsh-browser-desktop /opt/dsh-src/node_modules/dsh-workspace-browser /opt/dsh-src/node_modules/dsh-browser-mcp /opt/dsh-src/node_modules/dsh-brave-devtools-mcp /opt/dsh-src/node_modules/dsh-plugins-page-extras /opt/dsh-src/node_modules/dsh-office /opt/dsh-src/node_modules/dsh-connector; do \
+      chmod -R a+rX "$dir" 2>/dev/null || true; \
+    done
 # The workspace plugin's own suite, kept in the image so the ported host logic can
 # be re-verified in place: docker exec <c> node --test /opt/dsh/node_modules/dsh-workspace-browser/workspace.test.js
 
 
-# Declare the plugins in the DSH installation's own manifest. This is what makes
-# their bare row names resolvable at boot: the launcher builds a module-resolution
-# table by walking the installation package's dependency closure (a package that
-# merely sits in node_modules is invisible to the loader — it fails with
-# "failed to import"), and `client-modules` scans loader entries for packages
-# declaring `dsh.client`, which needs the specifier to be a package name.
-#
-# It is ALSO what puts a bundle on the Plugins page: the plugin manager builds that
-# list from `dsh.profile.bundles` ∪ the profile's dependencies ∪ the INSTALLATION's
-# dependencies, and gives every entry with a `dsh.bundle.patch` a switch that
-# selects/deselects it. `dsh-browser-mcp` relies on exactly that — declare it here
-# or it is invisible in the UI no matter what else is done.
-RUN set -eux; \
-    for spec in "/opt/dsh/node_modules/@deepseek-ai/dsh/package.json:/opt/dsh/node_modules" "/opt/dsh-src/apps/cli/package.json:/opt/dsh-src/node_modules"; do \
-      anchor="${spec%%:*}"; root="${spec##*:}"; \
-      [ -f "$anchor" ] || continue; \
-      [ -d "$root/dsh-browser-desktop" ] || continue; \
-      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const m = JSON.parse(fs.readFileSync(a, "utf8")); const v = (n) => { try { return JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { return null; } }; const deps = { ...(m.dependencies ?? {}) }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "dsh-office", "dsh-connector", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { const ver = v(n); if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
-    done
 COPY --chmod=0644 docker/profile-switcher.overlay.yml /opt/seek-harness/profile-switcher.overlay.yml
 COPY --chmod=0644 docker/browser-use.overlay.yml /opt/seek-harness/browser-use.overlay.yml
 COPY --chmod=0644 docker/workspace-browser.overlay.yml /opt/seek-harness/workspace-browser.overlay.yml
@@ -777,12 +763,11 @@ RUN node /tmp/check-connector.mjs --repo /tmp/connector-repo /opt/dsh/node_modul
 # 0755 first; the file itself stays 0644 (it is run through an interpreter).
 RUN install -d -m 0755 /opt/office-native
 COPY --chmod=0644 tools/office-swap-pages.py /opt/office-native/office-swap-pages.py
+# The engine itself comes from the ONE apt transaction at the top of this stage
+# (search "ONE apt transaction"): libreoffice-writer/calc/impress/draw and the
+# python3-docx/python3-openpyxl bindings are in that package list. This block only
+# writes the wrappers and proves the binaries answer.
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
-      python3-docx python3-openpyxl; \
-    rm -rf /var/lib/apt/lists/*; \
     soffice --version; \
     printf '%s\n' \
       '#!/bin/sh' \
@@ -1006,14 +991,39 @@ RUN set -eux; \
     done; \
     [ "$installed" = "1" ] || { echo "ERROR: no DSH installation node_modules found"; exit 1; }; \
     rm -rf /opt/dsh-cua-vm; \
-    chmod -R a+rX /opt/dsh/node_modules/dsh-cua-vm /opt/dsh-src/node_modules/dsh-cua-vm 2>/dev/null || true; \
+    chmod -R a+rX /opt/dsh/node_modules/dsh-cua-vm /opt/dsh-src/node_modules/dsh-cua-vm 2>/dev/null || true
+# Its manifest row comes from the ONE declaration block right below (the
+# `dsh-cua-vm` entry in its package list). It runs after this copy on purpose: the
+# block resolves every name against a node_modules root, so the package must be
+# installed before it can be declared.
+#
+# Declare EVERY installed plugin in the DSH installation's own manifest, in ONE
+# block. This is what makes their bare row names resolvable at boot: the launcher
+# builds a module-resolution table by walking the installation package's
+# dependency closure (a package that merely sits in node_modules is invisible to
+# the loader — it fails with "failed to import"), and `client-modules` scans
+# loader entries for packages declaring `dsh.client`, which needs the specifier to
+# be a package name.
+#
+# It is ALSO what puts a bundle on the Plugins page: the plugin manager builds that
+# list from `dsh.profile.bundles` ∪ the profile's dependencies ∪ the INSTALLATION's
+# dependencies, and gives every entry with a `dsh.bundle.patch` a switch that
+# selects/deselects it. `dsh-browser-mcp` relies on exactly that — declare it here
+# or it is invisible in the UI no matter what else is done.
+#
+# ONE block, at the END of plugin staging, because a declaration made earlier only
+# covers the packages installed earlier: this used to be two blocks, and the
+# second one (for `dsh-cua-vm`) re-derived the anchor from scratch. The package
+# list is the contract — `check-connector.mjs` pins the `for (const n of [`
+# line, and a package missing from it is a bundle that resolves on one install
+# root and not the other.
+RUN set -eux; \
     for spec in "/opt/dsh/node_modules/@deepseek-ai/dsh/package.json:/opt/dsh/node_modules" "/opt/dsh-src/apps/cli/package.json:/opt/dsh-src/node_modules"; do \
       anchor="${spec%%:*}"; root="${spec##*:}"; \
       [ -f "$anchor" ] || continue; \
-      [ -d "$root/dsh-cua-vm" ] || continue; \
-      node -e 'const fs=require("node:fs");const a=process.argv[1];const r=process.argv[2];const m=JSON.parse(fs.readFileSync(a,"utf8"));const v=JSON.parse(fs.readFileSync(r+"/dsh-cua-vm/package.json","utf8")).version;m.dependencies={...(m.dependencies??{}),"dsh-cua-vm":v};fs.writeFileSync(a,JSON.stringify(m,null,2)+"\n");console.log("declared dsh-cua-vm",v,"in",a)' "$anchor" "$root"; \
+      [ -d "$root/dsh-browser-desktop" ] || continue; \
+      node -e 'const fs = require("node:fs"); const a = process.argv[1]; const r = process.argv[2]; const d0 = JSON.parse(fs.readFileSync(a, "utf8")).dependencies ?? {}; const deps = { ...d0 }; for (const n of ["dsh-profile-switcher", "dsh-browser-desktop", "dsh-workspace-browser", "dsh-browser-mcp", "dsh-brave-devtools-mcp", "dsh-plugins-page-extras", "dsh-office", "dsh-connector", "dsh-cua-vm", "@deepseek-ai/dsh-browser-use", "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp"]) { let ver = null; try { ver = JSON.parse(fs.readFileSync(r + "/" + n + "/package.json", "utf8")).version; } catch { ver = null; } if (ver) { deps[n] = ver; console.log("declared", n, ver); } else { console.log("NOT declaring", n, "- not installed in", r); } } const m = JSON.parse(fs.readFileSync(a, "utf8")); m.dependencies = deps; fs.writeFileSync(a, JSON.stringify(m, null, 2) + "\n"); console.log("updated", a);' "$anchor" "$root"; \
     done
-
 # ---------------------------------------------------------------------
 # OPENCODE — the CLI that `dsh-opencode-connect` drives. THE PLUGIN ITSELF IS
 # NOT IN THIS IMAGE, ON PURPOSE.

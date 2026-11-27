@@ -75,7 +75,6 @@ exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date -Is) provision v$VERSION gpu=$GPU share='$SHARE_TAG' res=$RESOLUTION ==="
 
 say() { echo "[provision] $*"; }
-die() { echo "[provision] FAILED: $*"; exit 1; }
 
 if [ -f "$MARKER" ] && grep -qx "version=$VERSION" "$MARKER" 2>/dev/null; then
   # A marker that records a broken apt is NOT "already provisioned": it is

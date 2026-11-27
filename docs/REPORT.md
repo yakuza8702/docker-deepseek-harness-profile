@@ -432,7 +432,7 @@ are covered in the smoke suite.
 | W7 | `screenshot()` returned `{file}` after unlinking that file | the field is gone from the contract; callers use `saveTo` |
 | W8 | two screendumps in the same millisecond shared a filename and one unlinked the other's frame | monotonic counter + random suffix |
 | W9 | `save` on Windows was silently ignored | refused with a sentence that names the working path |
-| W10 | docs (REPORT, BRANCH-NOTES, compose header) claimed the dead envs and 7100 | rewritten against the real mapping |
+| W10 | docs (REPORT, BRANCH-NOTES, compose header) claimed the dead envs and 7100 | rewritten against the real mapping; both notes now live in `docs/` (`docs/REPORT.md`, `docs/BRANCH-NOTES.md`) |
 
 ### 9.6 Architecture change: Windows is direct QEMU (replaces the container backend)
 

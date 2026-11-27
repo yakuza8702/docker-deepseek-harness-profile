@@ -3,48 +3,23 @@
 #
 #   docker compose -f compose.yaml -f compose.windows.yaml up -d
 #
-# WHAT THIS ADDS
-#   * the host devices and groups a Windows guest needs: /dev/kvm (the same
-#     one the Linux guest uses) and, only if you want the virtio-gpu display,
-#     /dev/dri with the render/video GIDs;
-#   * DSH_CUA_VM_WINDOWS=1, which is what makes `kind: "windows"` appear at all
-#     (0 removes the option entirely);
-#   * the two QEMU/serial paths a Windows boot writes, on the same /cua-vm
-#     volume as everything else.
+# Adds the host devices and groups a Windows guest needs (/dev/kvm always,
+# /dev/dri only for the virtio-gpu display), DSH_CUA_VM_WINDOWS=1, and the
+# QEMU/serial paths a boot writes.
 #
-# WHAT IT DELIBERATELY DOES NOT ADD
-#   No second container engine, no privileged sidecar, no extra runtime. A Windows computer
-#   is `qemu-system-x86_64` started by the SAME supervisor that runs the Linux
-#   guest: OVMF + swtpm + a qcow2 disk under /cua-vm, QMP and VNC on loopback,
-#   and SLIRP networking. The harness keeps cap_drop ALL, read-only rootfs and
-#   no-new-privileges — nothing here adds a capability.
+# No second container engine, no privileged sidecar, no new capability.
 #
-# NETWORKING
-#   QEMU user-mode networking (SLIRP): the guest gets outbound internet (so it
-#   can fetch testing harnesses, Windows Update and pip packages) and reaches
-#   HOST services through the gateway 10.0.2.2 — e.g. a site the model serves on
-#   the harness at :3079 is http://10.0.2.2:3079/ inside Windows. SSH is
-#   forwarded from 127.0.0.1:<allocated> to guest :22, which is what
-#   cua_vm_exec/put/get use.
-#   A tap/bridge interface is possible for real LAN presence, but it needs
-#   CAP_NET_ADMIN and a host bridge, so it is NOT the default and is not wired
-#   here (see the README's "Bridge networking" note).
+# NETWORKING: QEMU user-mode (SLIRP). The guest gets outbound internet and
+# reaches HOST services through the gateway 10.0.2.2 — a site the model serves
+# at :3079 is http://10.0.2.2:3079/ inside Windows. SSH is forwarded from
+# 127.0.0.1:<allocated> to guest :22, which is what cua_vm_exec/put/get use.
 #
-# INSTALL MEDIA AND STORE
-#   Everything Windows lives under /cua-vm:
-#     /cua-vm/iso/                 downloaded install media (one per version)
-#     /cua-vm/windows/<name>/      disk.qcow2, efi-vars.qcow2, tpm/, oem/,
-#                                  credentials.json, id_ed25519, serial.log
-#   The ISO is downloaded once (Microsoft's evaluation URLs, ~5.5 GB) or taken
-#   from windowsIso (a URL, or a file inside the store). The virtio-win drivers
-#   ISO is OPTIONAL: put it at /cua-vm/iso/virtio-win.iso and the guest gets
-#   virtio-blk/virtio-net; without it the disk is AHCI and the NIC is e1000e,
-#   which stock Windows installs from.
+# STORE: everything Windows lives under /cua-vm — install media in
+# /cua-vm/iso/, one directory per computer under /cua-vm/windows/<name>/
+# (disk.qcow2, efi-vars.qcow2, tpm/, oem/, credentials.json, serial.log).
 #
-# LIVE VIEW
-#   The display is QEMU VNC on loopback, relayed through websockify+noVNC to
-#   /vm/port/<name>/ — the panel's "Show VM" streams it and a human can drive
-#   the same screen the model is driving. Nothing is published raw.
+# HARDENING, RESOURCE-CEILING AND BRIDGE-NETWORKING RATIONALE:
+# docs/compose-hardening.md.
 # =====================================================================
 
 services:
@@ -73,29 +48,3 @@ services:
       DSH_CUA_VM_WIN_MCP: "${DSH_CUA_VM_WIN_MCP:-1}"
 
 volumes: {}
-
-# ---------------------------------------------------------------------
-# HARDENING NOTES — comments only, deliberately not keys.
-#
-# * read_only: the harness rootfs stays read-only (compose.yaml). Everything a
-#   Windows computer writes lands in the /cua-vm volume — disk.qcow2,
-#   efi-vars.qcow2, tpm/, oem/, serial.log, credentials.json — or in /tmp
-#   (tmpfs). Do NOT mount the store read-only to "harden" it: QEMU writes the
-#   disk image and swtpm writes its state, so a read-only store is a boot
-#   failure, not a hardening.
-#
-# * Suggested ceilings for a full Windows install plus a running guest, as
-#   COMMENTS on purpose — a real key here would OOM-kill the install halfway
-#   through on a host that would otherwise have finished it:
-#       mem_limit: 12g
-#       pids_limit: 512
-#   QEMU reserves the guest's RAM eagerly (chunks of 1 GB), so mem_limit has to
-#   cover guest memory + OVMF + swtpm + the supervisor. Lower the guest's RAM
-#   before lowering this.
-#
-# * tap/bridge networking is NOT supported by this file. It needs CAP_NET_ADMIN
-#   (the harness runs cap_drop ALL) and a host bridge; SLIRP user-mode
-#   networking is the only wired path, and the guest still reaches host
-#   services at 10.0.2.2. See the README's "Bridge networking" note for what
-#   enabling it would require.
-# ---------------------------------------------------------------------

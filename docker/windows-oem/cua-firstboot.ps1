@@ -2325,7 +2325,7 @@ Step 'autostart-windowless' {
   # really does - an independent stdio server per SSH session (19 tools) - and
   # the clipboard/session-2 features need either these on-demand tasks (which
   # they now have) or an upstream pipe server (which does not exist). See
-  # plugins/dsh-cua-vm/README.md and REPORT.md.
+  # plugins/dsh-cua-vm/README.md and docs/REPORT.md (repo root `docs/`).
   $py = Get-RealPython
   if (-not $py) { throw 'python is missing: cannot register the dsh-cua task' }
   $pyw = Join-Path (Split-Path -Parent $py) 'pythonw.exe'

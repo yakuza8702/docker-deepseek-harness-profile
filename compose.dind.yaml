@@ -3,42 +3,19 @@
 #
 #   docker compose -f compose.yaml -f compose.dind.yaml up -d
 #
-# Option A (DOCKER_HOST=socket-proxy) and Option B (compose.docker.yaml,
-# host docker.sock) both LEND the agent the host daemon. This override
-# does not: it gives the agent an engine of its own, in a sidecar.
+# Option A (DOCKER_HOST=socket-proxy) and Option B (compose.docker.yaml, host
+# docker.sock) both LEND the agent the host daemon. This one gives it an engine
+# of its own, in a sidecar: the harness keeps cap_drop ALL, read_only rootfs and
+# no-new-privileges, because *using* docker needs no capability — only a TCP
+# connection. The engine's root API (2375) is reachable only on the private
+# `harness-docker` network and is never published.
 #
-#   * the harness keeps every bit of its hardening — cap_drop ALL,
-#     read_only rootfs, no-new-privileges — because *using* docker needs
-#     no capability, only a TCP connection to the sidecar;
-#   * the engine's root API (2375) is reachable ONLY on the private
-#     `harness-docker` network. It is never published, so no other stack
-#     on the host can drive it and nothing the agent does touches the
-#     host daemon;
-#   * everything the agent builds, runs and tests lives under DIND_DATA,
-#     one directory that can be deleted to purge the whole engine.
-#
-# Image hand-off (agent-built image → host), no host-daemon changes:
-#   DIND_EXPORT is mounted at /export in the harness, so a finished image
-#   leaves the isolated engine as a plain archive:
-#       docker save myapp:1.0 | gzip > /export/myapp-1.0.tgz
-#   and the host's own daemon picks it up:
-#       docker load < <DIND_EXPORT>/myapp-1.0.tgz
-#
-# Purge (keep the finished images, throw the engine away):
+# Purge (images survive, engine goes):
 #   docker compose -f compose.yaml -f compose.dind.yaml rm -sf dind
-#   sudo rm -rf "$DIND_DATA"   # build cache, test containers, scratch layers
-#   DIND_EXPORT (archives) and DIND_REGISTRY_DATA (pushed images) live
-#   OUTSIDE the engine's data root, so they survive by construction.
-#   NOTE: dockerd creates DIND_DATA root-owned (0710), so the rm needs root —
-#   a plain user rm fails with EACCES and looks like "purge didn't work".
+#   sudo rm -rf "$DIND_DATA"    # root-owned 0710: a plain rm fails EACCES
 #
-# SECURITY: the sidecar is `privileged` — that is what a real nested
-# dockerd needs (it mounts overlayfs and manages iptables/cgroups). It is
-# not the host: it has its own PID/mount/net namespaces and sees exactly
-# one host path (DIND_DATA). Do not mount anything else into it. The
-# privilege-free alternatives are a rootless engine (docker:dind-rootless,
-# needs /dev/fuse + unprivileged user namespaces) or a Sysbox runtime on
-# the host; both are host-level installs, this file is not.
+# The `privileged` sidecar argument, what it can and cannot see, and the
+# privilege-free alternatives: docs/compose-hardening.md.
 # =====================================================================
 
 services:

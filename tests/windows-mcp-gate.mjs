@@ -834,11 +834,19 @@ try {
     autoRevealed && boundDesk.revealed === true && Array.isArray(boundDesk.tools) && boundDesk.tools.length === 19,
     `autoRevealed=${autoRevealed} revealed=${boundDesk.revealed} tools=${Array.isArray(boundDesk.tools) ? boundDesk.tools.length : typeof boundDesk.tools}`)
   const jDoctor = await doctor(agentJ.agent)
+  // The version in the FAILURE TEXT is read from the plugin's own `package.json`,
+  // never hardcoded: the previous literal went stale the moment `index.js` moved
+  // on (WP-7.1), so a red would have named a version that no longer exists.
+  // The assertion itself is unchanged — a semver string, and
+  // (below) that it equals the package's — this only fixes what the failure says.
+  const pluginPackageVersion = JSON.parse(
+    readFileSync(path.join(REPO, 'plugins', 'dsh-cua-vm', 'package.json'), 'utf8')
+  ).version
   checkContract('(j) the doctor carries pluginVersion (identity travels with the verdict)',
     'pluginVersion' in jDoctor,
     typeof jDoctor.pluginVersion === 'string' && /^\d+\.\d+\.\d+/u.test(jDoctor.pluginVersion),
     `pluginVersion=${jDoctor.pluginVersion}`,
-    'WP-3.7 + WP-7.1: PLUGIN_VERSION 0.2.1 === package.json')
+    `WP-3.7 + WP-7.1: PLUGIN_VERSION ${pluginPackageVersion} === package.json`)
   checkContract('(j) ...and payload.relayHash (WHICH guest payload answered the probe)',
     'payload' in jDoctor,
     /^[0-9a-f]{64}$/u.test(String(jDoctor.payload?.relayHash ?? '')),

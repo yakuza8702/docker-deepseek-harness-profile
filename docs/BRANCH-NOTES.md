@@ -2127,7 +2127,7 @@ them is the part that **notices when one of them stops being true**.
 | `tools/check-cua-vm.mjs` | NEW `relay` section (both modes, loopback bind, the probe pair and its 8-byte answer, the probe outside the session lock, `bufsize: 0` + `CREATE_NO_WINDOW`, child restart/`child-exit`, `DSH_CUA_MCP_RELAY_PORT`/`_LOG`) plus needles on the backend (`OEM_MCP_RELAY_FILE`, staged to `oemDir`, the `$OEM$` copy and byte-compare), firstboot (`mcp-relay-task`, `cua-mcp-host`, `Test-RelayPing` + `byte[] 8` + `-ceq 'RELAY_OK'`, `task-started-but-relay-not-listening`), `win-mcp.js` (`RELAY_COMMAND` `py -3`, the fallback reason, `relayDoctorFacts`, `interactive-relay`/`session-0-direct`), `index.js` (`transportText`, both transport sentences), the Dockerfile (both COPYs + the proof loop) and `cua-mcp-relay.py` added to J1-6b's flat-tree set |
 | `README.md` | new "The MCP server runs in the interactive session — the loopback relay" section: the Session 0 evidence table, the lane-preference table, the doctor fields, and the two env rows |
 | `plugins/dsh-cua-vm/README.md` | "The interactive session — the MCP server lives there now (the relay)" replaces "…and what does not exist yet" (the note that said no long-lived user-session server could be reached), and the dsh-cua tools section now names the relay command instead of `ssh … --stdio` |
-| `BRANCH-NOTES.md` | this section |
+| `docs/BRANCH-NOTES.md` | this section |
 
 **Verify.** All of these, all exit 0, from the repo root:
 
@@ -2254,7 +2254,7 @@ installing — 30 min for Linux, which is synchronous).
 | `tests/supervisor-smoke.mjs` | F1 rewritten for the deferred answer (answer → poll the registry ≤5 s / 200 ms → `restoreFrom.kind === 'checkpoint'` + file exists + `checkpointStatus: 'saved'`), the Windows-disk-not-the-vmm-disk proof adapted to the upgrade, and a new P4/D1 block: a fake QMP monitor + a 1 GB policy against a 2 GB disk, proving a quota-refused **guest-initiated** power-off still records `powered-off` + `checkpointSkipped: quota` |
 | `tools/check-cua-vm.mjs` | 18 new supervisor needles (the budget/QMP constants, every new function, the pending token + its guard, `checkpointDiskFileAsync`, `checkpoint: status`/`checkpointDeferred`, `noteTickFailure`, `stateFrom: 'qmp-poll'`) plus the **P5 order assertion** — `windowsStopPhase` before `recordWindowsPoweredOff`, `powered-off` before the deferred schedule, and `powered-off` before `windowsCheckpointPlan` in the guest path |
 | `README.md` / `plugins/dsh-cua-vm/README.md` | the shutdown contract: the button answers in seconds, the convert is deferred and upgrades the restore point, a quota refusal records `checkpointSkipped` and the computer still boots its installed disk, and a guest-initiated shutdown is recorded even when its checkpoint fails |
-| `BRANCH-NOTES.md` | this section |
+| `docs/BRANCH-NOTES.md` | this section |
 
 ### Verify
 
@@ -2393,7 +2393,7 @@ down over a transport it was only trying to improve), and honours
 | `tests/modules-unit.mjs` | **J22-14** rewritten for the `--ping` contract (exact string, port interpolation, no `powershell`/`GetBytes`/`TcpClient` token) + the 12 s budget; **J22-14b** added: `shouldUpgradeToRelay` upgrades only a live blind lane, never mid-call, at most once per 60 s |
 | `tools/check-cua-vm.mjs` | 12 winMcp needles (the 12 s constant, the `--ping` command shape, the three upgrade constants, `shouldUpgradeToRelay`, `maybeUpgradeTransport`, `startUpgradeWatch` + its call, the env knob, the forced probe) and 8 relay needles (`--ping [port]` usage, `PING_TIMEOUT`/`PING_BUDGET`, `read_probe_answer`, `run_ping`, the argv branch, `emit_token`) |
 | `README.md` / `plugins/dsh-cua-vm/README.md` | the probe is the relay's own `--ping` (fast, no PowerShell race) with a 12 s budget; a late-starting relay self-heals — a blind session-0 attach upgrades to the interactive relay within ~15 s, one attempt per 60 s, `DSH_CUA_VM_WIN_MCP_UPGRADE=0` to disable; `DSH_CUA_VM_WIN_MCP_UPGRADE` added to the variable tables |
-| `BRANCH-NOTES.md` | this section |
+| `docs/BRANCH-NOTES.md` | this section |
 
 ### Verify
 
@@ -2574,7 +2574,7 @@ already made, and it answers in one fast round trip.
 | `tools/ci-gates.mjs` | `scp-argv-check.mjs` added to `REPO_GATES` — repository files only, so a push can always answer it |
 | `tests/modules-unit.mjs` | WP-10: `buildScpArgv` loaded in a child (throwaway store) and parsed as argv, plus the doctor's verdict order asserted by offset |
 | `README.md` / `plugins/dsh-cua-vm/README.md` | put/get on Windows is `scp` with `-P` (and scp's `-p` has no value), one shared option list and one argv builder; the doctor is verdict-first, a probe is detail (`probeAgeMs`/`stale`/`overridden`) and can never report a powered-off computer as online |
-| `BRANCH-NOTES.md` | this section |
+| `docs/BRANCH-NOTES.md` | this section |
 
 ### Verify
 
@@ -2698,7 +2698,7 @@ The default is read with GET on purpose: a POST `{}` with no `sessionId` flips t
 | `tools/check-cua-vm.mjs` | 7 index.js needles: `grantDefault: true`, the two grant snapshots, `function nudgeRelayUpgrade(`, its blind-lane guard, the `DSH_CUA_VM_WIN_MCP_UPGRADE` line inside it, the client call, and the pair of call sites |
 | `README.md` | the grant is ON by default per session (in memory; panel switch or `POST {"grant":false}` denies; offline hides the 19 names regardless); the relay upgrade now rides the 10 s poll (≤60 s heal, plus the 15 s fast path, `DSH_CUA_VM_WIN_MCP_UPGRADE=0` disables both); the env row and the gate paragraph updated |
 | `plugins/dsh-cua-vm/README.md` | the same two changes in the plugin's own words, in “The gate: grant → reveal → guard” and “A late relay heals the live session”, plus the env table row |
-| `BRANCH-NOTES.md` | this section |
+| `docs/BRANCH-NOTES.md` | this section |
 
 ### Verify
 
@@ -2820,7 +2820,7 @@ from Session 0), no boot-time re-assert of the relay, no AutoAdminLogon re-asser
 | `plugins/dsh-cua-vm/package.json` | WP-7 (G) | `"version": "0.2.0"` — the string the gate compares against `PLUGIN_VERSION` |
 | `plugins/dsh-cua-vm/README.md` | WP-7 (G) | the probe is a handshake (carrier, candidates, 8-byte accumulate, 1,250 ms / exit-2 measurements), `RELAY_SKEW`, the stale-payload story (`payload.skew`), the repair (record grammar, throttle/backoff, kill switch), the boot guard, the `ok\|blind\|leaking` table, auto-reveal, `pluginVersion 0.2.0` |
 | `.env.example` | WP-7 (G) | `DSH_CUA_VM_WIN_MCP_REPAIR=1` beside `DSH_CUA_VM_WIN_MCP` |
-| `BRANCH-NOTES.md` | WP-7 (G) | this section |
+| `docs/BRANCH-NOTES.md` | WP-7 (G) | this section |
 
 **The ownership map was extended to 15 files (authorized).** SOL §6 froze thirteen
 files for the eight work packages and listed `Dockerfile` and
@@ -3036,7 +3036,7 @@ re-derived from the guest's actual `bridge.py` with its hash recorded.
 | `tools/check-cua-vm.mjs` | WP-7 (G) | the four needle blocks (`oemBoot`, `winMcp`, `index`, `supervisor`) that make a one-word revert visible without PowerShell; no needle deleted |
 | `plugins/dsh-cua-vm/package.json` | WP-8 (H) | `"version": "0.2.1"` — the string the cross-file WP-6.6 assertion compares against `PLUGIN_VERSION` |
 | `plugins/dsh-cua-vm/README.md` | WP-8 (H) | `#### What the receipts mean` (the three frozen sentences + what each receipt really is), `#### The element lane` (`win32ui`, the `desktop` facts field by field, the `elementLaneOk:false` fallback), `#### Where to save` (`C:\cua-work`, the DACL/IL, the empty-`save_path` default, "the profile root is not a save target"), `#### Attaching is not not-the-target` (the five codes) and the agent-surface paragraph (pinned build, executed imports, hash-gated patch, the boot wait); `pluginVersion 0.2.1` |
-| `BRANCH-NOTES.md` | WP-8 (H) | this section |
+| `docs/BRANCH-NOTES.md` | WP-8 (H) | this section |
 | `.env.example` | WP-8 (H) | `DSH_CUA_WINDOWS_DSH_CUA=dsh-cua==0.4.1` and `DSH_CUA_WINDOWS_SSH_WAIT_MS=60000`, each with the one line that says why |
 | `README.md` (repo root) | WP-8 (H) | the Windows section gains the `save_path` sentence: screenshots belong under `C:\cua-work`, and the `%TEMP%` default is a default rather than a redirect |
 
@@ -3293,7 +3293,7 @@ slot measured` and the suite itself is the authority on its exact total and on
 whether it passes right now. The gate and the mutation table below are the two
 numbers this slot OWNS, and they are exact.
 
-| **WP-E** needles, mutations, identity, docs | `tools/check-cua-vm.mjs`, `plugins/dsh-cua-vm/package.json`, one line of `index.js`, `README.md`, `.env.example`, `BRANCH-NOTES.md`, `.github/workflows/prebuild-gates.yml` | `node tools/check-cua-vm.mjs` → **1309 assertion(s) across 24 file(s)**, exit 0. `node tools/check-cua-vm.mjs --mutations` → **mutations: 22/22 red, 0 false-green**, exit 0 (9.6 s) |
+| **WP-E** needles, mutations, identity, docs | `tools/check-cua-vm.mjs`, `plugins/dsh-cua-vm/package.json`, one line of `index.js`, `README.md`, `.env.example`, `docs/BRANCH-NOTES.md`, `.github/workflows/prebuild-gates.yml` | `node tools/check-cua-vm.mjs` → **1309 assertion(s) across 24 file(s)**, exit 0. `node tools/check-cua-vm.mjs --mutations` → **mutations: 22/22 red, 0 false-green**, exit 0 (9.6 s) |
 
 ### The gate's arithmetic (a dropped row is a failure, not a new baseline)
 

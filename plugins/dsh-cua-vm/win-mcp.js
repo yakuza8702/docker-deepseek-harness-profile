@@ -1951,11 +1951,17 @@ export const DESKTOP_FACTS_FAILURE_TTL_MS = 5000
  */
 export const DESKTOP_FACTS_ABSENT = 'facts-file-absent'
 
-/** The closed set `desktop.errorCode` may name (C4). `''` is a measured answer. */
-export const DESKTOP_FACTS_ERROR_CODES = Object.freeze(['', 'facts-file-absent', 'facts-unparsable', 'ssh-failed', 'read-error'])
+/**
+ * The closed set `desktop.errorCode` may name (C4). `''` is a measured answer.
+ * NOT exported: the set is an implementation detail of the classifier below, and
+ * an exported list invites a caller to validate against a copy of the contract
+ * instead of against `classifyDesktopFactsError`. `DESKTOP_FACTS_ABSENT` stays
+ * exported because callers COMPARE with it.
+ */
+const DESKTOP_FACTS_ERROR_CODES = Object.freeze(['', 'facts-file-absent', 'facts-unparsable', 'ssh-failed', 'read-error'])
 
-/** The absent case's ONE sentence (C4) — never the doubled cmd stderr again. */
-export const DESKTOP_FACTS_ABSENT_ERROR = `facts-file-absent: ${DESKTOP_FACTS_PATH} (the guest payload may predate the facts writer)`
+/** The absent case's ONE sentence (C4) — never the doubled cmd stderr again. Internal, like the set above. */
+const DESKTOP_FACTS_ABSENT_ERROR = `facts-file-absent: ${DESKTOP_FACTS_PATH} (the guest payload may predate the facts writer)`
 
 /**
  * CLASSIFY ONE READ, FIRST MATCH WINS (C4's table, in its frozen order).
