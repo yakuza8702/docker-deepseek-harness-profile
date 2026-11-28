@@ -21,7 +21,8 @@ import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { check } from './harness.mjs'
 import {
-  BUILT_CHECKS, PROVENANCE_FILE, applyPatch, baseVerdict, patchState, repositoryHead, verifyBuilt
+  BUILT_CHECKS, PROVENANCE_FILE, applyPatch, authFixEnabled, baseVerdict, main, patchState,
+  repositoryHead, verifyAbsent, verifyBuilt
 } from '../../tools/apply-dsh-source-patches.mjs'
 
 const root = mkdtempSync(path.join(os.tmpdir(), 'dsh-source-patch-'))
@@ -155,6 +156,55 @@ if (!makeRepo()) {
     noContract instanceof Error && /no compiled-artifact contract for unrecorded\.patch/u.test(String(noContract)), firstLine(noContract))
 
   check('S10: the provenance file name is the documented one', PROVENANCE_FILE === '.dsh-profile-patches.json', PROVENANCE_FILE)
+
+  // ---- the DSH_AUTH_FIX switch ------------------------------------------
+  check('S11: the switch defaults to ON', authFixEnabled({}) === true, 'default')
+  check('S11: DSH_AUTH_FIX=0 turns it OFF', authFixEnabled({ DSH_AUTH_FIX: '0' }) === false, '0')
+  check('S11: an explicit 1 keeps it ON', authFixEnabled({ DSH_AUTH_FIX: '1' }) === true, '1')
+
+  // A stock build proves the markers are ABSENT; a marker that leaks through is a failure.
+  const absentTree = mkdtempSync(path.join(root, 'absent-'))
+  const absentSpec = BUILT_CHECKS['auth-fix.patch'][0]
+  const absentDirs = BUILT_CHECKS['auth-fix.patch'].map((spec) => path.join(absentTree, spec.dir))
+  for (const dir of absentDirs) {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, 'index.js'), '// stock upstream, no patch markers\n')
+  }
+  const absentDir = absentDirs[0]
+  const absentOk = (() => {
+    try {
+      verifyAbsent(absentTree, 'auth-fix.patch', log)
+      return true
+    } catch (error) {
+      return error
+    }
+  })()
+  check('S12: a stock lib passes the DSH_AUTH_FIX=0 artifact check', absentOk === true, String(absentOk))
+  writeFileSync(path.join(absentDir, 'index.js'), `// ${absentSpec.markers[0]}\n`)
+  const leaked = (() => {
+    try {
+      verifyAbsent(absentTree, 'auth-fix.patch', log)
+      return null
+    } catch (error) {
+      return error
+    }
+  })()
+  check('S12: a patched marker in a DSH_AUTH_FIX=0 build FAILS', leaked instanceof Error, firstLine(leaked))
+
+  // The CLI with the switch off must not patch and must record provenance "off".
+  const offRepo = path.join(root, 'off-repo')
+  mkdirSync(offRepo, { recursive: true })
+  writeFileSync(path.join(offRepo, 'account.txt'), 'grant: token-a\n')
+  const offGit = (args) => spawnSync('git', ['-c', 'user.name=unit', '-c', 'user.email=unit@example.com', '-C', offRepo, ...args], { encoding: 'utf8' })
+  offGit(['init', '-q']); offGit(['add', 'account.txt']); offGit(['commit', '-q', '-m', 'base'])
+  const offLogs = []
+  const code = main([offRepo, '--patch', patch, '--auth-fix', '0'], (line) => offLogs.push(line))
+  const offTree = read(path.join(offRepo, 'account.txt'))
+  const provenance = JSON.parse(read(path.join(offRepo, PROVENANCE_FILE)))
+  check('S13: the CLI exits cleanly with the switch off', code === 0, String(code))
+  check('S13: it leaves the stock tree untouched', offTree === 'grant: token-a\n', offTree)
+  check('S13: provenance records status "off"', provenance.patches[0].status === 'off', JSON.stringify(provenance))
+  check('S13: the skip is announced, not silent', offLogs.some((line) => /auth fix: off/u.test(line)), JSON.stringify(offLogs))
 }
 
 rmSync(root, { recursive: true, force: true })

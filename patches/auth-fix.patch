@@ -1,5 +1,5 @@
 diff --git a/docs/subsystems/account.md b/docs/subsystems/account.md
-index 22073c8a..c82f115b 100644
+index 22073c8a..d443c142 100644
 --- a/docs/subsystems/account.md
 +++ b/docs/subsystems/account.md
 @@ -8,7 +8,7 @@ Source: [`packages/account/deepseek-account/src/index.ts`](../../packages/accoun
@@ -7,12 +7,12 @@ index 22073c8a..c82f115b 100644
  ## Request credentials
  
 -`resolveRequestCredential(url)` is Host-only. It answers `undefined` while signed out, during credential removal, and for any destination outside the configured `inferenceOrigin`; otherwise it returns an `AccountRequestCredential` whose `headers` carry the token as `x-dsh-auth-token` and whose `reject()` removes the stored grant only while it still matches that token, containing storage failures so the caller reports the destination's rejection. Its `revoked` signal aborts when the account signs out of the sign-in that token belongs to, by the user or after a rejection, once the `deepseek-account/signed-out` listeners have returned; the account model route and the DeepSeek web providers run each model, Files, Search, and Fetch request that carries the token under it, so a sign-out ends those requests even after the plugin that sent them has unloaded. Consumers do not call it themselves: [`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.md) asks for the credential on behalf of the `deepseek-account` model route and the DeepSeek web providers, for a destination under the origin of that route's base URL or, without that route, of `DEEPSEEK_BASE_URL`. `reject()` runs on the account service mounted when it is called, so a reload between a request and the destination's answer still removes the grant; without a mounted service it leaves the grant for the next one to reject. A credential released by an account service that has since been replaced keeps an unaborted signal, because the replacement withdraws only the credentials it released.
-+`resolveRequestCredential(url)` is Host-only. It answers `undefined` while signed out, during credential removal, and for any destination outside the configured `inferenceOrigin`; otherwise it returns an `AccountRequestCredential` whose `headers` carry the token as `x-dsh-auth-token` and whose `reject()` reports the destination's rejection under the account service's two-answer rule: the grant is removed only once a second rejection of that token at least one request deadline later confirms it and while the grant still matches the token, containing storage failures so the caller reports the destination's rejection. Its `revoked` signal aborts when the account signs out of the sign-in that token belongs to, by the user or after a rejection, once the `deepseek-account/signed-out` listeners have returned; the account model route and the DeepSeek web providers run each model, Files, Search, and Fetch request that carries the token under it, so a sign-out ends those requests even after the plugin that sent them has unloaded. Consumers do not call it themselves: [`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.md) asks for the credential on behalf of the `deepseek-account` model route and the DeepSeek web providers, for a destination under the origin of that route's base URL or, without that route, of `DEEPSEEK_BASE_URL`. `reject()` runs on the account service mounted when it is called, so a reload between a request and the destination's answer still removes the grant; without a mounted service it leaves the grant for the next one to reject. A credential released by an account service that has since been replaced keeps an unaborted signal, because the replacement withdraws only the credentials it released. A detail read the destination does not answer (an HTTP 202 challenge, a 5xx, a timeout) is retried once immediately; a RUN of consecutive failures for one field opens a doubling window (5 s to 60 s) in which profile and wallet reads replay their last outcome without another round trip, so a destination that rejects every request is probed rather than hammered and a signed-in account keeps its cached identity.
++`resolveRequestCredential(url)` is Host-only. It answers `undefined` while signed out, during credential removal, and for any destination outside the configured `inferenceOrigin`; otherwise it returns an `AccountRequestCredential` whose `headers` carry the token as `x-dsh-auth-token` and whose `reject()` reports the destination's rejection under the account service's two-answer rule: the grant is removed only once a second rejection of that token at least one request deadline later confirms it and while the grant still matches the token, containing storage failures so the caller reports the destination's rejection. Its `revoked` signal aborts when the account signs out of the sign-in that token belongs to, by the user or after a rejection, once the `deepseek-account/signed-out` listeners have returned; the account model route and the DeepSeek web providers run each model, Files, Search, and Fetch request that carries the token under it, so a sign-out ends those requests even after the plugin that sent them has unloaded. Consumers do not call it themselves: [`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.md) asks for the credential on behalf of the `deepseek-account` model route and the DeepSeek web providers, for a destination under the origin of that route's base URL or, without that route, of `DEEPSEEK_BASE_URL`. `reject()` runs on the account service mounted when it is called, so a reload between a request and the destination's answer still removes the grant; without a mounted service it leaves the grant for the next one to reject. A credential released by an account service that has since been replaced keeps an unaborted signal, because the replacement withdraws only the credentials it released. A detail read the destination does not answer (an HTTP 202 challenge, a 5xx, a timeout) is retried once immediately; a RUN of consecutive failures for one field opens a doubling window (5 s to 60 s) in which profile and wallet reads replay their last outcome without another round trip, so a destination that rejects every request is probed rather than hammered and a signed-in account keeps its cached identity. The grant also persists the last ready identity, and a profile read answers that disk-seeded identity before any Platform round trip, then refreshes it in the background: a restarted Host and a browser with an empty cookie jar both render the signed-in account while the Platform is unreachable. A ready answer replaces the seed, and the background refresh is coalesced and shares the same failure window, so neither a page reload nor a new device adds a request per load.
  
  Model routes that bill the account register a running-task report with `registerRunningTaskReport(report)` inside `ctx.effect()`; `hasRunningAccountTasks()` answers true while any report does, so the sign-out confirmation can warn about work the sign-out interrupts. The route plugin owns cancellation of that work after `deepseek-account/signed-out`; a request that outlives the plugin ends through its credential's `revoked` signal, and the plugin's failure callback for that request cancels the work.
  
 diff --git a/docs/subsystems/account.zh.md b/docs/subsystems/account.zh.md
-index fc54815c..d0bcfebf 100644
+index fc54815c..d03a2c81 100644
 --- a/docs/subsystems/account.zh.md
 +++ b/docs/subsystems/account.zh.md
 @@ -8,7 +8,7 @@
@@ -20,12 +20,12 @@ index fc54815c..d0bcfebf 100644
  ## 请求凭据
  
 -`resolveRequestCredential(url)` 仅限 Host。未登录、凭据删除进行中，以及目标地址不在配置的 `inferenceOrigin` 之内时，它回答 `undefined`；否则返回一个 `AccountRequestCredential`：`headers` 以 `x-dsh-auth-token` 携带 token，`reject()` 仅在已存授权仍与该 token 一致时删除它，并隔离存储失败，使调用方报告的是目标地址的拒绝。其 `revoked` 信号在账号退出该 token 所属的登录时中止，无论退登由用户发起还是由拒绝触发，且在 `deepseek-account/signed-out` 的监听器返回之后；账号模型路由和 DeepSeek Web 提供方让携带该 token 的每个模型、Files、Search 与 Fetch 请求受它约束，因此即使发出请求的插件已卸载，退登仍会结束这些请求。消费方不直接调用它：[`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.zh.md) 代 `deepseek-account` 模型路由和 DeepSeek Web 提供方索取这份凭据，目标地址位于该路由基础地址的 origin 之下；没有该路由时，位于 `DEEPSEEK_BASE_URL` 的 origin 之下。`reject()` 在被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会移除授权；没有挂载的服务时，授权留给下一个挂载的服务处理。已被替换的账号服务释放的凭据，其信号保持未中止，因为替换后的服务只撤回自己释放的凭据。
-+`resolveRequestCredential(url)` 仅限 Host。未登录、凭据删除进行中，以及目标地址不在配置的 `inferenceOrigin` 之内时，它回答 `undefined`；否则返回一个 `AccountRequestCredential`：`headers` 以 `x-dsh-auth-token` 携带 token，`reject()` 按账号服务的两次应答规则上报目标的拒绝——只有在同一 token 的第二次拒绝至少间隔一个请求期限之后确认、且已存授权仍与该 token 一致时才删除它，并隔离存储失败，使调用方报告的是目标地址的拒绝。其 `revoked` 信号在账号退出该 token 所属的登录时中止，无论退登由用户发起还是由拒绝触发，且在 `deepseek-account/signed-out` 的监听器返回之后；账号模型路由和 DeepSeek Web 提供方让携带该 token 的每个模型、Files、Search 与 Fetch 请求受它约束，因此即使发出请求的插件已卸载，退登仍会结束这些请求。消费方不直接调用它：[`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.zh.md) 代 `deepseek-account` 模型路由和 DeepSeek Web 提供方索取这份凭据，目标地址位于该路由基础地址的 origin 之下；没有该路由时，位于 `DEEPSEEK_BASE_URL` 的 origin 之下。`reject()` 在被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会移除授权；没有挂载的服务时，授权留给下一个挂载的服务处理。已被替换的账号服务释放的凭据，其信号保持未中止，因为替换后的服务只撤回自己释放的凭据。 目标地址不给出答案的详情读取（HTTP 202 挑战、5xx、超时）会立即重试一次；同一字段的连续失败会开启一个倍增的窗口（5 秒至 60 秒），窗口内资料与钱包读取重放上一次结果而不再发出请求，因此持续拒绝请求的目标只会被探测而不是被反复冲击，已登录账号继续使用缓存的身份。
++`resolveRequestCredential(url)` 仅限 Host。未登录、凭据删除进行中，以及目标地址不在配置的 `inferenceOrigin` 之内时，它回答 `undefined`；否则返回一个 `AccountRequestCredential`：`headers` 以 `x-dsh-auth-token` 携带 token，`reject()` 按账号服务的两次应答规则上报目标的拒绝——只有在同一 token 的第二次拒绝至少间隔一个请求期限之后确认、且已存授权仍与该 token 一致时才删除它，并隔离存储失败，使调用方报告的是目标地址的拒绝。其 `revoked` 信号在账号退出该 token 所属的登录时中止，无论退登由用户发起还是由拒绝触发，且在 `deepseek-account/signed-out` 的监听器返回之后；账号模型路由和 DeepSeek Web 提供方让携带该 token 的每个模型、Files、Search 与 Fetch 请求受它约束，因此即使发出请求的插件已卸载，退登仍会结束这些请求。消费方不直接调用它：[`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.zh.md) 代 `deepseek-account` 模型路由和 DeepSeek Web 提供方索取这份凭据，目标地址位于该路由基础地址的 origin 之下；没有该路由时，位于 `DEEPSEEK_BASE_URL` 的 origin 之下。`reject()` 在被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会移除授权；没有挂载的服务时，授权留给下一个挂载的服务处理。已被替换的账号服务释放的凭据，其信号保持未中止，因为替换后的服务只撤回自己释放的凭据。 目标地址不给出答案的详情读取（HTTP 202 挑战、5xx、超时）会立即重试一次；同一字段的连续失败会开启一个倍增的窗口（5 秒至 60 秒），窗口内资料与钱包读取重放上一次结果而不再发出请求，因此持续拒绝请求的目标只会被探测而不是被反复冲击，已登录账号继续使用缓存的身份。授权同时持久化最近一次 ready 的身份，资料读取先返回该由磁盘种入的身份、随后在后台刷新，因此重启后的 Host 与空 cookie 罐的浏览器在 Platform 不可达时也能渲染已登录账号。ready 回答会替换磁盘种子，后台刷新会合并并共用同一失败窗口，所以页面重载或新设备都不会按每次加载增加请求。
  
  按账号计费的模型路由在 `ctx.effect()` 内用 `registerRunningTaskReport(report)` 注册运行中任务报告；只要有报告回答 true，`hasRunningAccountTasks()` 就回答 true，使退登确认能够提醒退登将打断的工作。`deepseek-account/signed-out` 之后取消这些工作由路由插件负责；比插件存活更久的请求通过其凭据的 `revoked` 信号结束，插件为该请求提供的失败回调随后取消这些工作。
  
 diff --git a/packages/account/deepseek-account/README.md b/packages/account/deepseek-account/README.md
-index 5874a864..f6f9b1e8 100644
+index 5874a864..058eae33 100644
 --- a/packages/account/deepseek-account/README.md
 +++ b/packages/account/deepseek-account/README.md
 @@ -13,7 +13,7 @@ getPlatformSession exports the stored grant only when its issuer matches platfor
@@ -46,7 +46,16 @@ index 5874a864..f6f9b1e8 100644
  
  platformOrigin defaults to `https://platform.deepseek.com` for login, profile, balance, logout, external navigation, and native embedded pages. harnessOrigin defaults to `https://harness.deepseek.com` for notification list, content, and events only. Private deployments set harnessOrigin explicitly. Both accept HTTPS, or loopback HTTP when allowLoopbackHttp is enabled. Model and file token destinations use inferenceOrigin.
  
-@@ -85,7 +85,7 @@ Account presence reads the credential store, and attempt state projects private
+@@ -75,6 +75,8 @@ inferenceOrigin defaults to `https://api.deepseek.com`. A private deployment pat
+ 
+ At service initialization, a valid stored grant whose issuer differs from platformOrigin is deleted locally before consumers read account state. Startup continues signed out without a remote logout request; API keys and device identity remain stored. Storage failures remain explicit, and account HTTP or response-validation failures do not delete a matching grant.
+ 
++The grant also carries the last ready identity (`id`, `name`, `contact`, `avatarUrl`). Initialization seeds it, and `getProfile` answers that seeded identity immediately while a background refresh updates it, so a restarted Host and a browser with an empty cookie jar both render the account without a Platform round-trip in the read path. A ready Platform answer clears the disk-only marker and later reads take the ordinary path. Refreshes are coalesced and share the per-field failure window, so an unreachable Platform costs at most one request per window instead of one per frame or page load. A rejection still counts as a strike only after two answers at least one request deadline apart, and no rejection removes the grant during the boot grace.
++
+ <a id="understand-the-implementation"></a>
+ ## Understand the implementation
+ 
+@@ -85,7 +87,7 @@ Account presence reads the credential store, and attempt state projects private
  
  The [credentials subsystem](../../../docs/subsystems/credentials.md) owns storage APIs; the [architecture](../../../docs/architecture.md) explains application composition.
  
@@ -55,7 +64,7 @@ index 5874a864..f6f9b1e8 100644
  
  Account updates share one ordered stream. A credential write takes priority over pending progress snapshots; a state read interrupted by a newer credential lifetime is discarded.
  
-@@ -109,7 +109,7 @@ No model request prefix changes.
+@@ -109,7 +111,7 @@ No model request prefix changes.
  
  The [desktop login decision](../../../.agents/notes/implemented/architecture/2026-09-14-deepseek-account-login.md) records cancellation and storage ownership.
  
@@ -65,7 +74,7 @@ index 5874a864..f6f9b1e8 100644
  accountRequestHeaders overlays requestHeaders for current, balance and embedded Platform page/API requests. Cookie pairs merge by name so routing overrides retain other deployment cookies. Authorization initialization, exchange, cancellation and logout keep requestHeaders. Both maps remain private to Host and Electron main; the session's userId stays Host-only too, and renderer bootstrap receives only origin and token.
  
 diff --git a/packages/account/deepseek-account/README.zh.md b/packages/account/deepseek-account/README.zh.md
-index 93dede11..9f12cb5f 100644
+index 93dede11..4e2ebabe 100644
 --- a/packages/account/deepseek-account/README.zh.md
 +++ b/packages/account/deepseek-account/README.zh.md
 @@ -13,7 +13,7 @@ getPlatformSession 仅在已存授权的 issuer 与 platformOrigin 一致时导
@@ -86,7 +95,16 @@ index 93dede11..9f12cb5f 100644
  
  platformOrigin 默认为 `https://platform.deepseek.com`，用于登录、资料、余额、退出登录、外部导航和原生内嵌页面。harnessOrigin 默认为 `https://harness.deepseek.com`，仅用于通知 list、content 和 events 接口。私有部署需显式设置 harnessOrigin。二者均接受 HTTPS；启用 allowLoopbackHttp 后也接受回环 HTTP。模型和文件 token 目标使用 inferenceOrigin。
  
-@@ -85,7 +85,7 @@ inferenceOrigin 默认为 `https://api.deepseek.com`。私有部署 patch 可将
+@@ -75,6 +75,8 @@ inferenceOrigin 默认为 `https://api.deepseek.com`。私有部署 patch 可将
+ 
+ 服务初始化时，若有效的已存授权 issuer 与 platformOrigin 不同，会在使用方读取账号状态前删除该本地授权，以未登录态继续启动，不发送远端退登请求；API Key 和设备标识保留。存储错误仍明确报错，账号 HTTP 或响应校验失败不会删除来源匹配的授权。
+ 
++授权同时携带最近一次 ready 的身份（`id`、`name`、`contact`、`avatarUrl`）。初始化会种入该身份，`getProfile` 立即返回它并在后台刷新，因此重启后的 Host 与空 cookie 罐的浏览器都无需在读取路径上往返 Platform 即可渲染账号。Platform 的 ready 回答会清除“仅来自磁盘”的标记，之后的读取走常规路径。刷新会合并，并共用按字段的失败窗口，因此 Platform 不可达时每个窗口至多一次请求，而不是每帧或每次页面加载一次。拒绝仍只有相隔至少一个请求截止时间的两次回答才计为一次 strike，且在启动宽限期内不会移除授权。
++
+ <a id="understand-the-implementation"></a>
+ ## 理解实现
+ 
+@@ -85,7 +87,7 @@ inferenceOrigin 默认为 `https://api.deepseek.com`。私有部署 patch 可将
  
  [凭证子系统](../../../docs/subsystems/credentials.zh.md)定义存储接口；[架构](../../../docs/architecture.zh.md)说明应用组合。
  
@@ -95,7 +113,7 @@ index 93dede11..9f12cb5f 100644
  
  账号更新共用一条有序流。凭据写入优先于待发送的进度快照；状态读取期间若凭据生命周期被替换，则丢弃该次读取。
  
-@@ -109,7 +109,7 @@ attemptTimeoutMs 包含初始化、等待浏览器和兑换的耗时。初始化
+@@ -109,7 +111,7 @@ attemptTimeoutMs 包含初始化、等待浏览器和兑换的耗时。初始化
  
  [桌面登录决策](../../../.agents/notes/implemented/architecture/2026-09-14-deepseek-account-login.zh.md)记录取消和存储的职责。
  
@@ -105,7 +123,7 @@ index 93dede11..9f12cb5f 100644
  accountRequestHeaders 覆盖 requestHeaders，供 current、余额以及内嵌 Platform 页面/API 请求使用。Cookie 按名称合并，路由覆盖保留其他部署 Cookie。授权初始化、兑换、取消和退登保持使用 requestHeaders。两组请求头仅供 Host 和 Electron 主进程使用；快照的 userId 同样仅限 Host，渲染层 bootstrap 仅接收 origin 和 token。
  
 diff --git a/packages/account/deepseek-account/src/index.ts b/packages/account/deepseek-account/src/index.ts
-index de9d559c..e8704e82 100644
+index de9d559c..34f8b7c0 100644
 --- a/packages/account/deepseek-account/src/index.ts
 +++ b/packages/account/deepseek-account/src/index.ts
 @@ -9,7 +9,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
@@ -145,7 +163,7 @@ index de9d559c..e8704e82 100644
  /** Deployment-specific platform and request deadlines. */
  export interface Config {
    /** Platform origin serving auth-api and browser pages. */
-@@ -127,7 +144,35 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -127,7 +144,43 @@ export class DeepSeekAccount extends TypertRemoteService {
     * cached identity from answering for a credential that has since changed.
     */
    private lastProfile: { readonly token: string; readonly profile: Extract<AccountDetails['profile'], { status: 'ready' }> } | undefined
@@ -173,6 +191,14 @@ index de9d559c..e8704e82 100644
 +  }>()
 +  /** Serialized grant payload an identity write-back is storing; undefined when none is in flight. */
 +  private profileWrite: string | undefined
++  /** In-flight background identity refresh behind a durable answer; coalesces every reader onto one read. */
++  private profileRefresh: Promise<void> | undefined
++  /**
++   * Grant whose identity was seeded from disk and has not been confirmed by a ready Platform read in
++   * this process. Only that identity answers immediately: a live read this process already made is
++   * not stale by definition and keeps the ordinary read path.
++   */
++  private durableProfile: { readonly token: string } | undefined
    private detailsLifetime = new AbortController()
 +  /** First rejection observed for the current grant; `at` is monotonic. Process-scoped on purpose. */
 +  private expiryWatch: { readonly token: string; readonly at: number } | undefined
@@ -181,7 +207,7 @@ index de9d559c..e8704e82 100644
    /** Aborted at the next sign-out; request credentials of the current sign-in carry its signal. */
    private signedOut = new AbortController()
    private closed = false
-@@ -171,8 +216,26 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -171,8 +224,26 @@ export class DeepSeekAccount extends TypertRemoteService {
      })
      ctx.on('credentials/record-updated', (key) => {
        if (key !== KEY) return
@@ -210,7 +236,7 @@ index de9d559c..e8704e82 100644
      })
      ctx.effect(() => async () => {
        this.closed = true
-@@ -195,7 +258,14 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -195,7 +266,15 @@ export class DeepSeekAccount extends TypertRemoteService {
      if (record.kind !== 'grant') throw new PlatformAuthError('storage')
      const parsed = grant.safeParse(record.payload)
      if (!parsed.success) throw new PlatformAuthError('storage')
@@ -220,13 +246,25 @@ index de9d559c..e8704e82 100644
 +      if (parsed.data.profile !== undefined) {
 +        this.lastProfile = { token: parsed.data.token, profile: persistedProfile(parsed.data.profile) }
 +        this.persistedProfile = persistedKey(parsed.data.token, parsed.data.profile)
++        this.durableProfile = { token: parsed.data.token }
 +      }
 +      return
 +    }
      await this.ctx.credentials.deleteRecord(KEY)
    }
  
-@@ -233,7 +303,9 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -230,13 +309,49 @@ export class DeepSeekAccount extends TypertRemoteService {
+     const lifetime = this.detailsLifetime
+     const stored = await this.readCurrentGrant(lifetime)
+     if (stored === null || lifetime.signal.aborted) return null
++    // The identity persisted with this grant answers first. A browser that just opened, another
++    // device, and a restarted Host all render the account from disk, with no Platform round-trip in
++    // the path — the case a persisted grant alone could not cover.
++    const cached = this.lastProfile?.token === stored.token ? this.lastProfile.profile : undefined
++    if (cached !== undefined && this.durableProfile?.token === stored.token) {
++      this.refreshProfile(client, lifetime, stored)
++      return cached
++    }
      const result = await this.getDetail('profile', this.detailHeaders(client), { lifetime, stored })
      if (this.detailsLifetime !== lifetime) return null
      if (result !== null) this.cacheProfile(stored.token, result)
@@ -235,12 +273,46 @@ index de9d559c..e8704e82 100644
 +    // persisted with this grant; only a ready read replaces it.
 +    if (result !== null && result.status !== 'failed') return result
      // Only this same grant's last ready read may stand in for a failed refresh.
-     const cached = this.lastProfile?.token === stored.token ? this.lastProfile.profile : undefined
-     return cached ?? result
-@@ -341,9 +413,56 @@ export class DeepSeekAccount extends TypertRemoteService {
+-    const cached = this.lastProfile?.token === stored.token ? this.lastProfile.profile : undefined
+-    return cached ?? result
++    const cachedAfter = this.lastProfile?.token === stored.token ? this.lastProfile.profile : undefined
++    return cachedAfter ?? result
++  }
++
++  /**
++   * Refresh the Platform identity behind an already-served durable answer, without delaying the
++   * caller. One refresh runs at a time and a rejection window suppresses the next, so a browser
++   * that re-reads on every stream frame costs at most one Platform request per window.
++   * @param client - identity of the requesting UI for this call.
++   * @param lifetime - detail lifetime the cached answer was read under.
++   * @param stored - grant the cached identity belongs to.
++   */
++  private refreshProfile(client: AccountClientMetadata, lifetime: AbortController,
++    stored: z.infer<typeof grant>): void {
++    if (this.profileRefresh !== undefined) return
++    const guard = this.detailGuards.get('profile')
++    // A rejected credential never opens a window: the next read must reach the expiry path again.
++    if (guard !== undefined && guard.token === stored.token && guard.retryAt > performance.now()) return
++    const read: Promise<void> = this.getDetail('profile', this.detailHeaders(client), { lifetime, stored })
++      .then((result) => {
++        if (result !== null && this.detailsLifetime === lifetime) this.cacheProfile(stored.token, result)
++      })
++      .catch((error: unknown) => {
++        // A background refresh has no caller to fail; the failure already opened its window.
++        this.ctx.logger.warn(`[deepseek-account] background identity refresh failed: ${String(error)}`)
++      })
++      .finally(() => { this.profileRefresh = undefined })
++    this.profileRefresh = read
+   }
+ 
+   /**
+@@ -341,9 +456,59 @@ export class DeepSeekAccount extends TypertRemoteService {
      // Identity publishers re-read the session snapshot; wake them only when the stable ID changes.
      const previous = this.lastProfile?.profile.value.id || null
      this.lastProfile = { token, profile }
++    // A live read now owns the identity: later reads take the ordinary path, where a refresh is
++    // awaited because it is what the caller asked for.
++    this.durableProfile = undefined
 +    // A ready answer breaks a rejection run: the strike policy only counts consecutive failures.
 +    this.expiryWatch = undefined
 +    this.persistProfile(token, profile.value)
@@ -294,7 +366,7 @@ index de9d559c..e8704e82 100644
    private async getDetail<K extends keyof AccountDetails>(field: K, headers: Record<string, string>,
      captured?: { lifetime: AbortController; stored: z.infer<typeof grant> }): Promise<AccountDetails[K] | null> {
      const lifetime = captured?.lifetime ?? this.detailsLifetime
-@@ -354,17 +473,62 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -354,17 +519,62 @@ export class DeepSeekAccount extends TypertRemoteService {
        delete this.attempt.initialProfile
        return initial as AccountDetails[K]
      }
@@ -357,7 +429,7 @@ index de9d559c..e8704e82 100644
    /** Deployment account headers plus the client identity headers derived from one call's metadata. */
    private detailHeaders(client: AccountClientMetadata): Record<string, string> {
      return { ...this.accountRequestHeaders, ...platformClientHeaders(this.platform, client) }
-@@ -382,7 +546,32 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -382,7 +592,32 @@ export class DeepSeekAccount extends TypertRemoteService {
      await this.expireCredential(token, lifetime)
    }
  
@@ -390,7 +462,7 @@ index de9d559c..e8704e82 100644
      this.removing ??= (async () => {
        if (this.attempt !== undefined) await this.cancelSignIn(this.attempt.view.id)
        const record = await this.ctx.credentials.readRecord(KEY)
-@@ -390,6 +579,7 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -390,6 +625,7 @@ export class DeepSeekAccount extends TypertRemoteService {
        const current = grant.parse(record.payload)
        if (current.token !== token || current.issuer !== this.origin) return this.getState()
        await this.ctx.credentials.deleteRecord(KEY)
@@ -398,10 +470,12 @@ index de9d559c..e8704e82 100644
        this.ctx.emit('deepseek-account/session-expired')
        this.attempt = undefined
        this.publishSignedOut()
-@@ -717,6 +907,11 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -717,6 +953,13 @@ export class DeepSeekAccount extends TypertRemoteService {
  
    private invalidateDetails(): void {
      this.lastProfile = undefined
++    // The disk seed answered for the grant that was mounted; a credential change must re-resolve it.
++    this.durableProfile = undefined
 +    // `persistedProfile` SURVIVES an invalidation on purpose. Clearing it here armed a rewrite of the
 +    // identity this process had just written, so a record event that the write-back could not
 +    // attribute (a delayed fan-out, a watcher reload, another listener) became: invalidate → client
@@ -410,7 +484,7 @@ index de9d559c..e8704e82 100644
      this.detailsLifetime.abort()
      this.detailsLifetime = new AbortController()
    }
-@@ -812,10 +1007,21 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -812,10 +1055,21 @@ export class DeepSeekAccount extends TypertRemoteService {
            // Invalid optional user data falls back to current without discarding a valid authorization.
          }
        }
@@ -434,7 +508,7 @@ index de9d559c..e8704e82 100644
      } catch (error) {
        if (deadline.signal.aborted) throw new PlatformAuthError('expired')
        throw error
-@@ -874,3 +1080,24 @@ export default DeepSeekAccount
+@@ -874,3 +1128,24 @@ export default DeepSeekAccount
  function deviceOsVersion(): string {
    return `${platform()} ${release()}`
  }
@@ -483,7 +557,7 @@ index a9c83444..41f65132 100644
     */
    reject(): Promise<void>
 diff --git a/packages/account/deepseek-account/tests/account.spec.ts b/packages/account/deepseek-account/tests/account.spec.ts
-index 76405b1a..3f89a0a7 100644
+index 76405b1a..200ecfc8 100644
 --- a/packages/account/deepseek-account/tests/account.spec.ts
 +++ b/packages/account/deepseek-account/tests/account.spec.ts
 @@ -11,7 +11,7 @@ import * as Connection from '@deepseek-ai/dsh-client-connection'
@@ -599,7 +673,7 @@ index 76405b1a..3f89a0a7 100644
  /** Inference origin a fixture allows a grant `storeAccount` wrote, which official inference refuses as development-issued. */
  const PRIVATE_INFERENCE = 'http://inference.example.test:8094'
  
-@@ -529,6 +579,428 @@ async function storedCredential(f: Awaited<ReturnType<typeof fixture>>) {
+@@ -529,6 +579,506 @@ async function storedCredential(f: Awaited<ReturnType<typeof fixture>>) {
    return credential
  }
  
@@ -621,7 +695,74 @@ index 76405b1a..3f89a0a7 100644
 +  ]))
 +})
 +
-+it('bounds Platform reads when the profile is persistently unreachable', async () => {
++it('renders the persisted identity for a fresh browser while the Platform never answers', async () => {
++  const f = await fixture()
++  await storeAccountWithProfile(f)
++  // The reported deployment: platform.deepseek.com is unreachable from the container's egress.
++  // A held read never settles, so any answer below can only have come from the grant on disk.
++  f.holdDetails()
++  // A container restart mounts a new account service over the same dsh-home volume.
++  const restarted = await f.remount()
++  // A fresh browser arrives with no cookie and no client state; only the Host's grant survives.
++  expect((await restarted.getState()).status).toBe('credential-stored')
++  const first = await Promise.race([
++    restarted.getProfile(clientMetadata()),
++    new Promise<'timeout'>((resolve) => { setTimeout(() => { resolve('timeout') }, 500) }),
++  ])
++  expect(first).toMatchObject({
++    status: 'ready', value: { id: 'test-user', name: 'Test Account', contact: '138****5678', avatarUrl: null },
++  })
++  // A second browser (its own cookie jar, another client build and locale) reads the same identity.
++  const second = await Promise.race([
++    restarted.getProfile({ version: '9.9.9-other-device', locale: 'zh', timezoneOffsetSeconds: 0 }),
++    new Promise<'timeout'>((resolve) => { setTimeout(() => { resolve('timeout') }, 500) }),
++  ])
++  expect(second).toMatchObject({ status: 'ready', value: { contact: '138****5678' } })
++})
++
++it('replays a rejected profile result inside the failure window without another Platform read', async () => {
++  fakeClock()
++  const f = await fixture()
++  // No persisted identity: the reads are foreground, which is where a rejection window replays.
++  await storeAccount(f)
++  f.detailStatus(202)
++  const before = f.detailRequests.length
++  expect(await f.account.getProfile(clientMetadata())).toMatchObject({ status: 'failed' })
++  expect(await f.account.getProfile(clientMetadata())).toMatchObject({ status: 'failed' })
++  expect(f.detailRequests.length - before).toBe(2)
++  // The window is open: the third read replays the rejected outcome with no request at all.
++  expect(await f.account.getProfile(clientMetadata())).toMatchObject({ status: 'failed' })
++  expect(f.detailRequests.length - before).toBe(2)
++})
++
++it('logs a background identity refresh that cannot run instead of failing the Host', async () => {
++  const f = await fixture()
++  // A stale durable identity makes the ready Platform answer rewrite the record.
++  await f.ctx.credentials.modifyRecord(credentialKey('deepseek-account-platform', 'default'), () => Promise.resolve({
++    kind: 'grant', payload: { version: 1, issuer: f.origin, token: 'test-platform-grant',
++      profile: { id: 'test-user', name: 'Stale Name', contact: '138****5678', avatarUrl: null } },
++  }))
++  const restarted = await f.remount()
++  const warn = vi.spyOn(f.ctx.logger, 'warn')
++  // The Platform answers, but the identity write-back cannot reach the store. A throwing store
++  // call must stay inside the background refresh: an unhandled rejection here would exit the Host.
++  const modify = vi.spyOn(f.ctx.credentials, 'modifyRecord').mockImplementation(() => { throw new Error('store unavailable') })
++  try {
++    f.detailStatus(200)
++    expect(await restarted.getProfile(clientMetadata())).toMatchObject({ status: 'ready' })
++    await expect.poll(() => warn.mock.calls.length).toBeGreaterThan(0)
++    expect(warn.mock.calls.some(([message]) => String(message).includes('background identity refresh failed'))).toBe(true)
++  } finally {
++    modify.mockRestore()
++  }
++})
++
++/** Let one admitted background read reach the mock Platform and settle. */
++async function settleBackgroundRead(): Promise<void> {
++  await new Promise<void>((resolve) => { setTimeout(resolve, 25) })
++}
++
++it('bounds Platform refreshes behind a durable identity when the profile is persistently unreachable', async () => {
 +  fakeClock()
 +  const f = await fixture()
 +  await storeAccountWithProfile(f)
@@ -630,28 +771,36 @@ index 76405b1a..3f89a0a7 100644
 +  f.detailStatus(202)
 +  const before = f.detailRequests.length
 +  const reads = () => restarted.getProfile(clientMetadata())
-+  // One transient failure is retried at once: a single 202 is a hiccup, not a broken Platform.
++  const refreshes = (): number => f.detailRequests.length - before
++  // The durable identity answers every read immediately; the one Platform cost is the refresh.
++  expect(await reads()).toMatchObject({ status: 'ready', value: { name: 'Test Account' } })
++  await expect.poll(refreshes).toBe(1)
++  await settleBackgroundRead()
++  // One transient failure is retried once: a single 202 is a hiccup, not a broken Platform.
 +  await reads()
-+  expect(f.detailRequests.length - before).toBe(1)
-+  await reads()
-+  expect(f.detailRequests.length - before).toBe(2)
++  await expect.poll(refreshes).toBe(2)
++  await settleBackgroundRead()
 +  // From the second consecutive failure a window is open. The client re-reads on every stream
 +  // frame; ten of those re-reads must cost nothing while the window is open.
 +  for (let index = 0; index < 10; index += 1) await reads()
-+  expect(f.detailRequests.length - before).toBe(2)
-+  // Each following window admits exactly one request, and doubles: 5 s, then 10 s.
++  expect(refreshes()).toBe(2)
++  // Each following window admits exactly one refresh, and doubles: 5 s, then 10 s.
 +  vi.advanceTimersByTime(5_000)
 +  await reads()
++  await expect.poll(refreshes).toBe(3)
++  await settleBackgroundRead()
 +  await reads()
-+  expect(f.detailRequests.length - before).toBe(3)
++  expect(refreshes()).toBe(3)
 +  vi.advanceTimersByTime(10_000)
 +  await reads()
-+  await reads()
-+  expect(f.detailRequests.length - before).toBe(4)
-+  // A ready answer clears the run, so the following read reaches the Platform immediately.
++  await expect.poll(refreshes).toBe(4)
++  await settleBackgroundRead()
++  // A ready answer clears the run, clears the disk-only marker, and the following read is a plain
++  // Platform read again.
 +  f.detailStatus(200)
 +  vi.advanceTimersByTime(20_000)
-+  expect(await restarted.getProfile(clientMetadata())).toMatchObject({ status: 'ready' })
++  await reads()
++  await expect.poll(async () => (await reads())?.status).toBe('ready')
 +})
 +
 +it('survives an identity write check that cannot read the record', async () => {
@@ -740,6 +889,9 @@ index 76405b1a..3f89a0a7 100644
 +  // The restart surrogate seeds the identity cache, so the rejected read still answers with it.
 +  const restarted = await f.remount()
 +  expect(await restarted.getProfile(clientMetadata())).toMatchObject({ status: 'ready', value: { contact: '138****5678' } })
++  // The durable answer's own background refresh records the first rejection before the clock moves.
++  await expect.poll(() => f.detailRequests.length).toBeGreaterThan(0)
++  await settleBackgroundRead()
 +  expect((await restarted.getState()).status).toBe('credential-stored')
 +  expect(await f.ctx.credentials.readRecord(key)).toBeDefined()
 +  pastBootGrace()
@@ -1028,7 +1180,7 @@ index 76405b1a..3f89a0a7 100644
  it('queries Platform Web endpoints with the stored grant and projects only masked profile and separate recharge and bonus balances', async () => {
    const f = await fixture()
    expect(await readDetails(f.account)).toBeNull()
-@@ -566,6 +1038,8 @@ it('publishes sign-out only after local grant removal and refuses token resoluti
+@@ -566,6 +1116,8 @@ it('publishes sign-out only after local grant removal and refuses token resoluti
  })
  
  it.each(['user sign-out', 'rejected token'] as const)('withdraws released request credentials at a %s, after its listeners ran', async (cause) => {
@@ -1037,7 +1189,7 @@ index 76405b1a..3f89a0a7 100644
    const f = await fixture(undefined, {}, false, {}, PRIVATE_INFERENCE)
    await storeAccount(f)
    const credential = await storedCredential(f)
-@@ -573,7 +1047,8 @@ it.each(['user sign-out', 'rejected token'] as const)('withdraws released reques
+@@ -573,7 +1125,8 @@ it.each(['user sign-out', 'rejected token'] as const)('withdraws released reques
    f.ctx.on('deepseek-account/signed-out', () => { observed.push(credential.revoked.aborted) })
    expect(credential.revoked.aborted).toBe(false)
    if (cause === 'user sign-out') await f.account.signOut(clientMetadata())
@@ -1047,7 +1199,7 @@ index 76405b1a..3f89a0a7 100644
    expect(observed).toEqual([false])
    expect(credential.revoked.aborted).toBe(true)
    // The next sign-in releases its credentials on a signal of its own.
-@@ -1197,7 +1672,9 @@ it.each([undefined, [{ currency: 'EUR', balance: '1' }], [{ currency: 'CNY', bal
+@@ -1197,7 +1750,9 @@ it.each([undefined, [{ currency: 'EUR', balance: '1' }], [{ currency: 'CNY', bal
    },
  )
  
@@ -1058,7 +1210,7 @@ index 76405b1a..3f89a0a7 100644
    const f = await fixture()
    await storeAccount(f)
    let signedOut = 0
-@@ -1205,14 +1682,20 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
+@@ -1205,14 +1760,20 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
    const expired = vi.fn()
    f.ctx.on('deepseek-account/session-expired', expired)
    f.detailStatus(401)
@@ -1081,7 +1233,7 @@ index 76405b1a..3f89a0a7 100644
    const f = await fixture()
    await storeAccount(f)
    let signedOut = 0
-@@ -1220,7 +1703,11 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
+@@ -1220,7 +1781,11 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
    const expired = vi.fn()
    f.ctx.on('deepseek-account/session-expired', expired)
    f.detailCode(40003)
@@ -1094,7 +1246,7 @@ index 76405b1a..3f89a0a7 100644
    expect(await f.account.getState()).toMatchObject({ status: 'signed-out', attempt: null })
    expect(await f.ctx.credentials.readRecord(credentialKey('deepseek-account-platform', 'default'))).toBeUndefined()
    expect(signedOut).toBe(1)
-@@ -1228,6 +1715,7 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
+@@ -1228,6 +1793,7 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
  })
  
  it('coalesces simultaneous unauthorized profile and balance responses', async () => {
@@ -1102,7 +1254,7 @@ index 76405b1a..3f89a0a7 100644
    const f = await fixture()
    await storeAccount(f)
    let signedOut = 0
-@@ -1235,6 +1723,9 @@ it('coalesces simultaneous unauthorized profile and balance responses', async ()
+@@ -1235,6 +1801,9 @@ it('coalesces simultaneous unauthorized profile and balance responses', async ()
    const expired = vi.fn()
    f.ctx.on('deepseek-account/session-expired', expired)
    f.detailStatus(401)
@@ -1112,7 +1264,7 @@ index 76405b1a..3f89a0a7 100644
    await Promise.all([f.account.getProfile(clientMetadata()), f.account.getBalance(clientMetadata())])
    expect(signedOut).toBe(1)
    expect(expired).toHaveBeenCalledOnce()
-@@ -1731,24 +2222,31 @@ it('reuses the last profile identity without querying again', async () => {
+@@ -1731,24 +2300,31 @@ it('reuses the last profile identity without querying again', async () => {
  })
  
  it('cancels a pending sign-in when the current stored grant expires', async () => {
@@ -1145,7 +1297,7 @@ index 76405b1a..3f89a0a7 100644
      expect(await f.account.getBalance(clientMetadata())).toBeNull()
      expect(await f.account.getState()).toMatchObject({ status: 'signed-out' })
    } finally { remove.mockRestore() }
-@@ -1759,10 +2257,15 @@ it.each([
+@@ -1759,10 +2335,15 @@ it.each([
    ['balance', 'token'], ['balance', 'issuer'], ['profile', 'missing'],
  ] as const)(
    'rechecks the stored grant before %s expiry removal: %s', async (field, change) => {
@@ -1161,7 +1313,7 @@ index 76405b1a..3f89a0a7 100644
      const original = f.ctx.credentials.readRecord.bind(f.ctx.credentials)
      let reads = 0
      const read = vi.spyOn(f.ctx.credentials, 'readRecord').mockImplementation(async (requested) => {
-@@ -1806,6 +2309,7 @@ it('ignores a 401 whose response cleanup overlaps a credential replacement', asy
+@@ -1806,6 +2387,7 @@ it('ignores a 401 whose response cleanup overlaps a credential replacement', asy
  })
  
  it('expires an inference-rejected token without another Platform request', async () => {
@@ -1169,7 +1321,7 @@ index 76405b1a..3f89a0a7 100644
    const f = await fixture(undefined, {}, false, {}, PRIVATE_INFERENCE)
    await storeAccount(f)
    const credential = await storedCredential(f)
-@@ -1813,6 +2317,7 @@ it('expires an inference-rejected token without another Platform request', async
+@@ -1813,6 +2395,7 @@ it('expires an inference-rejected token without another Platform request', async
    f.ctx.on('deepseek-account/signed-out', () => { published.push('signed-out') })
    f.ctx.on('deepseek-account/session-expired', () => { published.push('session-expired') })
    await credential.reject()
@@ -1288,6 +1440,334 @@ index 46b601da..da7e2617 100644
  
  `candidates(request)` 以相同顺序返回相同的种类，但不读取凭据。每个候选用 `configured()` 回答就绪检查，用 `resolve(signal)` 给出凭据，并给出 `endpoint`，API 密钥还给出供诊断使用的 `reference`。`routeKind(route)` 给出已挂载的模型路由插件在该路由 id 下登记的种类，其他路由一律为 `undefined`。
  
+diff --git a/packages/boot/app-boot/src/index.ts b/packages/boot/app-boot/src/index.ts
+index 99dc0570..24b0f331 100644
+--- a/packages/boot/app-boot/src/index.ts
++++ b/packages/boot/app-boot/src/index.ts
+@@ -8,7 +8,7 @@
+ 
+ import { pathToFileURL } from 'node:url'
+ import { readFileSync } from 'node:fs'
+-import { inspect, parseEnv } from 'node:util'
++import { debuglog, inspect, parseEnv } from 'node:util'
+ import { captureStartupComposition, type StartupCompositionDiagnostic } from './startup-diagnostics.ts'
+ export type { StartupCompositionDiagnostic, StartupPluginState, StartupServiceState } from './startup-diagnostics.ts'
+ import { basename, dirname, isAbsolute, resolve } from 'node:path'
+@@ -858,11 +858,29 @@ async function observeLoaderRejectionCheckpoint(reasons: readonly unknown[]): Pr
+  */
+ export const FAIL_LOUD_RELEASE_TIMEOUT_MS = 2_000
+ 
++/** `NODE_DEBUG` channel for a carrier teardown that is not a Host failure. */
++const debugBoot = debuglog('dsh:app-boot')
++
++/**
++ * Whether a rejection is the carrier teardown of a client that disconnected
++ * mid-response. The /api HTTP bridge marks its abort reason with this property;
++ * a handler or library that lets the reason escape as an unhandled rejection is
++ * reporting that teardown, never a load failure. Property name duplicated rather
++ * than imported so the boot layer keeps no dependency on the connection package.
++ * @param err - rejected value.
++ * @returns whether it carries the bridge's client-disconnect marker.
++ */
++function isClientDisconnect(err: unknown): boolean {
++  return typeof err === 'object' && err !== null && Reflect.get(err, 'dshClientDisconnected') === true
++}
++
+ /**
+  * Install before boot to turn an unhandled rejection or an uncaught exception,
+  * at any point in the process lifetime, into one labelled stderr diagnostic and
+  * `exit(1)`. A rejection already included by {@link auditStartupEntries} is
+- * ignored during its process checkpoint; every other rejection and every
++ * ignored during its process checkpoint; so is one carrying the /api bridge's
++ * client-disconnect marker, because a browser that reloaded or navigated away
++ * must never take the Host down with it. Every other rejection and every
+  * uncaught exception remains fatal. Control never returns to the failed
+  * operation after either: only the throw site knows which state is intact, and
+  * a listener that threw mid-update (a stream `'data'` handler, a half-applied
+@@ -936,6 +954,13 @@ export function installFailLoud(
+   }
+   const onRejection = (err: unknown): void => {
+     if (assembledActivationRejections.has(err)) return
++    // A client that reloads or navigates away aborts its carrier; an abort reason that escapes
++    // into an unhandled rejection is that teardown. Continuing is the only safe answer: the Host
++    // is healthy and every other browser session still depends on it.
++    if (isClientDisconnect(err)) {
++      debugBoot(`ignoring client teardown: ${inspect(err)}`)
++      return
++    }
+     // Label kept stable: the Web profile expected-output e2e tests match it.
+     report(err, 'fatal load failure')
+   }
+diff --git a/packages/boot/app-boot/tests/app-boot.spec.ts b/packages/boot/app-boot/tests/app-boot.spec.ts
+index dc4764ae..ce78660d 100644
+--- a/packages/boot/app-boot/tests/app-boot.spec.ts
++++ b/packages/boot/app-boot/tests/app-boot.spec.ts
+@@ -451,6 +451,23 @@ describe('installFailLoud', () => {
+     expect(proc.exits).toEqual([1])
+   })
+ 
++  it('keeps the Host alive when an aborted client teardown escapes as a rejection', () => {
++    const proc = fakeProc()
++    installFailLoud(NAME, proc)
++    // What the /api bridge mints when a browser reloads or navigates away mid-response.
++    const teardown = Object.assign(new Error('client disconnected before the response completed'), {
++      name: 'AbortError',
++      dshClientDisconnected: true,
++    })
++    proc.rejection(teardown)
++    expect(proc.written).toEqual([])
++    expect(proc.exits).toEqual([])
++    // The same handler still fails loud on a real rejection after a teardown.
++    proc.rejection(new Error('boom'))
++    expect(proc.written[0]).toContain(`${NAME}: fatal load failure: `)
++    expect(proc.exits).toEqual([1])
++  })
++
+   // One rejection is reported per install: the first is the diagnosis, so each
+   // formatting case needs its own handler rather than reusing a latched one.
+   it('stringifies a non-Error rejection and an Error without a stack falls back to its message', () => {
+diff --git a/packages/client/connection/README.md b/packages/client/connection/README.md
+index c0da1f74..3032f1d0 100644
+--- a/packages/client/connection/README.md
++++ b/packages/client/connection/README.md
+@@ -31,6 +31,8 @@ A static desktop page can provide `__DSH_TRANSPORT__.streamBaseUrl` for the HTTP
+ 
+ Unary RPC requests use JSON. A Host handler may return byte attachments that it has already separated from the JSON-compatible result value, with each attachment naming its result-relative path. Connection writes these values as multipart parts. The JSON `metadata` part contains the RPC response envelope with `null` placeholders and an attachment table recording each path, codec, and part identifier. Paths use string keys and numeric array indices; no business field name is reserved. The Client validates the envelope, `rpcId`, attachment table, and parts, then restores each byte value as an `ArrayBuffer`-backed view. Results without attachments, including base64 strings, and failures remain JSON. Logical RPC carriers return decoded native values directly. Connection does not discover binary fields or depend on Typert; the handler that owns a result protocol performs any type-directed or runtime projection before returning. Binary parameters, events, and streamed binary results are unsupported.
+ 
++An HTTP response the client abandons — a page reload, a navigation, a closed tab — aborts its carrier. That abort is normal teardown, not a Host failure: the bridge cancels with a marked `AbortError`, settles quietly when the handler or the response body observes it, and writes nothing to the socket the client left. `installFailLoud` recognizes the marker, so a handler or library that lets the reason escape as an unhandled rejection cannot exit the process while other browser sessions still depend on it.
++
+ The browser uses HTTP POST for Remote unary calls. API Gateway owns the `/api/remote.mux` WebSocket and its logical streams; shell-owned compositions provide equivalent Remote streams, including a stream's uplink, through `connection.rpc.open` without opening a WebSocket. The browser plugin reads the page transport, its synced recovery settings, and location, then delegates to `installConnection(ctx, options)`. A composition that owns its carrier may call the same installer directly; the whole-client test tier does so. Non-page carriers supply `ClientTransportHooks.createWebSocket` with the same authenticated Cookie as HTTP and a `streamBaseUrl`; `ConnectionHandle.openWebSocket()` resolves the Mux path against that base and invokes the selected factory. Each invocation creates one Context-owned service, so several Client trees can use different carriers in one realm. The Host half always provides the carrier-neutral RPC and exact `GET`/`HEAD`/`POST` route registries. When a Web carrier is present it also owns the sole `/api` route, Fetch bridge and Host/Origin checks, delegating credential verification to ConnectionAuthentication; a shell-owned carrier dispatches the shared Fetch handler directly. Each exact route declares buffered or streaming request-body handling before the bridge reads any bytes. Typert Gateway claims generated Remote endpoints, feature packages register non-JSON responses such as Session-log downloads and raw file uploads, and unclaimed requests return 404. Loopback hostname classification remains package-internal to the browser-facing Client state. Browser raw-body transfer is provided by [`dsh-client-file-upload`](../file-upload/README.md).
+ 
+ -----
+diff --git a/packages/client/connection/README.zh.md b/packages/client/connection/README.zh.md
+index 636ccafe..4f8f116b 100644
+--- a/packages/client/connection/README.zh.md
++++ b/packages/client/connection/README.zh.md
+@@ -29,6 +29,8 @@ kind: "package-reference"
+ 
+ 静态桌面页面可以通过 `__DSH_TRANSPORT__.streamBaseUrl` 提供其所拥有 Host 的 HTTP origin。Gateway 将该 origin 用于 WebSocket，HTTP 传输仍独立选择。桌面载体负责认证；仅设置 origin 不会授予访问权限。
+ 
++客户端放弃的 HTTP 响应（页面重载、导航、关闭标签页）会中止其载体。该中止是正常的收尾而并非 Host 故障：bridge 以带标记的 `AbortError` 取消，在 handler 或响应体观察到它时安静结束，并且不向客户端已离开的 socket 写入任何内容。`installFailLoud` 识别该标记，因此 handler 或库即使把该原因泄漏为未处理的 rejection，也无法在其他浏览器会话仍依赖 Host 时退出进程。
++
+ 一元 RPC 请求使用 JSON。Host handler 可以返回已经从 JSON 兼容结果值中分离的字节附件，每个附件标明其相对于结果的路径。Connection 将这些值写为 multipart 部分。JSON `metadata` 部分包含带 `null` 占位值的 RPC 响应信封，以及记录各路径、codec 和部分标识符的附件表。路径使用字符串键与数字数组下标，不保留任何业务字段名。Client 校验信封、`rpcId`、附件表和各部分，再将每个字节值恢复为以 `ArrayBuffer` 为底层缓冲区的视图。没有附件的结果（包括 base64 字符串）与失败仍使用 JSON。逻辑 RPC 载体直接返回解码后的原生值。Connection 不识别二进制字段，也不依赖 Typert；拥有结果协议的 handler 在返回前执行按类型或按运行时值的投影。不支持二进制参数、事件和二进制流式结果。
+ 
+ 浏览器通过 HTTP POST 执行 Remote 一元调用；API Gateway 自己拥有 `/api/remote.mux` WebSocket 及其逻辑流。由 shell 持有的组合通过 `connection.rpc.open` 提供等价的 Remote 流（包括流的上行），不打开 WebSocket。浏览器插件读取页面 transport、同步的恢复设置与 location，再委托 `installConnection(ctx, options)`。持有自身载体的组合可以直接调用同一个安装函数；整机客户端测试档就是这一消费者。非页面载体通过 `ClientTransportHooks.createWebSocket` 使用与 HTTP 相同的认证 Cookie，并提供 `streamBaseUrl`；`ConnectionHandle.openWebSocket()` 根据该 base 解析 Mux 路径，再调用所选工厂。每次调用都会创建一个归所属 Context 的服务，因此同一 realm 中的多棵 Client 树可以使用不同载体。Host half 始终提供与载体无关的 RPC 注册表和精确 `GET`/`HEAD`/`POST` 路由注册表。存在 Web 载体时，它还持有唯一 `/api` route、Fetch bridge 与 Host/Origin 校验，并委托 ConnectionAuthentication 验证凭据；由 shell 持有的载体则直接分派共享 Fetch handler。每条精确路由会在 bridge 读取任何字节前声明缓冲或流式请求体处理方式。Typert Gateway 认领生成的 Remote endpoint，功能包注册 Session 日志下载、原始文件上传等非 JSON 响应，未认领的请求返回 404。Loopback hostname 判定只供浏览器侧当前页面状态使用，留在包内。浏览器原始请求体传输由 [`dsh-client-file-upload`](../file-upload/README.zh.md) 提供。
+diff --git a/packages/client/connection/src/http-bridge.ts b/packages/client/connection/src/http-bridge.ts
+index 61d89c01..892ce86b 100644
+--- a/packages/client/connection/src/http-bridge.ts
++++ b/packages/client/connection/src/http-bridge.ts
+@@ -8,6 +8,43 @@ import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol'
+ import { Readable } from 'node:stream'
+ import type { ConnectionFetchHandler } from './rpc.ts'
+ 
++/**
++ * Report a carrier teardown only when `NODE_DEBUG` names this channel. Kept as a local
++ * environment read rather than `node:util`'s `debuglog`, because this module is also reached
++ * from browser-environment test graphs where a Node builtin would be externalized.
++ * @param message - diagnostic text.
++ */
++function debug(message: string): void {
++  if (typeof process === 'undefined' || !process.env.NODE_DEBUG?.split(/[\s,]+/).includes('dsh:connection')) return
++  console.debug(`[dsh:connection] ${message}`)
++}
++
++/**
++ * Marks the abort reason the bridge mints when the client went away before the
++ * response completed. Duck-typed on purpose: the boot-layer fatal handler must
++ * recognize a carrier teardown without importing the connection package.
++ */
++export const CLIENT_DISCONNECTED = 'dshClientDisconnected'
++
++/**
++ * Reason one aborted carrier is cancelled with: a client that disconnects,
++ * reloads, or navigates away while its request is in flight.
++ *
++ * `name` stays `AbortError` so every existing cancellation branch keeps
++ * matching, while {@link CLIENT_DISCONNECTED} lets the process-level fail-loud
++ * handler tell this normal teardown from a real load failure: a handler (or a
++ * library it awaits) that lets the reason escape as an unhandled rejection must
++ * never exit the Host.
++ */
++export class ClientDisconnectedError extends Error {
++  readonly dshClientDisconnected = true
++
++  constructor() {
++    super('client disconnected before the response completed')
++    this.name = 'AbortError'
++  }
++}
++
+ /** Default carrier cap for all HTTP RPC bodies: sized for the default
+  * aggregate image limit (200 MiB) after base64 expansion plus envelope
+  * headroom (~267.7 MiB required), rounded up for slack. The bridge buffers
+@@ -42,13 +79,19 @@ export async function bridge(
+   maxRequestBodyBytes = DEFAULT_MAX_REQUEST_BODY_BYTES,
+ ): Promise<void> {
+   const abort = new AbortController()
++  let clientDisconnected = false
++  /** Whether this carrier is already teardown: the client left, or an abort was raised for it. */
++  const disconnected = (): boolean => clientDisconnected || abort.signal.aborted
+   // Client-disconnect detection MUST hang off the response, not the request:
+   // since Node 16, IncomingMessage 'close' fires as soon as the request body is
+   // fully consumed (immediately for a bodyless GET), which would abort a
+   // streaming response right after open. ServerResponse 'close' fires on connection teardown;
+   // writableEnded distinguishes a normal end() from the client going away.
+   res.on('close', () => {
+-    if (!res.writableEnded) abort.abort()
++    if (res.writableEnded) return
++    clientDisconnected = true
++    debug('client disconnected before the response completed')
++    abort.abort(new ClientDisconnectedError())
+   })
+   /* v8 ignore next 2 -- node:http always sets url/method on server requests. */
+   const url = new URL(req.url ?? '/', 'http://dsh.internal')
+@@ -94,34 +137,64 @@ export async function bridge(
+       duplex: 'half',
+     } as RequestInit & { duplex: 'half' })
+   }
+-  const response = await apiHandler.fetch(request, peer)
++  let response: Response
++  try {
++    response = await apiHandler.fetch(request, peer)
++  } catch (error) {
++    // A disconnected client cancels its carrier: the handler's rejection is this request's
++    // teardown, not a Host failure. Nothing can be written to the socket it left behind.
++    if (disconnected()) {
++      debug('handler settled after client disconnect')
++      if (bodyMode === 'streaming' && !req.readableEnded) req.destroy()
++      return
++    }
++    throw error
++  }
+   const requestUnread = bodyMode === 'streaming' && !req.readableEnded
+-  const responseHeaders = Object.fromEntries(response.headers.entries())
+-  res.writeHead(response.status, requestUnread ? { ...responseHeaders, connection: 'close' } : responseHeaders)
++  if (disconnected() || res.destroyed) {
++    // The response body is still drained below: cancelling Node multipart bodies can race their
++    // producer, and a handler tied to the carrier signal settles only once it observes the abort.
++    debug('response abandoned by client')
++  } else {
++    const responseHeaders = Object.fromEntries(response.headers.entries())
++    try {
++      res.writeHead(response.status, requestUnread ? { ...responseHeaders, connection: 'close' } : responseHeaders)
++    } catch (error) {
++      // The socket can be gone between the guard above and the write itself; teardown, not failure.
++      if (!disconnected()) throw error
++      debug('response headers abandoned by client')
++    }
++  }
+   if (response.body === null) {
+-    res.end()
++    if (!disconnected() && !res.destroyed) res.end()
+     if (requestUnread) req.destroy()
+     return
+   }
+-  for await (const chunk of response.body) {
+-    // Drain without writing after disconnect: cancelling Node multipart bodies
+-    // can race their producer and reject with ERR_INVALID_STATE.
+-    if (abort.signal.aborted) continue
+-    // Backpressure: a false return means the socket buffer is full — wait for drain
+-    // instead of buffering unboundedly (slow or suspended consumers). 'close' also
+-    // resolves so a mid-wait disconnect cannot park this loop forever.
+-    if (!res.write(chunk) && !res.destroyed) {
+-      await new Promise<void>((resolve) => {
+-        const done = (): void => {
+-          res.off('drain', done)
+-          res.off('close', done)
+-          resolve()
+-        }
+-        res.once('drain', done)
+-        res.once('close', done)
+-      })
++  try {
++    for await (const chunk of response.body) {
++      // Drain without writing after disconnect: cancelling Node multipart bodies
++      // can race their producer and reject with ERR_INVALID_STATE.
++      if (disconnected()) continue
++      // Backpressure: a false return means the socket buffer is full — wait for drain
++      // instead of buffering unboundedly (slow or suspended consumers). 'close' also
++      // resolves so a mid-wait disconnect cannot park this loop forever.
++      if (!res.write(chunk) && !res.destroyed) {
++        await new Promise<void>((resolve) => {
++          const done = (): void => {
++            res.off('drain', done)
++            res.off('close', done)
++            resolve()
++          }
++          res.once('drain', done)
++          res.once('close', done)
++        })
++      }
+     }
++  } catch (error) {
++    // The body producer observes the same carrier teardown; its rejection is that teardown.
++    if (!disconnected()) throw error
++    debug('response body abandoned by client')
+   }
+-  res.end()
++  if (!disconnected() && !res.destroyed) res.end()
+   if (requestUnread) req.destroy()
+ }
+diff --git a/packages/client/connection/tests/http-bridge.host.spec.ts b/packages/client/connection/tests/http-bridge.host.spec.ts
+index e612a060..67b024bb 100644
+--- a/packages/client/connection/tests/http-bridge.host.spec.ts
++++ b/packages/client/connection/tests/http-bridge.host.spec.ts
+@@ -3,7 +3,7 @@ import { Readable } from 'node:stream'
+ import type { IncomingMessage, ServerResponse } from 'node:http'
+ import { Context } from '@deepseek-ai/cordis'
+ import { describe, expect, it } from 'vitest'
+-import { bridge } from '../src/http-bridge.ts'
++import { bridge, ClientDisconnectedError } from '../src/http-bridge.ts'
+ import { Peer } from '../src/peer.ts'
+ 
+ const PEER = new Peer(new Context(), { principal: { kind: 'owner' } })
+@@ -79,6 +79,46 @@ describe('HTTP bridge abort', () => {
+     expect(carrierSignal?.aborted).toBe(true)
+   })
+ 
++  it('settles quietly when the handler rejects with the teardown reason after the client left', async () => {
++    const body = JSON.stringify({
++      type: 'client-request', rpcId: 'handler-1', method: 'account/getProfile', payload: { args: {} },
++    })
++    const request = Readable.from([Buffer.from(body)]) as IncomingMessage
++    Object.assign(request, {
++      url: '/api/account/getProfile',
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++    })
++    const response = Object.assign(new EventEmitter(), {
++      destroyed: false,
++      writableEnded: false,
++      writeHead() { return this },
++      write() { return true },
++      end() { this.writableEnded = true; return this },
++    }) as unknown as ServerResponse
++    const started = Promise.withResolvers<undefined>()
++    const settled = Promise.withResolvers<never>()
++    let carrier: AbortSignal | undefined
++    const pending = bridge(request, response, {
++      requestBodyMode: () => 'buffered',
++      fetch: async (input) => {
++        carrier = input.signal
++        started.resolve(undefined)
++        await settled.promise
++        return Response.json({ ok: true })
++      },
++    }, PEER)
++    await started.promise
++    response.emit('close')
++    // A handler still awaiting work tied to the carrier rejects with the very reason the bridge
++    // aborted with. That escape used to reach the process as a fatal unhandled rejection; the
++    // carrier teardown must settle the bridge instead of failing the Host.
++    settled.reject(carrier!.reason)
++    await expect(pending).resolves.toBeUndefined()
++    expect(carrier?.reason).toBeInstanceOf(ClientDisconnectedError)
++    expect(Reflect.get(carrier!.reason as object, 'dshClientDisconnected')).toBe(true)
++  })
++
+   it.each(['write', 'backpressure'])('finishes a multipart response without further writes when the client closes during %s', async (phase) => {
+     const request = Readable.from([]) as IncomingMessage
+     Object.assign(request, { url: '/api/workspaceFiles/readBytes', method: 'GET', headers: {} })
 diff --git a/packages/client/ui-settings-account/README.md b/packages/client/ui-settings-account/README.md
 index 5c212e17..e8519c17 100644
 --- a/packages/client/ui-settings-account/README.md

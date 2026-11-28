@@ -359,6 +359,9 @@ jobs:
           build-args: |
             DSH_VERSION=${{ needs.check.outputs.dsh_version }}
             DSH_SOURCE_REF=${{ needs.check.outputs.source_ref }}
+            # Auth-fix switch: 1 (default) ships the patch, 0 ships stock upstream.
+            # A repository variable can pin it without editing this workflow.
+            DSH_AUTH_FIX=${{ vars.DSH_AUTH_FIX || '1' }}
             CUA_CLI_VERSION=${{ inputs.cua_cli_version || vars.CUA_CLI_VERSION || env.CUA_CLI_VERSION }}
             OPENCODE_VERSION=${{ github.event.inputs.opencode == 'false' && '0' || vars.OPENCODE_VERSION || env.OPENCODE_VERSION }}
             # Opt-in GPU support: the distro QEMU plus qemu-system-modules-opengl

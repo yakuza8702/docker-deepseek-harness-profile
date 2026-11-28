@@ -80,9 +80,11 @@ record_ready_log() {
 #
 #   applied=4b399c39   the built Host lib carries the two-strike expiry + durable
 #                      identity (one informational line)
-#   source, not applied a source-channel image that skipped the patch — a WARN,
-#                      because a sign-in can then be lost on restart and a single
-#                      401 still removes the stored grant
+#   applied=off        STOCK upstream, requested with DSH_AUTH_FIX=0 — a notice,
+#                      not a warning: the operator asked for the unpatched tree
+#   applied=no+source  a source-channel image that skipped the patch without the
+#                      switch recorded — a WARN, because a sign-in can then be
+#                      lost on restart and a single 401 still removes the grant
 #   npm                 silent on purpose: the stock image, expected, and the
 #                      README says so. Nothing to warn about on every boot.
 # ---------------------------------------------------------------------
@@ -94,10 +96,12 @@ report_auth_fix() {
   channel="$(sed -n 's/^channel=//p' "$status" 2>/dev/null | head -1)"
   if [[ "$applied" == "4b399c39" ]]; then
     log "auth fix: active — two-strike 401 expiry + durable account identity are in the built Host lib (base 4b399c39)"
+  elif [[ "$applied" == "off" ]]; then
+    log "auth fix: off — stock upstream 0.2.3-alpha.2, requested with DSH_AUTH_FIX=0 (no patch in this image)"
   elif [[ "$channel" == "source" ]]; then
-    log "WARN: this source-channel image was built WITHOUT patches/auth-fix.patch (DSH_SIGNIN_FIX=0?):"
+    log "WARN: this source-channel image was built WITHOUT patches/auth-fix.patch (DSH_AUTH_FIX=0?):"
     log "      a sign-in can still be lost on restart and ONE HTTP 401 still removes the stored grant."
-    log "      Rebuild with DSH_SIGNIN_FIX=1 (default) — see patches/README.md."
+    log "      Rebuild with DSH_AUTH_FIX=1 (default) — see patches/README.md."
   fi
 }
 # ---------------------------------------------------------------------

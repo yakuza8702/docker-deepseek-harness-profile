@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
+# DSH_AUTH_FIX is a build switch, not a credential: the Dockerfile linter reads "AUTH"
+# as a secret-bearing name. It carries "0" or "1" only, so the rule is skipped above.
 # =====================================================================
 # seek-harness — hardened DeepSeek Harness container
 #
@@ -65,12 +68,17 @@ RUN mkdir -p /opt/dsh /src
 # hunk no longer applies or when the compiled Host lib lacks the patch's markers,
 # so an upstream refactor can never silently ship the old behaviour.
 #
-#   DSH_SIGNIN_FIX=1 (default)  apply + verify on the source channel
-#   DSH_SIGNIN_FIX=0            build the source tree unpatched (debugging only)
+#   DSH_AUTH_FIX=1 (default)  apply + verify on the source channel: the shipped image
+#                             keeps the durable sign-in fix the user asked for
+#   DSH_AUTH_FIX=0            ship STOCK upstream: no patch, markers verified absent,
+#                             provenance/status "off" — the escape hatch that makes a
+#                             stock 0.2.3-alpha.2 image possible without editing files
 #
+# The switch is read by the applier too (`--auth-fix`), so a 0 build proves the compiled
+# artifact carries none of the patch's markers instead of trusting the build log.
 # Base commit and the full story: patches/README.md.
 # ---------------------------------------------------------------------
-ARG DSH_SIGNIN_FIX=1
+ARG DSH_AUTH_FIX=1
 COPY --chmod=0644 patches/auth-fix.patch /tmp/auth-fix.patch
 COPY --chmod=0644 tools/apply-dsh-source-patches.mjs /tmp/apply-dsh-source-patches.mjs
 
@@ -81,9 +89,11 @@ RUN if [ -z "${DSH_SOURCE_REF}" ]; then \
    && node -p "require('/opt/dsh/node_modules/@deepseek-ai/dsh/package.json').version" > /opt/dsh/.dsh-version \
    && echo "fetched @deepseek-ai/dsh $(cat /opt/dsh/.dsh-version) (npm)" \
    && /opt/dsh/node_modules/.bin/dsh --version \
-   && if [ "${DSH_SIGNIN_FIX}" = "1" ]; then \
+   && if [ "${DSH_AUTH_FIX}" = "1" ]; then \
         echo "NOTE: npm channel — @deepseek-ai/dsh ships compiled JavaScript, so patches/auth-fix.patch cannot be applied."; \
         echo "      Build with DSH_SOURCE_REF=dsh-v0.2.3-alpha.2 (workflow channel=github-tag) to ship the auth fix."; \
+      else \
+        echo "auth fix: off (DSH_AUTH_FIX=0) — npm channel is stock upstream anyway"; \
       fi; \
     fi
 
@@ -93,19 +103,17 @@ RUN if [ -n "${DSH_SOURCE_REF}" ]; then \
    && rm -rf /var/lib/apt/lists/* \
    && git clone --depth 1 --branch "${DSH_SOURCE_REF}" https://github.com/deepseek-ai/deepseek-harness.git /src \
    && npm install -g --no-audit --no-fund pnpm@10 \
-   && if [ "${DSH_SIGNIN_FIX}" = "1" ]; then \
+   && if [ "${DSH_AUTH_FIX}" = "1" ]; then \
         node /tmp/apply-dsh-source-patches.mjs /src \
-          --patch /tmp/auth-fix.patch --expect-base 4b399c39; \
+          --patch /tmp/auth-fix.patch --expect-base 4b399c39 --auth-fix 1; \
       else \
-        echo "auth fix: DSH_SIGNIN_FIX=${DSH_SIGNIN_FIX} — built WITHOUT patches/auth-fix.patch"; \
+        echo "auth fix: off (DSH_AUTH_FIX=0) — built WITHOUT patches/auth-fix.patch"; \
       fi \
    && cd /src \
    && (pnpm install --frozen-lockfile || pnpm install) \
    && pnpm run build \
-   && if [ "${DSH_SIGNIN_FIX}" = "1" ]; then \
-        node /tmp/apply-dsh-source-patches.mjs /src \
-          --verify-built --patch /tmp/auth-fix.patch; \
-      fi \
+   && node /tmp/apply-dsh-source-patches.mjs /src \
+        --verify-built --patch /tmp/auth-fix.patch --auth-fix "${DSH_AUTH_FIX}" \
    && node -p "require('/src/package.json').version" > /src/.dsh-version \
    && echo "built @deepseek-ai/dsh $(cat /src/.dsh-version) (source ${DSH_SOURCE_REF})" \
    && node /src/apps/cli/lib/bin.js --version; \
@@ -249,7 +257,7 @@ RUN if [ -f /opt/dsh/node_modules/.bin/dsh ]; then \
 # I am about to run carry the fix?":
 #
 #   applied=4b399c39    source channel, fix compiled into the Host lib
-#   applied=no + source source channel built with DSH_SIGNIN_FIX=0 (a WARN at boot)
+#   applied=off+source source channel built with DSH_AUTH_FIX=0 (stock; a notice at boot)
 #   applied=no + npm    the stock npm image (expected; the entrypoint stays quiet)
 #
 # The entrypoint logs one line from it on every boot (report_auth_fix).
@@ -271,7 +279,7 @@ RUN set -eu; \
     if grep -rq expiryConfirmed "$libdir" 2>/dev/null; then \
       printf 'applied=4b399c39\nchannel=source\n' > /opt/seek-harness/patches/auth-fix.status; \
     elif [ -d /opt/dsh-src/packages ]; then \
-      printf 'applied=no\nchannel=source\n' > /opt/seek-harness/patches/auth-fix.status; \
+      printf 'applied=off\nchannel=source\n' > /opt/seek-harness/patches/auth-fix.status; \
     elif [ -f /opt/dsh/node_modules/.bin/dsh ]; then \
       printf 'applied=no\nchannel=npm\n' > /opt/seek-harness/patches/auth-fix.status; \
     else \

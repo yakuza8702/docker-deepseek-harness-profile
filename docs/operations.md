@@ -43,9 +43,11 @@ restart, a single 401 no longer deleting the stored grant, and an honest "Can't
 reach DeepSeek right now / Try again" card instead of a blank one. It is a diff
 against the upstream **TypeScript sources**, so an image can only carry it on the
 **source** channel: the `dsh-fetch` stage applies it after the clone and before
-`pnpm run build` (`DSH_SIGNIN_FIX=1`, the default), then verifies the compiled Host
-lib carries it. Either step failing stops the build; `DSH_SIGNIN_FIX=0` builds the
-source tree unpatched (debugging only) and the entrypoint then warns at boot.
+`pnpm run build` (`DSH_AUTH_FIX=1`, the default), then verifies the compiled Host
+lib carries it. Either step failing stops the build; `DSH_AUTH_FIX=0` builds the
+source tree unpatched (stock upstream), the applier records `status: "off"`, the
+post-build check proves the markers are absent, and the entrypoint logs
+`auth fix: off` at boot.
 
 Consequence for this repository's automation: to keep `:latest` carrying the fix,
 build with `channel=github-tag` — the workflow input, or the repository variable

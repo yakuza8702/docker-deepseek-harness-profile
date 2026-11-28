@@ -202,6 +202,15 @@ upstream `0.2.3-alpha.2` (commit `4b399c39`) still has:
 * an account that reads as **signed out after a restart** while the Platform is
   unreachable — the identity is now persisted beside the grant and seeded back at
   boot, and only a *ready* Platform read replaces it;
+* a **fresh browser session, or a second device, shown as signed out** even though
+  the grant is on disk — `getProfile` now answers that persisted identity before
+  any Platform round-trip and refreshes it in the background, so a new cookie jar
+  and a restarted container both render the signed-in account while the Platform
+  is unreachable (the refresh is coalesced and shares the failure window);
+* the Host **exiting on a browser reload**: an aborted `/api` response is a normal
+  carrier teardown now — the bridge cancels with a marked `AbortError`, settles
+  without writing to the dead socket, and the fail-loud guard ignores that reason,
+  so a page reload, navigation or closed tab can never take the Host down;
 * **one HTTP 401 deleting the stored grant** (a proxy, a clock skew, a platform
   edge is enough — the "logged out again" / 403 storms): a rejection now only
   records a strike, and the grant is removed when a **second** rejection of the
@@ -222,8 +231,11 @@ rather than hammered.
 
 It is a patch against the upstream **TypeScript sources**, so it can only reach a
 **source build**: the image applies it between the clone and `pnpm run build`
-(`DSH_SIGNIN_FIX=1`, the default), then proves the compiled Host lib carries it and
-fails the build if the patch stops applying.
+(`DSH_AUTH_FIX=1`, the default), then proves the compiled Host lib carries it and
+fails the build if the patch stops applying. `--build-arg DSH_AUTH_FIX=0` is the
+escape hatch: the source tree is built unpatched, the applier records
+`status: "off"`, and the post-build check proves the markers are absent — the
+entrypoint logs `auth fix: off` for that image.
 
 ```bash
 docker build --build-arg DSH_SOURCE_REF=dsh-v0.2.3-alpha.2 -t seek-harness:auth-fix .

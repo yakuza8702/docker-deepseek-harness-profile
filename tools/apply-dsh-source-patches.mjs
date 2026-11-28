@@ -233,6 +233,54 @@ export function verifyBuilt(repo, patchFile = DEFAULT_PATCH, log = () => {}) {
   return { checks: checks.length, files: fileCount };
 }
 
+/**
+ * Whether this build enables the auth fix. The Dockerfile passes DSH_AUTH_FIX as a build arg
+ * (default 1, the fix); `0` (or false/off/no) ships the stock upstream tree, which is the escape
+ * hatch when the patch must not be in the image.
+ * @param {NodeJS.ProcessEnv} [env] environment to read.
+ * @returns {boolean} true unless the switch explicitly disables it.
+ */
+export function authFixEnabled(env = process.env) {
+  const raw = String(env.DSH_AUTH_FIX ?? "1").trim().toLowerCase();
+  return !["0", "false", "off", "no"].includes(raw);
+}
+
+/**
+ * Prove the COMPILED lib does NOT carry the patch — the stock artifact check a DSH_AUTH_FIX=0
+ * build runs after `pnpm run build`, so "stock" is verified rather than assumed.
+ * @param {string} repo built monorepo checkout.
+ * @param {string} [patchFile] patch whose BUILT_CHECKS markers must be absent.
+ * @param {(line: string) => void} [log]
+ * @returns {{ checks: number, files: number }}
+ */
+export function verifyAbsent(repo, patchFile = DEFAULT_PATCH, log = () => {}) {
+  const name = path.basename(patchFile);
+  const checks = BUILT_CHECKS[name];
+  if (!checks) throw new Error(`no compiled-artifact contract for ${name} — add one to BUILT_CHECKS`);
+  const problems = [];
+  let fileCount = 0;
+  for (const check of checks) {
+    const dir = path.join(repo, check.dir);
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+      problems.push(`${check.dir} does not exist — the package was not built (is this the source channel?)`);
+      continue;
+    }
+    const files = walkJs(dir);
+    fileCount += files.length;
+    const present = check.markers.filter(
+      (marker) => files.some((file) => readFileSync(file, "utf8").includes(marker)),
+    );
+    if (present.length > 0) {
+      problems.push(`${check.dir} still carries ${present.map((marker) => `'${marker}'`).join(", ")} — ${check.reason}`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(`DSH_AUTH_FIX=0 but the compiled artifact still carries ${name}:\n  ${problems.join("\n  ")}`);
+  }
+  log(`${name}: DSH_AUTH_FIX=0 — compiled artifact carries none of its markers (${checks.length} check(s), ${fileCount} file(s))`);
+  return { checks: checks.length, files: fileCount };
+}
+
 /** Parse argv; keeps the CLI honest about unknown options and missing values. */
 export function parseArgs(argv) {
   const args = {
@@ -241,6 +289,7 @@ export function parseArgs(argv) {
     expectBase: undefined,
     dryRun: false,
     verifyBuilt: false,
+    authFix: undefined,
     help: false,
   };
   const positional = [];
@@ -251,6 +300,11 @@ export function parseArgs(argv) {
       if (value === undefined || value.startsWith("--")) throw new Error(`${arg} needs a value`);
       if (arg === "--patch") args.patch = path.resolve(value);
       else args.expectBase = value;
+      index += 1;
+    } else if (arg === "--auth-fix") {
+      const value = argv[index + 1];
+      if (value !== "0" && value !== "1") throw new Error("--auth-fix needs 0 or 1");
+      args.authFix = value === "1";
       index += 1;
     } else if (arg === "--dry-run") args.dryRun = true;
     else if (arg === "--verify-built") args.verifyBuilt = true;
@@ -264,8 +318,11 @@ export function parseArgs(argv) {
 }
 
 const USAGE = `usage:
-  node tools/apply-dsh-source-patches.mjs <repo-dir> [--patch <file>] [--expect-base <sha>] [--dry-run]
-  node tools/apply-dsh-source-patches.mjs <repo-dir> --verify-built [--patch <file>]`;
+  node tools/apply-dsh-source-patches.mjs <repo-dir> [--patch <file>] [--expect-base <sha>] [--dry-run] [--auth-fix 0|1]
+  node tools/apply-dsh-source-patches.mjs <repo-dir> --verify-built [--patch <file>] [--auth-fix 0|1]
+
+--auth-fix defaults to DSH_AUTH_FIX (the Dockerfile build arg; 1 unless set to 0).
+With 1, --verify-built proves the markers are present; with 0 it proves they are absent (stock).`;
 
 /** CLI entry; returns the process exit code. */
 export function main(argv = process.argv.slice(2), log = (line) => console.log(line)) {
@@ -282,8 +339,24 @@ export function main(argv = process.argv.slice(2), log = (line) => console.log(l
   if (!existsSync(repo) || !statSync(repo).isDirectory()) {
     throw new Error(`not a directory: ${repo}`);
   }
+  const authFix = args.authFix ?? authFixEnabled();
   if (args.verifyBuilt) {
-    verifyBuilt(repo, args.patch, log);
+    if (authFix) verifyBuilt(repo, args.patch, log);
+    else verifyAbsent(repo, args.patch, log);
+    return 0;
+  }
+  if (!authFix) {
+    log(`auth fix: off (DSH_AUTH_FIX=0) — ${path.basename(args.patch)} is NOT applied`);
+    if (!args.dryRun) {
+      const file = writeProvenance(repo, [{
+        file: path.basename(args.patch),
+        sha256: sha256File(args.patch),
+        status: "off",
+        reason: "DSH_AUTH_FIX=0",
+        appliedAt: new Date().toISOString(),
+      }]);
+      log(`provenance: ${path.relative(repo, file) || file}`);
+    }
     return 0;
   }
   const result = applyPatch(repo, {
