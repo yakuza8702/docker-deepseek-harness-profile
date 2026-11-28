@@ -253,7 +253,18 @@ RUN if [ -f /opt/dsh/node_modules/.bin/dsh ]; then \
 #   applied=no + npm    the stock npm image (expected; the entrypoint stays quiet)
 #
 # The entrypoint logs one line from it on every boot (report_auth_fix).
+#
+# /opt/seek-harness IS CREATED BY THE FIRST COPY INTO IT, and `--chmod=0644`
+# stamps the directories that copy invents — measured on this base image:
+# `644 root:root /opt/seek-harness`. The image ends `USER node`, so a 0644
+# /opt/seek-harness hides EVERYTHING beneath it from the runtime user: the
+# entrypoint could not even read proxy.mjs, and the uid-1000 gate in the CUA
+# section failed with "EACCES: /opt/seek-harness/cua-check is not traversable by
+# uid 1000 (dir mode 755 root:root)" — the leaf was 0755, the parent was not.
+# Create the directory (and its subdir) 0755 BEFORE the first copy, the same
+# `install -d` treatment windows-oem, office-skills and ocr-tools get.
 # ---------------------------------------------------------------------
+RUN install -d -m 0755 /opt/seek-harness /opt/seek-harness/patches
 COPY --chmod=0644 patches/auth-fix.patch /opt/seek-harness/patches/auth-fix.patch
 RUN set -eu; \
     libdir=/opt/dsh-src/packages/account/deepseek-account/lib; \
@@ -1247,7 +1258,9 @@ COPY --chmod=0644 docker/proxy.mjs compose.yaml compose.windows.yaml .env.exampl
 RUN set -eux; \
     for dir in /usr/local/share/cua-vm/windows-oem /opt/seek-harness/cua-check; do \
       setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -x '$dir' && test -r '$dir'" \
-        || { echo "EACCES: $dir is not traversable by uid 1000 (dir mode $(stat -c '%a %U:%G' "$dir"))"; exit 1; }; \
+        || { echo "EACCES: $dir is not traversable by uid 1000 (dir mode $(stat -c '%a %U:%G' "$dir"))"; \
+             stat -c '  ancestor: %a %U:%G %n' "$(dirname "$dir")" "$(dirname "$(dirname "$dir")")" 2>/dev/null || true; \
+             exit 1; }; \
     done; \
     for f in Autounattend.xml setupcomplete.cmd cua-firstboot.ps1 Unattend.vbs cua-clip-agent.ps1 cua-mcp-relay.py cua-relay-guard.ps1; do \
       setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/usr/local/share/cua-vm/windows-oem/$f' && test -s '/usr/local/share/cua-vm/windows-oem/$f'" \
@@ -1259,7 +1272,7 @@ RUN set -eux; \
       setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "test -r '/opt/seek-harness/cua-check/$f' && test -s '/opt/seek-harness/cua-check/$f'" \
         || { echo "EACCES: the fallback copy /opt/seek-harness/cua-check/$f is unreadable by uid 1000"; exit 1; }; \
     done; \
-    stat -c '%a %U:%G %n' /usr/local/share/cua-vm /usr/local/share/cua-vm/windows-oem /opt/seek-harness/cua-check
+    stat -c '%a %U:%G %n' /opt/seek-harness /usr/local/share/cua-vm /usr/local/share/cua-vm/windows-oem /opt/seek-harness/cua-check
 RUN node /opt/seek-harness/check-cua-rea.mjs --root /opt/seek-harness/cua-check \
  && node /opt/seek-harness/check-cua-vm.mjs --root /opt/seek-harness/cua-check \
  && rm -f /opt/seek-harness/cua-check/Dockerfile
