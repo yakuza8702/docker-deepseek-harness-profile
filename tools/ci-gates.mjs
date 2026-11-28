@@ -250,6 +250,13 @@ const REPO_GATES = [
   // files only (two shell stubs and a temp store), so a push can always answer.
   { file: "scp-argv-check.mjs", args: [], label: "Windows put/get argv shape (scp -P, port never a path)" },
   { file: "check-recovery-page.mjs", args: [], label: "recovery page scripts parse" },
+  // SELECTIVE EGRESS. A gate for a shape, not a line: exporting one proxy address
+  // to the whole container made every socket depend on it, so an address the
+  // container could not resolve took the entire internet away (2026-11-28). This
+  // runs the router's own suite against local stubs (routed/direct, the DIRECT
+  // fail-safe, STRICT, the WebSocket relay, the probe exit codes) and asserts the
+  // wiring that keeps the upstream out of the general egress path.
+  { file: "check-egress-router.mjs", args: [], label: "selective egress: router suite + entrypoint/browser wiring" },
   { file: "check-tool-trim.mjs", args: [], label: "MCP catalogue trim policy" },
   // OFFLINE, and deliberately a HARD gate: the build-time bundle patches are
   // content-anchored, and on 2026-11-15 an upstream bundler change turned that

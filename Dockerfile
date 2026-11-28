@@ -428,7 +428,12 @@ RUN printf '%s\n' \
 # guard block there): pnpm refuses a lockfile tarball resolution without an
 # integrity unless the URL is git-hosted, so one Market install of a curated
 # release-archive plugin bricks every install in that profile.
-COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs docker/lockfile-integrity.mjs /opt/seek-harness/
+# egress-router.mjs: the loopback selective proxy the harness (and the embedded
+# browser) use for the Platform hosts. It must be readable by uid 1000 because the
+# entrypoint starts it as the runtime user, and it is started ONLY when
+# DSH_EGRESS_PROXY (or HTTPS_PROXY/ALL_PROXY) is set — see apply_egress_proxy.
+COPY docker/proxy.mjs docker/entrypoint.sh docker/recovery.mjs docker/lockfile-integrity.mjs \
+     docker/egress-router.mjs /opt/seek-harness/
 # The MCP tool-catalogue trimmer (see docker/mcp-slim.mjs): one proxy in front of
 # the two browser MCP servers, dropping the verbs the other one already offers and
 # compressing what is left. Its gate runs here so a policy that drops a tool the
@@ -445,6 +450,7 @@ COPY --chmod=0644 tools/check-cua-vm.mjs /opt/seek-harness/check-cua-vm.mjs
 # Hide the image-owned MCP rows from a user-installed MCP manager (see the file).
 COPY --chmod=0644 tools/patch-mcp-manager.mjs /opt/seek-harness/patch-mcp-manager.mjs
 RUN chmod 0755 /opt/seek-harness/proxy.mjs /opt/seek-harness/entrypoint.sh /opt/seek-harness/recovery.mjs \
+      /opt/seek-harness/egress-router.mjs \
  && ln -sfn /opt/seek-harness/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # The lockfile guard must recognise exactly the shapes pnpm accepts without an

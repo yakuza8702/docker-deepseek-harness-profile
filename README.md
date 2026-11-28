@@ -188,6 +188,11 @@ docker run --rm -it --entrypoint bash ghcr.io/yakuza8702/docker-deepseek-harness
 | `DSH_PERMISSION_MODE` | unset | `read-only` / `workspace-write` / `danger-full-access` — confined modes use the Landlock launcher that ships **inside the image** (kernel ≥ 5.13) and is probe-verified at build time; nothing to mount. `bwrap` is installed too but cannot create user namespaces under this hardening, so Landlock is the backend that runs |
 | `DSH_TOOLS_MODE` | unset | `native` / `ptc` / `both` |
 | `DSH_NODE_FLAGS` | `--expose-internals` | Node flags for the DSH main process only (agent children don't inherit) |
+| `DSH_EGRESS_PROXY` | unset | Optional upstream proxy used **only** for `DSH_EGRESS_ROUTE_HOSTS`; the entrypoint probes it, starts the loopback router and leaves the env unset when it is unusable. `HTTPS_PROXY`/`ALL_PROXY` are accepted as the same knob |
+| `DSH_EGRESS_ROUTE_HOSTS` | `chat.deepseek.com,platform.deepseek.com` | Comma list of hosts that travel through `DSH_EGRESS_PROXY`; every other host is tunneled DIRECT |
+| `DSH_EGRESS_STRICT` | `0` | `1` = a failed upstream CONNECT is a 502 instead of a DIRECT fallback |
+| `DSH_DESKTOP_PROXY` | `router` | Embedded Brave egress: `router` (same selective policy as the harness), `direct` (`--no-proxy-server`) or a `http://host:port` proxy URL |
+| `EGRESS_ROUTER_PORT` | `3090` | Loopback port of the egress router (must differ from `DSH_PORT`/`PROXY_PORT`) |
 
 ## Sign-in durability fix (source channel)
 
@@ -231,36 +236,72 @@ so an image built that way keeps upstream's behaviour — the build log says so.
 expiry …` on a patched source build). Base commit, scope and the update recipe:
 [patches/README.md](patches/README.md).
 
-## Platform egress — when only the CONTAINER cannot reach chat.deepseek.com
+## Platform egress — selective by design, never one proxy for the internet
 
-Symptom, seen in the field: the same build works when run on the host
-(`npx dsh web`, or the source checkout) but inside the container every account
-call fails with a **202 with a non-JSON body**:
+Symptom, seen in the field: the same build works on the host (`npx dsh web`, or
+the source checkout) but inside the container sign-in fails with *could not
+complete the operation* and every cloud model fails to load.
+
+### What is actually measured (from a container of this image)
+
+| request | result |
+| --- | --- |
+| `GET chat.deepseek.com/auth-api/v0/users/current`, Node/`curl` UA | **403**, CloudFront "Request blocked" page |
+| the same request in a **real Brave** navigation | **403** block page (not a UA problem) |
+| the same request with a browser `User-Agent` | **202**, empty body |
+| `GET platform.deepseek.com/auth-api/v0/users/current` | **403** / **202** (never JSON) |
+| `GET platform.deepseek.com/api/v0/users/get_user_summary` | **200 JSON** `{"code":40002,"msg":"Missing Token"}` |
+| `GET api.deepseek.com/models` | **401 JSON** (the API edge is fine) |
+
+So the Platform **auth-api/pages** are what rejects a container egress; the
+inference API is not. DSH reads the account and exchanges the sign-in code on
+`platform.deepseek.com/auth-api/v0/dsh/*`, and the authorize page it opens lives
+on `chat.deepseek.com` — both are behind that rejection. `docker logs` shows it
+as `[deepseek-account] response rejected { … stage: 'parse-json' }`; the local
+state stays fine, so the UI is the only thing that looks broken.
+
+The difference between host and container is the **egress path**, not the code:
+a host VPN/proxy is what usually makes the host work, and Docker traffic does not
+follow it.
+
+### The shape of the fix (and why the obvious fix was worse)
+
+The first attempt exported `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` to the whole
+container. That made **one** proxy address the egress path for **every** socket —
+Node fetch, curl, git, apt **and the embedded browser** (Chromium honours the
+upper-case spellings too: measured, `HTTPS_PROXY` alone made Brave issue
+`CONNECT example.com:443`). When that address was unreachable, the container lost
+its entire internet: no model, no package install, no web UI upstream. And it is
+unreachable by default — `host.docker.internal` does **not** resolve on a plain
+Linux/docker network, and inside dind it is the dind gateway, **not** the machine
+running your desktop Docker (measured: `getent hosts host.docker.internal` fails
+on both the default and a user-defined bridge).
+
+So the container is never told about the upstream directly. The entrypoint starts
+a **loopback router** (`docker/egress-router.mjs`) and points everything at it:
 
 ```
-[deepseek-account] response rejected { path: '/auth-api/v0/users/current',
-  status: 202, stage: 'parse-json', errorCode: 'protocol' }
-[deepseek-account] response rejected { path: '/auth-api/v0/users/logout', … 202 … }
+harness/browser ─► 127.0.0.1:3090 (router) ─┬─► chat.deepseek.com, platform.deepseek.com ─► upstream proxy
+                                            └─► everything else (api.deepseek.com, npm, git, …) ─► DIRECT
 ```
 
-Sign-in (the token exchange is a Host call), the account card and sign-out
-revocation all sit on those calls, so the UI reports an error even though the
-local state is fine. **This is not the harness and not your DeepSeek account**:
-`chat.deepseek.com` sits behind a CDN/WAF that answers a request profile it does
-not like with 202/403 and an HTML or empty body. Measured from a container:
-`curl`/Node with their default `User-Agent: node` get **403 "Request blocked"**
-(CloudFront), a browser `User-Agent` gets **202 with an empty body** — and the
-same requests from a residential/host network get the normal JSON.
+Four properties fall out of that shape:
 
-What differs between the host and the container is the **egress path**, not the
-code: DSH sends no User-Agent of its own (Node's `node`), so a host VPN/proxy is
-what usually makes the host work — and Docker traffic does not follow it.
+1. **General egress never depends on the proxy.** `api.deepseek.com` (the model
+   routes), npm, git and the web UI go out directly, exactly as before.
+2. **An unusable upstream is detected, not exported.** The entrypoint runs
+   `egress-router.mjs --probe` first: TCP-unreachable (or a URL that is not an
+   http(s) proxy) logs the cause and leaves the proxy env **unset** — the
+   container keeps direct egress and says why.
+3. **A routed request falls back to DIRECT** if the upstream refuses the CONNECT,
+   so a half-broken proxy degrades one host, never the container. Set
+   `DSH_EGRESS_STRICT=1` to forbid that fallback (a 502 instead).
+4. **The embedded browser uses the same route.** It is started with
+   `--proxy-server=http://127.0.0.1:3090` and the proxy env stripped, so the
+   sign-in authorize page takes the upstream route while noVNC and the harness UI
+   stay direct (the router relays WebSocket upgrades).
 
-### Fix: give the container the host's egress
-
-Point the container at the same HTTP proxy the host uses, and the entrypoint does
-the rest (Node's `fetch` ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1`;
-the entrypoint sets it when a proxy is configured):
+### Configure
 
 ```yaml
 # compose.override.yaml — local only
@@ -268,31 +309,56 @@ services:
   seek-harness:
     environment:
       DSH_EGRESS_PROXY: "http://host.docker.internal:7890"   # or any HTTPS_PROXY
+      # DSH_EGRESS_ROUTE_HOSTS: "chat.deepseek.com,platform.deepseek.com"  # default
+      # DSH_EGRESS_STRICT: "0"     # 1 = no DIRECT fallback for routed hosts
+      # DSH_DESKTOP_PROXY: "router"  # router (default) | direct | http://proxy:port
 ```
 
-or, one-shot:
-
-```bash
-docker run --add-host host.docker.internal:host-gateway \
-  -e DSH_EGRESS_PROXY=http://host.docker.internal:7890 … ghcr.io/…:latest
-```
+`host.docker.internal` is mapped by `compose.yaml` (`extra_hosts:
+host.docker.internal:host-gateway`), which fixes plain Linux/docker. Under
+**dind** that name is the dind container's gateway — point `DSH_EGRESS_PROXY` at
+an address the container can really reach (the host's LAN IP, or the proxy's own
+container/service name).
 
 If the host's route is a VPN interface rather than a proxy, give the container
 that route instead (`network_mode: host`, or a VPN sidecar) — the requirement is
-that the Platform sees the same source address it sees for the host.
+that the Platform sees the source address it sees for the host.
 
 ### Verify
 
 ```bash
-# inside the container: 401/200 + JSON means the edge accepts this egress;
-# 202/403 + HTML/empty means it does not (and no code change will fix that).
+# 1. what the entrypoint decided (every boot):
+docker compose logs seek-harness | grep 'egress:'
+#   ok:   egress: harness egress -> http://127.0.0.1:3090 (…); chat.deepseek.com,… -> http://…, all other hosts DIRECT
+#   bad:  WARN: egress: http://… is NOT usable from this container: … (the env stays unset)
+
+# 2. probe the upstream directly (same code path the entrypoint uses):
 docker compose exec seek-harness sh -c \
-  "curl -sS -o /dev/null -w '%{http_code}\n' -H 'x-dsh-auth-token: probe' \
-     https://chat.deepseek.com/auth-api/v0/users/current"
+  'EGRESS_UPSTREAM=http://host.docker.internal:7890 node /opt/seek-harness/egress-router.mjs --probe'
+#   exit 0 usable · 3 reachable but CONNECT refused · 2 unreachable
+
+# 3. what the Platform actually answers (401/200 + JSON = accepted;
+#    202/403 + HTML/empty = this egress is blocked, no code change will fix it):
+docker compose exec seek-harness sh -c \
+  "curl -sS -o /dev/null -w '%{http_code} %{content_type}\\n' -H 'x-dsh-auth-token: probe' \
+     https://platform.deepseek.com/auth-api/v0/users/current"
 ```
 
-`docker logs` shows the applied route on every boot:
-`egress: Node fetch routed through … (NODE_USE_ENV_PROXY=1, NO_PROXY=…)`.
+### Troubleshooting
+
+| log line | cause | fix |
+| --- | --- | --- |
+| `tcp=ENOTFOUND` | `host.docker.internal` does not resolve (dind, or no `extra_hosts`) | use the host's LAN IP, or the proxy's service name |
+| `tcp=ECONNREFUSED` | the proxy listens on the host's loopback only | bind it to the docker gateway / `0.0.0.0`, or forward the port |
+| `CONNECT 407` | the proxy wants auth | `http://user:pass@host:port` |
+| `CONNECT 403/502` (verdict `upstream-reachable-but-connect-refused`) | the proxy refuses CONNECT to that host | allow CONNECT to `chat.deepseek.com:443` and `platform.deepseek.com:443` |
+| `egress: router exited … restarting` | the router crashed | report it with `/tmp/dsh-egress-router.log`; the supervisor restarts it |
+| `egress: … keeping DIRECT egress` | the probe rejected the upstream | see the two rows above; the container is still online |
+
+The router itself is small and dependency-free (`docker/egress-router.mjs`); its
+contract — routed vs direct, the DIRECT fail-safe, `EGRESS_STRICT`, the
+WebSocket relay and the probe exit codes — is pinned by
+`tests/egress-router.mjs` and runs in `node tools/ci-gates.mjs`.
 
 ## What's inside (smanx devtools-latest set)
 

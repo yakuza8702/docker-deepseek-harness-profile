@@ -37,6 +37,14 @@ services:
     image: ghcr.io/yakuza8702/docker-deepseek-harness-profile:latest
     container_name: seek-harness
     restart: unless-stopped
+    # `host.docker.internal` is NOT defined on a plain Linux/docker network (and
+    # inside dind it is the dind gateway, not the machine running the desktop
+    # Docker). Without this line every `DSH_EGRESS_PROXY=http://host.docker.internal:…`
+    # fails name resolution — the entrypoint now detects and reports that instead
+    # of exporting a dead proxy. On dind, point DSH_EGRESS_PROXY at an address the
+    # container can truly reach (the host's LAN IP, or the proxy's own container).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       # DSH_BIND=127.0.0.1 (default, local only) or 0.0.0.0 (LAN, needs auth)
       - "${DSH_BIND:-127.0.0.1}:${PROXY_PORT:-3080}:${PROXY_PORT:-3080}"
@@ -66,16 +74,23 @@ services:
       DSH_TELEMETRY_DISABLED: "${DSH_TELEMETRY_DISABLED:-1}"
       DSH_PERMISSION_MODE: "${DSH_PERMISSION_MODE:-}"
       DSH_TOOLS_MODE: "${DSH_TOOLS_MODE:-}"
-      # Egress for the harness's OWN outbound calls (Platform account, model API).
-      # A VPN/proxy on the host is NOT inherited by the container: Docker hands it
-      # the host's default route, not the host's tunnel. Set one of these and the
-      # entrypoint exports NODE_USE_ENV_PROXY=1, because Node's fetch IGNORES the
-      # proxy env without it (README: "Platform egress").
+      # Egress: an OPTIONAL upstream proxy, used ONLY for the two Platform hosts
+      # (chat.deepseek.com / platform.deepseek.com). The entrypoint probes it and
+      # starts a loopback router; everything else keeps going out DIRECT. Setting
+      # this to an address the container cannot reach therefore no longer takes
+      # the whole internet away — the router is not exported at all and a warning
+      # names the cause (README: "Platform egress").
       DSH_EGRESS_PROXY: "${DSH_EGRESS_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"
       HTTP_PROXY: "${HTTP_PROXY:-}"
       ALL_PROXY: "${ALL_PROXY:-}"
       NO_PROXY: "${NO_PROXY:-}"
+      # What travels through the upstream, comma list (default: the Platform).
+      DSH_EGRESS_ROUTE_HOSTS: "${DSH_EGRESS_ROUTE_HOSTS:-}"
+      # 1 = a failed upstream CONNECT is an error instead of a DIRECT fallback.
+      DSH_EGRESS_STRICT: "${DSH_EGRESS_STRICT:-0}"
+      # router | direct | <proxy-url> — how the embedded browser egresses.
+      DSH_DESKTOP_PROXY: "${DSH_DESKTOP_PROXY:-router}"
       # --- browser desktop (Browser Use + human takeover) ---
       # There is deliberately NO desktop port here: Xvfb/x11vnc/websockify and
       # the browser all bind 127.0.0.1 inside the container and the reverse

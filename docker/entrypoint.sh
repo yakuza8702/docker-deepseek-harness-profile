@@ -101,33 +101,154 @@ report_auth_fix() {
   fi
 }
 # ---------------------------------------------------------------------
-# Egress proxy for the harness's OWN outbound calls (Platform account,
-# api.deepseek.com, web providers).
+# EGRESS — SELECTIVE, never global.
 #
-# WHY THIS EXISTS. Node's fetch IGNORES HTTP(S)_PROXY unless NODE_USE_ENV_PROXY=1
-# is set — measured on this image's Node 24.22.3: with it, fetch issues
-# `CONNECT <host>:443` to the proxy; without it, it connects directly and the env
-# is dead weight. A container whose egress differs from the host's (a VPN or a
-# proxy on the host that Docker traffic bypasses is the common case) therefore
-# reaches chat.deepseek.com from a different address, and the Platform edge
-# answers its account calls with a 202/403 NON-JSON body — the harness logs
-# `[deepseek-account] response rejected { … stage: 'parse-json' … }`, sign-in and
-# the account card fail, while the SAME build run on the host works.
+# THE STORY (2026-11-27/28, both halves measured from this image)
+# ---------------------------------------------------------------
+# chat.deepseek.com's edge answers a request from a container egress with a 403
+# "Request blocked" page (curl AND a real Brave navigation — measured), and a
+# browser User-Agent only turns that into a 202 with an EMPTY body. The Platform
+# account read (`GET https://platform.deepseek.com/auth-api/v0/users/current`)
+# answers the same way, so `[deepseek-account]` fails at `parse-json` and sign-in
+# cannot complete. The SAME build on the host (VPN/proxy egress) works, so the
+# difference is the egress path.
 #
-# `DSH_EGRESS_PROXY` is the explicit spelling; a plain HTTPS_PROXY / ALL_PROXY is
-# honoured too, so exporting the host's proxy is enough. Setting any of them
-# turns on NODE_USE_ENV_PROXY for the harness process (and only here: an
-# inherited value is respected, never forced off).
+# The first fix exported HTTPS_PROXY/HTTP_PROXY/ALL_PROXY to the whole container.
+# That was worse than the disease: ONE bad proxy address became the egress path
+# for EVERY socket (Node's fetch with NODE_USE_ENV_PROXY=1, curl, apt, git, and
+# the embedded browser — Chromium honours the upper-case spellings too: measured,
+# `HTTPS_PROXY` alone makes Brave issue `CONNECT example.com:443`). If the proxy
+# is unreachable — and `host.docker.internal` does NOT resolve inside a plain
+# Linux/dind network, measured here — the container loses the ENTIRE internet and
+# every cloud model fails to load. "The proxy is down" must never mean "the
+# container has no internet".
+#
+# THE SHAPE OF THE FIX
+# --------------------
+#   * egress-router.mjs (loopback, started here) is the ONLY proxy the container
+#     is told about. It sends the two Platform hosts to the operator's proxy and
+#     tunnels everything else DIRECT — api.deepseek.com, npmjs, git, the model
+#     routes all keep working when the proxy does not;
+#   * the upstream is PROBED first. An unreachable or wrong-address proxy is
+#     reported and the proxy env is simply NOT exported: the container stays on
+#     direct egress instead of losing the internet;
+#   * each routed request falls back to DIRECT if the upstream refuses it, so a
+#     dead/half-working proxy degrades one host, never the whole container
+#     (`DSH_EGRESS_STRICT=1` turns that fallback into a hard 502);
+#   * the embedded Brave is pointed at the same router (see start_desktop), so the
+#     sign-in browser leg uses the same route as the server side. `--no-proxy-server`
+#     via DSH_DESKTOP_PROXY=direct opts the browser back out.
+#
+# WHY THE ROUTER IS NOT JUST `HTTPS_PROXY=<upstream>`: there is no per-host
+# spelling of the proxy env. Routing the harness through the upstream and the
+# browser direct (or vice versa) is only expressible with a local hop.
 # ---------------------------------------------------------------------
+EGRESS_ROUTER="${EGRESS_ROUTER:-/opt/seek-harness/egress-router.mjs}"
+EGRESS_ROUTER_PORT="${EGRESS_ROUTER_PORT:-3090}"
+EGRESS_ROUTER_LOG="${EGRESS_ROUTER_LOG:-/tmp/dsh-egress-router.log}"
+EGRESS_ROUTE_HOSTS="${DSH_EGRESS_ROUTE_HOSTS:-chat.deepseek.com,platform.deepseek.com}"
+EGRESS_ROUTER_URL=""
+EGRESS_PID=""
+
+# Wait until a loopback port accepts a TCP connection; 0 = never opened.
+wait_for_port() {
+  local port="$1" tries="${2:-100}"
+  local i
+  for ((i = 0; i < tries; i++)); do
+    if node -e 'const net=require("node:net");const s=net.connect(+process.argv[1],"127.0.0.1");s.on("connect",()=>{s.destroy();process.exit(0)});s.on("error",()=>process.exit(1))' "$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 apply_egress_proxy() {
-  local proxy="${DSH_EGRESS_PROXY:-${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}}"
-  [[ -n "$proxy" ]] || return 0
+  local upstream="${DSH_EGRESS_PROXY:-${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}}"
+  [[ -n "$upstream" ]] || return 0
+
+  if [[ "$EGRESS_ROUTER_PORT" == "$DSH_PORT" || "$EGRESS_ROUTER_PORT" == "$PROXY_PORT" ]]; then
+    log "WARN: egress: EGRESS_ROUTER_PORT (${EGRESS_ROUTER_PORT}) collides with a service port — keeping DIRECT egress"
+    return 0
+  fi
+  if [[ ! -f "$EGRESS_ROUTER" ]]; then
+    log "WARN: egress: ${EGRESS_ROUTER} is missing from this image — keeping DIRECT egress (no proxy env exported)"
+    return 0
+  fi
+
+  # PROBE FIRST. This is the difference between "the proxy is broken" and "the
+  # container is offline": an address the container cannot reach must not become
+  # the egress path for everything.
+  local probe rc
+  probe="$(EGRESS_UPSTREAM="$upstream" EGRESS_ROUTE_HOSTS="$EGRESS_ROUTE_HOSTS" \
+           EGRESS_TIMEOUT_MS="${EGRESS_TIMEOUT_MS:-6000}" \
+           timeout 25 node "$EGRESS_ROUTER" --probe 2>&1)"
+  rc=$?
+  case "$rc" in
+    0)
+      log "egress: upstream ${upstream} reachable — routing ${EGRESS_ROUTE_HOSTS} through it, everything else DIRECT"
+      ;;
+    3)
+      log "WARN: egress: ${upstream} is reachable but REFUSES the Platform CONNECT:"
+      printf '%s\n' "$probe" | sed 's/^/      /' >&2
+      log "WARN: egress: routed hosts will fall back to DIRECT (set DSH_EGRESS_STRICT=1 to forbid that)"
+      ;;
+    *)
+      log "WARN: egress: ${upstream} is NOT usable from this container:"
+      printf '%s\n' "$probe" | sed 's/^/      /' >&2
+      log "WARN: egress: NOT exporting the proxy env — the container keeps DIRECT egress,"
+      log "      so cloud models, package installs and git keep working (this is the"
+      log "      regression that made EVERY model unreachable when the proxy was exported)."
+      log "      Fix the address and restart. Common causes:"
+      log "        * host.docker.internal does not resolve on a plain Linux/dind network —"
+      log "          add 'extra_hosts: [\"host.docker.internal:host-gateway\"]' (compose.yaml)"
+      log "          or use an address the container can actually reach (the host's LAN IP);"
+      log "        * the proxy is bound to 127.0.0.1 on the host only (it must listen on the"
+      log "          docker bridge/gateway interface for the container to reach it);"
+      log "        * the proxy needs auth: http://user:pass@host:port."
+      return 0
+      ;;
+  esac
+
+  # Supervisor loop: the router is the egress path for the harness AND the
+  # browser, so it must come back if it ever dies.
+  (
+    while :; do
+      EGRESS_UPSTREAM="$upstream" \
+      EGRESS_ROUTE_HOSTS="$EGRESS_ROUTE_HOSTS" \
+      EGRESS_ROUTER_HOST=127.0.0.1 \
+      EGRESS_ROUTER_PORT="$EGRESS_ROUTER_PORT" \
+      EGRESS_STRICT="${DSH_EGRESS_STRICT:-0}" \
+      EGRESS_TIMEOUT_MS="${EGRESS_TIMEOUT_MS:-20000}" \
+        node "$EGRESS_ROUTER" >>"$EGRESS_ROUTER_LOG" 2>&1
+      log "egress: router exited (status=$?) — restarting in 1s"
+      sleep 1
+    done
+  ) &
+  EGRESS_PID=$!
+
+  if ! wait_for_port "$EGRESS_ROUTER_PORT" 120; then
+    log "WARN: egress: the router never opened 127.0.0.1:${EGRESS_ROUTER_PORT} — keeping DIRECT egress"
+    log "      (last lines of ${EGRESS_ROUTER_LOG}:)"
+    tail -n 5 "$EGRESS_ROUTER_LOG" 2>/dev/null | sed 's/^/      /' >&2 || true
+    # The supervisor is a subshell wrapping the node process: signal both, or a
+    # router that never opened its port stays behind holding nothing useful.
+    pkill -TERM -P "$EGRESS_PID" 2>/dev/null || true
+    kill "$EGRESS_PID" 2>/dev/null || true
+    EGRESS_PID=""
+    return 0
+  fi
+
+  EGRESS_ROUTER_URL="http://127.0.0.1:${EGRESS_ROUTER_PORT}"
+  export HTTPS_PROXY="$EGRESS_ROUTER_URL" HTTP_PROXY="$EGRESS_ROUTER_URL" ALL_PROXY="$EGRESS_ROUTER_URL"
+  export https_proxy="$EGRESS_ROUTER_URL" http_proxy="$EGRESS_ROUTER_URL" all_proxy="$EGRESS_ROUTER_URL"
+  # Node's fetch ignores the proxy env without this (measured on Node 24.22.3).
   export NODE_USE_ENV_PROXY="${NODE_USE_ENV_PROXY:-1}"
-  export HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" ALL_PROXY="$proxy"
-  # Loopback must never be proxied: the reverse proxy, the web server and the
-  # MCP relays all live on 127.0.0.1 inside this container.
+  # Loopback must never be proxied: the reverse proxy, the web server, the MCP
+  # relays and the desktop stack all live on 127.0.0.1 inside this container.
   export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
-  log "egress: Node fetch routed through ${proxy} (NODE_USE_ENV_PROXY=${NODE_USE_ENV_PROXY}, NO_PROXY=${NO_PROXY})"
+  export no_proxy="$NO_PROXY"
+  log "egress: harness egress -> ${EGRESS_ROUTER_URL} (NODE_USE_ENV_PROXY=${NODE_USE_ENV_PROXY}); ${EGRESS_ROUTE_HOSTS} -> ${upstream}, all other hosts DIRECT"
 }
 
 # ---------------------------------------------------------------------
@@ -1176,12 +1297,45 @@ start_desktop() {
     log "desktop: /dev/shm is only $((shm_kb / 1024)) MB — starting the browser with --disable-dev-shm-usage (set shm_size on the service to remove this)"
   fi
 
+  # EGRESS FOR THE BROWSER — the same selective policy as the harness, never the
+  # raw upstream. Chromium does read the proxy env in its UPPER-CASE spelling
+  # (measured on this image's Brave 158: `HTTPS_PROXY` alone made it emit
+  # `CONNECT example.com:443`), so an unqualified export would drag the browser
+  # through whatever the harness uses — a second consumer of a hop that already
+  # proved able to take the whole container offline. Point the browser at the same
+  # loopback router while it exists: the Platform hosts take the upstream route
+  # (the sign-in authorize page is on chat.deepseek.com, which the container's own
+  # address cannot load: measured 403 CloudFront block page in a real Brave), and
+  # everything else — noVNC, the harness UI, the WebSocket event streams — is
+  # tunneled DIRECT. A dead proxy therefore costs one host, never the desktop.
+  #   DSH_DESKTOP_PROXY=direct   force DIRECT (--no-proxy-server)
+  #   DSH_DESKTOP_PROXY=<url>    force that proxy for the whole browser
+  declare -a browser_proxy=()
+  local desktop_proxy="${DSH_DESKTOP_PROXY:-router}"
+  if [[ "$desktop_proxy" == "direct" ]]; then
+    browser_proxy+=(--no-proxy-server)
+    desktop_proxy="direct (forced)"
+  elif [[ "$desktop_proxy" == "router" ]]; then
+    if [[ -n "${EGRESS_ROUTER_URL:-}" ]]; then
+      browser_proxy+=(--proxy-server="${EGRESS_ROUTER_URL}")
+      desktop_proxy="${EGRESS_ROUTER_URL} (selective: ${EGRESS_ROUTE_HOSTS} -> upstream, rest DIRECT)"
+    else
+      browser_proxy+=(--no-proxy-server)
+      desktop_proxy="direct (no egress router)"
+    fi
+  else
+    browser_proxy+=(--proxy-server="${desktop_proxy}")
+  fi
+  log "desktop: browser egress = ${desktop_proxy}"
+
   # Supervise the browser: a crash must not take the desktop (and with it the
   # panel and the model's browser tools) down for the rest of the container's
   # life.
   (
     while :; do
-      desktop_env brave-desktop \
+      desktop_env env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY \
+                     -u https_proxy -u http_proxy -u all_proxy -u NODE_USE_ENV_PROXY \
+        brave-desktop \
         --user-data-dir="$DESKTOP_PROFILE" \
         --password-store=basic \
         --remote-debugging-address=127.0.0.1 \
@@ -1190,6 +1344,7 @@ start_desktop() {
         --window-size="${DSH_DESKTOP_WIDTH},${DSH_DESKTOP_HEIGHT}" \
         --no-first-run --no-default-browser-check --hide-crash-restore-bubble \
         ${browser_extra[@]+"${browser_extra[@]}"} \
+        ${browser_proxy[@]+"${browser_proxy[@]}"} \
         "${DSH_DESKTOP_START_URL:-about:blank}" >>"$DESKTOP_TMP/logs/brave.log" 2>&1
       log "desktop: browser exited (status=$?) — restarting"
       sleep 1
