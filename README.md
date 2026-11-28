@@ -196,8 +196,9 @@ docker run --rm -it --entrypoint bash ghcr.io/yakuza8702/docker-deepseek-harness
 
 ## Sign-in durability fix (source channel)
 
-`patches/auth-fix.patch` fixes three defects in the DeepSeek account path that
-upstream `0.2.3-alpha.2` (commit `4b399c39`) still has:
+`patches/auth-fix.patch` fixes the sign-in defects in the DeepSeek account path
+that upstream `0.2.3-alpha.2` (commit `4b399c39`) still has, plus a Host-survival
+hardening on the same surface:
 
 * an account that reads as **signed out after a restart** while the Platform is
   unreachable — the identity is now persisted beside the grant and seeded back at
