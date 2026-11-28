@@ -231,6 +231,69 @@ so an image built that way keeps upstream's behaviour — the build log says so.
 expiry …` on a patched source build). Base commit, scope and the update recipe:
 [patches/README.md](patches/README.md).
 
+## Platform egress — when only the CONTAINER cannot reach chat.deepseek.com
+
+Symptom, seen in the field: the same build works when run on the host
+(`npx dsh web`, or the source checkout) but inside the container every account
+call fails with a **202 with a non-JSON body**:
+
+```
+[deepseek-account] response rejected { path: '/auth-api/v0/users/current',
+  status: 202, stage: 'parse-json', errorCode: 'protocol' }
+[deepseek-account] response rejected { path: '/auth-api/v0/users/logout', … 202 … }
+```
+
+Sign-in (the token exchange is a Host call), the account card and sign-out
+revocation all sit on those calls, so the UI reports an error even though the
+local state is fine. **This is not the harness and not your DeepSeek account**:
+`chat.deepseek.com` sits behind a CDN/WAF that answers a request profile it does
+not like with 202/403 and an HTML or empty body. Measured from a container:
+`curl`/Node with their default `User-Agent: node` get **403 "Request blocked"**
+(CloudFront), a browser `User-Agent` gets **202 with an empty body** — and the
+same requests from a residential/host network get the normal JSON.
+
+What differs between the host and the container is the **egress path**, not the
+code: DSH sends no User-Agent of its own (Node's `node`), so a host VPN/proxy is
+what usually makes the host work — and Docker traffic does not follow it.
+
+### Fix: give the container the host's egress
+
+Point the container at the same HTTP proxy the host uses, and the entrypoint does
+the rest (Node's `fetch` ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1`;
+the entrypoint sets it when a proxy is configured):
+
+```yaml
+# compose.override.yaml — local only
+services:
+  seek-harness:
+    environment:
+      DSH_EGRESS_PROXY: "http://host.docker.internal:7890"   # or any HTTPS_PROXY
+```
+
+or, one-shot:
+
+```bash
+docker run --add-host host.docker.internal:host-gateway \
+  -e DSH_EGRESS_PROXY=http://host.docker.internal:7890 … ghcr.io/…:latest
+```
+
+If the host's route is a VPN interface rather than a proxy, give the container
+that route instead (`network_mode: host`, or a VPN sidecar) — the requirement is
+that the Platform sees the same source address it sees for the host.
+
+### Verify
+
+```bash
+# inside the container: 401/200 + JSON means the edge accepts this egress;
+# 202/403 + HTML/empty means it does not (and no code change will fix that).
+docker compose exec seek-harness sh -c \
+  "curl -sS -o /dev/null -w '%{http_code}\n' -H 'x-dsh-auth-token: probe' \
+     https://chat.deepseek.com/auth-api/v0/users/current"
+```
+
+`docker logs` shows the applied route on every boot:
+`egress: Node fetch routed through … (NODE_USE_ENV_PROXY=1, NO_PROXY=…)`.
+
 ## What's inside (smanx devtools-latest set)
 
 `git` `curl` `wget` `nano` `jq` `less` `ripgrep` `rsync` `procps` `ca-certificates` `unzip` `vim` `zip` `htop` `tmux` `tree` `openssl` `python3` `bash-completion` `build-essential` (via base image) · npm globals: **pnpm** (pinned) · **uv** (`uvx` for MCP servers) · **docker CLI + compose plugin** · `tini` · `bubblewrap` (DSH Linux sandbox backend)

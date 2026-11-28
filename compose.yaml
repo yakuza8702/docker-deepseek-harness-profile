@@ -66,6 +66,16 @@ services:
       DSH_TELEMETRY_DISABLED: "${DSH_TELEMETRY_DISABLED:-1}"
       DSH_PERMISSION_MODE: "${DSH_PERMISSION_MODE:-}"
       DSH_TOOLS_MODE: "${DSH_TOOLS_MODE:-}"
+      # Egress for the harness's OWN outbound calls (Platform account, model API).
+      # A VPN/proxy on the host is NOT inherited by the container: Docker hands it
+      # the host's default route, not the host's tunnel. Set one of these and the
+      # entrypoint exports NODE_USE_ENV_PROXY=1, because Node's fetch IGNORES the
+      # proxy env without it (README: "Platform egress").
+      DSH_EGRESS_PROXY: "${DSH_EGRESS_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      ALL_PROXY: "${ALL_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-}"
       # --- browser desktop (Browser Use + human takeover) ---
       # There is deliberately NO desktop port here: Xvfb/x11vnc/websockify and
       # the browser all bind 127.0.0.1 inside the container and the reverse

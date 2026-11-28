@@ -101,6 +101,36 @@ report_auth_fix() {
   fi
 }
 # ---------------------------------------------------------------------
+# Egress proxy for the harness's OWN outbound calls (Platform account,
+# api.deepseek.com, web providers).
+#
+# WHY THIS EXISTS. Node's fetch IGNORES HTTP(S)_PROXY unless NODE_USE_ENV_PROXY=1
+# is set — measured on this image's Node 24.22.3: with it, fetch issues
+# `CONNECT <host>:443` to the proxy; without it, it connects directly and the env
+# is dead weight. A container whose egress differs from the host's (a VPN or a
+# proxy on the host that Docker traffic bypasses is the common case) therefore
+# reaches chat.deepseek.com from a different address, and the Platform edge
+# answers its account calls with a 202/403 NON-JSON body — the harness logs
+# `[deepseek-account] response rejected { … stage: 'parse-json' … }`, sign-in and
+# the account card fail, while the SAME build run on the host works.
+#
+# `DSH_EGRESS_PROXY` is the explicit spelling; a plain HTTPS_PROXY / ALL_PROXY is
+# honoured too, so exporting the host's proxy is enough. Setting any of them
+# turns on NODE_USE_ENV_PROXY for the harness process (and only here: an
+# inherited value is respected, never forced off).
+# ---------------------------------------------------------------------
+apply_egress_proxy() {
+  local proxy="${DSH_EGRESS_PROXY:-${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}}"
+  [[ -n "$proxy" ]] || return 0
+  export NODE_USE_ENV_PROXY="${NODE_USE_ENV_PROXY:-1}"
+  export HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" ALL_PROXY="$proxy"
+  # Loopback must never be proxied: the reverse proxy, the web server and the
+  # MCP relays all live on 127.0.0.1 inside this container.
+  export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
+  log "egress: Node fetch routed through ${proxy} (NODE_USE_ENV_PROXY=${NODE_USE_ENV_PROXY}, NO_PROXY=${NO_PROXY})"
+}
+
+# ---------------------------------------------------------------------
 # `~/.dsh` must BE the harness home (fresh-start trap).
 #
 # This image keeps HOME=/workspace on purpose (the Web UI's directory picker
@@ -803,6 +833,10 @@ fi
 
 # Auth fix provenance — one line on every boot (patches/README.md).
 report_auth_fix
+
+# Route the harness's outbound calls through the operator's proxy, if any: Node's
+# fetch ignores the env without NODE_USE_ENV_PROXY (see apply_egress_proxy).
+apply_egress_proxy
 
 # ---------------------------------------------------------------------
 # Docker access diagnostics (non-fatal — purely informational)
