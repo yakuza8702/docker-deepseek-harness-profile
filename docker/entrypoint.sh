@@ -150,14 +150,17 @@ EGRESS_ROUTE_HOSTS="${DSH_EGRESS_ROUTE_HOSTS:-chat.deepseek.com,platform.deepsee
 EGRESS_ROUTER_URL=""
 EGRESS_PID=""
 
-# Wait until a loopback port accepts a TCP connection; 0 = never opened.
+# 0 = something is listening on that loopback port right now.
+port_open() {
+  node -e 'const net=require("node:net");const s=net.connect(+process.argv[1],"127.0.0.1");s.on("connect",()=>{s.destroy();process.exit(0)});s.on("error",()=>process.exit(1))' "$1" 2>/dev/null
+}
+
+# Wait until a loopback port accepts a TCP connection; 1 = never opened.
 wait_for_port() {
   local port="$1" tries="${2:-100}"
   local i
   for ((i = 0; i < tries; i++)); do
-    if node -e 'const net=require("node:net");const s=net.connect(+process.argv[1],"127.0.0.1");s.on("connect",()=>{s.destroy();process.exit(0)});s.on("error",()=>process.exit(1))' "$port" 2>/dev/null; then
-      return 0
-    fi
+    port_open "$port" && return 0
     sleep 0.1
   done
   return 1
@@ -179,11 +182,14 @@ apply_egress_proxy() {
   # PROBE FIRST. This is the difference between "the proxy is broken" and "the
   # container is offline": an address the container cannot reach must not become
   # the egress path for everything.
-  local probe rc
+  # `|| rc=$?` is load-bearing: this script runs under `set -e`, and a bare
+  # assignment from a failing command substitution would KILL THE ENTRYPOINT —
+  # i.e. the very case this probe exists to survive (an unusable proxy) would
+  # abort the boot instead of falling back to direct egress.
+  local probe rc=0
   probe="$(EGRESS_UPSTREAM="$upstream" EGRESS_ROUTE_HOSTS="$EGRESS_ROUTE_HOSTS" \
            EGRESS_TIMEOUT_MS="${EGRESS_TIMEOUT_MS:-6000}" \
-           timeout 25 node "$EGRESS_ROUTER" --probe 2>&1)"
-  rc=$?
+           timeout 25 node "$EGRESS_ROUTER" --probe 2>&1)" || rc=$?
   case "$rc" in
     0)
       log "egress: upstream ${upstream} reachable — routing ${EGRESS_ROUTE_HOSTS} through it, everything else DIRECT"
@@ -210,6 +216,16 @@ apply_egress_proxy() {
       ;;
   esac
 
+  # A port that is ALREADY taken is not "our router": exporting a proxy env that
+  # points at some other listener would be the same class of failure this whole
+  # change removes. Stay direct and say so.
+  if port_open "$EGRESS_ROUTER_PORT"; then
+    log "WARN: egress: 127.0.0.1:${EGRESS_ROUTER_PORT} is already in use (leftover router or another process) —"
+    log "      not starting a second one and not exporting the proxy env; keeping DIRECT egress."
+    log "      Set EGRESS_ROUTER_PORT to a free port to use the upstream proxy."
+    return 0
+  fi
+
   # Supervisor loop: the router is the egress path for the harness AND the
   # browser, so it must come back if it ever dies.
   (
@@ -220,8 +236,10 @@ apply_egress_proxy() {
       EGRESS_ROUTER_PORT="$EGRESS_ROUTER_PORT" \
       EGRESS_STRICT="${DSH_EGRESS_STRICT:-0}" \
       EGRESS_TIMEOUT_MS="${EGRESS_TIMEOUT_MS:-20000}" \
-        node "$EGRESS_ROUTER" >>"$EGRESS_ROUTER_LOG" 2>&1
-      log "egress: router exited (status=$?) — restarting in 1s"
+        node "$EGRESS_ROUTER" >>"$EGRESS_ROUTER_LOG" 2>&1 && router_status=0 || router_status=$?
+      # Same reason as the probe: under `set -e` the failing node call would end
+      # the supervisor subshell, leaving the container with no router at all.
+      log "egress: router exited (status=${router_status}) — restarting in 1s"
       sleep 1
     done
   ) &

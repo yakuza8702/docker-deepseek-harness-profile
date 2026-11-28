@@ -101,6 +101,14 @@ check("an unusable upstream leaves the proxy env UNSET (no total egress loss)", 
   if (!/return 0/.test(failBranch)) throw new Error("the failure branch does not return to direct egress");
 });
 
+check("a failing probe/router cannot abort the boot (the script runs under set -e)", () => {
+  if (!/^set -euo pipefail$/m.test(entrypoint)) throw new Error("the entrypoint no longer runs under set -e — re-check this hazard");
+  // A bare `probe="$(…)"` whose command substitution fails would kill the whole
+  // entrypoint: the one case the probe exists to survive would abort the boot.
+  if (!/probe="\$\([\s\S]*?\)" \|\| rc=\$\?/.test(proxyFn)) throw new Error("the probe assignment is not errexit-safe");
+  if (!/router_status=0 \|\| router_status=\$\?/.test(proxyFn)) throw new Error("the supervisor loop is not errexit-safe");
+});
+
 check("the exported proxy points at the LOOPBACK ROUTER, never at the upstream", () => {
   if (!/EGRESS_ROUTER_URL="http:\/\/127\.0\.0\.1:\$\{EGRESS_ROUTER_PORT\}"/.test(entrypoint)) throw new Error("EGRESS_ROUTER_URL is not loopback");
   if (!/export HTTPS_PROXY="\$EGRESS_ROUTER_URL"/.test(proxyFn)) throw new Error("HTTPS_PROXY is not the router");
