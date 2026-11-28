@@ -1,5 +1,5 @@
 diff --git a/docs/subsystems/account.md b/docs/subsystems/account.md
-index 22073c8a..f4848dd5 100644
+index 22073c8a..c82f115b 100644
 --- a/docs/subsystems/account.md
 +++ b/docs/subsystems/account.md
 @@ -8,7 +8,7 @@ Source: [`packages/account/deepseek-account/src/index.ts`](../../packages/accoun
@@ -7,12 +7,12 @@ index 22073c8a..f4848dd5 100644
  ## Request credentials
  
 -`resolveRequestCredential(url)` is Host-only. It answers `undefined` while signed out, during credential removal, and for any destination outside the configured `inferenceOrigin`; otherwise it returns an `AccountRequestCredential` whose `headers` carry the token as `x-dsh-auth-token` and whose `reject()` removes the stored grant only while it still matches that token, containing storage failures so the caller reports the destination's rejection. Its `revoked` signal aborts when the account signs out of the sign-in that token belongs to, by the user or after a rejection, once the `deepseek-account/signed-out` listeners have returned; the account model route and the DeepSeek web providers run each model, Files, Search, and Fetch request that carries the token under it, so a sign-out ends those requests even after the plugin that sent them has unloaded. Consumers do not call it themselves: [`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.md) asks for the credential on behalf of the `deepseek-account` model route and the DeepSeek web providers, for a destination under the origin of that route's base URL or, without that route, of `DEEPSEEK_BASE_URL`. `reject()` runs on the account service mounted when it is called, so a reload between a request and the destination's answer still removes the grant; without a mounted service it leaves the grant for the next one to reject. A credential released by an account service that has since been replaced keeps an unaborted signal, because the replacement withdraws only the credentials it released.
-+`resolveRequestCredential(url)` is Host-only. It answers `undefined` while signed out, during credential removal, and for any destination outside the configured `inferenceOrigin`; otherwise it returns an `AccountRequestCredential` whose `headers` carry the token as `x-dsh-auth-token` and whose `reject()` reports the destination's rejection under the account service's two-answer rule: the grant is removed only once a second rejection of that token at least one request deadline later confirms it and while the grant still matches the token, containing storage failures so the caller reports the destination's rejection. Its `revoked` signal aborts when the account signs out of the sign-in that token belongs to, by the user or after a rejection, once the `deepseek-account/signed-out` listeners have returned; the account model route and the DeepSeek web providers run each model, Files, Search, and Fetch request that carries the token under it, so a sign-out ends those requests even after the plugin that sent them has unloaded. Consumers do not call it themselves: [`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.md) asks for the credential on behalf of the `deepseek-account` model route and the DeepSeek web providers, for a destination under the origin of that route's base URL or, without that route, of `DEEPSEEK_BASE_URL`. `reject()` runs on the account service mounted when it is called, so a reload between a request and the destination's answer still removes the grant; without a mounted service it leaves the grant for the next one to reject. A credential released by an account service that has since been replaced keeps an unaborted signal, because the replacement withdraws only the credentials it released.
++`resolveRequestCredential(url)` is Host-only. It answers `undefined` while signed out, during credential removal, and for any destination outside the configured `inferenceOrigin`; otherwise it returns an `AccountRequestCredential` whose `headers` carry the token as `x-dsh-auth-token` and whose `reject()` reports the destination's rejection under the account service's two-answer rule: the grant is removed only once a second rejection of that token at least one request deadline later confirms it and while the grant still matches the token, containing storage failures so the caller reports the destination's rejection. Its `revoked` signal aborts when the account signs out of the sign-in that token belongs to, by the user or after a rejection, once the `deepseek-account/signed-out` listeners have returned; the account model route and the DeepSeek web providers run each model, Files, Search, and Fetch request that carries the token under it, so a sign-out ends those requests even after the plugin that sent them has unloaded. Consumers do not call it themselves: [`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.md) asks for the credential on behalf of the `deepseek-account` model route and the DeepSeek web providers, for a destination under the origin of that route's base URL or, without that route, of `DEEPSEEK_BASE_URL`. `reject()` runs on the account service mounted when it is called, so a reload between a request and the destination's answer still removes the grant; without a mounted service it leaves the grant for the next one to reject. A credential released by an account service that has since been replaced keeps an unaborted signal, because the replacement withdraws only the credentials it released. A detail read the destination does not answer (an HTTP 202 challenge, a 5xx, a timeout) is retried once immediately; a RUN of consecutive failures for one field opens a doubling window (5 s to 60 s) in which profile and wallet reads replay their last outcome without another round trip, so a destination that rejects every request is probed rather than hammered and a signed-in account keeps its cached identity.
  
  Model routes that bill the account register a running-task report with `registerRunningTaskReport(report)` inside `ctx.effect()`; `hasRunningAccountTasks()` answers true while any report does, so the sign-out confirmation can warn about work the sign-out interrupts. The route plugin owns cancellation of that work after `deepseek-account/signed-out`; a request that outlives the plugin ends through its credential's `revoked` signal, and the plugin's failure callback for that request cancels the work.
  
 diff --git a/docs/subsystems/account.zh.md b/docs/subsystems/account.zh.md
-index fc54815c..dfe69b47 100644
+index fc54815c..d0bcfebf 100644
 --- a/docs/subsystems/account.zh.md
 +++ b/docs/subsystems/account.zh.md
 @@ -8,7 +8,7 @@
@@ -20,12 +20,12 @@ index fc54815c..dfe69b47 100644
  ## 请求凭据
  
 -`resolveRequestCredential(url)` 仅限 Host。未登录、凭据删除进行中，以及目标地址不在配置的 `inferenceOrigin` 之内时，它回答 `undefined`；否则返回一个 `AccountRequestCredential`：`headers` 以 `x-dsh-auth-token` 携带 token，`reject()` 仅在已存授权仍与该 token 一致时删除它，并隔离存储失败，使调用方报告的是目标地址的拒绝。其 `revoked` 信号在账号退出该 token 所属的登录时中止，无论退登由用户发起还是由拒绝触发，且在 `deepseek-account/signed-out` 的监听器返回之后；账号模型路由和 DeepSeek Web 提供方让携带该 token 的每个模型、Files、Search 与 Fetch 请求受它约束，因此即使发出请求的插件已卸载，退登仍会结束这些请求。消费方不直接调用它：[`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.zh.md) 代 `deepseek-account` 模型路由和 DeepSeek Web 提供方索取这份凭据，目标地址位于该路由基础地址的 origin 之下；没有该路由时，位于 `DEEPSEEK_BASE_URL` 的 origin 之下。`reject()` 在被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会移除授权；没有挂载的服务时，授权留给下一个挂载的服务处理。已被替换的账号服务释放的凭据，其信号保持未中止，因为替换后的服务只撤回自己释放的凭据。
-+`resolveRequestCredential(url)` 仅限 Host。未登录、凭据删除进行中，以及目标地址不在配置的 `inferenceOrigin` 之内时，它回答 `undefined`；否则返回一个 `AccountRequestCredential`：`headers` 以 `x-dsh-auth-token` 携带 token，`reject()` 按账号服务的两次应答规则上报目标的拒绝——只有在同一 token 的第二次拒绝至少间隔一个请求期限之后确认、且已存授权仍与该 token 一致时才删除它，并隔离存储失败，使调用方报告的是目标地址的拒绝。其 `revoked` 信号在账号退出该 token 所属的登录时中止，无论退登由用户发起还是由拒绝触发，且在 `deepseek-account/signed-out` 的监听器返回之后；账号模型路由和 DeepSeek Web 提供方让携带该 token 的每个模型、Files、Search 与 Fetch 请求受它约束，因此即使发出请求的插件已卸载，退登仍会结束这些请求。消费方不直接调用它：[`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.zh.md) 代 `deepseek-account` 模型路由和 DeepSeek Web 提供方索取这份凭据，目标地址位于该路由基础地址的 origin 之下；没有该路由时，位于 `DEEPSEEK_BASE_URL` 的 origin 之下。`reject()` 在被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会移除授权；没有挂载的服务时，授权留给下一个挂载的服务处理。已被替换的账号服务释放的凭据，其信号保持未中止，因为替换后的服务只撤回自己释放的凭据。
++`resolveRequestCredential(url)` 仅限 Host。未登录、凭据删除进行中，以及目标地址不在配置的 `inferenceOrigin` 之内时，它回答 `undefined`；否则返回一个 `AccountRequestCredential`：`headers` 以 `x-dsh-auth-token` 携带 token，`reject()` 按账号服务的两次应答规则上报目标的拒绝——只有在同一 token 的第二次拒绝至少间隔一个请求期限之后确认、且已存授权仍与该 token 一致时才删除它，并隔离存储失败，使调用方报告的是目标地址的拒绝。其 `revoked` 信号在账号退出该 token 所属的登录时中止，无论退登由用户发起还是由拒绝触发，且在 `deepseek-account/signed-out` 的监听器返回之后；账号模型路由和 DeepSeek Web 提供方让携带该 token 的每个模型、Files、Search 与 Fetch 请求受它约束，因此即使发出请求的插件已卸载，退登仍会结束这些请求。消费方不直接调用它：[`ctx.deepseekAuth`](../../packages/account/deepseek-auth/README.zh.md) 代 `deepseek-account` 模型路由和 DeepSeek Web 提供方索取这份凭据，目标地址位于该路由基础地址的 origin 之下；没有该路由时，位于 `DEEPSEEK_BASE_URL` 的 origin 之下。`reject()` 在被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会移除授权；没有挂载的服务时，授权留给下一个挂载的服务处理。已被替换的账号服务释放的凭据，其信号保持未中止，因为替换后的服务只撤回自己释放的凭据。 目标地址不给出答案的详情读取（HTTP 202 挑战、5xx、超时）会立即重试一次；同一字段的连续失败会开启一个倍增的窗口（5 秒至 60 秒），窗口内资料与钱包读取重放上一次结果而不再发出请求，因此持续拒绝请求的目标只会被探测而不是被反复冲击，已登录账号继续使用缓存的身份。
  
  按账号计费的模型路由在 `ctx.effect()` 内用 `registerRunningTaskReport(report)` 注册运行中任务报告；只要有报告回答 true，`hasRunningAccountTasks()` 就回答 true，使退登确认能够提醒退登将打断的工作。`deepseek-account/signed-out` 之后取消这些工作由路由插件负责；比插件存活更久的请求通过其凭据的 `revoked` 信号结束，插件为该请求提供的失败回调随后取消这些工作。
  
 diff --git a/packages/account/deepseek-account/README.md b/packages/account/deepseek-account/README.md
-index 5874a864..f2f304ce 100644
+index 5874a864..f6f9b1e8 100644
 --- a/packages/account/deepseek-account/README.md
 +++ b/packages/account/deepseek-account/README.md
 @@ -13,7 +13,7 @@ getPlatformSession exports the stored grant only when its issuer matches platfor
@@ -33,7 +33,7 @@ index 5874a864..f2f304ce 100644
  `desktopPlatform` defaults to `null`, which sends `x-client-platform: web`; the Desktop profile supplies `darwin` or `win32`, becoming `desktop-mac` or `desktop-win`. The service owns all five headers, so deployment configuration cannot override them; `x-client-bundle-id` is intentionally empty, and `x-client-locale` reduces the caller's language to `zh_CN` or `en_US`. PlatformSession carries deployment headers only, and the embedding client composes the same five headers for the Platform documents and API requests it opens, only at the configured origin.
  
 -Profile and balance HTTP 401 responses or top-level response code `40003` (invalid authorization) clear the rejected local grant and emit the live `deepseek-account/session-expired` notification. Concurrent responses share one removal; responses from an invalidated credential generation cannot clear its replacement. Other HTTP failures retain the grant. `resolveRequestCredential(url)` releases the credential for one allowed destination as the request headers, a `reject()` that removes the stored grant after an HTTP 401 while it still matches that token, containing storage failures, and a `revoked` signal; the removal runs on the account service mounted when `reject()` is called, so a reload between the request and the destination's answer still removes the grant. [`ctx.deepseekAuth`](../deepseek-auth/README.md) calls it for the account model route and the DeepSeek web providers, which end the request that carries the token when `revoked` aborts.
-+Profile and balance HTTP 401 responses or top-level response code `40003` (invalid authorization) record one rejection of the current grant; the grant is removed and the live `deepseek-account/session-expired` notification emitted only once a second rejection of the same token arrives at least `requestTimeoutMs` after the first and outside the boot grace, because one rejection is not proof that the token is invalid. A ready profile read, a new sign-in, and a completed removal each clear the run. Concurrent confirmed responses share one removal; responses from an invalidated credential generation cannot clear its replacement. Other HTTP failures retain the grant. `resolveRequestCredential(url)` releases the credential for one allowed destination as the request headers, a `reject()` that reports the destination's rejection under the same two-answer rule while the grant still matches that token, containing storage failures, and a `revoked` signal; the removal runs on the account service mounted when `reject()` is called, so a reload between the request and the destination's answer still removes the grant. [`ctx.deepseekAuth`](../deepseek-auth/README.md) calls it for the account model route and the DeepSeek web providers, which end the request that carries the token when `revoked` aborts.
++Profile and balance HTTP 401 responses or top-level response code `40003` (invalid authorization) record one rejection of the current grant; the grant is removed and the live `deepseek-account/session-expired` notification emitted only once a second rejection of the same token arrives at least `requestTimeoutMs` after the first and outside the boot grace, because one rejection is not proof that the token is invalid. A ready profile read, a new sign-in, and a completed removal each clear the run. Concurrent confirmed responses share one removal; responses from an invalidated credential generation cannot clear its replacement. Other HTTP failures retain the grant. A detail read the destination does not answer (an HTTP 202 challenge, a 5xx, a timeout) is retried once immediately; a RUN of consecutive failures for one field opens a doubling window (5 s to 60 s) in which profile and wallet reads replay their last outcome without another round trip, so a destination that rejects every request is probed rather than hammered and a signed-in account keeps its cached identity. `resolveRequestCredential(url)` releases the credential for one allowed destination as the request headers, a `reject()` that reports the destination's rejection under the same two-answer rule while the grant still matches that token, containing storage failures, and a `revoked` signal; the removal runs on the account service mounted when `reject()` is called, so a reload between the request and the destination's answer still removes the grant. [`ctx.deepseekAuth`](../deepseek-auth/README.md) calls it for the account model route and the DeepSeek web providers, which end the request that carries the token when `revoked` aborts.
  
  ## Summary
  
@@ -65,7 +65,7 @@ index 5874a864..f2f304ce 100644
  accountRequestHeaders overlays requestHeaders for current, balance and embedded Platform page/API requests. Cookie pairs merge by name so routing overrides retain other deployment cookies. Authorization initialization, exchange, cancellation and logout keep requestHeaders. Both maps remain private to Host and Electron main; the session's userId stays Host-only too, and renderer bootstrap receives only origin and token.
  
 diff --git a/packages/account/deepseek-account/README.zh.md b/packages/account/deepseek-account/README.zh.md
-index 93dede11..c52eccd3 100644
+index 93dede11..9f12cb5f 100644
 --- a/packages/account/deepseek-account/README.zh.md
 +++ b/packages/account/deepseek-account/README.zh.md
 @@ -13,7 +13,7 @@ getPlatformSession 仅在已存授权的 issuer 与 platformOrigin 一致时导
@@ -73,7 +73,7 @@ index 93dede11..c52eccd3 100644
  `desktopPlatform` 默认为 `null`，此时携带 `x-client-platform: web`；Desktop profile 提供 `darwin` 或 `win32`，改为 `desktop-mac` 或 `desktop-win`。五个请求头均由 provider 拥有，部署配置无法覆盖；`x-client-bundle-id` 有意保持为空，`x-client-locale` 将调用方语言归约为 `zh_CN` 或 `en_US`。PlatformSession 只携带部署请求头，内嵌客户端为自行打开的 Platform 文档和 API 请求组装同样的五个请求头，且仅在配置来源发送。
  
 -资料和余额接口返回 HTTP 401 或顶层响应码 `40003`（鉴权失效）时清除被拒绝的本地凭据，并发送实时 `deepseek-account/session-expired` 通知。并发响应共用一次清除操作；已失效凭据代次的响应不能清除替换后的凭据。其他 HTTP 错误保留凭据。`resolveRequestCredential(url)` 把一个允许目标的凭据以请求头、`reject()` 和 `revoked` 信号的形式释放；`reject()` 在 HTTP 401 后、且存储的授权仍匹配该 token 时清除它并隔离存储失败；清除在 `reject()` 被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会清除授权。[`ctx.deepseekAuth`](../deepseek-auth/README.zh.md) 代账号模型路由和 DeepSeek Web 提供方调用它，后两者在 `revoked` 中止时结束携带该 token 的请求。
-+资料和余额接口返回 HTTP 401 或顶层响应码 `40003`（鉴权失效）时，只记下当前授权的第一次拒绝；仅当同一 token 的第二次拒绝与第一次相隔不少于 `requestTimeoutMs`、且已越过启动宽限期时，才清除该授权并发送实时 `deepseek-account/session-expired` 通知，因为单次拒绝不足以证明 token 失效。一次成功的资料读取、一次新的登录以及一次完成的清除都会重置这段计数。已确认的并发响应共用一次清除操作；已失效凭据代次的响应不能清除替换后的凭据。其他 HTTP 错误保留凭据。`resolveRequestCredential(url)` 把一个允许目标的凭据以请求头、`reject()` 和 `revoked` 信号的形式释放；`reject()` 按同样的两次应答规则、在存储的授权仍匹配该 token 时上报并清除它，且隔离存储失败；清除在 `reject()` 被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会清除授权。[`ctx.deepseekAuth`](../deepseek-auth/README.zh.md) 代账号模型路由和 DeepSeek Web 提供方调用它，后两者在 `revoked` 中止时结束携带该 token 的请求。
++资料和余额接口返回 HTTP 401 或顶层响应码 `40003`（鉴权失效）时，只记下当前授权的第一次拒绝；仅当同一 token 的第二次拒绝与第一次相隔不少于 `requestTimeoutMs`、且已越过启动宽限期时，才清除该授权并发送实时 `deepseek-account/session-expired` 通知，因为单次拒绝不足以证明 token 失效。一次成功的资料读取、一次新的登录以及一次完成的清除都会重置这段计数。已确认的并发响应共用一次清除操作；已失效凭据代次的响应不能清除替换后的凭据。其他 HTTP 错误保留凭据。 目标地址不给出答案的详情读取（HTTP 202 挑战、5xx、超时）会立即重试一次；同一字段的连续失败会开启一个倍增的窗口（5 秒至 60 秒），窗口内资料与钱包读取重放上一次结果而不再发出请求，因此持续拒绝请求的目标只会被探测而不是被反复冲击，已登录账号继续使用缓存的身份。`resolveRequestCredential(url)` 把一个允许目标的凭据以请求头、`reject()` 和 `revoked` 信号的形式释放；`reject()` 按同样的两次应答规则、在存储的授权仍匹配该 token 时上报并清除它，且隔离存储失败；清除在 `reject()` 被调用时挂载的账号服务上执行，因此请求与目的地应答之间发生的重载仍会清除授权。[`ctx.deepseekAuth`](../deepseek-auth/README.zh.md) 代账号模型路由和 DeepSeek Web 提供方调用它，后两者在 `revoked` 中止时结束携带该 token 的请求。
  
  ## 概述
  
@@ -105,7 +105,7 @@ index 93dede11..c52eccd3 100644
  accountRequestHeaders 覆盖 requestHeaders，供 current、余额以及内嵌 Platform 页面/API 请求使用。Cookie 按名称合并，路由覆盖保留其他部署 Cookie。授权初始化、兑换、取消和退登保持使用 requestHeaders。两组请求头仅供 Host 和 Electron 主进程使用；快照的 userId 同样仅限 Host，渲染层 bootstrap 仅接收 origin 和 token。
  
 diff --git a/packages/account/deepseek-account/src/index.ts b/packages/account/deepseek-account/src/index.ts
-index de9d559c..98f64efb 100644
+index de9d559c..e8704e82 100644
 --- a/packages/account/deepseek-account/src/index.ts
 +++ b/packages/account/deepseek-account/src/index.ts
 @@ -9,7 +9,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
@@ -117,7 +117,7 @@ index de9d559c..98f64efb 100644
  import { credentialKey } from '@deepseek-ai/dsh-credentials'
  import type { AuthorizationSession } from '@deepseek-ai/dsh-authorization'
  import { profile, readAccountDetail } from './details.ts'
-@@ -32,7 +32,13 @@ declare module '@deepseek-ai/cordis' {
+@@ -32,9 +32,26 @@ declare module '@deepseek-ai/cordis' {
  
  const KEY = credentialKey('deepseek-account-platform', 'default')
  const DEVICE = credentialKey('deepseek-account-platform', 'device')
@@ -131,13 +131,46 @@ index de9d559c..98f64efb 100644
 +})
  const device = z.object({ id: z.uuid() })
  
++/**
++ * Backoff after a rejected Platform detail read. The client re-reads the account on every stream
++ * frame, settings entry and top-up return, so an unthrottled retry turns ONE rejection (a WAF 202,
++ * a proxy 401, an expired token) into a request storm: the account surfaces keep asking and every
++ * ask costs a Platform round-trip. The first retry waits this long, then the delay doubles to the
++ * cap; a ready read resets both. One rejection therefore costs at most one request per window.
++ */
++const DETAILS_RETRY_BASE_MS = 5_000
++/** Ceiling for the detail-read backoff, so a persistently broken Platform is probed, not hammered. */
++const DETAILS_RETRY_MAX_MS = 60_000
++
  /** Deployment-specific platform and request deadlines. */
-@@ -127,7 +133,15 @@ export class DeepSeekAccount extends TypertRemoteService {
+ export interface Config {
+   /** Platform origin serving auth-api and browser pages. */
+@@ -127,7 +144,35 @@ export class DeepSeekAccount extends TypertRemoteService {
     * cached identity from answering for a credential that has since changed.
     */
    private lastProfile: { readonly token: string; readonly profile: Extract<AccountDetails['profile'], { status: 'ready' }> } | undefined
-+  /** Fingerprint of the identity already on disk, so an unchanged profile is not rewritten on every read. */
++  /**
++   * Fingerprint of the identity already on disk for the CURRENT token, so an unchanged profile is
++   * not rewritten on every read. Token-scoped: a re-authorization must write its own identity even
++   * when the account is the same, and a replaced record must be able to cache again.
++   */
 +  private persistedProfile: string | undefined
++  /**
++   * Per-field read guard: the last outcome and, after a rejection, the window in which the Platform
++   * is not asked again. Keyed by field so a failing balance never silences the profile (or the
++   * reverse), and bound to the token so a re-authorization starts clean.
++   */
++  private readonly detailGuards = new Map<keyof AccountDetails, {
++    readonly token: string
++    /** Consecutive failed reads for this token; one failure is retried, a run opens a window. */
++    readonly failures: number
++    /** Window applied by the last failure; doubles per consecutive failure up to the cap. */
++    readonly delay: number
++    /** Monotonic instant before which no request is made for this field. */
++    readonly retryAt: number
++    /** The answer an open window replays: the failed outcome, or a rejected read's null. */
++    readonly outcome: AccountDetails[keyof AccountDetails] | null
++  }>()
 +  /** Serialized grant payload an identity write-back is storing; undefined when none is in flight. */
 +  private profileWrite: string | undefined
    private detailsLifetime = new AbortController()
@@ -148,7 +181,7 @@ index de9d559c..98f64efb 100644
    /** Aborted at the next sign-out; request credentials of the current sign-in carry its signal. */
    private signedOut = new AbortController()
    private closed = false
-@@ -171,8 +185,20 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -171,8 +216,26 @@ export class DeepSeekAccount extends TypertRemoteService {
      })
      ctx.on('credentials/record-updated', (key) => {
        if (key !== KEY) return
@@ -167,11 +200,17 @@ index de9d559c..98f64efb 100644
 +        if (own) return
 +        this.invalidateDetails()
 +        this.changed('credentials-changed')
++      }).catch((error: unknown) => {
++        // A verification that cannot run is not proof of a foreign write, and an unhandled rejection
++        // here would take the whole Host process down: invalidate instead, which is the safe answer.
++        this.invalidateDetails()
++        this.changed('credentials-changed')
++        this.ctx.logger.warn(`[deepseek-account] identity write check failed: ${String(error)}`)
 +      })
      })
      ctx.effect(() => async () => {
        this.closed = true
-@@ -195,7 +221,14 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -195,7 +258,14 @@ export class DeepSeekAccount extends TypertRemoteService {
      if (record.kind !== 'grant') throw new PlatformAuthError('storage')
      const parsed = grant.safeParse(record.payload)
      if (!parsed.success) throw new PlatformAuthError('storage')
@@ -180,14 +219,14 @@ index de9d559c..98f64efb 100644
 +      // Seed the identity cache so a restart renders the account before any Platform read.
 +      if (parsed.data.profile !== undefined) {
 +        this.lastProfile = { token: parsed.data.token, profile: persistedProfile(parsed.data.profile) }
-+        this.persistedProfile = profileFingerprint(parsed.data.profile)
++        this.persistedProfile = persistedKey(parsed.data.token, parsed.data.profile)
 +      }
 +      return
 +    }
      await this.ctx.credentials.deleteRecord(KEY)
    }
  
-@@ -233,7 +266,9 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -233,7 +303,9 @@ export class DeepSeekAccount extends TypertRemoteService {
      const result = await this.getDetail('profile', this.detailHeaders(client), { lifetime, stored })
      if (this.detailsLifetime !== lifetime) return null
      if (result !== null) this.cacheProfile(stored.token, result)
@@ -198,7 +237,7 @@ index de9d559c..98f64efb 100644
      // Only this same grant's last ready read may stand in for a failed refresh.
      const cached = this.lastProfile?.token === stored.token ? this.lastProfile.profile : undefined
      return cached ?? result
-@@ -341,9 +376,54 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -341,9 +413,56 @@ export class DeepSeekAccount extends TypertRemoteService {
      // Identity publishers re-read the session snapshot; wake them only when the stable ID changes.
      const previous = this.lastProfile?.profile.value.id || null
      this.lastProfile = { token, profile }
@@ -216,7 +255,9 @@ index de9d559c..98f64efb 100644
 +   */
 +  private persistProfile(token: string, value: AccountProfile): void {
 +    const cached = cacheableProfile(value)
-+    const fingerprint = profileFingerprint(cached)
++    // Token-scoped: the same account signing in again owns a new grant record, which carries no
++    // identity yet, so the fingerprint of the previous record must not suppress this write.
++    const fingerprint = persistedKey(token, cached)
 +    if (this.persistedProfile === fingerprint) return
 +    this.persistedProfile = fingerprint
 +    const payload = { version: 1 as const, token, issuer: this.origin, profile: cached }
@@ -253,7 +294,70 @@ index de9d559c..98f64efb 100644
    private async getDetail<K extends keyof AccountDetails>(field: K, headers: Record<string, string>,
      captured?: { lifetime: AbortController; stored: z.infer<typeof grant> }): Promise<AccountDetails[K] | null> {
      const lifetime = captured?.lifetime ?? this.detailsLifetime
-@@ -382,7 +462,32 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -354,17 +473,62 @@ export class DeepSeekAccount extends TypertRemoteService {
+       delete this.attempt.initialProfile
+       return initial as AccountDetails[K]
+     }
++    // A field the Platform just rejected replays its last answer until the backoff window passes:
++    // the client re-reads on every frame, settings entry and top-up return, so an unthrottled retry
++    // turns ONE rejection (a WAF 202, a proxy 401, an expired token) into a request storm. Replaying
++    // the rejected outcome keeps every caller's contract — a cached identity still answers, a null
++    // still means "signed out or grant changed" — without paying another round-trip.
++    const guard = this.detailGuards.get(field)
++    if (guard !== undefined && guard.token === stored.token && guard.retryAt > performance.now()) {
++      return guard.outcome as AccountDetails[K] | null
++    }
+     try {
+       const details = await readAccountDetail(field, this.origin, stored.token,
+         AbortSignal.any([lifetime.signal, AbortSignal.timeout(field === 'balance' ? this.balanceTimeout : this.requestTimeout)]), headers)
++      this.settleDetail(field, stored.token, details)
+       return this.detailsLifetime !== lifetime ? null : details
+     } catch (_unauthorized) {
+       // readAccountDetail exposes only authenticated credential rejection failures.
++      this.settleDetail(field, stored.token, null)
+       if (this.detailsLifetime === lifetime) await this.expireCredential(stored.token, lifetime)
+       return null
+     }
+   }
+ 
++  /**
++   * Record one read's outcome and decide whether the Platform may be asked again immediately.
++   *
++   * A READY answer clears the history. A REJECTED CREDENTIAL (null) never opens a window: the user's
++   * account state has to resolve, so the next read must reach the expiry path again. An UNREACHABLE
++   * answer (`failed` — a 202/WAF challenge, a 5xx, a timeout) is retried once immediately, because one
++   * transient failure is not a broken Platform; only a RUN of them opens a window (base, then doubling
++   * to the cap). That is the difference between a hiccup and the request storm this guard exists for.
++   * @param field - profile or wallet query the outcome belongs to.
++   * @param token - grant the read was made with; a different token starts its own history.
++   * @param outcome - the read's answer, or null when the destination rejected the credential.
++   */
++  private settleDetail<K extends keyof AccountDetails>(field: K, token: string,
++    outcome: AccountDetails[K] | null): void {
++    const previous = this.detailGuards.get(field)
++    const sameToken = previous !== undefined && previous.token === token
++    if (outcome === null) {
++      this.detailGuards.set(field, { token, failures: 0, delay: DETAILS_RETRY_BASE_MS, retryAt: 0, outcome: null })
++      return
++    }
++    if (outcome.status !== 'failed') {
++      this.detailGuards.set(field, { token, failures: 0, delay: DETAILS_RETRY_BASE_MS, retryAt: 0, outcome })
++      return
++    }
++    const failures = sameToken ? previous.failures + 1 : 1
++    if (failures < 2) {
++      this.detailGuards.set(field, { token, failures, delay: DETAILS_RETRY_BASE_MS, retryAt: 0, outcome })
++      return
++    }
++    // The first WINDOW is the base delay; each further consecutive failure doubles it, to the cap.
++    const delay = Math.min(DETAILS_RETRY_BASE_MS * 2 ** (failures - 2), DETAILS_RETRY_MAX_MS)
++    this.detailGuards.set(field, { token, failures, delay, retryAt: performance.now() + delay, outcome })
++  }
++
+   /** Deployment account headers plus the client identity headers derived from one call's metadata. */
+   private detailHeaders(client: AccountClientMetadata): Record<string, string> {
+     return { ...this.accountRequestHeaders, ...platformClientHeaders(this.platform, client) }
+@@ -382,7 +546,32 @@ export class DeepSeekAccount extends TypertRemoteService {
      await this.expireCredential(token, lifetime)
    }
  
@@ -286,7 +390,7 @@ index de9d559c..98f64efb 100644
      this.removing ??= (async () => {
        if (this.attempt !== undefined) await this.cancelSignIn(this.attempt.view.id)
        const record = await this.ctx.credentials.readRecord(KEY)
-@@ -390,6 +495,7 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -390,6 +579,7 @@ export class DeepSeekAccount extends TypertRemoteService {
        const current = grant.parse(record.payload)
        if (current.token !== token || current.issuer !== this.origin) return this.getState()
        await this.ctx.credentials.deleteRecord(KEY)
@@ -294,17 +398,19 @@ index de9d559c..98f64efb 100644
        this.ctx.emit('deepseek-account/session-expired')
        this.attempt = undefined
        this.publishSignedOut()
-@@ -717,6 +823,9 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -717,6 +907,11 @@ export class DeepSeekAccount extends TypertRemoteService {
  
    private invalidateDetails(): void {
      this.lastProfile = undefined
-+    // The identity this process last wrote is no longer known to be on disk, so the next ready read
-+    // writes it again rather than trusting a fingerprint from a replaced record.
-+    this.persistedProfile = undefined
++    // `persistedProfile` SURVIVES an invalidation on purpose. Clearing it here armed a rewrite of the
++    // identity this process had just written, so a record event that the write-back could not
++    // attribute (a delayed fan-out, a watcher reload, another listener) became: invalidate → client
++    // frame → profile read → identical write → event → invalidate, one Platform round-trip per turn.
++    // The fingerprint is token-scoped, so a re-authorization or a replaced record still writes.
      this.detailsLifetime.abort()
      this.detailsLifetime = new AbortController()
    }
-@@ -812,10 +921,21 @@ export class DeepSeekAccount extends TypertRemoteService {
+@@ -812,10 +1007,21 @@ export class DeepSeekAccount extends TypertRemoteService {
            // Invalid optional user data falls back to current without discarding a valid authorization.
          }
        }
@@ -328,7 +434,7 @@ index de9d559c..98f64efb 100644
      } catch (error) {
        if (deadline.signal.aborted) throw new PlatformAuthError('expired')
        throw error
-@@ -874,3 +994,20 @@ export default DeepSeekAccount
+@@ -874,3 +1080,24 @@ export default DeepSeekAccount
  function deviceOsVersion(): string {
    return `${platform()} ${release()}`
  }
@@ -349,6 +455,10 @@ index de9d559c..98f64efb 100644
 +/** Identity equality for write suppression; a tuple keeps the answer independent of key order. */
 +const profileFingerprint = (value: z.infer<typeof cachedProfile>): string =>
 +  JSON.stringify([value.id ?? null, value.name ?? null, value.contact ?? null, value.avatarUrl ?? null])
++
++/** Write-suppression key: one grant token's identity, so a new sign-in writes its own record. */
++const persistedKey = (token: string, value: z.infer<typeof cachedProfile>): string =>
++  `${token}\u0000${profileFingerprint(value)}`
 diff --git a/packages/account/deepseek-account/src/types.ts b/packages/account/deepseek-account/src/types.ts
 index a9c83444..41f65132 100644
 --- a/packages/account/deepseek-account/src/types.ts
@@ -373,7 +483,7 @@ index a9c83444..41f65132 100644
     */
    reject(): Promise<void>
 diff --git a/packages/account/deepseek-account/tests/account.spec.ts b/packages/account/deepseek-account/tests/account.spec.ts
-index 76405b1a..69044a24 100644
+index 76405b1a..3f89a0a7 100644
 --- a/packages/account/deepseek-account/tests/account.spec.ts
 +++ b/packages/account/deepseek-account/tests/account.spec.ts
 @@ -11,7 +11,7 @@ import * as Connection from '@deepseek-ai/dsh-client-connection'
@@ -489,7 +599,7 @@ index 76405b1a..69044a24 100644
  /** Inference origin a fixture allows a grant `storeAccount` wrote, which official inference refuses as development-issued. */
  const PRIVATE_INFERENCE = 'http://inference.example.test:8094'
  
-@@ -529,6 +579,347 @@ async function storedCredential(f: Awaited<ReturnType<typeof fixture>>) {
+@@ -529,6 +579,428 @@ async function storedCredential(f: Awaited<ReturnType<typeof fixture>>) {
    return credential
  }
  
@@ -509,6 +619,87 @@ index 76405b1a..69044a24 100644
 +  expect(f.detailRequests).toEqual(expect.arrayContaining([
 +    { path: '/auth-api/v0/users/current', authorization: 'test-platform-grant' },
 +  ]))
++})
++
++it('bounds Platform reads when the profile is persistently unreachable', async () => {
++  fakeClock()
++  const f = await fixture()
++  await storeAccountWithProfile(f)
++  const restarted = await f.remount()
++  // A WAF/edge challenge: HTTP 202 with an empty body — `stage: parse-json` in the diagnostic.
++  f.detailStatus(202)
++  const before = f.detailRequests.length
++  const reads = () => restarted.getProfile(clientMetadata())
++  // One transient failure is retried at once: a single 202 is a hiccup, not a broken Platform.
++  await reads()
++  expect(f.detailRequests.length - before).toBe(1)
++  await reads()
++  expect(f.detailRequests.length - before).toBe(2)
++  // From the second consecutive failure a window is open. The client re-reads on every stream
++  // frame; ten of those re-reads must cost nothing while the window is open.
++  for (let index = 0; index < 10; index += 1) await reads()
++  expect(f.detailRequests.length - before).toBe(2)
++  // Each following window admits exactly one request, and doubles: 5 s, then 10 s.
++  vi.advanceTimersByTime(5_000)
++  await reads()
++  await reads()
++  expect(f.detailRequests.length - before).toBe(3)
++  vi.advanceTimersByTime(10_000)
++  await reads()
++  await reads()
++  expect(f.detailRequests.length - before).toBe(4)
++  // A ready answer clears the run, so the following read reaches the Platform immediately.
++  f.detailStatus(200)
++  vi.advanceTimersByTime(20_000)
++  expect(await restarted.getProfile(clientMetadata())).toMatchObject({ status: 'ready' })
++})
++
++it('survives an identity write check that cannot read the record', async () => {
++  const f = await fixture()
++  await storeAccount(f)
++  const held = await gatedProfileWrite(f)
++  try {
++    expect(await f.account.getProfile(clientMetadata())).toMatchObject({ status: 'ready' })
++    await expect.poll(async () => f.ctx.credentials.readRecord(held.key))
++      .toMatchObject({ payload: { profile: { name: 'Test Account' } } })
++    // The verification read throws. The listener must invalidate and swallow it: an unhandled
++    // rejection out of a credentials event would take the whole Host process down. Vitest fails the
++    // run on an unhandled rejection, so completing this block proves the guard held.
++    const read = vi.spyOn(f.ctx.credentials, 'readRecord').mockImplementation(() => { throw new Error('store unavailable') })
++    try {
++      f.ctx.emit('credentials/record-updated', held.key)
++      await new Promise<void>((resolve) => { setTimeout(resolve, 10) })
++    } finally { read.mockRestore() }
++  } finally {
++    held.gate.resolve(undefined)
++    held.modify.mockRestore()
++  }
++})
++
++it('does not rewrite the identity after a cache invalidation', async () => {
++  const f = await fixture()
++  const key = credentialKey('deepseek-account-platform', 'default')
++  await storeAccountWithProfile(f)
++  const restarted = await f.remount()
++  const modify = vi.spyOn(f.ctx.credentials, 'modifyRecord')
++  try {
++    // The seeded fingerprint matches, so the first ready read writes nothing.
++    expect(await restarted.getProfile(clientMetadata())).toMatchObject({ status: 'ready' })
++    const writes = () => modify.mock.calls.filter(([requested]) => requested === key)
++    expect(writes()).toHaveLength(0)
++    // A record event invalidates the cache. The identity this process wrote is still the record's,
++    // so the next ready read must NOT write again — that write is what fed the event loop.
++    f.ctx.emit('credentials/record-updated', key)
++    expect(await restarted.getProfile(clientMetadata())).toMatchObject({ status: 'ready' })
++    expect(writes()).toHaveLength(0)
++    // A replacement credential is a different token, so its identity IS written.
++    await f.ctx.credentials.modifyRecord(key, () => Promise.resolve({
++      kind: 'grant', payload: { version: 1, issuer: f.origin, token: 'replacement-token' },
++    }))
++    const seeded = writes().length
++    expect(await restarted.getProfile(clientMetadata())).toMatchObject({ status: 'ready' })
++    expect(writes().length).toBe(seeded + 1)
++  } finally { modify.mockRestore() }
 +})
 +
 +it('writes the identity cache back once and keeps it stable', async () => {
@@ -837,7 +1028,7 @@ index 76405b1a..69044a24 100644
  it('queries Platform Web endpoints with the stored grant and projects only masked profile and separate recharge and bonus balances', async () => {
    const f = await fixture()
    expect(await readDetails(f.account)).toBeNull()
-@@ -566,6 +957,8 @@ it('publishes sign-out only after local grant removal and refuses token resoluti
+@@ -566,6 +1038,8 @@ it('publishes sign-out only after local grant removal and refuses token resoluti
  })
  
  it.each(['user sign-out', 'rejected token'] as const)('withdraws released request credentials at a %s, after its listeners ran', async (cause) => {
@@ -846,7 +1037,7 @@ index 76405b1a..69044a24 100644
    const f = await fixture(undefined, {}, false, {}, PRIVATE_INFERENCE)
    await storeAccount(f)
    const credential = await storedCredential(f)
-@@ -573,7 +966,8 @@ it.each(['user sign-out', 'rejected token'] as const)('withdraws released reques
+@@ -573,7 +1047,8 @@ it.each(['user sign-out', 'rejected token'] as const)('withdraws released reques
    f.ctx.on('deepseek-account/signed-out', () => { observed.push(credential.revoked.aborted) })
    expect(credential.revoked.aborted).toBe(false)
    if (cause === 'user sign-out') await f.account.signOut(clientMetadata())
@@ -856,7 +1047,7 @@ index 76405b1a..69044a24 100644
    expect(observed).toEqual([false])
    expect(credential.revoked.aborted).toBe(true)
    // The next sign-in releases its credentials on a signal of its own.
-@@ -1197,7 +1591,9 @@ it.each([undefined, [{ currency: 'EUR', balance: '1' }], [{ currency: 'CNY', bal
+@@ -1197,7 +1672,9 @@ it.each([undefined, [{ currency: 'EUR', balance: '1' }], [{ currency: 'CNY', bal
    },
  )
  
@@ -867,7 +1058,7 @@ index 76405b1a..69044a24 100644
    const f = await fixture()
    await storeAccount(f)
    let signedOut = 0
-@@ -1205,14 +1601,20 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
+@@ -1205,14 +1682,20 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
    const expired = vi.fn()
    f.ctx.on('deepseek-account/session-expired', expired)
    f.detailStatus(401)
@@ -890,7 +1081,7 @@ index 76405b1a..69044a24 100644
    const f = await fixture()
    await storeAccount(f)
    let signedOut = 0
-@@ -1220,7 +1622,11 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
+@@ -1220,7 +1703,11 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
    const expired = vi.fn()
    f.ctx.on('deepseek-account/session-expired', expired)
    f.detailCode(40003)
@@ -903,7 +1094,7 @@ index 76405b1a..69044a24 100644
    expect(await f.account.getState()).toMatchObject({ status: 'signed-out', attempt: null })
    expect(await f.ctx.credentials.readRecord(credentialKey('deepseek-account-platform', 'default'))).toBeUndefined()
    expect(signedOut).toBe(1)
-@@ -1228,6 +1634,7 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
+@@ -1228,6 +1715,7 @@ it.each(['profile', 'balance'] as const)('clears the rejected account grant afte
  })
  
  it('coalesces simultaneous unauthorized profile and balance responses', async () => {
@@ -911,7 +1102,7 @@ index 76405b1a..69044a24 100644
    const f = await fixture()
    await storeAccount(f)
    let signedOut = 0
-@@ -1235,6 +1642,9 @@ it('coalesces simultaneous unauthorized profile and balance responses', async ()
+@@ -1235,6 +1723,9 @@ it('coalesces simultaneous unauthorized profile and balance responses', async ()
    const expired = vi.fn()
    f.ctx.on('deepseek-account/session-expired', expired)
    f.detailStatus(401)
@@ -921,7 +1112,7 @@ index 76405b1a..69044a24 100644
    await Promise.all([f.account.getProfile(clientMetadata()), f.account.getBalance(clientMetadata())])
    expect(signedOut).toBe(1)
    expect(expired).toHaveBeenCalledOnce()
-@@ -1731,24 +2141,31 @@ it('reuses the last profile identity without querying again', async () => {
+@@ -1731,24 +2222,31 @@ it('reuses the last profile identity without querying again', async () => {
  })
  
  it('cancels a pending sign-in when the current stored grant expires', async () => {
@@ -954,7 +1145,7 @@ index 76405b1a..69044a24 100644
      expect(await f.account.getBalance(clientMetadata())).toBeNull()
      expect(await f.account.getState()).toMatchObject({ status: 'signed-out' })
    } finally { remove.mockRestore() }
-@@ -1759,10 +2176,15 @@ it.each([
+@@ -1759,10 +2257,15 @@ it.each([
    ['balance', 'token'], ['balance', 'issuer'], ['profile', 'missing'],
  ] as const)(
    'rechecks the stored grant before %s expiry removal: %s', async (field, change) => {
@@ -970,7 +1161,7 @@ index 76405b1a..69044a24 100644
      const original = f.ctx.credentials.readRecord.bind(f.ctx.credentials)
      let reads = 0
      const read = vi.spyOn(f.ctx.credentials, 'readRecord').mockImplementation(async (requested) => {
-@@ -1806,6 +2228,7 @@ it('ignores a 401 whose response cleanup overlaps a credential replacement', asy
+@@ -1806,6 +2309,7 @@ it('ignores a 401 whose response cleanup overlaps a credential replacement', asy
  })
  
  it('expires an inference-rejected token without another Platform request', async () => {
@@ -978,7 +1169,7 @@ index 76405b1a..69044a24 100644
    const f = await fixture(undefined, {}, false, {}, PRIVATE_INFERENCE)
    await storeAccount(f)
    const credential = await storedCredential(f)
-@@ -1813,6 +2236,7 @@ it('expires an inference-rejected token without another Platform request', async
+@@ -1813,6 +2317,7 @@ it('expires an inference-rejected token without another Platform request', async
    f.ctx.on('deepseek-account/signed-out', () => { published.push('signed-out') })
    f.ctx.on('deepseek-account/session-expired', () => { published.push('session-expired') })
    await credential.reject()

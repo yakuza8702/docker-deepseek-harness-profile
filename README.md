@@ -207,6 +207,14 @@ upstream `0.2.3-alpha.2` (commit `4b399c39`) still has:
   now / Try again", and the retry shares the grant handle so a revoked grant
   starts no read.
 
+It also **bounds the account read rate** against a destination that rejects every
+request: the field failure a WAF/edge challenge produced (HTTP 202 with an empty
+body, `stage=parse-json`) used to be re-read on every client refresh, at ~1
+request/second. One unreachable answer is still retried at once; a *run* of them
+opens a doubling window (5 s → 60 s) in which profile and wallet reads replay
+their last outcome without another round trip, so a broken destination is probed
+rather than hammered.
+
 It is a patch against the upstream **TypeScript sources**, so it can only reach a
 **source build**: the image applies it between the clone and `pnpm run build`
 (`DSH_SIGNIN_FIX=1`, the default), then proves the compiled Host lib carries it and

@@ -14,7 +14,7 @@ them.
 
 | Patch | Base commit | Tag | Files |
 |---|---|---|---|
-| [`auth-fix.patch`](auth-fix.patch) | `4b399c39a6d1479cd84ca591b4d7c88e24d38a96` | `dsh-v0.2.3-alpha.2` | 20 files, +906 / −74 |
+| [`auth-fix.patch`](auth-fix.patch) | `4b399c39a6d1479cd84ca591b4d7c88e24d38a96` | `dsh-v0.2.3-alpha.2` | 20 files, +1077 / −74 |
 
 ## `auth-fix.patch` — what it fixes
 
@@ -36,6 +36,16 @@ Three user-visible defects in the DeepSeek account (sign-in) path:
    failed carrier), offers "Can't reach DeepSeek right now / Try again", and the
    retry shares the grant handle so a revoked grant starts no read and publishes
    nothing.
+
+It also **bounds the read rate against a destination that rejects every request**
+(the 202 `stage=parse-json` storm a WAF/edge challenge produced in the field):
+one unreachable answer is retried at once, but a *run* of consecutive failures
+for one field opens a doubling window (5 s → 60 s) in which profile and wallet
+reads replay their last outcome without another round trip, so a broken
+destination is probed rather than hammered. The identity write-back also no
+longer re-arms itself on a cache invalidation (its fingerprint is token-scoped
+and survives invalidation), so a credentials event can never drive a
+read → write → event → invalidate cycle.
 
 It also makes the credential-change listener suppress only a write-back it can
 verify (a sign-out, a re-authorization, another process's edit still invalidates),
